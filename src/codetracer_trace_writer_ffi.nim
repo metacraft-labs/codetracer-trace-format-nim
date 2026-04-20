@@ -19,7 +19,7 @@
 ##   3. The Rust API has separate begin_metadata/finish_metadata/begin_events/
 ##      finish_events/begin_paths/finish_paths. The Nim API wraps these as no-ops
 ##      (metadata/paths are written on close) and provides the same function symbols
-##      for link-compatibility. They always return true.
+##      for link-compatibility. They always return 0 (success).
 ##
 ##   4. trace_writer_start and trace_writer_set_workdir are supported.
 ##
@@ -34,6 +34,7 @@
 import codetracer_trace_writer
 import codetracer_trace_types
 import std/tables
+import std/os
 
 # ---------------------------------------------------------------------------
 # Thread-local error buffer
@@ -70,6 +71,8 @@ type
 
   TraceWriterState = object
     writer: TraceWriter
+    writerReady: bool  # true once .ct file has been created
+    programName: string  # stored from trace_writer_new, used when creating .ct
     workdir: string
     started: bool
     # Function registry: name+path+line -> id
@@ -172,22 +175,17 @@ proc trace_writer_new(
     program: cstring,
     format: FfiTraceFormat,
 ): TraceWriterHandle {.exportc, cdecl.} =
-  ## Create a new trace writer.
-  ## The trace is written to a .ct file in the current working directory.
-  ## Returns NULL on failure (check trace_writer_last_error).
+  ## Create a new trace writer handle.
+  ## The .ct file is NOT created here — it is deferred to trace_writer_begin_events
+  ## which receives the output path from the Python recorder. This ensures the .ct
+  ## file ends up in the correct output directory rather than the current working dir.
+  ## Returns NULL on allocation failure (check trace_writer_last_error).
   let prog = toNimStr(program)
-
-  # Determine output path — use current directory + program name
-  let path = prog & ".ct"
-
-  let res = newTraceWriter(path, prog, @[], "")
-  if res.isErr:
-    setError(res.error)
-    return nil
 
   let state = cast[TraceWriterHandle](alloc0(sizeof(TraceWriterState)))
   state[] = TraceWriterState(
-    writer: res.get(),
+    writerReady: false,
+    programName: prog,
     workdir: "",
     started: false,
     functions: @[],
@@ -201,8 +199,8 @@ proc trace_writer_free(handle: TraceWriterHandle) {.exportc, cdecl.} =
   ## Free a trace writer handle. Passing NULL is a no-op.
   if handle.isNil:
     return
-  # Close if not already closed
-  if not handle.writer.closed:
+  # Close if writer was actually created and not already closed
+  if handle.writerReady and not handle.writer.closed:
     discard handle.writer.close()
   `=destroy`(handle[])
   dealloc(handle)
@@ -214,54 +212,79 @@ proc trace_writer_free(handle: TraceWriterHandle) {.exportc, cdecl.} =
 proc trace_writer_begin_metadata(
     handle: TraceWriterHandle,
     path: cstring,
-): bool {.exportc, cdecl.} =
+): cint {.exportc, cdecl.} =
   ## Begin writing metadata. In the Nim CTFS implementation, metadata is
   ## written on close, so this is a no-op that records the path.
   if handle.isNil:
     setError("NULL handle")
-    return false
-  true
+    return 1.cint
+  0.cint
 
-proc trace_writer_finish_metadata(handle: TraceWriterHandle): bool {.exportc, cdecl.} =
+proc trace_writer_finish_metadata(handle: TraceWriterHandle): cint {.exportc, cdecl.} =
   if handle.isNil:
     setError("NULL handle")
-    return false
-  true
+    return 1.cint
+  0.cint
 
 proc trace_writer_begin_events(
     handle: TraceWriterHandle,
     path: cstring,
-): bool {.exportc, cdecl.} =
+): cint {.exportc, cdecl.} =
+  ## Creates the .ct file in the same directory as the given events path.
+  ## The .ct filename is derived from the program name stored at construction time.
+  ## This is the point where the actual CTFS container file is opened on disk.
   if handle.isNil:
     setError("NULL handle")
-    return false
-  true
+    return 1.cint
 
-proc trace_writer_finish_events(handle: TraceWriterHandle): bool {.exportc, cdecl.} =
+  if handle.writerReady:
+    # Already initialized — nothing to do (idempotent)
+    return 0.cint
+
+  let eventsPath = toNimStr(path)
+  let outDir = parentDir(eventsPath)
+  # Place the .ct file in the same directory as the events path.
+  # Use only the base filename of the program (strip directory and extension),
+  # since programName may be a full path like "/tmp/test_recorder.py".
+  let (_, progBase, _) = splitFile(handle.programName)
+  let ctPath = outDir / (progBase & ".ct")
+
+  let res = newTraceWriter(ctPath, handle.programName, @[], handle.workdir)
+  if res.isErr:
+    setError(res.error)
+    return 1.cint
+
+  handle.writer = res.get()
+  handle.writerReady = true
+  0.cint
+
+proc trace_writer_finish_events(handle: TraceWriterHandle): cint {.exportc, cdecl.} =
   if handle.isNil:
     setError("NULL handle")
-    return false
+    return 1.cint
+  if not handle.writerReady:
+    return 0.cint
   # Flush (sync) current events
   let res = handle.writer.sync()
   if res.isErr:
     setError(res.error)
-    return false
-  true
+    return 1.cint
+  0.cint
 
 proc trace_writer_begin_paths(
     handle: TraceWriterHandle,
     path: cstring,
-): bool {.exportc, cdecl.} =
+): cint {.exportc, cdecl.} =
   if handle.isNil:
     setError("NULL handle")
-    return false
-  true
+    return 1.cint
+  0.cint
 
-proc trace_writer_finish_paths(handle: TraceWriterHandle): bool {.exportc, cdecl.} =
+proc trace_writer_finish_paths(handle: TraceWriterHandle): cint {.exportc, cdecl.} =
   if handle.isNil:
     setError("NULL handle")
-    return false
-  true
+    return 1.cint
+  0.cint
 
 # ---------------------------------------------------------------------------
 # Tracing primitives
@@ -287,11 +310,14 @@ proc trace_writer_set_workdir(
     workdir: cstring,
 ) {.exportc, cdecl.} =
   ## Override the working directory recorded in the trace metadata.
+  ## Can be called before or after begin_events — the value is stored and
+  ## propagated to the writer when/if it becomes ready.
   if handle.isNil:
     return
   handle.workdir = toNimStr(workdir)
-  # Update the metadata in the writer
-  handle.writer.metadata.workdir = handle.workdir
+  # Update the metadata in the writer if already created
+  if handle.writerReady:
+    handle.writer.metadata.workdir = handle.workdir
 
 proc trace_writer_register_step(
     handle: TraceWriterHandle,
@@ -492,17 +518,21 @@ proc trace_writer_register_special_event(
 # Close
 # ---------------------------------------------------------------------------
 
-proc trace_writer_close(handle: TraceWriterHandle): bool {.exportc, cdecl.} =
+proc trace_writer_close(handle: TraceWriterHandle): cint {.exportc, cdecl.} =
   ## Close the trace writer and flush all remaining data.
-  ## Returns true on success, false on failure.
+  ## Returns 0 on success, non-zero on failure.
+  ## If the writer was never initialized (begin_events never called), this is a no-op.
   if handle.isNil:
     setError("NULL handle")
-    return false
+    return 1.cint
+  if not handle.writerReady:
+    # Writer was never opened — nothing to close
+    return 0.cint
   let res = handle.writer.close()
   if res.isErr:
     setError(res.error)
-    return false
-  true
+    return 1.cint
+  0.cint
 
 # ---------------------------------------------------------------------------
 # NimMain — required for static/shared lib initialization

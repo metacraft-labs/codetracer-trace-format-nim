@@ -33,11 +33,11 @@ int main(void) {
     printf("[OK] trace_writer_set_workdir\n");
 
     /* Begin metadata/events/paths (compatibility stubs) */
-    ASSERT(trace_writer_begin_metadata(writer, "/tmp/meta.json"),
+    ASSERT(trace_writer_begin_metadata(writer, "/tmp/meta.json") == 0,
         "begin_metadata should succeed");
-    ASSERT(trace_writer_begin_events(writer, "/tmp/events.bin"),
+    ASSERT(trace_writer_begin_events(writer, "/tmp/events.bin") == 0,
         "begin_events should succeed");
-    ASSERT(trace_writer_begin_paths(writer, "/tmp/paths.json"),
+    ASSERT(trace_writer_begin_paths(writer, "/tmp/paths.json") == 0,
         "begin_paths should succeed");
     printf("[OK] begin_metadata/events/paths\n");
 
@@ -89,13 +89,13 @@ int main(void) {
     printf("[OK] trace_writer_register_special_event\n");
 
     /* Finish events/metadata/paths */
-    ASSERT(trace_writer_finish_events(writer), "finish_events should succeed");
-    ASSERT(trace_writer_finish_metadata(writer), "finish_metadata should succeed");
-    ASSERT(trace_writer_finish_paths(writer), "finish_paths should succeed");
+    ASSERT(trace_writer_finish_events(writer) == 0, "finish_events should succeed");
+    ASSERT(trace_writer_finish_metadata(writer) == 0, "finish_metadata should succeed");
+    ASSERT(trace_writer_finish_paths(writer) == 0, "finish_paths should succeed");
     printf("[OK] finish_events/metadata/paths\n");
 
     /* Close the writer */
-    ASSERT(trace_writer_close(writer), "close should succeed");
+    ASSERT(trace_writer_close(writer) == 0, "close should succeed");
     printf("[OK] trace_writer_close\n");
 
     /* Verify the .ct file exists */
@@ -108,7 +108,7 @@ int main(void) {
 
     /* Test NULL handle safety */
     trace_writer_free(NULL);
-    ASSERT(!trace_writer_close(NULL), "close(NULL) should return false");
+    ASSERT(trace_writer_close(NULL) != 0, "close(NULL) should return non-zero (error)");
     trace_writer_register_step(NULL, "/foo", 1);
     printf("[OK] NULL handle safety\n");
 
