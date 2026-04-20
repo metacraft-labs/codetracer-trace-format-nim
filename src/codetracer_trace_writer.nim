@@ -42,12 +42,12 @@ type
     ctfs: Ctfs                       ## CTFS container
     eventsFile: CtfsInternalFile     ## Handle for events.log
     encoder: SplitBinaryEncoder      ## Event serializer
-    paths: seq[string]               ## Registered paths (for paths.json)
-    metadata: TraceMetadata          ## Program name, args, workdir
+    paths*: seq[string]              ## Registered paths (for paths.json)
+    metadata*: TraceMetadata         ## Program name, args, workdir
     eventCount: uint64               ## Total events written
     chunkEventCount: int             ## Events in current chunk
     chunkThreshold: int              ## Events per chunk
-    closed: bool
+    closed*: bool
     filePath: string                 ## Path to .ct file
 
 # ---------------------------------------------------------------------------

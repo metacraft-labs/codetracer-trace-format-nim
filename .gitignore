@@ -1,4 +1,7 @@
 *.out
+*.a
+*.so
+*.dylib
 nimcache/
 tests/test_base40
 tests/test_chunk_index
@@ -8,3 +11,9 @@ tests/test_seekable_zstd
 tests/test_trace_types
 tests/test_varint
 tests/test_split_binary
+tests/test_cross_compat
+tests/test_golden_fixtures
+tests/test_trace_writer
+tests/test_ffi
+tests/bench_split_binary
+tests/bench_seekable_zstd
