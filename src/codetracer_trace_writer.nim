@@ -195,6 +195,22 @@ proc writeValue*(w: var TraceWriter, variableId: uint64,
       variableId: VariableId(variableId), value: value)))
 
 # ---------------------------------------------------------------------------
+# Sync (for streaming / concurrent readers)
+# ---------------------------------------------------------------------------
+
+proc sync*(w: var TraceWriter): Result[void, string] =
+  ## Flush buffered events to disk so concurrent readers can see them.
+  ## Unlike close(), this does not finalize the container — the writer
+  ## remains open for further events.
+  if w.closed:
+    return ok()
+  let flushRes = w.flushChunk()
+  if flushRes.isErr:
+    return err("failed to flush chunk during sync: " & flushRes.error)
+  w.ctfs.syncAllEntries()
+  ok()
+
+# ---------------------------------------------------------------------------
 # Close
 # ---------------------------------------------------------------------------
 
