@@ -492,12 +492,12 @@ proc encodeEvent*(enc: var SplitBinaryEncoder, event: TraceLowLevelEvent) =
   ensureSpace(enc.buf, 512)
   case event.kind
   of tleStep:
-    # 1 + 8 + 8 = 17 bytes, fits stack
-    var stk: StackStage
-    stk.stkWriteU8(0)
-    stk.stkWriteU64(uint64(event.step.pathId))
-    stk.stkWriteI64(int64(event.step.line))
-    stk.flushTo(enc.buf)
+    # 17 bytes: tag(1) + pathId(8) + line(8) — direct store (no memcpy call)
+    let p = enc.buf.pos
+    enc.buf.data[p] = 0
+    cast[ptr uint64](addr enc.buf.data[p + 1])[] = uint64(event.step.pathId)
+    cast[ptr int64](addr enc.buf.data[p + 9])[] = int64(event.step.line)
+    enc.buf.pos = p + 17
 
   of tlePath:
     # Header (1 + 4 = 5 bytes) on stack, then string direct
@@ -587,12 +587,12 @@ proc encodeEvent*(enc: var SplitBinaryEncoder, event: TraceLowLevelEvent) =
       enc.buf.writeStr(line)
 
   of tleBindVariable:
-    # 1 + 8 + 8 = 17 bytes, fits stack
-    var stk: StackStage
-    stk.stkWriteU8(11)
-    stk.stkWriteU64(uint64(event.bindVar.variableId))
-    stk.stkWriteI64(int64(event.bindVar.place))
-    stk.flushTo(enc.buf)
+    # 17 bytes: tag(1) + variableId(8) + place(8) — direct store (no memcpy call)
+    let p = enc.buf.pos
+    enc.buf.data[p] = 11
+    cast[ptr uint64](addr enc.buf.data[p + 1])[] = uint64(event.bindVar.variableId)
+    cast[ptr int64](addr enc.buf.data[p + 9])[] = int64(event.bindVar.place)
+    enc.buf.pos = p + 17
 
   of tleAssignment:
     enc.buf.writeU8(12)
@@ -623,13 +623,13 @@ proc encodeEvent*(enc: var SplitBinaryEncoder, event: TraceLowLevelEvent) =
       encodeCborValueRecordInto(enc.buf, event.cellValue.value)
 
   of tleAssignCompoundItem:
-    # 1 + 8 + 8 + 8 = 25 bytes, fits stack
-    var stk: StackStage
-    stk.stkWriteU8(16)
-    stk.stkWriteI64(int64(event.assignCompoundItem.place))
-    stk.stkWriteU64(event.assignCompoundItem.index)
-    stk.stkWriteI64(int64(event.assignCompoundItem.itemPlace))
-    stk.flushTo(enc.buf)
+    # 25 bytes: tag(1) + place(8) + index(8) + itemPlace(8) — direct store (no memcpy call)
+    let p = enc.buf.pos
+    enc.buf.data[p] = 16
+    cast[ptr int64](addr enc.buf.data[p + 1])[] = int64(event.assignCompoundItem.place)
+    cast[ptr uint64](addr enc.buf.data[p + 9])[] = uint64(event.assignCompoundItem.index)
+    cast[ptr int64](addr enc.buf.data[p + 17])[] = int64(event.assignCompoundItem.itemPlace)
+    enc.buf.pos = p + 25
 
   of tleAssignCell:
     var stk: StackStage
@@ -640,43 +640,45 @@ proc encodeEvent*(enc: var SplitBinaryEncoder, event: TraceLowLevelEvent) =
       encodeCborValueRecordInto(enc.buf, event.assignCell.newValue)
 
   of tleVariableCell:
-    # 1 + 8 + 8 = 17 bytes, fits stack
-    var stk: StackStage
-    stk.stkWriteU8(18)
-    stk.stkWriteU64(uint64(event.variableCell.variableId))
-    stk.stkWriteI64(int64(event.variableCell.place))
-    stk.flushTo(enc.buf)
+    # 17 bytes: tag(1) + variableId(8) + place(8) — direct store (no memcpy call)
+    let p = enc.buf.pos
+    enc.buf.data[p] = 18
+    cast[ptr uint64](addr enc.buf.data[p + 1])[] = uint64(event.variableCell.variableId)
+    cast[ptr int64](addr enc.buf.data[p + 9])[] = int64(event.variableCell.place)
+    enc.buf.pos = p + 17
 
   of tleDropVariable:
-    # 1 + 8 = 9 bytes, fits stack
-    var stk: StackStage
-    stk.stkWriteU8(19)
-    stk.stkWriteU64(uint64(event.dropVarId))
-    stk.flushTo(enc.buf)
+    # 9 bytes: tag(1) + variableId(8) — direct store (no memcpy call)
+    let p = enc.buf.pos
+    enc.buf.data[p] = 19
+    cast[ptr uint64](addr enc.buf.data[p + 1])[] = uint64(event.dropVarId)
+    enc.buf.pos = p + 9
 
   of tleThreadStart:
-    # 1 + 8 = 9 bytes, fits stack
-    var stk: StackStage
-    stk.stkWriteU8(20)
-    stk.stkWriteU64(uint64(event.threadStartId))
-    stk.flushTo(enc.buf)
+    # 9 bytes: tag(1) + threadId(8) — direct store (no memcpy call)
+    let p = enc.buf.pos
+    enc.buf.data[p] = 20
+    cast[ptr uint64](addr enc.buf.data[p + 1])[] = uint64(event.threadStartId)
+    enc.buf.pos = p + 9
 
   of tleThreadExit:
-    var stk: StackStage
-    stk.stkWriteU8(21)
-    stk.stkWriteU64(uint64(event.threadExitId))
-    stk.flushTo(enc.buf)
+    # 9 bytes: tag(1) + threadId(8) — direct store (no memcpy call)
+    let p = enc.buf.pos
+    enc.buf.data[p] = 21
+    cast[ptr uint64](addr enc.buf.data[p + 1])[] = uint64(event.threadExitId)
+    enc.buf.pos = p + 9
 
   of tleThreadSwitch:
-    var stk: StackStage
-    stk.stkWriteU8(22)
-    stk.stkWriteU64(uint64(event.threadSwitchId))
-    stk.flushTo(enc.buf)
+    # 9 bytes: tag(1) + threadId(8) — direct store (no memcpy call)
+    let p = enc.buf.pos
+    enc.buf.data[p] = 22
+    cast[ptr uint64](addr enc.buf.data[p + 1])[] = uint64(event.threadSwitchId)
+    enc.buf.pos = p + 9
 
   of tleDropLastStep:
-    var stk: StackStage
-    stk.stkWriteU8(23)
-    stk.flushTo(enc.buf)
+    # 1 byte: tag(1) — direct write
+    enc.buf.data[enc.buf.pos] = 23
+    enc.buf.pos += 1
 
 {.pop.} # checks: off, boundChecks: off
 
