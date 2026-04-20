@@ -1,8 +1,10 @@
 {.push raises: [].}
 
-## Comprehensive tests for the seekable Zstd encoder/decoder.
+## Comprehensive tests for the seekable Zstd encoder/decoder,
+## including head format (v0.1.1) and cross-compatibility validation.
 
 import results
+import stew/endians2
 import codetracer_ctfs/seekable_zstd
 
 # ---------------------------------------------------------------------------
@@ -273,6 +275,276 @@ proc test_incremental_write() =
   echo "PASS: test_incremental_write"
 
 # ---------------------------------------------------------------------------
+# Head format tests (Task 2: M3)
+# ---------------------------------------------------------------------------
+
+proc test_head_format_roundtrip() =
+  ## Serialize a seek table in head format, parse it back, verify.
+  let table = SeekTable(entries: @[
+    SeekTableEntry(compressedSize: 100, decompressedSize: 500),
+    SeekTableEntry(compressedSize: 200, decompressedSize: 1000),
+    SeekTableEntry(compressedSize: 150, decompressedSize: 750),
+  ])
+
+  let serialized = serializeSeekTableHead(table)
+  let parseRes = parseSeekTableHead(serialized)
+  doAssert parseRes.isOk, "parseSeekTableHead failed: " & parseRes.error
+
+  let parsed = parseRes.get()
+  doAssert parsed.entries.len == table.entries.len,
+    "head format: entry count mismatch"
+
+  for i in 0 ..< table.entries.len:
+    doAssert parsed.entries[i].compressedSize == table.entries[i].compressedSize,
+      "head format: compressed size mismatch at entry " & $i
+    doAssert parsed.entries[i].decompressedSize == table.entries[i].decompressedSize,
+      "head format: decompressed size mismatch at entry " & $i
+
+  echo "PASS: test_head_format_roundtrip"
+
+proc test_head_format_empty() =
+  ## Head format with zero entries.
+  let table = SeekTable(entries: @[])
+  let serialized = serializeSeekTableHead(table)
+  let parseRes = parseSeekTableHead(serialized)
+  doAssert parseRes.isOk, "head format empty parse failed: " & parseRes.error
+  doAssert parseRes.get().entries.len == 0, "head format empty: expected 0 entries"
+  echo "PASS: test_head_format_empty"
+
+proc test_head_format_auto_detect() =
+  ## Auto-detect: parseSeekTable should detect head format when given head data.
+  let table = SeekTable(entries: @[
+    SeekTableEntry(compressedSize: 42, decompressedSize: 128),
+  ])
+
+  let headData = serializeSeekTableHead(table)
+  let parseRes = parseSeekTable(headData)
+  doAssert parseRes.isOk, "auto-detect head format failed: " & parseRes.error
+  doAssert parseRes.get().entries.len == 1, "auto-detect: expected 1 entry"
+  doAssert parseRes.get().entries[0].compressedSize == 42,
+    "auto-detect: compressed size mismatch"
+
+  echo "PASS: test_head_format_auto_detect"
+
+proc test_foot_vs_head_equivalence() =
+  ## Same seek table serialized in foot and head formats should parse to equal data.
+  let table = SeekTable(entries: @[
+    SeekTableEntry(compressedSize: 300, decompressedSize: 1500),
+    SeekTableEntry(compressedSize: 400, decompressedSize: 2000),
+  ])
+
+  let footData = serializeSeekTable(table)
+  let headData = serializeSeekTableHead(table)
+
+  let footParsed = parseSeekTable(footData)
+  let headParsed = parseSeekTable(headData)
+
+  doAssert footParsed.isOk, "foot parse failed"
+  doAssert headParsed.isOk, "head parse failed"
+
+  let ft = footParsed.get()
+  let ht = headParsed.get()
+
+  doAssert ft.entries.len == ht.entries.len, "foot vs head: entry count mismatch"
+  for i in 0 ..< ft.entries.len:
+    doAssert ft.entries[i].compressedSize == ht.entries[i].compressedSize,
+      "foot vs head: compressed size mismatch at " & $i
+    doAssert ft.entries[i].decompressedSize == ht.entries[i].decompressedSize,
+      "foot vs head: decompressed size mismatch at " & $i
+
+  echo "PASS: test_foot_vs_head_equivalence"
+
+# ---------------------------------------------------------------------------
+# Cross-compatibility validation tests (Task 3: M3)
+# ---------------------------------------------------------------------------
+
+const ZstdFrameMagic = 0xFD2FB528'u32
+
+proc test_zstd_frame_magic() =
+  ## Verify each compressed frame starts with the Zstd magic number.
+  let threshold = 2000
+  var enc = newSeekableZstdEncoder(frameThreshold = threshold)
+
+  let original = makeCompressibleData(10000)
+  enc.write(original)
+  let compressed = enc.finish()
+
+  let decRes = initSeekableZstdDecoder(compressed)
+  doAssert decRes.isOk, "decoder init failed: " & decRes.error
+  let dec = decRes.get()
+
+  # Check each frame starts with Zstd magic
+  var frameStart = 0
+  for i in 0 ..< dec.frameCount:
+    let entry = dec.seekTable.entries[i]
+    doAssert frameStart + 4 <= compressed.len,
+      "frame " & $i & " magic check: not enough data"
+
+    var magic4: array[4, byte]
+    magic4[0] = compressed[frameStart + 0]
+    magic4[1] = compressed[frameStart + 1]
+    magic4[2] = compressed[frameStart + 2]
+    magic4[3] = compressed[frameStart + 3]
+    let frameMagic = fromBytesLE(uint32, magic4)
+    doAssert frameMagic == ZstdFrameMagic,
+      "frame " & $i & ": expected Zstd magic 0xFD2FB528, got 0x" & $frameMagic
+
+    frameStart += int(entry.compressedSize)
+
+  echo "PASS: test_zstd_frame_magic"
+
+proc test_seek_table_footer_magic() =
+  ## Verify the seek table footer magic is correct in the raw output.
+  let threshold = 4096
+  var enc = newSeekableZstdEncoder(frameThreshold = threshold)
+
+  let original = makeCompressibleData(20000)
+  enc.write(original)
+  let compressed = enc.finish()
+
+  # Last 4 bytes should be the seekable magic number
+  doAssert compressed.len >= 4, "compressed data too small"
+  var magic4: array[4, byte]
+  magic4[0] = compressed[compressed.len - 4]
+  magic4[1] = compressed[compressed.len - 3]
+  magic4[2] = compressed[compressed.len - 2]
+  magic4[3] = compressed[compressed.len - 1]
+  let seekMagic = fromBytesLE(uint32, magic4)
+  doAssert seekMagic == SeekableMagicNumber,
+    "footer seekable magic mismatch: expected 0x8F92EAB1, got 0x" & $seekMagic
+
+  echo "PASS: test_seek_table_footer_magic"
+
+proc test_cumulative_compressed_offsets() =
+  ## Verify cumulative compressed sizes in the seek table match actual frame offsets.
+  let threshold = 3000
+  var enc = newSeekableZstdEncoder(frameThreshold = threshold)
+
+  let original = makeCompressibleData(15000)
+  enc.write(original)
+  let compressed = enc.finish()
+
+  let decRes = initSeekableZstdDecoder(compressed)
+  doAssert decRes.isOk, "decoder init failed: " & decRes.error
+  let dec = decRes.get()
+
+  # Walk frames and verify each starts with Zstd magic at the cumulative offset
+  var cumulativeOffset: uint64 = 0
+  for i in 0 ..< dec.frameCount:
+    let entry = dec.seekTable.entries[i]
+    let offset = int(cumulativeOffset)
+
+    # Verify we can read the Zstd frame magic at this offset
+    doAssert offset + 4 <= compressed.len,
+      "cumulative offset " & $offset & " + 4 exceeds data len " & $compressed.len
+
+    var magic4: array[4, byte]
+    magic4[0] = compressed[offset + 0]
+    magic4[1] = compressed[offset + 1]
+    magic4[2] = compressed[offset + 2]
+    magic4[3] = compressed[offset + 3]
+    let frameMagic = fromBytesLE(uint32, magic4)
+    doAssert frameMagic == ZstdFrameMagic,
+      "frame " & $i & " at offset " & $offset & ": wrong magic"
+
+    cumulativeOffset += uint64(entry.compressedSize)
+
+  # After all frames, cumulativeOffset should point to the seek table skippable frame
+  var skipMagic4: array[4, byte]
+  let skipOffset = int(cumulativeOffset)
+  doAssert skipOffset + 4 <= compressed.len,
+    "seek table skippable frame not found at expected offset"
+  skipMagic4[0] = compressed[skipOffset + 0]
+  skipMagic4[1] = compressed[skipOffset + 1]
+  skipMagic4[2] = compressed[skipOffset + 2]
+  skipMagic4[3] = compressed[skipOffset + 3]
+  let skipMagic = fromBytesLE(uint32, skipMagic4)
+  doAssert skipMagic == SkippableFrameMagic,
+    "expected skippable frame magic at offset " & $skipOffset
+
+  echo "PASS: test_cumulative_compressed_offsets"
+
+proc test_entry_count_matches_frames() =
+  ## Verify the seek table entry count matches the number of Zstd frames.
+  let threshold = 1500
+  var enc = newSeekableZstdEncoder(frameThreshold = threshold)
+
+  let original = makeCompressibleData(7500)
+  enc.write(original)
+  let compressed = enc.finish()
+
+  let decRes = initSeekableZstdDecoder(compressed)
+  doAssert decRes.isOk, "decoder init failed: " & decRes.error
+  let dec = decRes.get()
+
+  # Count actual Zstd frames by scanning for magic numbers
+  var actualFrameCount = 0
+  var scanPos = 0
+  while scanPos + 4 <= compressed.len:
+    var magic4: array[4, byte]
+    magic4[0] = compressed[scanPos + 0]
+    magic4[1] = compressed[scanPos + 1]
+    magic4[2] = compressed[scanPos + 2]
+    magic4[3] = compressed[scanPos + 3]
+    let magic = fromBytesLE(uint32, magic4)
+    if magic == ZstdFrameMagic:
+      actualFrameCount += 1
+      # Skip past this frame using the seek table entry
+      if actualFrameCount <= dec.frameCount:
+        scanPos += int(dec.seekTable.entries[actualFrameCount - 1].compressedSize)
+      else:
+        break
+    elif magic == SkippableFrameMagic:
+      break  # Reached the seek table
+    else:
+      scanPos += 1
+
+  doAssert actualFrameCount == dec.frameCount,
+    "frame count mismatch: seek table says " & $dec.frameCount &
+    " but found " & $actualFrameCount & " Zstd frames"
+
+  echo "PASS: test_entry_count_matches_frames"
+
+proc test_write_read_roundtrip_validation() =
+  ## Write with Nim encoder, read back with Nim decoder, verify full roundtrip
+  ## including raw byte-level format validation.
+  let threshold = 2048
+  var enc = newSeekableZstdEncoder(frameThreshold = threshold)
+
+  let original = makeKnownData(8192)
+  enc.write(original)
+  let compressed = enc.finish()
+
+  # Parse the raw bytes manually to verify format structure
+  # 1) First bytes should be Zstd frame magic (first compressed frame)
+  doAssert compressed.len >= 4, "output too small"
+  var magic4: array[4, byte]
+  magic4[0] = compressed[0]
+  magic4[1] = compressed[1]
+  magic4[2] = compressed[2]
+  magic4[3] = compressed[3]
+  doAssert fromBytesLE(uint32, magic4) == ZstdFrameMagic,
+    "first bytes should be Zstd frame magic"
+
+  # 2) Last 4 bytes should be seekable magic
+  magic4[0] = compressed[compressed.len - 4]
+  magic4[1] = compressed[compressed.len - 3]
+  magic4[2] = compressed[compressed.len - 2]
+  magic4[3] = compressed[compressed.len - 1]
+  doAssert fromBytesLE(uint32, magic4) == SeekableMagicNumber,
+    "last 4 bytes should be seekable magic"
+
+  # 3) Full decode should match
+  let decRes = initSeekableZstdDecoder(compressed)
+  doAssert decRes.isOk, "decoder init failed: " & decRes.error
+  let dec = decRes.get()
+  let decompRes = dec.decompressAll()
+  doAssert decompRes.isOk, "decompressAll failed: " & decompRes.error
+  doAssert decompRes.get() == original, "roundtrip data mismatch"
+
+  echo "PASS: test_write_read_roundtrip_validation"
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -285,5 +557,18 @@ test_seek_table_parse()
 test_large_data()
 test_frame_count()
 test_incremental_write()
+
+# Head format tests
+test_head_format_roundtrip()
+test_head_format_empty()
+test_head_format_auto_detect()
+test_foot_vs_head_equivalence()
+
+# Cross-compatibility validation tests
+test_zstd_frame_magic()
+test_seek_table_footer_magic()
+test_cumulative_compressed_offsets()
+test_entry_count_matches_frames()
+test_write_read_roundtrip_validation()
 
 echo "All seekable_zstd tests passed."

@@ -69,6 +69,53 @@ proc totalCompressedSize*(table: SeekTable): uint64 =
   for entry in table.entries:
     result += uint64(entry.compressedSize)
 
+proc serializeSeekTableHead*(table: SeekTable): seq[byte] =
+  ## Serialize a seek table in "head" format (v0.1.1) as a Zstd skippable frame.
+  ##
+  ## Layout:
+  ##   [Skippable_Magic: 4 LE] [Frame_Size: 4 LE]
+  ##   [Num_Frames: 4 LE] [Descriptor: 1 byte = 0x00] [Seekable_Magic: 4 LE]
+  ##   [Entry_0: c_size(4 LE) + d_size(4 LE)] ... [Entry_N-1]
+  let numEntries = table.entries.len
+  let frameSize = uint32(numEntries * SeekTableEntrySize + SeekTableFooterSize)
+  let totalSize = SkippableHeaderSize + int(frameSize)
+  result = newSeq[byte](totalSize)
+
+  var pos = 0
+
+  # Skippable magic (0x184D2A5E)
+  let magicBytes = toBytesLE(SkippableFrameMagic)
+  copyMem(addr result[pos], unsafeAddr magicBytes[0], 4)
+  pos += 4
+
+  # Frame size
+  let frameSizeBytes = toBytesLE(frameSize)
+  copyMem(addr result[pos], unsafeAddr frameSizeBytes[0], 4)
+  pos += 4
+
+  # Integrity: num_frames
+  let numFramesBytes = toBytesLE(uint32(numEntries))
+  copyMem(addr result[pos], unsafeAddr numFramesBytes[0], 4)
+  pos += 4
+
+  # Integrity: descriptor (0x00 = no checksums)
+  result[pos] = 0x00
+  pos += 1
+
+  # Integrity: seekable magic (0x8F92EAB1)
+  let seekMagicBytes = toBytesLE(SeekableMagicNumber)
+  copyMem(addr result[pos], unsafeAddr seekMagicBytes[0], 4)
+  pos += 4
+
+  # Entries
+  for entry in table.entries:
+    let cBytes = toBytesLE(entry.compressedSize)
+    copyMem(addr result[pos], unsafeAddr cBytes[0], 4)
+    pos += 4
+    let dBytes = toBytesLE(entry.decompressedSize)
+    copyMem(addr result[pos], unsafeAddr dBytes[0], 4)
+    pos += 4
+
 proc serializeSeekTable*(table: SeekTable): seq[byte] =
   ## Serialize a seek table in "foot" format as a Zstd skippable frame.
   ##
@@ -115,11 +162,8 @@ proc serializeSeekTable*(table: SeekTable): seq[byte] =
   let seekMagicBytes = toBytesLE(SeekableMagicNumber)
   copyMem(addr result[pos], unsafeAddr seekMagicBytes[0], 4)
 
-proc parseSeekTable*(data: openArray[byte]): Result[SeekTable, string] =
-  ## Parse a seek table from the end of the data (foot format).
-  ##
-  ## The data must contain the compressed frames followed by the seek table
-  ## skippable frame as the last element.
+proc parseSeekTableFoot(data: openArray[byte]): Result[SeekTable, string] =
+  ## Parse a seek table in "foot" format from the end of the data.
   if data.len < SkippableHeaderSize + SeekTableFooterSize:
     return err("data too small to contain a seek table")
 
@@ -197,6 +241,108 @@ proc parseSeekTable*(data: openArray[byte]): Result[SeekTable, string] =
     )
 
   ok(SeekTable(entries: entries))
+
+proc parseSeekTableHead*(data: openArray[byte]): Result[SeekTable, string] =
+  ## Parse a seek table in "head" format (v0.1.1) from the beginning of the data.
+  ##
+  ## Head format layout:
+  ##   [Skippable_Magic: 4 LE] [Frame_Size: 4 LE]
+  ##   [Num_Frames: 4 LE] [Descriptor: 1] [Seekable_Magic: 4 LE]
+  ##   [Entry_0: c_size(4 LE) + d_size(4 LE)] ... [Entry_N-1]
+  if data.len < SkippableHeaderSize + SeekTableFooterSize:
+    return err("data too small to contain a head seek table")
+
+  # Check skippable magic at start
+  var hdr4: array[4, byte]
+  hdr4[0] = data[0]
+  hdr4[1] = data[1]
+  hdr4[2] = data[2]
+  hdr4[3] = data[3]
+  let skippableMagic = fromBytesLE(uint32, hdr4)
+  if skippableMagic != SkippableFrameMagic:
+    return err("head format: skippable frame magic mismatch")
+
+  # Frame size
+  hdr4[0] = data[4]
+  hdr4[1] = data[5]
+  hdr4[2] = data[6]
+  hdr4[3] = data[7]
+  let declaredFrameSize = fromBytesLE(uint32, hdr4)
+
+  # Integrity starts at offset 8 (right after header)
+  let integrityStart = SkippableHeaderSize
+
+  if data.len < integrityStart + SeekTableFooterSize:
+    return err("head format: data too small for integrity")
+
+  # Read num_frames
+  var nf4: array[4, byte]
+  nf4[0] = data[integrityStart + 0]
+  nf4[1] = data[integrityStart + 1]
+  nf4[2] = data[integrityStart + 2]
+  nf4[3] = data[integrityStart + 3]
+  let numFrames = fromBytesLE(uint32, nf4)
+
+  # Check descriptor — reserved bits must be zero
+  let descriptor = data[integrityStart + 4]
+  if ((descriptor shr 2) and 0x1F'u8) != 0:
+    return err("head format: reserved descriptor bits are set")
+
+  # Check seekable magic
+  var magic4: array[4, byte]
+  magic4[0] = data[integrityStart + 5]
+  magic4[1] = data[integrityStart + 6]
+  magic4[2] = data[integrityStart + 7]
+  magic4[3] = data[integrityStart + 8]
+  let seekMagic = fromBytesLE(uint32, magic4)
+  if seekMagic != SeekableMagicNumber:
+    return err("head format: seekable magic number mismatch")
+
+  # Verify frame size
+  let entriesSize = int(numFrames) * SeekTableEntrySize
+  let expectedFrameSize = uint32(entriesSize + SeekTableFooterSize)
+  if declaredFrameSize != expectedFrameSize:
+    return err("head format: frame size mismatch")
+
+  let entriesStart = integrityStart + SeekTableFooterSize
+  let totalSkippable = SkippableHeaderSize + int(declaredFrameSize)
+  if data.len < totalSkippable:
+    return err("head format: data too small for entries")
+
+  # Parse entries
+  var entries = newSeq[SeekTableEntry](numFrames)
+  for i in 0 ..< int(numFrames):
+    let offset = entriesStart + i * SeekTableEntrySize
+    var c4, d4: array[4, byte]
+    c4[0] = data[offset + 0]
+    c4[1] = data[offset + 1]
+    c4[2] = data[offset + 2]
+    c4[3] = data[offset + 3]
+    d4[0] = data[offset + 4]
+    d4[1] = data[offset + 5]
+    d4[2] = data[offset + 6]
+    d4[3] = data[offset + 7]
+    entries[i] = SeekTableEntry(
+      compressedSize: fromBytesLE(uint32, c4),
+      decompressedSize: fromBytesLE(uint32, d4),
+    )
+
+  ok(SeekTable(entries: entries))
+
+proc parseSeekTable*(data: openArray[byte]): Result[SeekTable, string] =
+  ## Parse a seek table, auto-detecting foot vs head format.
+  ##
+  ## First tries foot format (seek table at end). If that fails, tries
+  ## head format (seek table at beginning).
+  let footRes = parseSeekTableFoot(data)
+  if footRes.isOk:
+    return footRes
+  # Try head format
+  let headRes = parseSeekTableHead(data)
+  if headRes.isOk:
+    return headRes
+  # Return the foot error as the primary one, since foot is the default format
+  err(footRes.error)
 
 # ---------------------------------------------------------------------------
 # Encoder
