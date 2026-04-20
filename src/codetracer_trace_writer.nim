@@ -284,6 +284,9 @@ proc close*(w: var TraceWriter): Result[void, string] =
     if writeRes.isErr:
       return err("failed to write paths.json: " & writeRes.error)
 
+  # Release encoder buffer
+  w.encoder.destroy()
+
   # Close CTFS container
   w.ctfs.closeCtfs()
   w.closed = true
