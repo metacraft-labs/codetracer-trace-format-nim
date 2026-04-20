@@ -7,16 +7,16 @@
 ##   Fixed fields: little-endian integers at natural width
 ##   Strings: 4-byte LE length + UTF-8 bytes
 ##   Dynamic payloads (ValueRecord, TypeRecord, AssignmentRecord):
-##     4-byte LE payload length + Nim-native binary bytes
+##     4-byte LE payload length + CBOR-encoded bytes
 ##
-## This matches the Rust split_binary module's layout for all
-## fixed-size and string fields. The dynamic payloads use a
-## Nim-native encoding (not CBOR) so traces written by Nim are
-## currently only readable by Nim.
+## Dynamic payloads are CBOR-encoded to match the Rust split_binary
+## module's format (which uses cbor4ii + serde). This enables
+## cross-language trace compatibility.
 
 import results
+import ./cbor
 import ../codetracer_trace_types
-export codetracer_trace_types, results
+export codetracer_trace_types, results, cbor
 
 # ===========================================================================
 # Low-level binary helpers
@@ -114,252 +114,60 @@ proc readBytes(data: openArray[byte], pos: var int, count: int): Result[seq[byte
   ok(result_bytes)
 
 # ===========================================================================
-# Native binary encoding for dynamic payloads
+# CBOR-based encoding for dynamic payloads
 # ===========================================================================
+#
+# Dynamic payloads (ValueRecord, TypeRecord, AssignmentRecord, etc.) are
+# now encoded using CBOR to match the Rust split_binary module's format
+# (cbor4ii + serde). The CBOR encoder/decoder is in cbor.nim.
+#
+# The functions below are thin wrappers that produce a seq[byte] payload
+# from the CBOR encoder, and decode payloads using the CBOR decoder.
 
-# Forward declarations
-proc writeValueRecord(out_buf: var seq[byte], v: ValueRecord) {.raises: [].}
-proc readValueRecord(data: openArray[byte], pos: var int): Result[ValueRecord, string] {.raises: [].}
+proc encodeCborPayloadValueRecord(v: ValueRecord): seq[byte] =
+  var enc = CborEncoder.init()
+  enc.encodeCborValueRecord(v)
+  enc.getBytes()
 
-proc writeTypeRecord(out_buf: var seq[byte], t: TypeRecord) =
-  writeU8(out_buf, byte(ord(t.kind)))
-  writeStr(out_buf, t.langType)
-  writeU8(out_buf, byte(ord(t.specificInfo.kind)))
-  case t.specificInfo.kind
-  of tsikNone: discard
-  of tsikStruct:
-    writeU32(out_buf, uint32(t.specificInfo.fields.len))
-    for f in t.specificInfo.fields:
-      writeStr(out_buf, f.name)
-      writeU64(out_buf, uint64(f.typeId))
-  of tsikPointer:
-    writeU64(out_buf, uint64(t.specificInfo.dereferenceTypeId))
+proc decodeCborPayloadValueRecord(data: openArray[byte]): Result[ValueRecord, string] =
+  var dec = CborDecoder.init(data)
+  dec.decodeCborValueRecord()
 
-proc readTypeRecord(data: openArray[byte], pos: var int): Result[TypeRecord, string] =
-  let kindByte = ?readU8(data, pos)
-  if int(kindByte) > ord(high(TypeKind)):
-    return err("invalid TypeKind: " & $kindByte)
-  let kind = TypeKind(kindByte)
-  let langType = ?readStr(data, pos)
-  let siKindByte = ?readU8(data, pos)
-  if int(siKindByte) > ord(high(TypeSpecificInfoKind)):
-    return err("invalid TypeSpecificInfoKind: " & $siKindByte)
-  let siKind = TypeSpecificInfoKind(siKindByte)
-  var si: TypeSpecificInfo
-  case siKind
-  of tsikNone:
-    si = TypeSpecificInfo(kind: tsikNone)
-  of tsikStruct:
-    let count = ?readU32(data, pos)
-    var fields = newSeq[FieldTypeRecord](int(count))
-    for i in 0 ..< int(count):
-      let name = ?readStr(data, pos)
-      let tid = ?readU64(data, pos)
-      fields[i] = FieldTypeRecord(name: name, typeId: TypeId(tid))
-    si = TypeSpecificInfo(kind: tsikStruct, fields: fields)
-  of tsikPointer:
-    let tid = ?readU64(data, pos)
-    si = TypeSpecificInfo(kind: tsikPointer, dereferenceTypeId: TypeId(tid))
-  ok(TypeRecord(kind: kind, langType: langType, specificInfo: si))
+proc encodeCborPayloadTypeRecord(t: TypeRecord): seq[byte] =
+  var enc = CborEncoder.init()
+  enc.encodeCborTypeRecord(t)
+  enc.getBytes()
 
-proc writeValueRecord(out_buf: var seq[byte], v: ValueRecord) =
-  writeU8(out_buf, byte(ord(v.kind)))
-  case v.kind
-  of vrkInt:
-    writeI64(out_buf, v.intVal)
-    writeU64(out_buf, uint64(v.intTypeId))
-  of vrkFloat:
-    writeF64(out_buf, v.floatVal)
-    writeU64(out_buf, uint64(v.floatTypeId))
-  of vrkBool:
-    writeBool(out_buf, v.boolVal)
-    writeU64(out_buf, uint64(v.boolTypeId))
-  of vrkString:
-    writeStr(out_buf, v.text)
-    writeU64(out_buf, uint64(v.strTypeId))
-  of vrkSequence:
-    writeU32(out_buf, uint32(v.seqElements.len))
-    for e in v.seqElements:
-      writeValueRecord(out_buf, e)
-    writeBool(out_buf, v.isSlice)
-    writeU64(out_buf, uint64(v.seqTypeId))
-  of vrkTuple:
-    writeU32(out_buf, uint32(v.tupleElements.len))
-    for e in v.tupleElements:
-      writeValueRecord(out_buf, e)
-    writeU64(out_buf, uint64(v.tupleTypeId))
-  of vrkStruct:
-    writeU32(out_buf, uint32(v.fieldValues.len))
-    for e in v.fieldValues:
-      writeValueRecord(out_buf, e)
-    writeU64(out_buf, uint64(v.structTypeId))
-  of vrkVariant:
-    writeStr(out_buf, v.discriminator)
-    if v.contents.len > 0:
-      writeBool(out_buf, true)
-      writeValueRecord(out_buf, v.contents[0])
-    else:
-      writeBool(out_buf, false)
-    writeU64(out_buf, uint64(v.variantTypeId))
-  of vrkReference:
-    if v.dereferenced.len > 0:
-      writeBool(out_buf, true)
-      writeValueRecord(out_buf, v.dereferenced[0])
-    else:
-      writeBool(out_buf, false)
-    writeU64(out_buf, v.address)
-    writeBool(out_buf, v.mutable)
-    writeU64(out_buf, uint64(v.refTypeId))
-  of vrkRaw:
-    writeStr(out_buf, v.rawStr)
-    writeU64(out_buf, uint64(v.rawTypeId))
-  of vrkError:
-    writeStr(out_buf, v.errorMsg)
-    writeU64(out_buf, uint64(v.errorTypeId))
-  of vrkNone:
-    writeU64(out_buf, uint64(v.noneTypeId))
-  of vrkCell:
-    writeI64(out_buf, int64(v.cellPlace))
-  of vrkBigInt:
-    writeU32(out_buf, uint32(v.bigIntBytes.len))
-    for b in v.bigIntBytes:
-      out_buf.add(b)
-    writeBool(out_buf, v.negative)
-    writeU64(out_buf, uint64(v.bigIntTypeId))
-  of vrkChar:
-    writeU8(out_buf, byte(v.charVal))
-    writeU64(out_buf, uint64(v.charTypeId))
+proc decodeCborPayloadTypeRecord(data: openArray[byte]): Result[TypeRecord, string] =
+  var dec = CborDecoder.init(data)
+  dec.decodeCborTypeRecord()
 
-proc readValueRecord(data: openArray[byte], pos: var int): Result[ValueRecord, string] =
-  let kindByte = ?readU8(data, pos)
-  if int(kindByte) > ord(high(ValueRecordKind)):
-    return err("invalid ValueRecordKind: " & $kindByte)
-  let kind = ValueRecordKind(kindByte)
-  case kind
-  of vrkInt:
-    let i = ?readI64(data, pos)
-    let tid = ?readU64(data, pos)
-    ok(ValueRecord(kind: vrkInt, intVal: i, intTypeId: TypeId(tid)))
-  of vrkFloat:
-    let f = ?readF64(data, pos)
-    let tid = ?readU64(data, pos)
-    ok(ValueRecord(kind: vrkFloat, floatVal: f, floatTypeId: TypeId(tid)))
-  of vrkBool:
-    let b = ?readBool(data, pos)
-    let tid = ?readU64(data, pos)
-    ok(ValueRecord(kind: vrkBool, boolVal: b, boolTypeId: TypeId(tid)))
-  of vrkString:
-    let text = ?readStr(data, pos)
-    let tid = ?readU64(data, pos)
-    ok(ValueRecord(kind: vrkString, text: text, strTypeId: TypeId(tid)))
-  of vrkSequence:
-    let count = ?readU32(data, pos)
-    var elems = newSeq[ValueRecord](int(count))
-    for i in 0 ..< int(count):
-      elems[i] = ?readValueRecord(data, pos)
-    let isSlice = ?readBool(data, pos)
-    let tid = ?readU64(data, pos)
-    ok(ValueRecord(kind: vrkSequence, seqElements: elems, isSlice: isSlice, seqTypeId: TypeId(tid)))
-  of vrkTuple:
-    let count = ?readU32(data, pos)
-    var elems = newSeq[ValueRecord](int(count))
-    for i in 0 ..< int(count):
-      elems[i] = ?readValueRecord(data, pos)
-    let tid = ?readU64(data, pos)
-    ok(ValueRecord(kind: vrkTuple, tupleElements: elems, tupleTypeId: TypeId(tid)))
-  of vrkStruct:
-    let count = ?readU32(data, pos)
-    var elems = newSeq[ValueRecord](int(count))
-    for i in 0 ..< int(count):
-      elems[i] = ?readValueRecord(data, pos)
-    let tid = ?readU64(data, pos)
-    ok(ValueRecord(kind: vrkStruct, fieldValues: elems, structTypeId: TypeId(tid)))
-  of vrkVariant:
-    let disc = ?readStr(data, pos)
-    let hasContents = ?readBool(data, pos)
-    var contents: seq[ValueRecord]
-    if hasContents:
-      contents = @[?readValueRecord(data, pos)]
-    let tid = ?readU64(data, pos)
-    ok(ValueRecord(kind: vrkVariant, discriminator: disc, contents: contents, variantTypeId: TypeId(tid)))
-  of vrkReference:
-    let hasDeref = ?readBool(data, pos)
-    var deref: seq[ValueRecord]
-    if hasDeref:
-      deref = @[?readValueRecord(data, pos)]
-    let address = ?readU64(data, pos)
-    let mutable = ?readBool(data, pos)
-    let tid = ?readU64(data, pos)
-    ok(ValueRecord(kind: vrkReference, dereferenced: deref, address: address, mutable: mutable, refTypeId: TypeId(tid)))
-  of vrkRaw:
-    let r = ?readStr(data, pos)
-    let tid = ?readU64(data, pos)
-    ok(ValueRecord(kind: vrkRaw, rawStr: r, rawTypeId: TypeId(tid)))
-  of vrkError:
-    let msg = ?readStr(data, pos)
-    let tid = ?readU64(data, pos)
-    ok(ValueRecord(kind: vrkError, errorMsg: msg, errorTypeId: TypeId(tid)))
-  of vrkNone:
-    let tid = ?readU64(data, pos)
-    ok(ValueRecord(kind: vrkNone, noneTypeId: TypeId(tid)))
-  of vrkCell:
-    let p = ?readI64(data, pos)
-    ok(ValueRecord(kind: vrkCell, cellPlace: Place(p)))
-  of vrkBigInt:
-    let count = ?readU32(data, pos)
-    let bytes = ?readBytes(data, pos, int(count))
-    let neg = ?readBool(data, pos)
-    let tid = ?readU64(data, pos)
-    ok(ValueRecord(kind: vrkBigInt, bigIntBytes: bytes, negative: neg, bigIntTypeId: TypeId(tid)))
-  of vrkChar:
-    let c = ?readU8(data, pos)
-    let tid = ?readU64(data, pos)
-    ok(ValueRecord(kind: vrkChar, charVal: char(c), charTypeId: TypeId(tid)))
+proc encodeCborPayloadAssignmentRecord(a: AssignmentRecord): seq[byte] =
+  var enc = CborEncoder.init()
+  enc.encodeCborAssignmentRecord(a)
+  enc.getBytes()
 
-proc writeFullValueRecord(out_buf: var seq[byte], fvr: FullValueRecord) =
-  writeU64(out_buf, uint64(fvr.variableId))
-  writeValueRecord(out_buf, fvr.value)
+proc decodeCborPayloadAssignmentRecord(data: openArray[byte]): Result[AssignmentRecord, string] =
+  var dec = CborDecoder.init(data)
+  dec.decodeCborAssignmentRecord()
 
-proc readFullValueRecord(data: openArray[byte], pos: var int): Result[FullValueRecord, string] =
-  let vid = ?readU64(data, pos)
-  let value = ?readValueRecord(data, pos)
-  ok(FullValueRecord(variableId: VariableId(vid), value: value))
+proc encodeCborPayloadFullValueRecord(fvr: FullValueRecord): seq[byte] =
+  var enc = CborEncoder.init()
+  enc.encodeCborFullValueRecord(fvr)
+  enc.getBytes()
 
-proc writeAssignmentRecord(out_buf: var seq[byte], a: AssignmentRecord) =
-  writeU64(out_buf, uint64(a.to))
-  writeU8(out_buf, byte(ord(a.passBy)))
-  writeU8(out_buf, byte(ord(a.frm.kind)))
-  case a.frm.kind
-  of rvkSimple:
-    writeU64(out_buf, uint64(a.frm.simpleId))
-  of rvkCompound:
-    writeU32(out_buf, uint32(a.frm.compoundIds.len))
-    for id in a.frm.compoundIds:
-      writeU64(out_buf, uint64(id))
+proc decodeCborPayloadFullValueRecord(data: openArray[byte]): Result[FullValueRecord, string] =
+  var dec = CborDecoder.init(data)
+  dec.decodeCborFullValueRecord()
 
-proc readAssignmentRecord(data: openArray[byte], pos: var int): Result[AssignmentRecord, string] =
-  let toId = ?readU64(data, pos)
-  let passByByte = ?readU8(data, pos)
-  if int(passByByte) > ord(high(PassBy)):
-    return err("invalid PassBy: " & $passByByte)
-  let passBy = PassBy(passByByte)
-  let rvKindByte = ?readU8(data, pos)
-  if int(rvKindByte) > ord(high(RValueKind)):
-    return err("invalid RValueKind: " & $rvKindByte)
-  let rvKind = RValueKind(rvKindByte)
-  var frm: RValue
-  case rvKind
-  of rvkSimple:
-    let sid = ?readU64(data, pos)
-    frm = RValue(kind: rvkSimple, simpleId: VariableId(sid))
-  of rvkCompound:
-    let count = ?readU32(data, pos)
-    var ids = newSeq[VariableId](int(count))
-    for i in 0 ..< int(count):
-      let id = ?readU64(data, pos)
-      ids[i] = VariableId(id)
-    frm = RValue(kind: rvkCompound, compoundIds: ids)
-  ok(AssignmentRecord(to: VariableId(toId), passBy: passBy, frm: frm))
+proc encodeCborPayloadCallArgs(args: seq[FullValueRecord]): seq[byte] =
+  var enc = CborEncoder.init()
+  enc.encodeCborCallArgs(args)
+  enc.getBytes()
+
+proc decodeCborPayloadCallArgs(data: openArray[byte]): Result[seq[FullValueRecord], string] =
+  var dec = CborDecoder.init(data)
+  dec.decodeCborCallArgs()
 
 # Helper: write a payload with 4-byte LE length prefix
 proc writePayload(out_buf: var seq[byte], payload: seq[byte]) =
@@ -410,15 +218,13 @@ proc encodeEvent*(enc: var SplitBinaryEncoder, event: TraceLowLevelEvent) =
 
   of tleType:
     writeU8(enc.buf, 4)
-    var payload: seq[byte]
-    writeTypeRecord(payload, event.typeRecord)
+    let payload = encodeCborPayloadTypeRecord(event.typeRecord)
     writePayload(enc.buf, payload)
 
   of tleValue:
     writeU8(enc.buf, 5)
     writeU64(enc.buf, uint64(event.fullValue.variableId))
-    var payload: seq[byte]
-    writeValueRecord(payload, event.fullValue.value)
+    let payload = encodeCborPayloadValueRecord(event.fullValue.value)
     writePayload(enc.buf, payload)
 
   of tleFunction:
@@ -430,16 +236,12 @@ proc encodeEvent*(enc: var SplitBinaryEncoder, event: TraceLowLevelEvent) =
   of tleCall:
     writeU8(enc.buf, 7)
     writeU64(enc.buf, uint64(event.callRecord.functionId))
-    var payload: seq[byte]
-    writeU32(payload, uint32(event.callRecord.args.len))
-    for arg in event.callRecord.args:
-      writeFullValueRecord(payload, arg)
+    let payload = encodeCborPayloadCallArgs(event.callRecord.args)
     writePayload(enc.buf, payload)
 
   of tleReturn:
     writeU8(enc.buf, 8)
-    var payload: seq[byte]
-    writeValueRecord(payload, event.returnRecord.returnValue)
+    let payload = encodeCborPayloadValueRecord(event.returnRecord.returnValue)
     writePayload(enc.buf, payload)
 
   of tleEvent:
@@ -461,8 +263,7 @@ proc encodeEvent*(enc: var SplitBinaryEncoder, event: TraceLowLevelEvent) =
 
   of tleAssignment:
     writeU8(enc.buf, 12)
-    var payload: seq[byte]
-    writeAssignmentRecord(payload, event.assignment)
+    let payload = encodeCborPayloadAssignmentRecord(event.assignment)
     writePayload(enc.buf, payload)
 
   of tleDropVariables:
@@ -474,15 +275,13 @@ proc encodeEvent*(enc: var SplitBinaryEncoder, event: TraceLowLevelEvent) =
   of tleCompoundValue:
     writeU8(enc.buf, 14)
     writeI64(enc.buf, int64(event.compoundValue.place))
-    var payload: seq[byte]
-    writeValueRecord(payload, event.compoundValue.value)
+    let payload = encodeCborPayloadValueRecord(event.compoundValue.value)
     writePayload(enc.buf, payload)
 
   of tleCellValue:
     writeU8(enc.buf, 15)
     writeI64(enc.buf, int64(event.cellValue.place))
-    var payload: seq[byte]
-    writeValueRecord(payload, event.cellValue.value)
+    let payload = encodeCborPayloadValueRecord(event.cellValue.value)
     writePayload(enc.buf, payload)
 
   of tleAssignCompoundItem:
@@ -494,8 +293,7 @@ proc encodeEvent*(enc: var SplitBinaryEncoder, event: TraceLowLevelEvent) =
   of tleAssignCell:
     writeU8(enc.buf, 17)
     writeI64(enc.buf, int64(event.assignCell.place))
-    var payload: seq[byte]
-    writeValueRecord(payload, event.assignCell.newValue)
+    let payload = encodeCborPayloadValueRecord(event.assignCell.newValue)
     writePayload(enc.buf, payload)
 
   of tleVariableCell:
@@ -550,15 +348,13 @@ proc decodeEvent*(data: openArray[byte], pos: var int): Result[TraceLowLevelEven
 
   of 4: # Type
     let payload = ?readPayload(data, pos)
-    var ppos = 0
-    let tr = ?readTypeRecord(payload, ppos)
+    let tr = ?decodeCborPayloadTypeRecord(payload)
     ok(TraceLowLevelEvent(kind: tleType, typeRecord: tr))
 
   of 5: # Value
     let varId = ?readU64(data, pos)
     let payload = ?readPayload(data, pos)
-    var ppos = 0
-    let value = ?readValueRecord(payload, ppos)
+    let value = ?decodeCborPayloadValueRecord(payload)
     ok(TraceLowLevelEvent(kind: tleValue,
       fullValue: FullValueRecord(variableId: VariableId(varId), value: value)))
 
@@ -572,18 +368,13 @@ proc decodeEvent*(data: openArray[byte], pos: var int): Result[TraceLowLevelEven
   of 7: # Call
     let funcId = ?readU64(data, pos)
     let payload = ?readPayload(data, pos)
-    var ppos = 0
-    let count = ?readU32(payload, ppos)
-    var args = newSeq[FullValueRecord](int(count))
-    for i in 0 ..< int(count):
-      args[i] = ?readFullValueRecord(payload, ppos)
+    let args = ?decodeCborPayloadCallArgs(payload)
     ok(TraceLowLevelEvent(kind: tleCall,
       callRecord: CallRecord(functionId: FunctionId(funcId), args: args)))
 
   of 8: # Return
     let payload = ?readPayload(data, pos)
-    var ppos = 0
-    let rv = ?readValueRecord(payload, ppos)
+    let rv = ?decodeCborPayloadValueRecord(payload)
     ok(TraceLowLevelEvent(kind: tleReturn,
       returnRecord: ReturnRecord(returnValue: rv)))
 
@@ -612,8 +403,7 @@ proc decodeEvent*(data: openArray[byte], pos: var int): Result[TraceLowLevelEven
 
   of 12: # Assignment
     let payload = ?readPayload(data, pos)
-    var ppos = 0
-    let ar = ?readAssignmentRecord(payload, ppos)
+    let ar = ?decodeCborPayloadAssignmentRecord(payload)
     ok(TraceLowLevelEvent(kind: tleAssignment, assignment: ar))
 
   of 13: # DropVariables
@@ -627,16 +417,14 @@ proc decodeEvent*(data: openArray[byte], pos: var int): Result[TraceLowLevelEven
   of 14: # CompoundValue
     let place = ?readI64(data, pos)
     let payload = ?readPayload(data, pos)
-    var ppos = 0
-    let value = ?readValueRecord(payload, ppos)
+    let value = ?decodeCborPayloadValueRecord(payload)
     ok(TraceLowLevelEvent(kind: tleCompoundValue,
       compoundValue: CompoundValueRecord(place: Place(place), value: value)))
 
   of 15: # CellValue
     let place = ?readI64(data, pos)
     let payload = ?readPayload(data, pos)
-    var ppos = 0
-    let value = ?readValueRecord(payload, ppos)
+    let value = ?decodeCborPayloadValueRecord(payload)
     ok(TraceLowLevelEvent(kind: tleCellValue,
       cellValue: CellValueRecord(place: Place(place), value: value)))
 
@@ -651,8 +439,7 @@ proc decodeEvent*(data: openArray[byte], pos: var int): Result[TraceLowLevelEven
   of 17: # AssignCell
     let place = ?readI64(data, pos)
     let payload = ?readPayload(data, pos)
-    var ppos = 0
-    let nv = ?readValueRecord(payload, ppos)
+    let nv = ?decodeCborPayloadValueRecord(payload)
     ok(TraceLowLevelEvent(kind: tleAssignCell,
       assignCell: AssignCellRecord(place: Place(place), newValue: nv)))
 
