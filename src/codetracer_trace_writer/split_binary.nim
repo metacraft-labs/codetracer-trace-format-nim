@@ -16,9 +16,9 @@
 import results
 import stew/endians2
 import ./cbor
-import ./fast_buffer
+import ./safe_buffer
 import ../codetracer_trace_types
-export codetracer_trace_types, results, cbor, fast_buffer
+export codetracer_trace_types, results, cbor, safe_buffer
 
 proc readU8(data: openArray[byte], pos: var int): Result[byte, string] =
   if pos >= data.len: return err("unexpected end of data reading u8")
@@ -109,25 +109,25 @@ proc decodeCborPayloadCallArgs(data: openArray[byte]): Result[seq[FullValueRecor
   var dec = CborDecoder.init(data)
   dec.decodeCborCallArgs()
 
-# Direct-to-buffer CBOR payload writing using FastBuffer.
+# Direct-to-buffer CBOR payload writing using SafeBuffer.
 # Writes a 4-byte length placeholder, encodes CBOR directly into the buffer,
 # then patches the length.
-template writePayloadCborDirect(buf: var FastBuffer, body: untyped) =
-  let lenPos = buf.len
+template writePayloadCborDirect(buf: var SafeBuffer, body: untyped) =
+  let lenPos = buf.pos
   # Reserve 4 bytes for length
   ensureCapacity(buf, 4)
-  buf.len += 4
-  let startPos = buf.len
+  buf.pos += 4
+  let startPos = buf.pos
   body
-  let payloadLen = uint32(buf.len - startPos)
+  let payloadLen = uint32(buf.pos - startPos)
   copyMem(addr buf.data[lenPos], unsafeAddr payloadLen, 4)
 
-# CBOR encoding directly into FastBuffer (no intermediate seq[byte])
-proc encodeCborValueRecordInto*(buf: var FastBuffer, v: ValueRecord) {.inline.}
-proc encodeCborTypeRecordInto*(buf: var FastBuffer, t: TypeRecord) {.inline.}
-proc encodeCborAssignmentRecordInto*(buf: var FastBuffer, a: AssignmentRecord) {.inline.}
-proc encodeCborCallArgsInto*(buf: var FastBuffer, args: seq[FullValueRecord]) {.inline.}
-proc encodeCborFullValueRecordInto*(buf: var FastBuffer, fvr: FullValueRecord) {.inline.}
+# CBOR encoding directly into SafeBuffer (no intermediate seq[byte])
+proc encodeCborValueRecordInto*(buf: var SafeBuffer, v: ValueRecord) {.inline.}
+proc encodeCborTypeRecordInto*(buf: var SafeBuffer, t: TypeRecord) {.inline.}
+proc encodeCborAssignmentRecordInto*(buf: var SafeBuffer, a: AssignmentRecord) {.inline.}
+proc encodeCborCallArgsInto*(buf: var SafeBuffer, args: seq[FullValueRecord]) {.inline.}
+proc encodeCborFullValueRecordInto*(buf: var SafeBuffer, fvr: FullValueRecord) {.inline.}
 
 # Pre-computed CBOR key bytes (same as in cbor.nim)
 const
@@ -164,7 +164,7 @@ const
 
 {.push checks: off, boundChecks: off.}
 
-proc encodeCborValueRecordInto*(buf: var FastBuffer, v: ValueRecord) =
+proc encodeCborValueRecordInto*(buf: var SafeBuffer, v: ValueRecord) =
   case v.kind
   of vrkInt:
     buf.writeCborMapHeader(3)
@@ -327,7 +327,7 @@ proc encodeCborValueRecordInto*(buf: var FastBuffer, v: ValueRecord) =
     buf.writeOpenArray(CborKeyTypeId2)
     buf.writeCborUint(uint64(v.charTypeId))
 
-proc encodeCborTypeSpecificInfoInto(buf: var FastBuffer, si: TypeSpecificInfo) {.inline.} =
+proc encodeCborTypeSpecificInfoInto(buf: var SafeBuffer, si: TypeSpecificInfo) {.inline.} =
   case si.kind
   of tsikNone:
     buf.writeCborMapHeader(1)
@@ -352,7 +352,7 @@ proc encodeCborTypeSpecificInfoInto(buf: var FastBuffer, si: TypeSpecificInfo) {
     buf.writeOpenArray(CborKeyDereferenceTypeId2)
     buf.writeCborUint(uint64(si.dereferenceTypeId))
 
-proc encodeCborTypeRecordInto*(buf: var FastBuffer, t: TypeRecord) =
+proc encodeCborTypeRecordInto*(buf: var SafeBuffer, t: TypeRecord) =
   buf.writeCborMapHeader(3)
   buf.writeOpenArray(CborKeyKind2)
   buf.writeCborUint(uint64(ord(t.kind)))
@@ -361,7 +361,7 @@ proc encodeCborTypeRecordInto*(buf: var FastBuffer, t: TypeRecord) =
   buf.writeOpenArray(CborKeySpecificInfo2)
   encodeCborTypeSpecificInfoInto(buf, t.specificInfo)
 
-proc encodeCborRValueInto(buf: var FastBuffer, rv: RValue) {.inline.} =
+proc encodeCborRValueInto(buf: var SafeBuffer, rv: RValue) {.inline.} =
   case rv.kind
   of rvkSimple:
     buf.writeCborMapHeader(2)
@@ -378,7 +378,7 @@ proc encodeCborRValueInto(buf: var FastBuffer, rv: RValue) {.inline.} =
     for id in rv.compoundIds:
       buf.writeCborUint(uint64(id))
 
-proc encodeCborAssignmentRecordInto*(buf: var FastBuffer, a: AssignmentRecord) =
+proc encodeCborAssignmentRecordInto*(buf: var SafeBuffer, a: AssignmentRecord) =
   buf.writeCborMapHeader(3)
   buf.writeOpenArray(CborKeyTo2)
   buf.writeCborUint(uint64(a.to))
@@ -389,14 +389,14 @@ proc encodeCborAssignmentRecordInto*(buf: var FastBuffer, a: AssignmentRecord) =
   buf.writeOpenArray(CborKeyFrom2)
   encodeCborRValueInto(buf, a.frm)
 
-proc encodeCborFullValueRecordInto*(buf: var FastBuffer, fvr: FullValueRecord) =
+proc encodeCborFullValueRecordInto*(buf: var SafeBuffer, fvr: FullValueRecord) =
   buf.writeCborMapHeader(2)
   buf.writeOpenArray(CborKeyVariableId2)
   buf.writeCborUint(uint64(fvr.variableId))
   buf.writeOpenArray(CborKeyValue2)
   encodeCborValueRecordInto(buf, fvr.value)
 
-proc encodeCborCallArgsInto*(buf: var FastBuffer, args: seq[FullValueRecord]) =
+proc encodeCborCallArgsInto*(buf: var SafeBuffer, args: seq[FullValueRecord]) =
   buf.writeCborArrayHeader(uint64(args.len))
   for arg in args:
     encodeCborFullValueRecordInto(buf, arg)
@@ -408,15 +408,53 @@ proc readPayload(data: openArray[byte], pos: var int): Result[seq[byte], string]
   readBytes(data, pos, int(length))
 
 # ===========================================================================
+# StackStage — fixed-size stack-array staging for zero-allocation encoding
+# ===========================================================================
+#
+# For fixed-size events, we stage all bytes into a 256-byte stack array
+# and flush once to the output buffer. This eliminates per-field
+# ensureCapacity calls and produces a single bulk copy.
+
+type
+  StackStage* {.byref.} = object
+    buf*: array[256, byte]  # Fixed stack allocation, no heap
+    pos*: int
+
+template stkWriteU8*(stk: var StackStage, v: uint8) =
+  stk.buf[stk.pos] = v
+  stk.pos += 1
+
+template stkWriteU32*(stk: var StackStage, v: uint32) =
+  let stkTmpU32 = v
+  copyMem(addr stk.buf[stk.pos], unsafeAddr stkTmpU32, 4)
+  stk.pos += 4
+
+template stkWriteU64*(stk: var StackStage, v: uint64) =
+  let stkTmpU64 = v
+  copyMem(addr stk.buf[stk.pos], unsafeAddr stkTmpU64, 8)
+  stk.pos += 8
+
+template stkWriteI64*(stk: var StackStage, v: int64) =
+  let stkTmpI64 = v
+  copyMem(addr stk.buf[stk.pos], unsafeAddr stkTmpI64, 8)
+  stk.pos += 8
+
+template flushTo*(stk: StackStage, output: var SafeBuffer) =
+  ## Flush staged bytes from stack array into the SafeBuffer in one bulk copy.
+  ensureCapacity(output, stk.pos)
+  copyMem(addr output.data[output.pos], unsafeAddr stk.buf[0], stk.pos)
+  output.pos += stk.pos
+
+# ===========================================================================
 # SplitBinaryEncoder
 # ===========================================================================
 
 type
   SplitBinaryEncoder* = object
-    buf*: FastBuffer
+    buf*: SafeBuffer
 
 proc init*(T: type SplitBinaryEncoder, capacity: int = 65536): SplitBinaryEncoder =
-  result.buf = initFastBuffer(capacity)
+  result.buf = initSafeBuffer(capacity)
 
 proc clear*(enc: var SplitBinaryEncoder) =
   enc.buf.clear()
@@ -425,29 +463,55 @@ proc getBytes*(enc: SplitBinaryEncoder): seq[byte] =
   enc.buf.toSeq()
 
 proc destroy*(enc: var SplitBinaryEncoder) =
-  enc.buf.destroy()
+  ## No-op: SafeBuffer uses GC-managed memory, no manual dealloc needed.
+  enc.buf.clear()
 
 {.push checks: off, boundChecks: off.}
 
 proc encodeEvent*(enc: var SplitBinaryEncoder, event: TraceLowLevelEvent) =
   ## Encode a single TraceLowLevelEvent into the encoder's buffer.
+  ## Fixed-size events use StackStage to batch all writes into a single
+  ## bulk copy. Events with variable-length data (strings, CBOR) stage
+  ## the fixed header on the stack, then append variable data directly.
   case event.kind
   of tleStep:
-    enc.buf.writeU8(0)
-    enc.buf.writeU64(uint64(event.step.pathId))
-    enc.buf.writeI64(int64(event.step.line))
+    # 1 + 8 + 8 = 17 bytes, fits stack
+    var stk: StackStage
+    stk.stkWriteU8(0)
+    stk.stkWriteU64(uint64(event.step.pathId))
+    stk.stkWriteI64(int64(event.step.line))
+    stk.flushTo(enc.buf)
 
   of tlePath:
-    enc.buf.writeU8(1)
-    enc.buf.writeStr(event.path)
+    # Header (1 + 4 = 5 bytes) on stack, then string direct
+    var stk: StackStage
+    stk.stkWriteU8(1)
+    stk.stkWriteU32(uint32(event.path.len))
+    stk.flushTo(enc.buf)
+    if event.path.len > 0:
+      ensureCapacity(enc.buf, event.path.len)
+      copyMem(addr enc.buf.data[enc.buf.pos], unsafeAddr event.path[0], event.path.len)
+      enc.buf.pos += event.path.len
 
   of tleVariableName:
-    enc.buf.writeU8(2)
-    enc.buf.writeStr(event.varName)
+    var stk: StackStage
+    stk.stkWriteU8(2)
+    stk.stkWriteU32(uint32(event.varName.len))
+    stk.flushTo(enc.buf)
+    if event.varName.len > 0:
+      ensureCapacity(enc.buf, event.varName.len)
+      copyMem(addr enc.buf.data[enc.buf.pos], unsafeAddr event.varName[0], event.varName.len)
+      enc.buf.pos += event.varName.len
 
   of tleVariable:
-    enc.buf.writeU8(3)
-    enc.buf.writeStr(event.variable)
+    var stk: StackStage
+    stk.stkWriteU8(3)
+    stk.stkWriteU32(uint32(event.variable.len))
+    stk.flushTo(enc.buf)
+    if event.variable.len > 0:
+      ensureCapacity(enc.buf, event.variable.len)
+      copyMem(addr enc.buf.data[enc.buf.pos], unsafeAddr event.variable[0], event.variable.len)
+      enc.buf.pos += event.variable.len
 
   of tleType:
     enc.buf.writeU8(4)
@@ -455,20 +519,33 @@ proc encodeEvent*(enc: var SplitBinaryEncoder, event: TraceLowLevelEvent) =
       encodeCborTypeRecordInto(enc.buf, event.typeRecord)
 
   of tleValue:
-    enc.buf.writeU8(5)
-    enc.buf.writeU64(uint64(event.fullValue.variableId))
+    # Header: 1 + 8 = 9 bytes on stack, then CBOR payload direct
+    var stk: StackStage
+    stk.stkWriteU8(5)
+    stk.stkWriteU64(uint64(event.fullValue.variableId))
+    stk.flushTo(enc.buf)
     writePayloadCborDirect(enc.buf):
       encodeCborValueRecordInto(enc.buf, event.fullValue.value)
 
   of tleFunction:
-    enc.buf.writeU8(6)
-    enc.buf.writeU64(uint64(event.functionRecord.pathId))
-    enc.buf.writeI64(int64(event.functionRecord.line))
-    enc.buf.writeStr(event.functionRecord.name)
+    # Header: 1 + 8 + 8 = 17 bytes on stack, then string
+    var stk: StackStage
+    stk.stkWriteU8(6)
+    stk.stkWriteU64(uint64(event.functionRecord.pathId))
+    stk.stkWriteI64(int64(event.functionRecord.line))
+    stk.stkWriteU32(uint32(event.functionRecord.name.len))
+    stk.flushTo(enc.buf)
+    if event.functionRecord.name.len > 0:
+      ensureCapacity(enc.buf, event.functionRecord.name.len)
+      copyMem(addr enc.buf.data[enc.buf.pos], unsafeAddr event.functionRecord.name[0], event.functionRecord.name.len)
+      enc.buf.pos += event.functionRecord.name.len
 
   of tleCall:
-    enc.buf.writeU8(7)
-    enc.buf.writeU64(uint64(event.callRecord.functionId))
+    # Header: 1 + 8 = 9 bytes on stack, then CBOR payload
+    var stk: StackStage
+    stk.stkWriteU8(7)
+    stk.stkWriteU64(uint64(event.callRecord.functionId))
+    stk.flushTo(enc.buf)
     writePayloadCborDirect(enc.buf):
       encodeCborCallArgsInto(enc.buf, event.callRecord.args)
 
@@ -478,8 +555,11 @@ proc encodeEvent*(enc: var SplitBinaryEncoder, event: TraceLowLevelEvent) =
       encodeCborValueRecordInto(enc.buf, event.returnRecord.returnValue)
 
   of tleEvent:
-    enc.buf.writeU8(9)
-    enc.buf.writeU8(byte(ord(event.recordEvent.kind)))
+    # Header: 1 + 1 = 2 bytes on stack, then two strings
+    var stk: StackStage
+    stk.stkWriteU8(9)
+    stk.stkWriteU8(byte(ord(event.recordEvent.kind)))
+    stk.flushTo(enc.buf)
     enc.buf.writeStr(event.recordEvent.metadata)
     enc.buf.writeStr(event.recordEvent.content)
 
@@ -490,9 +570,12 @@ proc encodeEvent*(enc: var SplitBinaryEncoder, event: TraceLowLevelEvent) =
       enc.buf.writeStr(line)
 
   of tleBindVariable:
-    enc.buf.writeU8(11)
-    enc.buf.writeU64(uint64(event.bindVar.variableId))
-    enc.buf.writeI64(int64(event.bindVar.place))
+    # 1 + 8 + 8 = 17 bytes, fits stack
+    var stk: StackStage
+    stk.stkWriteU8(11)
+    stk.stkWriteU64(uint64(event.bindVar.variableId))
+    stk.stkWriteI64(int64(event.bindVar.place))
+    stk.flushTo(enc.buf)
 
   of tleAssignment:
     enc.buf.writeU8(12)
@@ -506,52 +589,77 @@ proc encodeEvent*(enc: var SplitBinaryEncoder, event: TraceLowLevelEvent) =
       enc.buf.writeU64(uint64(id))
 
   of tleCompoundValue:
-    enc.buf.writeU8(14)
-    enc.buf.writeI64(int64(event.compoundValue.place))
+    # Header: 1 + 8 = 9 bytes on stack, then CBOR
+    var stk: StackStage
+    stk.stkWriteU8(14)
+    stk.stkWriteI64(int64(event.compoundValue.place))
+    stk.flushTo(enc.buf)
     writePayloadCborDirect(enc.buf):
       encodeCborValueRecordInto(enc.buf, event.compoundValue.value)
 
   of tleCellValue:
-    enc.buf.writeU8(15)
-    enc.buf.writeI64(int64(event.cellValue.place))
+    var stk: StackStage
+    stk.stkWriteU8(15)
+    stk.stkWriteI64(int64(event.cellValue.place))
+    stk.flushTo(enc.buf)
     writePayloadCborDirect(enc.buf):
       encodeCborValueRecordInto(enc.buf, event.cellValue.value)
 
   of tleAssignCompoundItem:
-    enc.buf.writeU8(16)
-    enc.buf.writeI64(int64(event.assignCompoundItem.place))
-    enc.buf.writeU64(event.assignCompoundItem.index)
-    enc.buf.writeI64(int64(event.assignCompoundItem.itemPlace))
+    # 1 + 8 + 8 + 8 = 25 bytes, fits stack
+    var stk: StackStage
+    stk.stkWriteU8(16)
+    stk.stkWriteI64(int64(event.assignCompoundItem.place))
+    stk.stkWriteU64(event.assignCompoundItem.index)
+    stk.stkWriteI64(int64(event.assignCompoundItem.itemPlace))
+    stk.flushTo(enc.buf)
 
   of tleAssignCell:
-    enc.buf.writeU8(17)
-    enc.buf.writeI64(int64(event.assignCell.place))
+    var stk: StackStage
+    stk.stkWriteU8(17)
+    stk.stkWriteI64(int64(event.assignCell.place))
+    stk.flushTo(enc.buf)
     writePayloadCborDirect(enc.buf):
       encodeCborValueRecordInto(enc.buf, event.assignCell.newValue)
 
   of tleVariableCell:
-    enc.buf.writeU8(18)
-    enc.buf.writeU64(uint64(event.variableCell.variableId))
-    enc.buf.writeI64(int64(event.variableCell.place))
+    # 1 + 8 + 8 = 17 bytes, fits stack
+    var stk: StackStage
+    stk.stkWriteU8(18)
+    stk.stkWriteU64(uint64(event.variableCell.variableId))
+    stk.stkWriteI64(int64(event.variableCell.place))
+    stk.flushTo(enc.buf)
 
   of tleDropVariable:
-    enc.buf.writeU8(19)
-    enc.buf.writeU64(uint64(event.dropVarId))
+    # 1 + 8 = 9 bytes, fits stack
+    var stk: StackStage
+    stk.stkWriteU8(19)
+    stk.stkWriteU64(uint64(event.dropVarId))
+    stk.flushTo(enc.buf)
 
   of tleThreadStart:
-    enc.buf.writeU8(20)
-    enc.buf.writeU64(uint64(event.threadStartId))
+    # 1 + 8 = 9 bytes, fits stack
+    var stk: StackStage
+    stk.stkWriteU8(20)
+    stk.stkWriteU64(uint64(event.threadStartId))
+    stk.flushTo(enc.buf)
 
   of tleThreadExit:
-    enc.buf.writeU8(21)
-    enc.buf.writeU64(uint64(event.threadExitId))
+    var stk: StackStage
+    stk.stkWriteU8(21)
+    stk.stkWriteU64(uint64(event.threadExitId))
+    stk.flushTo(enc.buf)
 
   of tleThreadSwitch:
-    enc.buf.writeU8(22)
-    enc.buf.writeU64(uint64(event.threadSwitchId))
+    var stk: StackStage
+    stk.stkWriteU8(22)
+    stk.stkWriteU64(uint64(event.threadSwitchId))
+    stk.flushTo(enc.buf)
 
   of tleDropLastStep:
-    enc.buf.writeU8(23)
+    var stk: StackStage
+    stk.stkWriteU8(23)
+    stk.flushTo(enc.buf)
 
 {.pop.} # checks: off, boundChecks: off
 
