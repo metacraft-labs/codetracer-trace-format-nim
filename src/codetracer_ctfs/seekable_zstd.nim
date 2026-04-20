@@ -43,17 +43,22 @@ type
     entries*: seq[SeekTableEntry]
 
   SeekableZstdEncoder* = object
-    buffer: seq[byte]           # Accumulation buffer for current frame
-    frames: seq[seq[byte]]      # Compressed frames
+    buffer: seq[byte]           # Accumulation buffer for current frame (pre-allocated)
+    bufferPos: int              # Write cursor into buffer
+    output: seq[byte]           # Single output buffer (all frames written here)
+    outputPos: int              # Write cursor into output
+    compressBuffer: seq[byte]   # Reusable compressed frame buffer (allocated once)
     seekTable: SeekTable        # Built incrementally
     frameThreshold: int         # Uncompressed bytes per frame
     compressionLevel: int       # Zstd compression level
+    cctx: pointer               # Reusable ZSTD compression context
 
   SeekableZstdDecoder* = object
     data: seq[byte]             # Complete compressed data including seek table
     seekTable*: SeekTable       # Parsed from footer
     frameOffsets: seq[uint64]   # Cumulative compressed offsets for each frame
     decompOffsets: seq[uint64]  # Cumulative decompressed offsets for each frame
+    dctx: pointer               # Reusable ZSTD decompression context
 
 # ---------------------------------------------------------------------------
 # SeekTable operations
@@ -352,56 +357,77 @@ proc newSeekableZstdEncoder*(
     frameThreshold: int = DefaultFrameThreshold,
     compressionLevel: int = DefaultCompressionLevel
 ): SeekableZstdEncoder =
+  let bound = int(ZSTD_compressBound(csize_t(frameThreshold)))
+  # Pre-allocate output for ~2x compressed estimate + some headroom
+  let initialOutputCap = max(bound * 4, 65536)
+  var output = newSeq[byte](initialOutputCap)
+  var buffer = newSeq[byte](frameThreshold)
+  var compressBuffer = newSeq[byte](bound)
+  let cctx = ZSTD_createCCtx()
   SeekableZstdEncoder(
-    buffer: @[],
-    frames: @[],
+    buffer: buffer,
+    bufferPos: 0,
+    output: output,
+    outputPos: 0,
+    compressBuffer: compressBuffer,
     seekTable: SeekTable(entries: @[]),
     frameThreshold: frameThreshold,
     compressionLevel: compressionLevel,
+    cctx: cctx,
   )
 
+proc ensureOutputCapacity(enc: var SeekableZstdEncoder, needed: int) {.inline.} =
+  ## Ensure output buffer has room for `needed` more bytes.
+  let required = enc.outputPos + needed
+  if required > enc.output.len:
+    var newCap = enc.output.len * 2
+    while newCap < required:
+      newCap = newCap * 2
+    enc.output.setLen(newCap)
+
 proc flushFrame(enc: var SeekableZstdEncoder) =
-  ## Compress the current buffer into a single Zstd frame and record it.
-  if enc.buffer.len == 0:
+  ## Compress the current buffer into the output buffer directly.
+  if enc.bufferPos == 0:
     return
 
-  let srcSize = csize_t(enc.buffer.len)
-  let bound = ZSTD_compressBound(srcSize)
-  var compressed = newSeq[byte](int(bound))
+  let srcSize = csize_t(enc.bufferPos)
 
-  let compressedSize = ZSTD_compress(
-    addr compressed[0], csize_t(compressed.len),
+  # Compress into reusable compressBuffer using context
+  let compressedSize = ZSTD_compressCCtx(
+    enc.cctx,
+    addr enc.compressBuffer[0], csize_t(enc.compressBuffer.len),
     addr enc.buffer[0], srcSize,
     cint(enc.compressionLevel),
   )
 
-  # Check for error (ZSTD_isError returns non-zero on error)
+  # Check for error
   if ZSTD_isError(compressedSize) != 0:
-    # On error, store an empty frame — caller will get an empty result.
-    # In practice this should never happen with valid inputs.
     return
 
-  compressed.setLen(int(compressedSize))
+  # Copy compressed data directly into output
+  enc.ensureOutputCapacity(int(compressedSize))
+  copyMem(addr enc.output[enc.outputPos], addr enc.compressBuffer[0], int(compressedSize))
+  enc.outputPos += int(compressedSize)
 
   enc.seekTable.entries.add(SeekTableEntry(
     compressedSize: uint32(compressedSize),
-    decompressedSize: uint32(enc.buffer.len),
+    decompressedSize: uint32(enc.bufferPos),
   ))
 
-  enc.frames.add(compressed)
-  enc.buffer.setLen(0)
+  enc.bufferPos = 0
 
 proc write*(enc: var SeekableZstdEncoder, data: openArray[byte]) =
   ## Append data to the encoder. When the internal buffer exceeds the frame
   ## threshold, a new compressed frame is flushed automatically.
   var offset = 0
   while offset < data.len:
-    let remaining = enc.frameThreshold - enc.buffer.len
+    let remaining = enc.frameThreshold - enc.bufferPos
     let chunk = min(remaining, data.len - offset)
-    enc.buffer.add(data.toOpenArray(offset, offset + chunk - 1))
+    copyMem(addr enc.buffer[enc.bufferPos], unsafeAddr data[offset], chunk)
+    enc.bufferPos += chunk
     offset += chunk
 
-    if enc.buffer.len >= enc.frameThreshold:
+    if enc.bufferPos >= enc.frameThreshold:
       enc.flushFrame()
 
 proc finish*(enc: var SeekableZstdEncoder): seq[byte] =
@@ -409,23 +435,22 @@ proc finish*(enc: var SeekableZstdEncoder): seq[byte] =
   ## Returns all compressed frames followed by the seek table skippable frame.
   enc.flushFrame()
 
-  # Calculate total output size
-  var totalSize = 0
-  for frame in enc.frames:
-    totalSize += frame.len
-
   let seekTableData = serializeSeekTable(enc.seekTable)
-  totalSize += seekTableData.len
 
-  result = newSeq[byte](totalSize)
-  var pos = 0
-  for frame in enc.frames:
-    if frame.len > 0:
-      copyMem(addr result[pos], unsafeAddr frame[0], frame.len)
-      pos += frame.len
-
+  # Append seek table to output
+  enc.ensureOutputCapacity(seekTableData.len)
   if seekTableData.len > 0:
-    copyMem(addr result[pos], unsafeAddr seekTableData[0], seekTableData.len)
+    copyMem(addr enc.output[enc.outputPos], unsafeAddr seekTableData[0], seekTableData.len)
+  enc.outputPos += seekTableData.len
+
+  # Return truncated output (no copy, just set length)
+  enc.output.setLen(enc.outputPos)
+  result = move enc.output
+
+  # Free the compression context
+  if enc.cctx != nil:
+    discard ZSTD_freeCCtx(enc.cctx)
+    enc.cctx = nil
 
 # ---------------------------------------------------------------------------
 # Decoder
@@ -451,6 +476,7 @@ proc initSeekableZstdDecoder*(data: openArray[byte]): Result[SeekableZstdDecoder
   var dec = SeekableZstdDecoder(
     data: @data,
     seekTable: tableRes.get(),
+    dctx: ZSTD_createDCtx(),
   )
   dec.buildOffsets()
 
@@ -460,6 +486,8 @@ proc initSeekableZstdDecoder*(data: openArray[byte]): Result[SeekableZstdDecoder
     dec.seekTable.entries.len * SeekTableEntrySize + SeekTableFooterSize
   let expectedLen = uint64(totalComp) + uint64(seekTableFrameSize)
   if expectedLen != uint64(data.len):
+    if dec.dctx != nil:
+      discard ZSTD_freeDCtx(dec.dctx)
     return err("data length mismatch: compressed frames + seek table != total size")
 
   ok(dec)
@@ -483,7 +511,8 @@ proc decompressFrame*(dec: SeekableZstdDecoder, frameIndex: int): Result[seq[byt
 
   var output = newSeq[byte](decompSize)
 
-  let actualSize = ZSTD_decompress(
+  let actualSize = ZSTD_decompressDCtx(
+    dec.dctx,
     addr output[0], csize_t(decompSize),
     unsafeAddr dec.data[compOffset], csize_t(compSize),
   )
@@ -506,13 +535,28 @@ proc decompressAll*(dec: SeekableZstdDecoder): Result[seq[byte], string] =
   var output = newSeq[byte](int(totalDecomp))
   var pos = 0
   for i in 0 ..< dec.seekTable.entries.len:
-    let frameRes = dec.decompressFrame(i)
-    if frameRes.isErr:
-      return err(frameRes.error)
-    let frameData = frameRes.get()
-    if frameData.len > 0:
-      copyMem(addr output[pos], unsafeAddr frameData[0], frameData.len)
-      pos += frameData.len
+    let entry = dec.seekTable.entries[i]
+    let compOffset = int(dec.frameOffsets[i])
+    let compSize = int(entry.compressedSize)
+    let decompSize = int(entry.decompressedSize)
+
+    if decompSize == 0:
+      continue
+
+    let actualSize = ZSTD_decompressDCtx(
+      dec.dctx,
+      addr output[pos], csize_t(decompSize),
+      unsafeAddr dec.data[compOffset], csize_t(compSize),
+    )
+
+    if ZSTD_isError(actualSize) != 0:
+      let errName = ZSTD_getErrorName(actualSize)
+      return err("zstd decompression error: " & $errName)
+
+    if int(actualSize) != decompSize:
+      return err("decompressed size mismatch: expected " & $decompSize & " got " & $actualSize)
+
+    pos += decompSize
 
   ok(output)
 

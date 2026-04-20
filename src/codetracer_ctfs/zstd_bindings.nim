@@ -26,6 +26,28 @@ proc ZSTD_isError*(code: csize_t): cuint
 proc ZSTD_getErrorName*(code: csize_t): cstring
   {.importc, header: "<zstd.h>".}
 
+# Context-based API for reuse across multiple compress/decompress calls
+proc ZSTD_createCCtx*(): pointer
+  {.importc, header: "<zstd.h>".}
+
+proc ZSTD_freeCCtx*(cctx: pointer): csize_t
+  {.importc, header: "<zstd.h>".}
+
+proc ZSTD_compressCCtx*(cctx: pointer, dst: pointer, dstCapacity: csize_t,
+                        src: pointer, srcSize: csize_t,
+                        compressionLevel: cint): csize_t
+  {.importc, header: "<zstd.h>".}
+
+proc ZSTD_createDCtx*(): pointer
+  {.importc, header: "<zstd.h>".}
+
+proc ZSTD_freeDCtx*(dctx: pointer): csize_t
+  {.importc, header: "<zstd.h>".}
+
+proc ZSTD_decompressDCtx*(dctx: pointer, dst: pointer, dstCapacity: csize_t,
+                          src: pointer, srcSize: csize_t): csize_t
+  {.importc, header: "<zstd.h>".}
+
 const
   ZSTD_CONTENTSIZE_UNKNOWN* = culonglong(0xFFFFFFFFFFFFFFFF'u64)
   ZSTD_CONTENTSIZE_ERROR* = culonglong(0xFFFFFFFFFFFFFFFE'u64)
