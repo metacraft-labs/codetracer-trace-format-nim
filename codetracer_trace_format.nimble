@@ -22,3 +22,7 @@ task test, "Run all tests":
 
 task bench, "Run benchmarks":
   exec "nim c -d:release -r tests/bench_seekable_zstd.nim"
+  exec "nim c -d:release -r tests/bench_split_binary.nim"
+
+task benchSplitBinary, "Run split-binary benchmarks":
+  exec "nim c -d:release -r tests/bench_split_binary.nim"
