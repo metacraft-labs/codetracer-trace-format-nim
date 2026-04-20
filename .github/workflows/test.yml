@@ -36,6 +36,7 @@ jobs:
           nim c -r --mm:${{ matrix.mm }} -p:src tests/test_varint.nim
           nim c -r --mm:${{ matrix.mm }} -p:src tests/test_split_binary.nim
           nim c -r --mm:${{ matrix.mm }} -p:src tests/test_trace_writer.nim
+          nim c -r --mm:${{ matrix.mm }} -p:src tests/test_golden_fixtures.nim
 
       - name: Verify library compiles as static lib (GC-free)
         run: nim c --mm:arc --app:staticlib --noMain -p:src src/codetracer_ctfs.nim

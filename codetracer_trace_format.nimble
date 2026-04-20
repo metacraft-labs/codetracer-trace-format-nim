@@ -20,6 +20,10 @@ task test, "Run all tests":
   exec "nim c -r tests/test_varint.nim"
   exec "nim c -r tests/test_split_binary.nim"
   exec "nim c -r tests/test_trace_writer.nim"
+  exec "nim c -r tests/test_golden_fixtures.nim"
+
+task regenerateFixtures, "Regenerate .expected golden fixture files":
+  exec "nim c -r tests/generate_golden_fixtures.nim"
 
 task bench, "Run benchmarks":
   exec "nim c -d:release -r tests/bench_seekable_zstd.nim"

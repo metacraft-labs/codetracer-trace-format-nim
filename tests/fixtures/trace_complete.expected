@@ -1,0 +1,39 @@
+=== CTFS Header ===
+magic: c0de72ace2
+version: 3
+compression: cmNone
+encryption: emNone
+block_size: 4096
+max_root_entries: 31
+
+=== File Entries ===
+[0] name: "events.log" size: 200 map_block: 1
+[1] name: "events.fmt" size: 12 map_block: 3
+[2] name: "meta.json" size: 87 map_block: 5
+[3] name: "paths.json" size: 32 map_block: 7
+
+=== Internal File: events.log ===
+[chunk 0] event_count: 5 first_geid: 0
+  event[0]: Path "/src/main.nim"
+  event[1]: Path "/src/lib.nim"
+  event[2]: Function path_id=0 line=1 name="main"
+  event[3]: Step path_id=0 line=1
+  event[4]: Call function_id=0 args_count=0
+[chunk 1] event_count: 5 first_geid: 5
+  event[0]: Step path_id=0 line=5
+  event[1]: Step path_id=0 line=6
+  event[2]: Step path_id=0 line=7
+  event[3]: Step path_id=1 line=10
+  event[4]: Return kind=None
+[chunk 2] event_count: 2 first_geid: 10
+  event[0]: Step path_id=0 line=8
+  event[1]: Step path_id=0 line=9
+
+=== Internal File: events.fmt ===
+split-binary
+
+=== Internal File: meta.json ===
+{"program":"test_program","args":["--flag","input.txt"],"workdir":"/home/user/project"}
+
+=== Internal File: paths.json ===
+["/src/main.nim","/src/lib.nim"]

@@ -1,0 +1,13 @@
+=== Split-Binary Events ===
+event_count: 10
+
+  event[0]: Step path_id=0 line=1
+  event[1]: Path "/src/main.nim"
+  event[2]: Function path_id=0 line=1 name="main"
+  event[3]: Call function_id=0 args_count=0
+  event[4]: Step path_id=0 line=5
+  event[5]: Value variable_id=1 kind=Int i=42 type_id=7
+  event[6]: Return kind=Int i=0 type_id=7
+  event[7]: DropLastStep
+  event[8]: ThreadStart id=1
+  event[9]: Event kind=elkWrite metadata="stdout" content="hello\n"

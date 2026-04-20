@@ -1,0 +1,20 @@
+=== CTFS Header ===
+magic: c0de72ace2
+version: 3
+compression: cmNone
+encryption: emNone
+block_size: 4096
+max_root_entries: 31
+
+=== File Entries ===
+[0] name: "hello.txt" size: 12 map_block: 1
+[1] name: "data.bin" size: 256 map_block: 3
+
+=== Internal File: hello.txt ===
+48656c6c6f2c204354465321
+
+=== Internal File: data.bin ===
+000102030405060708090a0b0c0d0e0f
+101112131415161718191a1b1c1d1e1f
+202122232425262728292a2b2c2d2e2f
+303132333435363738393a3b3c3d3e3f... (256 bytes total)
