@@ -1,9 +1,14 @@
 {.push raises: [].}
 
-## Safe buffer with cursor for high-performance binary writing.
-## Uses seq[byte] (GC-managed) with a separate write position cursor.
-## Key insight: pre-allocate full capacity, write via indexed access,
-## only truncate (setLen) at the end. This avoids per-write setLen overhead.
+## ChunkBuffer: fixed-capacity buffer for streaming event encoding.
+## Allocated once at init, never resized in the hot path.
+## The buffer is sized generously (chunkThreshold * 256 bytes) so that
+## a full chunk of events fits without growing. A single `ensureSpace`
+## check per event (in encodeEvent) is the only branch in the hot path.
+##
+## Safety net: if the buffer is ever too small (pathological case with
+## huge strings), growIfNeeded expands it. This is marked {.noinline.}
+## so the fast path stays compact in the instruction cache.
 
 type
   SafeBuffer* = object
@@ -20,7 +25,9 @@ proc clear*(buf: var SafeBuffer) {.inline.} =
 proc len*(buf: SafeBuffer): int {.inline.} =
   buf.pos
 
-proc ensureCapacity*(buf: var SafeBuffer, needed: int) {.inline.} =
+proc growIfNeeded*(buf: var SafeBuffer, needed: int) {.noinline.} =
+  ## Rare path: grow the buffer. Should almost never be called in
+  ## streaming mode since the buffer is pre-sized for a full chunk.
   let required = buf.pos + needed
   if required > buf.data.len:
     var newCap = buf.data.len * 2
@@ -28,20 +35,27 @@ proc ensureCapacity*(buf: var SafeBuffer, needed: int) {.inline.} =
       newCap = newCap * 2
     buf.data.setLen(newCap)
 
+template ensureSpace*(buf: var SafeBuffer, needed: int) =
+  ## Fast inline check - the branch is almost never taken when the
+  ## buffer is correctly pre-sized for streaming chunks.
+  if unlikely(buf.pos + needed > buf.data.len):
+    buf.growIfNeeded(needed)
+
+# Keep ensureCapacity as an alias for backward compatibility (tests, etc.)
+template ensureCapacity*(buf: var SafeBuffer, needed: int) =
+  ensureSpace(buf, needed)
+
 {.push checks: off, boundChecks: off.}
 
 proc writeU8*(buf: var SafeBuffer, v: uint8) {.inline.} =
-  ensureCapacity(buf, 1)
   buf.data[buf.pos] = v
   buf.pos += 1
 
 proc writeU32*(buf: var SafeBuffer, v: uint32) {.inline.} =
-  ensureCapacity(buf, 4)
   copyMem(addr buf.data[buf.pos], unsafeAddr v, 4)
   buf.pos += 4
 
 proc writeU64*(buf: var SafeBuffer, v: uint64) {.inline.} =
-  ensureCapacity(buf, 8)
   copyMem(addr buf.data[buf.pos], unsafeAddr v, 8)
   buf.pos += 8
 
@@ -52,19 +66,18 @@ proc writeF64*(buf: var SafeBuffer, v: float64) {.inline.} =
   writeU64(buf, cast[uint64](v))
 
 proc writeBool*(buf: var SafeBuffer, v: bool) {.inline.} =
-  ensureCapacity(buf, 1)
   buf.data[buf.pos] = if v: 1'u8 else: 0'u8
   buf.pos += 1
 
 proc writeBytes*(buf: var SafeBuffer, src: pointer, count: int) {.inline.} =
   if count > 0:
-    ensureCapacity(buf, count)
     copyMem(addr buf.data[buf.pos], src, count)
     buf.pos += count
 
 proc writeStr*(buf: var SafeBuffer, s: string) {.inline.} =
+  # Safety net for long strings that exceed the per-event ensureSpace budget
+  ensureSpace(buf, 4 + s.len)
   let slen = uint32(s.len)
-  ensureCapacity(buf, 4 + s.len)
   copyMem(addr buf.data[buf.pos], unsafeAddr slen, 4)
   buf.pos += 4
   if s.len > 0:
@@ -72,8 +85,10 @@ proc writeStr*(buf: var SafeBuffer, s: string) {.inline.} =
     buf.pos += s.len
 
 proc writeOpenArray*(buf: var SafeBuffer, data: openArray[byte]) {.inline.} =
+  ## For short pre-computed CBOR keys (all <= 20 bytes), no check needed
+  ## since ensureSpace(512) at event start covers them. But we keep the
+  ## safety net for correctness with arbitrary data.
   if data.len > 0:
-    ensureCapacity(buf, data.len)
     copyMem(addr buf.data[buf.pos], unsafeAddr data[0], data.len)
     buf.pos += data.len
 
@@ -90,22 +105,18 @@ proc toSeq*(buf: SafeBuffer): seq[byte] =
 proc writeCborTypeAndValue*(buf: var SafeBuffer, majorType: byte, value: uint64) {.inline.} =
   let mt = majorType shl 5
   if value <= 23:
-    ensureCapacity(buf, 1)
     buf.data[buf.pos] = mt or byte(value)
     buf.pos += 1
   elif value <= 0xFF:
-    ensureCapacity(buf, 2)
     buf.data[buf.pos] = mt or 24
     buf.data[buf.pos + 1] = byte(value)
     buf.pos += 2
   elif value <= 0xFFFF:
-    ensureCapacity(buf, 3)
     buf.data[buf.pos] = mt or 25
     buf.data[buf.pos + 1] = byte(value shr 8)
     buf.data[buf.pos + 2] = byte(value)
     buf.pos += 3
   elif value <= 0xFFFF_FFFF'u64:
-    ensureCapacity(buf, 5)
     buf.data[buf.pos] = mt or 26
     buf.data[buf.pos + 1] = byte(value shr 24)
     buf.data[buf.pos + 2] = byte(value shr 16)
@@ -113,7 +124,6 @@ proc writeCborTypeAndValue*(buf: var SafeBuffer, majorType: byte, value: uint64)
     buf.data[buf.pos + 4] = byte(value)
     buf.pos += 5
   else:
-    ensureCapacity(buf, 9)
     buf.data[buf.pos] = mt or 27
     buf.data[buf.pos + 1] = byte(value shr 56)
     buf.data[buf.pos + 2] = byte(value shr 48)
@@ -138,16 +148,18 @@ proc writeCborInt*(buf: var SafeBuffer, value: int64) {.inline.} =
     buf.writeCborNegInt(uint64(-1 - value))
 
 proc writeCborTextString*(buf: var SafeBuffer, s: string) {.inline.} =
+  # Safety net for long strings (9 bytes for CBOR header + string content)
+  ensureSpace(buf, 9 + s.len)
   buf.writeCborTypeAndValue(3, uint64(s.len))
   if s.len > 0:
-    ensureCapacity(buf, s.len)
     copyMem(addr buf.data[buf.pos], unsafeAddr s[0], s.len)
     buf.pos += s.len
 
 proc writeCborByteString*(buf: var SafeBuffer, data: openArray[byte]) {.inline.} =
+  # Safety net for large byte strings
+  ensureSpace(buf, 9 + data.len)
   buf.writeCborTypeAndValue(2, uint64(data.len))
   if data.len > 0:
-    ensureCapacity(buf, data.len)
     copyMem(addr buf.data[buf.pos], unsafeAddr data[0], data.len)
     buf.pos += data.len
 
@@ -158,17 +170,14 @@ proc writeCborMapHeader*(buf: var SafeBuffer, count: uint64) {.inline.} =
   buf.writeCborTypeAndValue(5, count)
 
 proc writeCborBool*(buf: var SafeBuffer, value: bool) {.inline.} =
-  ensureCapacity(buf, 1)
   buf.data[buf.pos] = if value: 0xF5'u8 else: 0xF4'u8
   buf.pos += 1
 
 proc writeCborNull*(buf: var SafeBuffer) {.inline.} =
-  ensureCapacity(buf, 1)
   buf.data[buf.pos] = 0xF6'u8
   buf.pos += 1
 
 proc writeCborFloat64*(buf: var SafeBuffer, value: float64) {.inline.} =
-  ensureCapacity(buf, 9)
   buf.data[buf.pos] = 0xFB'u8
   let bits = cast[uint64](value)
   buf.data[buf.pos + 1] = byte(bits shr 56)

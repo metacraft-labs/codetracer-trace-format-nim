@@ -13,11 +13,11 @@ export codetracer_trace_types, results, cbor, safe_buffer
 
 # Direct-to-buffer CBOR payload writing using SafeBuffer.
 # Writes a 4-byte length placeholder, encodes CBOR directly into the buffer,
-# then patches the length.
+# then patches the length. No capacity check here — ensureSpace is called
+# once at the top of encodeEvent.
 template writePayloadCborDirect(buf: var SafeBuffer, body: untyped) =
   let lenPos = buf.pos
   # Reserve 4 bytes for length
-  ensureCapacity(buf, 4)
   buf.pos += 4
   let startPos = buf.pos
   body
@@ -313,7 +313,8 @@ type
   SafeSplitBinaryEncoder* = object
     buf*: SafeBuffer
 
-proc init*(T: type SafeSplitBinaryEncoder, capacity: int = 65536): SafeSplitBinaryEncoder =
+proc init*(T: type SafeSplitBinaryEncoder, capacity: int = 1048576): SafeSplitBinaryEncoder =
+  ## Default 1MB buffer — sized for a full chunk of 4096 events at ~256 bytes each.
   result.buf = initSafeBuffer(capacity)
 
 proc clear*(enc: var SafeSplitBinaryEncoder) =
@@ -325,6 +326,10 @@ proc getBytes*(enc: SafeSplitBinaryEncoder): seq[byte] =
 {.push checks: off, boundChecks: off.}
 
 proc encodeEvent*(enc: var SafeSplitBinaryEncoder, event: TraceLowLevelEvent) =
+  ## Single capacity check per event: 512 bytes covers all fixed-size events.
+  ## For variable-length data (strings, CBOR), the safety-net ensureSpace
+  ## in writeStr/writeCborTextString handles overflow via the unlikely path.
+  ensureSpace(enc.buf, 512)
   case event.kind
   of tleStep:
     enc.buf.writeU8(0)

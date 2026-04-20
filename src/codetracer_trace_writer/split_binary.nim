@@ -111,11 +111,12 @@ proc decodeCborPayloadCallArgs(data: openArray[byte]): Result[seq[FullValueRecor
 
 # Direct-to-buffer CBOR payload writing using SafeBuffer.
 # Writes a 4-byte length placeholder, encodes CBOR directly into the buffer,
-# then patches the length.
+# then patches the length. No capacity check here — ensureSpace is called
+# once at the top of encodeEvent for the common case, and growIfNeeded
+# handles the rare overflow for large CBOR payloads.
 template writePayloadCborDirect(buf: var SafeBuffer, body: untyped) =
   let lenPos = buf.pos
   # Reserve 4 bytes for length
-  ensureCapacity(buf, 4)
   buf.pos += 4
   let startPos = buf.pos
   body
@@ -441,7 +442,7 @@ template stkWriteI64*(stk: var StackStage, v: int64) =
 
 template flushTo*(stk: StackStage, output: var SafeBuffer) =
   ## Flush staged bytes from stack array into the SafeBuffer in one bulk copy.
-  ensureCapacity(output, stk.pos)
+  ## No capacity check — ensureSpace is called once at the top of encodeEvent.
   copyMem(addr output.data[output.pos], unsafeAddr stk.buf[0], stk.pos)
   output.pos += stk.pos
 
@@ -453,7 +454,9 @@ type
   SplitBinaryEncoder* = object
     buf*: SafeBuffer
 
-proc init*(T: type SplitBinaryEncoder, capacity: int = 65536): SplitBinaryEncoder =
+proc init*(T: type SplitBinaryEncoder, capacity: int = 1048576): SplitBinaryEncoder =
+  ## Default 1MB buffer — sized for a full chunk of 4096 events at ~256 bytes each.
+  ## In streaming mode this never needs to grow.
   result.buf = initSafeBuffer(capacity)
 
 proc clear*(enc: var SplitBinaryEncoder) =
@@ -473,6 +476,12 @@ proc encodeEvent*(enc: var SplitBinaryEncoder, event: TraceLowLevelEvent) =
   ## Fixed-size events use StackStage to batch all writes into a single
   ## bulk copy. Events with variable-length data (strings, CBOR) stage
   ## the fixed header on the stack, then append variable data directly.
+  ##
+  ## Single capacity check per event: 512 bytes covers all fixed-size events
+  ## and the fixed portion of variable-length events. For events with large
+  ## CBOR payloads or long strings, the ensureSpace inside writeCborTextString
+  ## (via the safety-net path) handles overflow.
+  ensureSpace(enc.buf, 512)
   case event.kind
   of tleStep:
     # 1 + 8 + 8 = 17 bytes, fits stack
@@ -489,7 +498,7 @@ proc encodeEvent*(enc: var SplitBinaryEncoder, event: TraceLowLevelEvent) =
     stk.stkWriteU32(uint32(event.path.len))
     stk.flushTo(enc.buf)
     if event.path.len > 0:
-      ensureCapacity(enc.buf, event.path.len)
+      ensureSpace(enc.buf, event.path.len)
       copyMem(addr enc.buf.data[enc.buf.pos], unsafeAddr event.path[0], event.path.len)
       enc.buf.pos += event.path.len
 
@@ -499,7 +508,7 @@ proc encodeEvent*(enc: var SplitBinaryEncoder, event: TraceLowLevelEvent) =
     stk.stkWriteU32(uint32(event.varName.len))
     stk.flushTo(enc.buf)
     if event.varName.len > 0:
-      ensureCapacity(enc.buf, event.varName.len)
+      ensureSpace(enc.buf, event.varName.len)
       copyMem(addr enc.buf.data[enc.buf.pos], unsafeAddr event.varName[0], event.varName.len)
       enc.buf.pos += event.varName.len
 
@@ -509,7 +518,7 @@ proc encodeEvent*(enc: var SplitBinaryEncoder, event: TraceLowLevelEvent) =
     stk.stkWriteU32(uint32(event.variable.len))
     stk.flushTo(enc.buf)
     if event.variable.len > 0:
-      ensureCapacity(enc.buf, event.variable.len)
+      ensureSpace(enc.buf, event.variable.len)
       copyMem(addr enc.buf.data[enc.buf.pos], unsafeAddr event.variable[0], event.variable.len)
       enc.buf.pos += event.variable.len
 
@@ -536,7 +545,7 @@ proc encodeEvent*(enc: var SplitBinaryEncoder, event: TraceLowLevelEvent) =
     stk.stkWriteU32(uint32(event.functionRecord.name.len))
     stk.flushTo(enc.buf)
     if event.functionRecord.name.len > 0:
-      ensureCapacity(enc.buf, event.functionRecord.name.len)
+      ensureSpace(enc.buf, event.functionRecord.name.len)
       copyMem(addr enc.buf.data[enc.buf.pos], unsafeAddr event.functionRecord.name[0], event.functionRecord.name.len)
       enc.buf.pos += event.functionRecord.name.len
 
