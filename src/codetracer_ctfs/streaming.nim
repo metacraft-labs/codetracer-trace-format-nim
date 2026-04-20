@@ -1,3 +1,6 @@
+when defined(nimPreviewSlimSystem):
+  import std/[syncio, assertions]
+
 {.push raises: [].}
 
 ## CTFS streaming mode — creates containers that stream writes to disk

@@ -1,3 +1,6 @@
+when defined(nimPreviewSlimSystem):
+  import std/[syncio, assertions]
+
 {.push raises: [].}
 
 ## CTFS type definitions, constants, and low-level helpers.

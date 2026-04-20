@@ -1,3 +1,6 @@
+when defined(nimPreviewSlimSystem):
+  import std/[syncio, assertions]
+
 {.push raises: [].}
 
 ## High-level trace writer API combining CTFS container + split-binary

@@ -1,3 +1,6 @@
+when defined(nimPreviewSlimSystem):
+  import std/[syncio, assertions]
+
 {.push raises: [].}
 
 ## Multi-level chain mapping for CTFS block allocation.

@@ -1,3 +1,6 @@
+when defined(nimPreviewSlimSystem):
+  import std/[syncio, assertions]
+
 {.push raises: [].}
 
 ## CTFS container create/read/write/close operations.
@@ -7,10 +10,11 @@ import ./types
 import ./base40
 import ./block_mapping
 
-proc createCtfs*(blockSize: uint32 = DefaultBlockSize,
-                 maxRootEntries: uint32 = DefaultMaxRootEntries,
-                 compression: CtfsCompressionMethod = cmNone,
-                 encryption: CtfsEncryptionMethod = emNone): Ctfs =
+proc createCtfs*(
+    blockSize: uint32 = DefaultBlockSize,
+    maxRootEntries: uint32 = DefaultMaxRootEntries,
+    compression: CtfsCompressionMethod = cmNone,
+    encryption: CtfsEncryptionMethod = emNone): Ctfs =
   ## Create a new in-memory CTFS v3 container.
   var c: Ctfs
   c.blockSize = blockSize
