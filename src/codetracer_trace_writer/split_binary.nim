@@ -465,6 +465,14 @@ proc clear*(enc: var SplitBinaryEncoder) =
 proc getBytes*(enc: SplitBinaryEncoder): seq[byte] =
   enc.buf.toSeq()
 
+proc getDataPtr*(enc: var SplitBinaryEncoder): ptr byte {.inline.} =
+  ## Zero-copy access to encoded data. Valid until next encodeEvent or clear.
+  enc.buf.dataPtr()
+
+proc getDataLen*(enc: SplitBinaryEncoder): int {.inline.} =
+  ## Number of encoded bytes currently in the buffer.
+  enc.buf.dataLen()
+
 proc destroy*(enc: var SplitBinaryEncoder) =
   ## No-op: SafeBuffer uses GC-managed memory, no manual dealloc needed.
   enc.buf.clear()

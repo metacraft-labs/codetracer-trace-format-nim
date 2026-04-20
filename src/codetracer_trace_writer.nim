@@ -57,23 +57,25 @@ type
 proc flushChunk(w: var TraceWriter): Result[void, string] =
   ## Compress the current encoder buffer as a single Zstd frame, write
   ## a chunk header + compressed data to the CTFS events.log file.
+  ## Uses zero-copy access to the encoder buffer (no intermediate seq).
   if w.chunkEventCount == 0:
     return ok()
 
-  let rawData = w.encoder.getBytes()
-  if rawData.len == 0:
+  let srcLen = w.encoder.getDataLen()
+  if srcLen == 0:
     w.encoder.clear()
     w.chunkEventCount = 0
     return ok()
 
-  # Compress with Zstd
-  let srcSize = csize_t(rawData.len)
+  # Zero-copy: compress directly from the encoder's internal buffer
+  let srcPtr = w.encoder.getDataPtr()
+  let srcSize = csize_t(srcLen)
   let bound = ZSTD_compressBound(srcSize)
   var compressed = newSeq[byte](int(bound))
 
   let compressedSize = ZSTD_compress(
     addr compressed[0], csize_t(compressed.len),
-    unsafeAddr rawData[0], srcSize,
+    srcPtr, srcSize,
     cint(TraceWriterCompressionLevel),
   )
 

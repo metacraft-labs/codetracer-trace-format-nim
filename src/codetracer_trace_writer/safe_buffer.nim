@@ -95,8 +95,20 @@ proc writeOpenArray*(buf: var SafeBuffer, data: openArray[byte]) {.inline.} =
 {.pop.} # checks: off, boundChecks: off
 
 proc toSeq*(buf: SafeBuffer): seq[byte] =
-  result = buf.data
-  result.setLen(buf.pos)
+  ## Returns a copy of only the used portion of the buffer.
+  ## For hot-path streaming, prefer dataPtr/dataLen for zero-copy access.
+  result = newSeq[byte](buf.pos)
+  if buf.pos > 0:
+    copyMem(addr result[0], unsafeAddr buf.data[0], buf.pos)
+
+proc dataPtr*(buf: var SafeBuffer): ptr byte {.inline.} =
+  ## Returns a pointer to the start of the buffer data.
+  ## Valid until the buffer is modified (grown or cleared).
+  addr buf.data[0]
+
+proc dataLen*(buf: SafeBuffer): int {.inline.} =
+  ## Returns the number of used bytes (same as len).
+  buf.pos
 
 # CBOR-specific write methods (big-endian integers for CBOR headers)
 
