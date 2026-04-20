@@ -21,6 +21,8 @@ import codetracer_ctfs/block_mapping
 import codetracer_ctfs/container
 import codetracer_ctfs/streaming
 import codetracer_ctfs/chunk_index
+import codetracer_ctfs/zstd_bindings
+import codetracer_ctfs/seekable_zstd
 
 export base40
 export types
@@ -28,3 +30,5 @@ export block_mapping
 export container
 export streaming
 export chunk_index
+export zstd_bindings
+export seekable_zstd
