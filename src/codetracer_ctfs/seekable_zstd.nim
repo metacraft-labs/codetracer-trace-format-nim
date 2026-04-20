@@ -54,10 +54,10 @@ type
     cctx: pointer               # Reusable ZSTD compression context
 
   SeekableZstdDecoder* = object
-    data: seq[byte]             # Complete compressed data including seek table
+    data*: seq[byte]             # Complete compressed data including seek table
     seekTable*: SeekTable       # Parsed from footer
-    frameOffsets: seq[uint64]   # Cumulative compressed offsets for each frame
-    decompOffsets: seq[uint64]  # Cumulative decompressed offsets for each frame
+    frameOffsets*: seq[uint64]   # Cumulative compressed offsets for each frame
+    decompOffsets*: seq[uint64]  # Cumulative decompressed offsets for each frame
     dctx: pointer               # Reusable ZSTD decompression context
 
 # ---------------------------------------------------------------------------
@@ -467,8 +467,19 @@ proc buildOffsets(dec: var SeekableZstdDecoder) =
     dec.frameOffsets[i + 1] = dec.frameOffsets[i] + uint64(dec.seekTable.entries[i].compressedSize)
     dec.decompOffsets[i + 1] = dec.decompOffsets[i] + uint64(dec.seekTable.entries[i].decompressedSize)
 
+proc verifyDataLength(dec: SeekableZstdDecoder, dataLen: int): Result[void, string] =
+  ## Verify that total compressed size + seek table frame size == data length.
+  let totalComp = dec.frameOffsets[dec.seekTable.entries.len]  # Use pre-computed offset
+  let seekTableFrameSize = uint64(SkippableHeaderSize +
+    dec.seekTable.entries.len * SeekTableEntrySize + SeekTableFooterSize)
+  let expectedLen = totalComp + seekTableFrameSize
+  if expectedLen != uint64(dataLen):
+    return err("data length mismatch: compressed frames + seek table != total size")
+  ok()
+
 proc initSeekableZstdDecoder*(data: openArray[byte]): Result[SeekableZstdDecoder, string] =
   ## Create a decoder by parsing the seek table from the footer of the data.
+  ## Note: this copies the data. For zero-copy, use initSeekableZstdDecoderMove.
   let tableRes = parseSeekTable(data)
   if tableRes.isErr:
     return err(tableRes.error)
@@ -480,15 +491,34 @@ proc initSeekableZstdDecoder*(data: openArray[byte]): Result[SeekableZstdDecoder
   )
   dec.buildOffsets()
 
-  # Verify that total compressed size + seek table frame size == data length
-  let totalComp = dec.seekTable.totalCompressedSize()
-  let seekTableFrameSize = SkippableHeaderSize +
-    dec.seekTable.entries.len * SeekTableEntrySize + SeekTableFooterSize
-  let expectedLen = uint64(totalComp) + uint64(seekTableFrameSize)
-  if expectedLen != uint64(data.len):
+  let verifyRes = dec.verifyDataLength(data.len)
+  if verifyRes.isErr:
     if dec.dctx != nil:
       discard ZSTD_freeDCtx(dec.dctx)
-    return err("data length mismatch: compressed frames + seek table != total size")
+    return err(verifyRes.error)
+
+  ok(dec)
+
+proc initSeekableZstdDecoderMove*(data: sink seq[byte]): Result[SeekableZstdDecoder, string] =
+  ## Create a decoder taking ownership of the data (no copy).
+  ## The caller's seq is consumed (moved) into the decoder.
+  let tableRes = parseSeekTable(data)
+  if tableRes.isErr:
+    return err(tableRes.error)
+
+  let dataLen = data.len
+  var dec = SeekableZstdDecoder(
+    data: move data,
+    seekTable: tableRes.get(),
+    dctx: ZSTD_createDCtx(),
+  )
+  dec.buildOffsets()
+
+  let verifyRes = dec.verifyDataLength(dataLen)
+  if verifyRes.isErr:
+    if dec.dctx != nil:
+      discard ZSTD_freeDCtx(dec.dctx)
+    return err(verifyRes.error)
 
   ok(dec)
 
@@ -526,15 +556,24 @@ proc decompressFrame*(dec: SeekableZstdDecoder, frameIndex: int): Result[seq[byt
 
   ok(output)
 
-proc decompressAll*(dec: SeekableZstdDecoder): Result[seq[byte], string] =
-  ## Decompress all frames and concatenate the result.
-  let totalDecomp = dec.seekTable.totalDecompressedSize()
-  if totalDecomp == 0:
-    return ok(newSeq[byte](0))
+proc totalDecompressedSizeFast*(dec: SeekableZstdDecoder): uint64 {.inline.} =
+  ## Total decompressed size using pre-computed offsets (O(1)).
+  dec.decompOffsets[dec.seekTable.entries.len]
 
-  var output = newSeq[byte](int(totalDecomp))
+proc decompressAllInto*(dec: SeekableZstdDecoder, output: ptr byte, outputLen: int): Result[void, string] =
+  ## Decompress all frames into a caller-provided buffer.
+  ## The buffer must be at least totalDecompressedSizeFast() bytes.
+  ## This is the zero-copy fast path — no allocations beyond the decompression itself.
+  let totalDecomp = int(dec.totalDecompressedSizeFast())
+  if outputLen < totalDecomp:
+    return err("output buffer too small: need " & $totalDecomp & " got " & $outputLen)
+
+  if totalDecomp == 0:
+    return ok()
+
+  let numFrames = dec.seekTable.entries.len
   var pos = 0
-  for i in 0 ..< dec.seekTable.entries.len:
+  for i in 0 ..< numFrames:
     let entry = dec.seekTable.entries[i]
     let compOffset = int(dec.frameOffsets[i])
     let compSize = int(entry.compressedSize)
@@ -545,7 +584,7 @@ proc decompressAll*(dec: SeekableZstdDecoder): Result[seq[byte], string] =
 
     let actualSize = ZSTD_decompressDCtx(
       dec.dctx,
-      addr output[pos], csize_t(decompSize),
+      cast[pointer](cast[uint](output) + uint(pos)), csize_t(decompSize),
       unsafeAddr dec.data[compOffset], csize_t(compSize),
     )
 
@@ -558,7 +597,22 @@ proc decompressAll*(dec: SeekableZstdDecoder): Result[seq[byte], string] =
 
     pos += decompSize
 
-  ok(output)
+  ok()
+
+proc decompressAll*(dec: SeekableZstdDecoder): Result[seq[byte], string] =
+  ## Decompress all frames and return the result.
+  ## For zero-copy into a pre-allocated buffer, use decompressAllInto.
+  let totalDecomp = int(dec.totalDecompressedSizeFast())
+  if totalDecomp == 0:
+    return ok(newSeq[byte](0))
+
+  var output = newSeq[byte](totalDecomp)
+
+  let res = dec.decompressAllInto(addr output[0], totalDecomp)
+  if res.isErr:
+    return err(res.error)
+
+  ok(move output)
 
 proc seekToOffset*(dec: SeekableZstdDecoder, decompressedOffset: uint64): Result[(int, uint64), string] =
   ## Given a decompressed byte offset, return (frameIndex, offsetWithinFrame).
