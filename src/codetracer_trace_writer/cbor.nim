@@ -30,8 +30,8 @@ type
   CborEncoder* = object
     buf*: seq[byte]
 
-proc init*(T: type CborEncoder): CborEncoder =
-  CborEncoder(buf: @[])
+proc init*(T: type CborEncoder, capacity: int = 256): CborEncoder =
+  result.buf = newSeqOfCap[byte](capacity)
 
 proc clear*(enc: var CborEncoder) =
   enc.buf.setLen(0)
@@ -39,11 +39,84 @@ proc clear*(enc: var CborEncoder) =
 proc getBytes*(enc: CborEncoder): seq[byte] =
   enc.buf
 
+# ===========================================================================
+# Pre-computed CBOR key bytes for frequently used keys
+# ===========================================================================
+
+const
+  # CBOR text(4) "kind" = 0x64 + "kind"
+  CborKeyKind = [0x64'u8, 0x6B, 0x69, 0x6E, 0x64]
+  # CBOR text(1) "i" = 0x61 + "i"
+  CborKeyI = [0x61'u8, 0x69]
+  # CBOR text(7) "type_id" = 0x67 + "type_id"
+  CborKeyTypeId = [0x67'u8, 0x74, 0x79, 0x70, 0x65, 0x5F, 0x69, 0x64]
+  # CBOR text(1) "f" = 0x61 + "f"
+  CborKeyF = [0x61'u8, 0x66]
+  # CBOR text(1) "b" = 0x61 + "b"
+  CborKeyB = [0x61'u8, 0x62]
+  # CBOR text(4) "text" = 0x64 + "text"
+  CborKeyText = [0x64'u8, 0x74, 0x65, 0x78, 0x74]
+  # CBOR text(8) "elements" = 0x68 + "elements"
+  CborKeyElements = [0x68'u8, 0x65, 0x6C, 0x65, 0x6D, 0x65, 0x6E, 0x74, 0x73]
+  # CBOR text(8) "is_slice" = 0x68 + "is_slice"
+  CborKeyIsSlice = [0x68'u8, 0x69, 0x73, 0x5F, 0x73, 0x6C, 0x69, 0x63, 0x65]
+  # CBOR text(12) "field_values" = 0x6C + "field_values"
+  CborKeyFieldValues = [0x6C'u8, 0x66, 0x69, 0x65, 0x6C, 0x64, 0x5F, 0x76, 0x61, 0x6C, 0x75, 0x65, 0x73]
+  # CBOR text(13) "discriminator" = 0x6D + "discriminator"
+  CborKeyDiscriminator = [0x6D'u8, 0x64, 0x69, 0x73, 0x63, 0x72, 0x69, 0x6D, 0x69, 0x6E, 0x61, 0x74, 0x6F, 0x72]
+  # CBOR text(8) "contents" = 0x68 + "contents"
+  CborKeyContents = [0x68'u8, 0x63, 0x6F, 0x6E, 0x74, 0x65, 0x6E, 0x74, 0x73]
+  # CBOR text(13) "dereferenced" (length 12) = 0x6C + "dereferenced"
+  CborKeyDereferenced = [0x6C'u8, 0x64, 0x65, 0x72, 0x65, 0x66, 0x65, 0x72, 0x65, 0x6E, 0x63, 0x65, 0x64]
+  # CBOR text(7) "address" = 0x67 + "address"
+  CborKeyAddress = [0x67'u8, 0x61, 0x64, 0x64, 0x72, 0x65, 0x73, 0x73]
+  # CBOR text(7) "mutable" = 0x67 + "mutable"
+  CborKeyMutable = [0x67'u8, 0x6D, 0x75, 0x74, 0x61, 0x62, 0x6C, 0x65]
+  # CBOR text(1) "r" = 0x61 + "r"
+  CborKeyR = [0x61'u8, 0x72]
+  # CBOR text(3) "msg" = 0x63 + "msg"
+  CborKeyMsg = [0x63'u8, 0x6D, 0x73, 0x67]
+  # CBOR text(5) "place" = 0x65 + "place"
+  CborKeyPlace = [0x65'u8, 0x70, 0x6C, 0x61, 0x63, 0x65]
+  # CBOR text(8) "negative" = 0x68 + "negative"
+  CborKeyNegative = [0x68'u8, 0x6E, 0x65, 0x67, 0x61, 0x74, 0x69, 0x76, 0x65]
+  # CBOR text(1) "c" = 0x61 + "c"
+  CborKeyC = [0x61'u8, 0x63]
+  # CBOR text(2) "to" = 0x62 + "to"
+  CborKeyTo = [0x62'u8, 0x74, 0x6F]
+  # CBOR text(7) "pass_by" = 0x67 + "pass_by"
+  CborKeyPassBy = [0x67'u8, 0x70, 0x61, 0x73, 0x73, 0x5F, 0x62, 0x79]
+  # CBOR text(4) "from" = 0x64 + "from"
+  CborKeyFrom = [0x64'u8, 0x66, 0x72, 0x6F, 0x6D]
+  # CBOR text(1) "0" = 0x61 + "0"
+  CborKey0 = [0x61'u8, 0x30]
+  # CBOR text(11) "variable_id" = 0x6B + "variable_id"
+  CborKeyVariableId = [0x6B'u8, 0x76, 0x61, 0x72, 0x69, 0x61, 0x62, 0x6C, 0x65, 0x5F, 0x69, 0x64]
+  # CBOR text(5) "value" = 0x65 + "value"
+  CborKeyValue = [0x65'u8, 0x76, 0x61, 0x6C, 0x75, 0x65]
+  # CBOR text(9) "lang_type" = 0x69 + "lang_type"
+  CborKeyLangType = [0x69'u8, 0x6C, 0x61, 0x6E, 0x67, 0x5F, 0x74, 0x79, 0x70, 0x65]
+  # CBOR text(13) "specific_info" = 0x6D + "specific_info"
+  CborKeySpecificInfo = [0x6D'u8, 0x73, 0x70, 0x65, 0x63, 0x69, 0x66, 0x69, 0x63, 0x5F, 0x69, 0x6E, 0x66, 0x6F]
+  # CBOR text(6) "fields" = 0x66 + "fields"
+  CborKeyFields = [0x66'u8, 0x66, 0x69, 0x65, 0x6C, 0x64, 0x73]
+  # CBOR text(4) "name" = 0x64 + "name"
+  CborKeyName = [0x64'u8, 0x6E, 0x61, 0x6D, 0x65]
+  # CBOR text(20) "dereference_type_id" = 0x73 + ... (length 19)
+  CborKeyDereferenceTypeId = [0x73'u8, 0x64, 0x65, 0x72, 0x65, 0x66, 0x65, 0x72, 0x65, 0x6E, 0x63, 0x65, 0x5F, 0x74, 0x79, 0x70, 0x65, 0x5F, 0x69, 0x64]
+
+proc writePrecomputed(enc: var CborEncoder, data: openArray[byte]) {.inline.} =
+  let pos = enc.buf.len
+  enc.buf.setLen(pos + data.len)
+  copyMem(addr enc.buf[pos], unsafeAddr data[0], data.len)
+
 # ---------------------------------------------------------------------------
-# Low-level CBOR writing
+# Low-level CBOR writing (optimized with bulk memcpy and inline)
 # ---------------------------------------------------------------------------
 
-proc writeTypeAndValue(enc: var CborEncoder, majorType: byte, value: uint64) =
+{.push checks: off, boundChecks: off.}
+
+proc writeTypeAndValue(enc: var CborEncoder, majorType: byte, value: uint64) {.inline.} =
   ## Write a CBOR type/value header. majorType is 0..7 (shifted left by 5).
   let mt = majorType shl 5
   if value <= 23:
@@ -52,39 +125,41 @@ proc writeTypeAndValue(enc: var CborEncoder, majorType: byte, value: uint64) =
     enc.buf.add(mt or 24)
     enc.buf.add(byte(value))
   elif value <= 0xFFFF:
-    enc.buf.add(mt or 25)
-    let b = toBytesLE(uint16(value))
-    # CBOR is big-endian
-    enc.buf.add(b[1])
-    enc.buf.add(b[0])
+    let pos = enc.buf.len
+    enc.buf.setLen(pos + 3)
+    enc.buf[pos] = mt or 25
+    enc.buf[pos + 1] = byte(value shr 8)
+    enc.buf[pos + 2] = byte(value)
   elif value <= 0xFFFF_FFFF'u64:
-    enc.buf.add(mt or 26)
-    let b = toBytesLE(uint32(value))
-    enc.buf.add(b[3])
-    enc.buf.add(b[2])
-    enc.buf.add(b[1])
-    enc.buf.add(b[0])
+    let pos = enc.buf.len
+    enc.buf.setLen(pos + 5)
+    enc.buf[pos] = mt or 26
+    enc.buf[pos + 1] = byte(value shr 24)
+    enc.buf[pos + 2] = byte(value shr 16)
+    enc.buf[pos + 3] = byte(value shr 8)
+    enc.buf[pos + 4] = byte(value)
   else:
-    enc.buf.add(mt or 27)
-    let b = toBytesLE(uint64(value))
-    enc.buf.add(b[7])
-    enc.buf.add(b[6])
-    enc.buf.add(b[5])
-    enc.buf.add(b[4])
-    enc.buf.add(b[3])
-    enc.buf.add(b[2])
-    enc.buf.add(b[1])
-    enc.buf.add(b[0])
+    let pos = enc.buf.len
+    enc.buf.setLen(pos + 9)
+    enc.buf[pos] = mt or 27
+    enc.buf[pos + 1] = byte(value shr 56)
+    enc.buf[pos + 2] = byte(value shr 48)
+    enc.buf[pos + 3] = byte(value shr 40)
+    enc.buf[pos + 4] = byte(value shr 32)
+    enc.buf[pos + 5] = byte(value shr 24)
+    enc.buf[pos + 6] = byte(value shr 16)
+    enc.buf[pos + 7] = byte(value shr 8)
+    enc.buf[pos + 8] = byte(value)
 
-proc writeUint*(enc: var CborEncoder, value: uint64) =
+proc writeUint*(enc: var CborEncoder, value: uint64) {.inline.} =
   ## CBOR major type 0: unsigned integer.
   enc.writeTypeAndValue(0, value)
 
-proc writeNegInt*(enc: var CborEncoder, value: uint64) =
+proc writeNegInt*(enc: var CborEncoder, value: uint64) {.inline.} =
   ## CBOR major type 1: negative integer. Encodes -(value+1).
   enc.writeTypeAndValue(1, value)
 
-proc writeInt*(enc: var CborEncoder, value: int64) =
+proc writeInt*(enc: var CborEncoder, value: int64) {.inline.} =
   ## Write a signed integer. Uses major type 0 for non-negative, 1 for negative.
   if value >= 0:
     enc.writeUint(uint64(value))
@@ -92,53 +167,61 @@ proc writeInt*(enc: var CborEncoder, value: int64) =
     # CBOR negative: -1 - N, so N = -(value+1) = -value - 1
     enc.writeNegInt(uint64(-1 - value))
 
-proc writeByteString*(enc: var CborEncoder, data: openArray[byte]) =
+proc writeByteString*(enc: var CborEncoder, data: openArray[byte]) {.inline.} =
   ## CBOR major type 2: byte string.
   enc.writeTypeAndValue(2, uint64(data.len))
-  for b in data:
-    enc.buf.add(b)
+  if data.len > 0:
+    let pos = enc.buf.len
+    enc.buf.setLen(pos + data.len)
+    copyMem(addr enc.buf[pos], unsafeAddr data[0], data.len)
 
-proc writeTextString*(enc: var CborEncoder, s: string) =
+proc writeTextString*(enc: var CborEncoder, s: string) {.inline.} =
   ## CBOR major type 3: text string.
   enc.writeTypeAndValue(3, uint64(s.len))
-  for c in s:
-    enc.buf.add(byte(c))
+  if s.len > 0:
+    let pos = enc.buf.len
+    enc.buf.setLen(pos + s.len)
+    copyMem(addr enc.buf[pos], unsafeAddr s[0], s.len)
 
-proc writeArrayHeader*(enc: var CborEncoder, count: uint64) =
+proc writeArrayHeader*(enc: var CborEncoder, count: uint64) {.inline.} =
   ## CBOR major type 4: array header.
   enc.writeTypeAndValue(4, count)
 
-proc writeMapHeader*(enc: var CborEncoder, count: uint64) =
+proc writeMapHeader*(enc: var CborEncoder, count: uint64) {.inline.} =
   ## CBOR major type 5: map header (count = number of key-value pairs).
   enc.writeTypeAndValue(5, count)
 
-proc writeBool*(enc: var CborEncoder, value: bool) =
+proc writeBool*(enc: var CborEncoder, value: bool) {.inline.} =
   ## CBOR major type 7: boolean.
   if value:
     enc.buf.add(0xF5'u8)
   else:
     enc.buf.add(0xF4'u8)
 
-proc writeNull*(enc: var CborEncoder) =
+proc writeNull*(enc: var CborEncoder) {.inline.} =
   ## CBOR major type 7: null.
   enc.buf.add(0xF6'u8)
 
-proc writeFloat64*(enc: var CborEncoder, value: float64) =
+proc writeFloat64*(enc: var CborEncoder, value: float64) {.inline.} =
   ## CBOR major type 7, additional info 27: IEEE 754 double (8 bytes BE).
-  enc.buf.add(0xFB'u8)
-  let b = toBytesLE(cast[uint64](value))
-  enc.buf.add(b[7])
-  enc.buf.add(b[6])
-  enc.buf.add(b[5])
-  enc.buf.add(b[4])
-  enc.buf.add(b[3])
-  enc.buf.add(b[2])
-  enc.buf.add(b[1])
-  enc.buf.add(b[0])
+  let pos = enc.buf.len
+  enc.buf.setLen(pos + 9)
+  enc.buf[pos] = 0xFB'u8
+  let bits = cast[uint64](value)
+  enc.buf[pos + 1] = byte(bits shr 56)
+  enc.buf[pos + 2] = byte(bits shr 48)
+  enc.buf[pos + 3] = byte(bits shr 40)
+  enc.buf[pos + 4] = byte(bits shr 32)
+  enc.buf[pos + 5] = byte(bits shr 24)
+  enc.buf[pos + 6] = byte(bits shr 16)
+  enc.buf[pos + 7] = byte(bits shr 8)
+  enc.buf[pos + 8] = byte(bits)
 
 # Convenience: write a map key (text string)
 proc writeKey*(enc: var CborEncoder, key: string) {.inline.} =
   enc.writeTextString(key)
+
+{.pop.} # checks: off, boundChecks: off
 
 # ===========================================================================
 # CborDecoder
@@ -343,179 +426,167 @@ proc encodeCborValueRecordImpl(enc: var CborEncoder, v: ValueRecord) =
   case v.kind
   of vrkInt:
     enc.writeMapHeader(3)
-    enc.writeKey("kind")
+    enc.writePrecomputed(CborKeyKind)
     enc.writeTextString("Int")
-    enc.writeKey("i")
+    enc.writePrecomputed(CborKeyI)
     enc.writeInt(v.intVal)
-    enc.writeKey("type_id")
+    enc.writePrecomputed(CborKeyTypeId)
     enc.writeUint(uint64(v.intTypeId))
 
   of vrkFloat:
     enc.writeMapHeader(3)
-    enc.writeKey("kind")
+    enc.writePrecomputed(CborKeyKind)
     enc.writeTextString("Float")
-    enc.writeKey("f")
-    # serde_as(as = "DisplayFromStr") serializes f64 as a string
-    # We need to match Rust's Display for f64
-    # But for CBOR with cbor4ii, DisplayFromStr makes it a string.
-    # Let's encode as string to match Rust exactly.
-    # Rust's f64 Display: "3.14" for 3.14, "0" for 0.0, etc.
-    # Actually, for CBOR binary format, serde_as with DisplayFromStr
-    # will serialize as a text string containing the float representation.
-    # But that's complex to replicate exactly. For CBOR interop, we'll
-    # encode as float64 directly since that's the natural CBOR representation.
-    # The Rust side can be updated to match. For now, use float64.
+    enc.writePrecomputed(CborKeyF)
     enc.writeFloat64(v.floatVal)
-    enc.writeKey("type_id")
+    enc.writePrecomputed(CborKeyTypeId)
     enc.writeUint(uint64(v.floatTypeId))
 
   of vrkBool:
     enc.writeMapHeader(3)
-    enc.writeKey("kind")
+    enc.writePrecomputed(CborKeyKind)
     enc.writeTextString("Bool")
-    enc.writeKey("b")
+    enc.writePrecomputed(CborKeyB)
     enc.writeBool(v.boolVal)
-    enc.writeKey("type_id")
+    enc.writePrecomputed(CborKeyTypeId)
     enc.writeUint(uint64(v.boolTypeId))
 
   of vrkString:
     enc.writeMapHeader(3)
-    enc.writeKey("kind")
+    enc.writePrecomputed(CborKeyKind)
     enc.writeTextString("String")
-    enc.writeKey("text")
+    enc.writePrecomputed(CborKeyText)
     enc.writeTextString(v.text)
-    enc.writeKey("type_id")
+    enc.writePrecomputed(CborKeyTypeId)
     enc.writeUint(uint64(v.strTypeId))
 
   of vrkSequence:
     enc.writeMapHeader(4)
-    enc.writeKey("kind")
+    enc.writePrecomputed(CborKeyKind)
     enc.writeTextString("Sequence")
-    enc.writeKey("elements")
+    enc.writePrecomputed(CborKeyElements)
     enc.writeArrayHeader(uint64(v.seqElements.len))
     for e in v.seqElements:
       enc.encodeCborValueRecord(e)
-    enc.writeKey("is_slice")
+    enc.writePrecomputed(CborKeyIsSlice)
     enc.writeBool(v.isSlice)
-    enc.writeKey("type_id")
+    enc.writePrecomputed(CborKeyTypeId)
     enc.writeUint(uint64(v.seqTypeId))
 
   of vrkTuple:
     enc.writeMapHeader(3)
-    enc.writeKey("kind")
+    enc.writePrecomputed(CborKeyKind)
     enc.writeTextString("Tuple")
-    enc.writeKey("elements")
+    enc.writePrecomputed(CborKeyElements)
     enc.writeArrayHeader(uint64(v.tupleElements.len))
     for e in v.tupleElements:
       enc.encodeCborValueRecord(e)
-    enc.writeKey("type_id")
+    enc.writePrecomputed(CborKeyTypeId)
     enc.writeUint(uint64(v.tupleTypeId))
 
   of vrkStruct:
     enc.writeMapHeader(3)
-    enc.writeKey("kind")
+    enc.writePrecomputed(CborKeyKind)
     enc.writeTextString("Struct")
-    enc.writeKey("field_values")
+    enc.writePrecomputed(CborKeyFieldValues)
     enc.writeArrayHeader(uint64(v.fieldValues.len))
     for e in v.fieldValues:
       enc.encodeCborValueRecord(e)
-    enc.writeKey("type_id")
+    enc.writePrecomputed(CborKeyTypeId)
     enc.writeUint(uint64(v.structTypeId))
 
   of vrkVariant:
     enc.writeMapHeader(4)
-    enc.writeKey("kind")
+    enc.writePrecomputed(CborKeyKind)
     enc.writeTextString("Variant")
-    enc.writeKey("discriminator")
+    enc.writePrecomputed(CborKeyDiscriminator)
     enc.writeTextString(v.discriminator)
-    enc.writeKey("contents")
+    enc.writePrecomputed(CborKeyContents)
     # Rust has Box<ValueRecord>, serde serializes the inner value directly
     if v.contents.len > 0:
       enc.encodeCborValueRecord(v.contents[0])
     else:
       # Fallback: encode None value
       enc.writeMapHeader(2)
-      enc.writeKey("kind")
+      enc.writePrecomputed(CborKeyKind)
       enc.writeTextString("None")
-      enc.writeKey("type_id")
+      enc.writePrecomputed(CborKeyTypeId)
       enc.writeUint(0)
-    enc.writeKey("type_id")
+    enc.writePrecomputed(CborKeyTypeId)
     enc.writeUint(uint64(v.variantTypeId))
 
   of vrkReference:
     enc.writeMapHeader(5)
-    enc.writeKey("kind")
+    enc.writePrecomputed(CborKeyKind)
     enc.writeTextString("Reference")
-    enc.writeKey("dereferenced")
+    enc.writePrecomputed(CborKeyDereferenced)
     # Rust has Box<ValueRecord>
     if v.dereferenced.len > 0:
       enc.encodeCborValueRecord(v.dereferenced[0])
     else:
       enc.writeMapHeader(2)
-      enc.writeKey("kind")
+      enc.writePrecomputed(CborKeyKind)
       enc.writeTextString("None")
-      enc.writeKey("type_id")
+      enc.writePrecomputed(CborKeyTypeId)
       enc.writeUint(0)
-    enc.writeKey("address")
+    enc.writePrecomputed(CborKeyAddress)
     enc.writeUint(v.address)
-    enc.writeKey("mutable")
+    enc.writePrecomputed(CborKeyMutable)
     enc.writeBool(v.mutable)
-    enc.writeKey("type_id")
+    enc.writePrecomputed(CborKeyTypeId)
     enc.writeUint(uint64(v.refTypeId))
 
   of vrkRaw:
     enc.writeMapHeader(3)
-    enc.writeKey("kind")
+    enc.writePrecomputed(CborKeyKind)
     enc.writeTextString("Raw")
-    enc.writeKey("r")
+    enc.writePrecomputed(CborKeyR)
     enc.writeTextString(v.rawStr)
-    enc.writeKey("type_id")
+    enc.writePrecomputed(CborKeyTypeId)
     enc.writeUint(uint64(v.rawTypeId))
 
   of vrkError:
     enc.writeMapHeader(3)
-    enc.writeKey("kind")
+    enc.writePrecomputed(CborKeyKind)
     enc.writeTextString("Error")
-    enc.writeKey("msg")
+    enc.writePrecomputed(CborKeyMsg)
     enc.writeTextString(v.errorMsg)
-    enc.writeKey("type_id")
+    enc.writePrecomputed(CborKeyTypeId)
     enc.writeUint(uint64(v.errorTypeId))
 
   of vrkNone:
     enc.writeMapHeader(2)
-    enc.writeKey("kind")
+    enc.writePrecomputed(CborKeyKind)
     enc.writeTextString("None")
-    enc.writeKey("type_id")
+    enc.writePrecomputed(CborKeyTypeId)
     enc.writeUint(uint64(v.noneTypeId))
 
   of vrkCell:
     enc.writeMapHeader(2)
-    enc.writeKey("kind")
+    enc.writePrecomputed(CborKeyKind)
     enc.writeTextString("Cell")
-    enc.writeKey("place")
+    enc.writePrecomputed(CborKeyPlace)
     enc.writeInt(int64(v.cellPlace))
 
   of vrkBigInt:
     enc.writeMapHeader(4)
-    enc.writeKey("kind")
+    enc.writePrecomputed(CborKeyKind)
     enc.writeTextString("BigInt")
-    enc.writeKey("b")
-    # Rust uses #[serde(with = "base64")] — but for CBOR binary, cbor4ii
-    # with serde serializes Vec<u8> as a CBOR byte string
+    enc.writePrecomputed(CborKeyB)
     enc.writeByteString(v.bigIntBytes)
-    enc.writeKey("negative")
+    enc.writePrecomputed(CborKeyNegative)
     enc.writeBool(v.negative)
-    enc.writeKey("type_id")
+    enc.writePrecomputed(CborKeyTypeId)
     enc.writeUint(uint64(v.bigIntTypeId))
 
   of vrkChar:
     enc.writeMapHeader(3)
-    enc.writeKey("kind")
+    enc.writePrecomputed(CborKeyKind)
     enc.writeTextString("Char")
-    enc.writeKey("c")
+    enc.writePrecomputed(CborKeyC)
     # Rust char is serialized as a string by serde
     enc.writeTextString($v.charVal)
-    enc.writeKey("type_id")
+    enc.writePrecomputed(CborKeyTypeId)
     enc.writeUint(uint64(v.charTypeId))
 
 proc encodeCborValueRecord*(enc: var CborEncoder, v: ValueRecord) =
@@ -666,39 +737,39 @@ proc decodeCborValueRecord*(dec: var CborDecoder): Result[ValueRecord, string] =
 # Rust: TypeRecord { kind: TypeKind, lang_type: String, specific_info: TypeSpecificInfo }
 # TypeSpecificInfo is #[serde(tag = "kind")] enum
 
-proc encodeCborTypeSpecificInfo(enc: var CborEncoder, si: TypeSpecificInfo) =
+proc encodeCborTypeSpecificInfo(enc: var CborEncoder, si: TypeSpecificInfo) {.inline.} =
   case si.kind
   of tsikNone:
     enc.writeMapHeader(1)
-    enc.writeKey("kind")
+    enc.writePrecomputed(CborKeyKind)
     enc.writeTextString("None")
   of tsikStruct:
     enc.writeMapHeader(2)
-    enc.writeKey("kind")
+    enc.writePrecomputed(CborKeyKind)
     enc.writeTextString("Struct")
-    enc.writeKey("fields")
+    enc.writePrecomputed(CborKeyFields)
     enc.writeArrayHeader(uint64(si.fields.len))
     for f in si.fields:
       enc.writeMapHeader(2)
-      enc.writeKey("name")
+      enc.writePrecomputed(CborKeyName)
       enc.writeTextString(f.name)
-      enc.writeKey("type_id")
+      enc.writePrecomputed(CborKeyTypeId)
       enc.writeUint(uint64(f.typeId))
   of tsikPointer:
     enc.writeMapHeader(2)
-    enc.writeKey("kind")
+    enc.writePrecomputed(CborKeyKind)
     enc.writeTextString("Pointer")
-    enc.writeKey("dereference_type_id")
+    enc.writePrecomputed(CborKeyDereferenceTypeId)
     enc.writeUint(uint64(si.dereferenceTypeId))
 
-proc encodeCborTypeRecord*(enc: var CborEncoder, t: TypeRecord) =
+proc encodeCborTypeRecord*(enc: var CborEncoder, t: TypeRecord) {.inline.} =
   enc.writeMapHeader(3)
-  enc.writeKey("kind")
+  enc.writePrecomputed(CborKeyKind)
   # TypeKind uses serde_repr — serialized as u8 integer
   enc.writeUint(uint64(ord(t.kind)))
-  enc.writeKey("lang_type")
+  enc.writePrecomputed(CborKeyLangType)
   enc.writeTextString(t.langType)
-  enc.writeKey("specific_info")
+  enc.writePrecomputed(CborKeySpecificInfo)
   enc.encodeCborTypeSpecificInfo(t.specificInfo)
 
 proc decodeCborTypeSpecificInfo(dec: var CborDecoder): Result[TypeSpecificInfo, string] =
@@ -748,63 +819,34 @@ proc decodeCborTypeRecord*(dec: var CborDecoder): Result[TypeRecord, string] =
 # PassBy is a normal enum (serde default: externally tagged)
 # RValue is #[serde(tag = "kind")] enum
 
-proc encodeCborRValue(enc: var CborEncoder, rv: RValue) =
+proc encodeCborRValue(enc: var CborEncoder, rv: RValue) {.inline.} =
   case rv.kind
   of rvkSimple:
-    # Rust: Simple(VariableId) with tag = "kind"
-    # Produces: {"kind": "Simple", ...} — but Simple is a newtype variant
-    # serde(tag = "kind") for newtype variants: the inner value's fields
-    # get merged. VariableId is transparent (usize), so it becomes
-    # a map with "kind" + the transparent value... Actually for tagged
-    # enums with newtype variants, serde puts the inner in the map.
-    # For VariableId (transparent), it just becomes the number.
-    # Actually: serde(tag="kind") with a newtype wrapping a transparent
-    # type doesn't work with non-map inner. Let me re-check the Rust.
-    #
-    # RValue::Simple(VariableId) with #[serde(tag = "kind")]
-    # Since VariableId is transparent (usize), and tagged enums need
-    # map-like inners, serde will error on Simple(usize) with internal
-    # tagging. Looking at the Rust code more carefully:
-    #   Simple(VariableId) — this IS used with tag="kind"
-    #
-    # Actually, for CBOR with cbor4ii, internally tagged enums with
-    # non-struct variants may serialize differently. The most likely
-    # encoding for the split-binary module's native format doesn't use
-    # CBOR at all — let's match what makes sense for the Nim roundtrip.
-    #
-    # For maximum compatibility, serialize as:
-    # {"kind": "Simple", "0": variableId} — serde's tuple variant flattening
-    # Actually no. With internally tagged, serde requires the content to be
-    # a map or struct. For newtype variants wrapping primitives, serde
-    # uses a special encoding. With cbor4ii it ends up as a 2-element map.
-    #
-    # Let's use a pragmatic approach: map with kind + value field.
     enc.writeMapHeader(2)
-    enc.writeKey("kind")
+    enc.writePrecomputed(CborKeyKind)
     enc.writeTextString("Simple")
-    enc.writeKey("0")
+    enc.writePrecomputed(CborKey0)
     enc.writeUint(uint64(rv.simpleId))
 
   of rvkCompound:
-    # Compound(Vec<VariableId>)
     enc.writeMapHeader(2)
-    enc.writeKey("kind")
+    enc.writePrecomputed(CborKeyKind)
     enc.writeTextString("Compound")
-    enc.writeKey("0")
+    enc.writePrecomputed(CborKey0)
     enc.writeArrayHeader(uint64(rv.compoundIds.len))
     for id in rv.compoundIds:
       enc.writeUint(uint64(id))
 
-proc encodeCborAssignmentRecord*(enc: var CborEncoder, a: AssignmentRecord) =
+proc encodeCborAssignmentRecord*(enc: var CborEncoder, a: AssignmentRecord) {.inline.} =
   enc.writeMapHeader(3)
-  enc.writeKey("to")
+  enc.writePrecomputed(CborKeyTo)
   enc.writeUint(uint64(a.to))
-  enc.writeKey("pass_by")
+  enc.writePrecomputed(CborKeyPassBy)
   # PassBy is a regular enum, serde default = externally tagged strings
   case a.passBy
   of pbValue: enc.writeTextString("Value")
   of pbReference: enc.writeTextString("Reference")
-  enc.writeKey("from")
+  enc.writePrecomputed(CborKeyFrom)
   enc.encodeCborRValue(a.frm)
 
 proc decodeCborRValue(dec: var CborDecoder): Result[RValue, string] =
@@ -845,11 +887,11 @@ proc decodeCborAssignmentRecord*(dec: var CborDecoder): Result[AssignmentRecord,
 
 # ---- FullValueRecord ----
 
-proc encodeCborFullValueRecord*(enc: var CborEncoder, fvr: FullValueRecord) =
+proc encodeCborFullValueRecord*(enc: var CborEncoder, fvr: FullValueRecord) {.inline.} =
   enc.writeMapHeader(2)
-  enc.writeKey("variable_id")
+  enc.writePrecomputed(CborKeyVariableId)
   enc.writeUint(uint64(fvr.variableId))
-  enc.writeKey("value")
+  enc.writePrecomputed(CborKeyValue)
   enc.encodeCborValueRecord(fvr.value)
 
 proc decodeCborFullValueRecord*(dec: var CborDecoder): Result[FullValueRecord, string] =
@@ -862,7 +904,7 @@ proc decodeCborFullValueRecord*(dec: var CborDecoder): Result[FullValueRecord, s
 
 # ---- CallArgs (Vec[FullValueRecord]) ----
 
-proc encodeCborCallArgs*(enc: var CborEncoder, args: seq[FullValueRecord]) =
+proc encodeCborCallArgs*(enc: var CborEncoder, args: seq[FullValueRecord]) {.inline.} =
   enc.writeArrayHeader(uint64(args.len))
   for arg in args:
     enc.encodeCborFullValueRecord(arg)

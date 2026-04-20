@@ -14,46 +14,50 @@
 ## cross-language trace compatibility.
 
 import results
+import stew/endians2
 import ./cbor
 import ../codetracer_trace_types
 export codetracer_trace_types, results, cbor
 
 # ===========================================================================
-# Low-level binary helpers
+# Low-level binary helpers (optimized: bulk memcpy instead of byte-at-a-time)
 # ===========================================================================
+
+{.push checks: off, boundChecks: off.}
 
 proc writeU8(out_buf: var seq[byte], v: byte) {.inline.} =
   out_buf.add(v)
 
 proc writeU32(out_buf: var seq[byte], v: uint32) {.inline.} =
-  out_buf.add(byte(v and 0xFF))
-  out_buf.add(byte((v shr 8) and 0xFF))
-  out_buf.add(byte((v shr 16) and 0xFF))
-  out_buf.add(byte((v shr 24) and 0xFF))
+  let pos = out_buf.len
+  out_buf.setLen(pos + 4)
+  let le = toBytesLE(v)
+  copyMem(addr out_buf[pos], unsafeAddr le[0], 4)
 
 proc writeU64(out_buf: var seq[byte], v: uint64) {.inline.} =
-  out_buf.add(byte(v and 0xFF))
-  out_buf.add(byte((v shr 8) and 0xFF))
-  out_buf.add(byte((v shr 16) and 0xFF))
-  out_buf.add(byte((v shr 24) and 0xFF))
-  out_buf.add(byte((v shr 32) and 0xFF))
-  out_buf.add(byte((v shr 40) and 0xFF))
-  out_buf.add(byte((v shr 48) and 0xFF))
-  out_buf.add(byte((v shr 56) and 0xFF))
+  let pos = out_buf.len
+  out_buf.setLen(pos + 8)
+  let le = toBytesLE(v)
+  copyMem(addr out_buf[pos], unsafeAddr le[0], 8)
 
 proc writeI64(out_buf: var seq[byte], v: int64) {.inline.} =
   writeU64(out_buf, cast[uint64](v))
 
-proc writeStr(out_buf: var seq[byte], s: string) =
-  writeU32(out_buf, uint32(s.len))
-  for c in s:
-    out_buf.add(byte(c))
+proc writeStr(out_buf: var seq[byte], s: string) {.inline.} =
+  let lenLE = toBytesLE(uint32(s.len))
+  let pos = out_buf.len
+  out_buf.setLen(pos + 4 + s.len)
+  copyMem(addr out_buf[pos], unsafeAddr lenLE[0], 4)
+  if s.len > 0:
+    copyMem(addr out_buf[pos + 4], unsafeAddr s[0], s.len)
 
 proc writeF64(out_buf: var seq[byte], v: float64) {.inline.} =
   writeU64(out_buf, cast[uint64](v))
 
 proc writeBool(out_buf: var seq[byte], v: bool) {.inline.} =
   out_buf.add(if v: 1'u8 else: 0'u8)
+
+{.pop.} # checks: off, boundChecks: off
 
 proc readU8(data: openArray[byte], pos: var int): Result[byte, string] =
   if pos >= data.len: return err("unexpected end of data reading u8")
@@ -124,56 +128,67 @@ proc readBytes(data: openArray[byte], pos: var int, count: int): Result[seq[byte
 # The functions below are thin wrappers that produce a seq[byte] payload
 # from the CBOR encoder, and decode payloads using the CBOR decoder.
 
-proc encodeCborPayloadValueRecord(v: ValueRecord): seq[byte] =
-  var enc = CborEncoder.init()
-  enc.encodeCborValueRecord(v)
-  enc.getBytes()
-
 proc decodeCborPayloadValueRecord(data: openArray[byte]): Result[ValueRecord, string] =
   var dec = CborDecoder.init(data)
   dec.decodeCborValueRecord()
-
-proc encodeCborPayloadTypeRecord(t: TypeRecord): seq[byte] =
-  var enc = CborEncoder.init()
-  enc.encodeCborTypeRecord(t)
-  enc.getBytes()
 
 proc decodeCborPayloadTypeRecord(data: openArray[byte]): Result[TypeRecord, string] =
   var dec = CborDecoder.init(data)
   dec.decodeCborTypeRecord()
 
-proc encodeCborPayloadAssignmentRecord(a: AssignmentRecord): seq[byte] =
-  var enc = CborEncoder.init()
-  enc.encodeCborAssignmentRecord(a)
-  enc.getBytes()
-
 proc decodeCborPayloadAssignmentRecord(data: openArray[byte]): Result[AssignmentRecord, string] =
   var dec = CborDecoder.init(data)
   dec.decodeCborAssignmentRecord()
-
-proc encodeCborPayloadFullValueRecord(fvr: FullValueRecord): seq[byte] =
-  var enc = CborEncoder.init()
-  enc.encodeCborFullValueRecord(fvr)
-  enc.getBytes()
 
 proc decodeCborPayloadFullValueRecord(data: openArray[byte]): Result[FullValueRecord, string] =
   var dec = CborDecoder.init(data)
   dec.decodeCborFullValueRecord()
 
-proc encodeCborPayloadCallArgs(args: seq[FullValueRecord]): seq[byte] =
-  var enc = CborEncoder.init()
-  enc.encodeCborCallArgs(args)
-  enc.getBytes()
-
 proc decodeCborPayloadCallArgs(data: openArray[byte]): Result[seq[FullValueRecord], string] =
   var dec = CborDecoder.init(data)
   dec.decodeCborCallArgs()
 
+# Direct-to-buffer CBOR payload writing (eliminates temp buffer allocation)
+# Writes a 4-byte length placeholder, encodes CBOR directly into the main
+# buffer, then patches the length.
+template writePayloadCborDirect(out_buf: var seq[byte], body: untyped) =
+  let lenPos = out_buf.len
+  out_buf.setLen(lenPos + 4)
+  let startPos = out_buf.len
+  body
+  let payloadLen = uint32(out_buf.len - startPos)
+  let patchLE = toBytesLE(payloadLen)
+  copyMem(addr out_buf[lenPos], unsafeAddr patchLE[0], 4)
+
+# Encode procs that write CBOR directly into an external buffer (zero-copy via move)
+proc encodeCborValueRecordInto*(buf: var seq[byte], v: ValueRecord) {.inline.} =
+  var enc = CborEncoder(buf: move buf)
+  enc.encodeCborValueRecord(v)
+  buf = move enc.buf
+
+proc encodeCborTypeRecordInto*(buf: var seq[byte], t: TypeRecord) {.inline.} =
+  var enc = CborEncoder(buf: move buf)
+  enc.encodeCborTypeRecord(t)
+  buf = move enc.buf
+
+proc encodeCborAssignmentRecordInto*(buf: var seq[byte], a: AssignmentRecord) {.inline.} =
+  var enc = CborEncoder(buf: move buf)
+  enc.encodeCborAssignmentRecord(a)
+  buf = move enc.buf
+
+proc encodeCborCallArgsInto*(buf: var seq[byte], args: seq[FullValueRecord]) {.inline.} =
+  var enc = CborEncoder(buf: move buf)
+  enc.encodeCborCallArgs(args)
+  buf = move enc.buf
+
 # Helper: write a payload with 4-byte LE length prefix
-proc writePayload(out_buf: var seq[byte], payload: seq[byte]) =
-  writeU32(out_buf, uint32(payload.len))
-  for b in payload:
-    out_buf.add(b)
+proc writePayload(out_buf: var seq[byte], payload: seq[byte]) {.inline.} =
+  let pos = out_buf.len
+  out_buf.setLen(pos + 4 + payload.len)
+  let lenLE = toBytesLE(uint32(payload.len))
+  copyMem(addr out_buf[pos], unsafeAddr lenLE[0], 4)
+  if payload.len > 0:
+    copyMem(addr out_buf[pos + 4], unsafeAddr payload[0], payload.len)
 
 proc readPayload(data: openArray[byte], pos: var int): Result[seq[byte], string] =
   let length = ?readU32(data, pos)
@@ -187,14 +202,16 @@ type
   SplitBinaryEncoder* = object
     buf*: seq[byte]
 
-proc init*(T: type SplitBinaryEncoder): SplitBinaryEncoder =
-  SplitBinaryEncoder(buf: @[])
+proc init*(T: type SplitBinaryEncoder, capacity: int = 65536): SplitBinaryEncoder =
+  result.buf = newSeqOfCap[byte](capacity)
 
 proc clear*(enc: var SplitBinaryEncoder) =
   enc.buf.setLen(0)
 
 proc getBytes*(enc: SplitBinaryEncoder): seq[byte] =
   enc.buf
+
+{.push checks: off, boundChecks: off.}
 
 proc encodeEvent*(enc: var SplitBinaryEncoder, event: TraceLowLevelEvent) =
   ## Encode a single TraceLowLevelEvent into the encoder's buffer.
@@ -218,14 +235,14 @@ proc encodeEvent*(enc: var SplitBinaryEncoder, event: TraceLowLevelEvent) =
 
   of tleType:
     writeU8(enc.buf, 4)
-    let payload = encodeCborPayloadTypeRecord(event.typeRecord)
-    writePayload(enc.buf, payload)
+    writePayloadCborDirect(enc.buf):
+      encodeCborTypeRecordInto(enc.buf, event.typeRecord)
 
   of tleValue:
     writeU8(enc.buf, 5)
     writeU64(enc.buf, uint64(event.fullValue.variableId))
-    let payload = encodeCborPayloadValueRecord(event.fullValue.value)
-    writePayload(enc.buf, payload)
+    writePayloadCborDirect(enc.buf):
+      encodeCborValueRecordInto(enc.buf, event.fullValue.value)
 
   of tleFunction:
     writeU8(enc.buf, 6)
@@ -236,13 +253,13 @@ proc encodeEvent*(enc: var SplitBinaryEncoder, event: TraceLowLevelEvent) =
   of tleCall:
     writeU8(enc.buf, 7)
     writeU64(enc.buf, uint64(event.callRecord.functionId))
-    let payload = encodeCborPayloadCallArgs(event.callRecord.args)
-    writePayload(enc.buf, payload)
+    writePayloadCborDirect(enc.buf):
+      encodeCborCallArgsInto(enc.buf, event.callRecord.args)
 
   of tleReturn:
     writeU8(enc.buf, 8)
-    let payload = encodeCborPayloadValueRecord(event.returnRecord.returnValue)
-    writePayload(enc.buf, payload)
+    writePayloadCborDirect(enc.buf):
+      encodeCborValueRecordInto(enc.buf, event.returnRecord.returnValue)
 
   of tleEvent:
     writeU8(enc.buf, 9)
@@ -263,8 +280,8 @@ proc encodeEvent*(enc: var SplitBinaryEncoder, event: TraceLowLevelEvent) =
 
   of tleAssignment:
     writeU8(enc.buf, 12)
-    let payload = encodeCborPayloadAssignmentRecord(event.assignment)
-    writePayload(enc.buf, payload)
+    writePayloadCborDirect(enc.buf):
+      encodeCborAssignmentRecordInto(enc.buf, event.assignment)
 
   of tleDropVariables:
     writeU8(enc.buf, 13)
@@ -275,14 +292,14 @@ proc encodeEvent*(enc: var SplitBinaryEncoder, event: TraceLowLevelEvent) =
   of tleCompoundValue:
     writeU8(enc.buf, 14)
     writeI64(enc.buf, int64(event.compoundValue.place))
-    let payload = encodeCborPayloadValueRecord(event.compoundValue.value)
-    writePayload(enc.buf, payload)
+    writePayloadCborDirect(enc.buf):
+      encodeCborValueRecordInto(enc.buf, event.compoundValue.value)
 
   of tleCellValue:
     writeU8(enc.buf, 15)
     writeI64(enc.buf, int64(event.cellValue.place))
-    let payload = encodeCborPayloadValueRecord(event.cellValue.value)
-    writePayload(enc.buf, payload)
+    writePayloadCborDirect(enc.buf):
+      encodeCborValueRecordInto(enc.buf, event.cellValue.value)
 
   of tleAssignCompoundItem:
     writeU8(enc.buf, 16)
@@ -293,8 +310,8 @@ proc encodeEvent*(enc: var SplitBinaryEncoder, event: TraceLowLevelEvent) =
   of tleAssignCell:
     writeU8(enc.buf, 17)
     writeI64(enc.buf, int64(event.assignCell.place))
-    let payload = encodeCborPayloadValueRecord(event.assignCell.newValue)
-    writePayload(enc.buf, payload)
+    writePayloadCborDirect(enc.buf):
+      encodeCborValueRecordInto(enc.buf, event.assignCell.newValue)
 
   of tleVariableCell:
     writeU8(enc.buf, 18)
@@ -319,6 +336,8 @@ proc encodeEvent*(enc: var SplitBinaryEncoder, event: TraceLowLevelEvent) =
 
   of tleDropLastStep:
     writeU8(enc.buf, 23)
+
+{.pop.} # checks: off, boundChecks: off
 
 # ===========================================================================
 # SplitBinaryDecoder
