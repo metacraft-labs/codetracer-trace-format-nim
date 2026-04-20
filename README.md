@@ -33,6 +33,10 @@ cs.syncEntry(fs)  # flush to disk for readers
 cs.closeCtfs()
 ```
 
+## Specification
+
+The format is documented in [codetracer-trace-format-spec](https://github.com/metacraft-labs/codetracer-trace-format-spec).
+
 ## Dependencies
 
 - `stew >= 0.1.0` (for `stew/endians2`)
