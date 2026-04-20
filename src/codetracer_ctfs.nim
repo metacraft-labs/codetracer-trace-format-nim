@@ -24,6 +24,10 @@ import codetracer_ctfs/chunk_index
 import codetracer_ctfs/zstd_bindings
 import codetracer_ctfs/seekable_zstd
 
+import codetracer_trace_types
+import codetracer_trace_writer/varint
+import codetracer_trace_writer/split_binary
+
 export base40
 export types
 export block_mapping
@@ -32,3 +36,7 @@ export streaming
 export chunk_index
 export zstd_bindings
 export seekable_zstd
+
+export codetracer_trace_types
+export varint
+export split_binary

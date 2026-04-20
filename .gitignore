@@ -4,3 +4,7 @@ tests/test_base40
 tests/test_chunk_index
 tests/test_container
 tests/test_streaming
+tests/test_seekable_zstd
+tests/test_trace_types
+tests/test_varint
+tests/test_split_binary
