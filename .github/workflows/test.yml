@@ -1,0 +1,30 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.2.x'
+
+      - name: Install dependencies
+        run: nimble install -y stew results
+
+      - name: Run tests
+        run: |
+          nim c -r tests/test_base40.nim
+          nim c -r tests/test_container.nim
+          nim c -r tests/test_streaming.nim
+          nim c -r tests/test_chunk_index.nim
+
+      - name: Compile with --mm:arc (GC-free verification)
+        run: nim c --mm:arc src/codetracer_ctfs.nim
