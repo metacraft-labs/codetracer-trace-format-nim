@@ -20,6 +20,7 @@ task test, "Run all tests":
   exec "nim c -r tests/test_varint.nim"
   exec "nim c -r tests/test_split_binary.nim"
   exec "nim c -r tests/test_trace_writer.nim"
+  exec "nim c -r tests/test_trace_reader.nim"
   exec "nim c -r tests/test_golden_fixtures.nim"
   exec "nim c -r tests/test_cross_compat.nim"
 
@@ -32,6 +33,12 @@ task bench, "Run benchmarks":
 
 task benchSplitBinary, "Run split-binary benchmarks":
   exec "nim c -d:release -r tests/bench_split_binary.nim"
+
+task buildCtPrint, "Build ct-print utility":
+  exec "nim c -d:release --mm:arc -p:src -o:ct-print src/codetracer_ct_print.nim"
+
+task testReader, "Run trace reader tests":
+  exec "nim c -r -p:src tests/test_trace_reader.nim"
 
 task buildStaticLib, "Build static library (C FFI)":
   exec "nim c --app:staticlib --mm:arc --noMain -d:release -p:src -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim"

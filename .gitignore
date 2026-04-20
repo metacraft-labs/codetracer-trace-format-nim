@@ -17,3 +17,5 @@ tests/test_trace_writer
 tests/test_ffi
 tests/bench_split_binary
 tests/bench_seekable_zstd
+tests/test_trace_reader
+ct-print
