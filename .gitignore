@@ -47,3 +47,9 @@ tests/test_reader_calls_events
 tests/test_reader_integration
 tests/test_streaming_value_encoder
 tests/test_value_ref
+tests/bench_regression_suite
+tests/test_cross_format
+tests/test_file_access
+tests/test_network_reader
+tests/test_query_protocol
+tests/test_replication
