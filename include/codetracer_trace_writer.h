@@ -186,6 +186,32 @@ const uint8_t* ct_meta_dat_path(meta_dat_reader_t h, size_t idx, size_t* out_len
 const uint8_t* ct_meta_dat_recorder_id(meta_dat_reader_t h, size_t* out_len);
 void ct_meta_dat_free(meta_dat_reader_t h);
 
+/* --------------------------------------------------------------------------
+ * Streaming value encoder (zero-allocation CBOR)
+ * -------------------------------------------------------------------------- */
+
+typedef void* value_encoder_t;
+
+value_encoder_t ct_value_encoder_new(void);
+void ct_value_encoder_free(value_encoder_t h);
+void ct_value_encoder_reset(value_encoder_t h);
+
+int ct_value_write_int(value_encoder_t h, int64_t value, uint64_t type_id);
+int ct_value_write_float(value_encoder_t h, double value, uint64_t type_id);
+int ct_value_write_bool(value_encoder_t h, int value);
+int ct_value_write_bool_typed(value_encoder_t h, int value, uint64_t type_id);
+int ct_value_write_string(value_encoder_t h, const uint8_t* data, size_t len, uint64_t type_id);
+int ct_value_write_none(value_encoder_t h);
+int ct_value_write_none_typed(value_encoder_t h, uint64_t type_id);
+int ct_value_write_raw(value_encoder_t h, const uint8_t* data, size_t len, uint64_t type_id);
+
+int ct_value_begin_struct(value_encoder_t h, uint64_t type_id, int field_count);
+int ct_value_begin_sequence(value_encoder_t h, uint64_t type_id, int element_count);
+int ct_value_begin_tuple(value_encoder_t h, uint64_t type_id, int element_count);
+int ct_value_end_compound(value_encoder_t h);
+
+const uint8_t* ct_value_get_bytes(value_encoder_t h, size_t* out_len);
+
 #ifdef __cplusplus
 }
 #endif

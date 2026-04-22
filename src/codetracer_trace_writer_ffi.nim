@@ -722,6 +722,173 @@ proc ct_meta_dat_free(h: MetaDatReaderHandle) {.exportc, cdecl.} =
   dealloc(h)
 
 # ---------------------------------------------------------------------------
+# Streaming Value Encoder — C FFI
+# ---------------------------------------------------------------------------
+
+import codetracer_trace_writer/streaming_value_encoder
+
+type ValueEncoderHandle = ptr StreamingValueEncoder
+
+proc ct_value_encoder_new(): ValueEncoderHandle {.exportc, cdecl.} =
+  ## Create a new streaming value encoder. Returns NULL on allocation failure.
+  let h = cast[ValueEncoderHandle](alloc0(sizeof(StreamingValueEncoder)))
+  h[] = StreamingValueEncoder.init()
+  return h
+
+proc ct_value_encoder_free(h: ValueEncoderHandle) {.exportc, cdecl.} =
+  ## Free a value encoder handle. Passing NULL is a no-op.
+  if h.isNil:
+    return
+  `=destroy`(h[])
+  dealloc(h)
+
+proc ct_value_encoder_reset(h: ValueEncoderHandle) {.exportc, cdecl.} =
+  ## Reset the encoder for reuse (clears buffer, resets nesting stack).
+  if h.isNil:
+    return
+  h[].reset()
+
+proc ct_value_write_int(h: ValueEncoderHandle, value: int64, type_id: uint64): cint {.exportc, cdecl.} =
+  if h.isNil:
+    setError("NULL handle")
+    return 1.cint
+  let r = h[].writeInt(value, type_id)
+  if r.isErr:
+    setError(r.error)
+    return 1.cint
+  0.cint
+
+proc ct_value_write_float(h: ValueEncoderHandle, value: float64, type_id: uint64): cint {.exportc, cdecl.} =
+  if h.isNil:
+    setError("NULL handle")
+    return 1.cint
+  let r = h[].writeFloat(value, type_id)
+  if r.isErr:
+    setError(r.error)
+    return 1.cint
+  0.cint
+
+proc ct_value_write_bool(h: ValueEncoderHandle, value: cint): cint {.exportc, cdecl.} =
+  if h.isNil:
+    setError("NULL handle")
+    return 1.cint
+  # Bool type_id is needed for byte-identical output; use 0 as default from C
+  let r = h[].writeBool(value != 0, typeId = 0'u64)
+  if r.isErr:
+    setError(r.error)
+    return 1.cint
+  0.cint
+
+proc ct_value_write_bool_typed(h: ValueEncoderHandle, value: cint, type_id: uint64): cint {.exportc, cdecl.} =
+  if h.isNil:
+    setError("NULL handle")
+    return 1.cint
+  let r = h[].writeBool(value != 0, typeId = type_id)
+  if r.isErr:
+    setError(r.error)
+    return 1.cint
+  0.cint
+
+proc ct_value_write_string(h: ValueEncoderHandle, data: ptr uint8, len: csize_t, type_id: uint64): cint {.exportc, cdecl.} =
+  if h.isNil:
+    setError("NULL handle")
+    return 1.cint
+  var s = ""
+  if not data.isNil and len > 0.csize_t:
+    s = newString(int(len))
+    copyMem(addr s[0], data, int(len))
+  let r = h[].writeString(s, type_id)
+  if r.isErr:
+    setError(r.error)
+    return 1.cint
+  0.cint
+
+proc ct_value_write_none(h: ValueEncoderHandle): cint {.exportc, cdecl.} =
+  if h.isNil:
+    setError("NULL handle")
+    return 1.cint
+  let r = h[].writeNone(typeId = 0'u64)
+  if r.isErr:
+    setError(r.error)
+    return 1.cint
+  0.cint
+
+proc ct_value_write_none_typed(h: ValueEncoderHandle, type_id: uint64): cint {.exportc, cdecl.} =
+  if h.isNil:
+    setError("NULL handle")
+    return 1.cint
+  let r = h[].writeNone(typeId = type_id)
+  if r.isErr:
+    setError(r.error)
+    return 1.cint
+  0.cint
+
+proc ct_value_write_raw(h: ValueEncoderHandle, data: ptr uint8, len: csize_t, type_id: uint64): cint {.exportc, cdecl.} =
+  if h.isNil:
+    setError("NULL handle")
+    return 1.cint
+  var s = ""
+  if not data.isNil and len > 0.csize_t:
+    s = newString(int(len))
+    copyMem(addr s[0], data, int(len))
+  let r = h[].writeRaw(s, type_id)
+  if r.isErr:
+    setError(r.error)
+    return 1.cint
+  0.cint
+
+proc ct_value_begin_struct(h: ValueEncoderHandle, type_id: uint64, field_count: cint): cint {.exportc, cdecl.} =
+  if h.isNil:
+    setError("NULL handle")
+    return 1.cint
+  let r = h[].beginStruct(type_id, int(field_count))
+  if r.isErr:
+    setError(r.error)
+    return 1.cint
+  0.cint
+
+proc ct_value_begin_sequence(h: ValueEncoderHandle, type_id: uint64, element_count: cint): cint {.exportc, cdecl.} =
+  if h.isNil:
+    setError("NULL handle")
+    return 1.cint
+  let r = h[].beginSequence(type_id, int(element_count))
+  if r.isErr:
+    setError(r.error)
+    return 1.cint
+  0.cint
+
+proc ct_value_begin_tuple(h: ValueEncoderHandle, type_id: uint64, element_count: cint): cint {.exportc, cdecl.} =
+  if h.isNil:
+    setError("NULL handle")
+    return 1.cint
+  let r = h[].beginTuple(type_id, int(element_count))
+  if r.isErr:
+    setError(r.error)
+    return 1.cint
+  0.cint
+
+proc ct_value_end_compound(h: ValueEncoderHandle): cint {.exportc, cdecl.} =
+  if h.isNil:
+    setError("NULL handle")
+    return 1.cint
+  let r = h[].endCompound()
+  if r.isErr:
+    setError(r.error)
+    return 1.cint
+  0.cint
+
+proc ct_value_get_bytes(h: ValueEncoderHandle, out_len: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+  ## Get pointer to the encoded CBOR bytes. Valid until next reset/write/free.
+  ## Sets *out_len to the byte count. Returns NULL on error.
+  if h.isNil or out_len.isNil:
+    return nil
+  let buf = h[].getBytesView()
+  out_len[] = csize_t(buf.len)
+  if buf.len == 0:
+    return nil
+  return cast[ptr uint8](unsafeAddr buf[0])
+
+# ---------------------------------------------------------------------------
 # NimMain — required for static/shared lib initialization
 # ---------------------------------------------------------------------------
 
