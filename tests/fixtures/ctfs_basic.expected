@@ -1,8 +1,8 @@
 === CTFS Header ===
 magic: c0de72ace2
-version: 3
-compression: cmNone
+version: 4
 encryption: emNone
+max_shards: 1
 block_size: 4096
 max_root_entries: 31
 

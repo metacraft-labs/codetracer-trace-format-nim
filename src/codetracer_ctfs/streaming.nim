@@ -13,13 +13,13 @@ import ./container
 
 proc createCtfsStreaming*(path: string, blockSize: uint32 = DefaultBlockSize,
                           maxRootEntries: uint32 = DefaultMaxRootEntries,
-                          compression: CtfsCompressionMethod = cmNone,
-                          encryption: CtfsEncryptionMethod = emNone): Result[Ctfs, string] =
-  ## Create a new CTFS v3 container that streams writes to disk.
+                          encryption: CtfsEncryptionMethod = emNone,
+                          maxShards: uint8 = DefaultMaxShards): Result[Ctfs, string] =
+  ## Create a new CTFS v4 container that streams writes to disk.
   ## The file is opened immediately and the initial root block (header +
   ## file entries) is written so concurrent readers can see the container
   ## structure as soon as it is created.
-  var c = createCtfs(blockSize, maxRootEntries, compression, encryption)
+  var c = createCtfs(blockSize, maxRootEntries, encryption, maxShards)
   try:
     c.streamFile = open(path, fmReadWrite)
     c.streamPath = path

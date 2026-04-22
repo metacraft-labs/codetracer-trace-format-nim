@@ -16,15 +16,40 @@ proc test_create_and_magic() {.raises: [].} =
     "initial size should be one block"
   echo "PASS: test_create_and_magic"
 
-proc test_compression_encryption_fields() {.raises: [].} =
-  ## Test compression and encryption method fields in the header.
-  var c = createCtfs(compression = cmZstd, encryption = emAes256Gcm)
+proc test_encryption_max_shards_fields() {.raises: [].} =
+  ## Test encryption and max_shards fields in the v4 header.
+  var c = createCtfs(encryption = emAes256Gcm, maxShards = 4)
   let bytes = c.toBytes()
-  doAssert readCompressionMethod(bytes) == cmZstd,
-    "compression method should be zstd"
+  doAssert bytes[5] == 4, "version should be 4"
+  doAssert bytes[6] == uint8(emAes256Gcm), "byte 6 should be encryption"
+  doAssert bytes[7] == 4, "byte 7 should be max_shards"
   doAssert readEncryptionMethod(bytes) == emAes256Gcm,
     "encryption method should be aes256gcm"
-  echo "PASS: test_compression_encryption_fields"
+  doAssert readMaxShards(bytes) == 4,
+    "max_shards should be 4"
+  # Compression is not in the header for v4
+  doAssert readCompressionMethod(bytes) == cmNone,
+    "compression should be cmNone for v4 (not in header)"
+  echo "PASS: test_encryption_max_shards_fields"
+
+proc test_v3_backward_compat() {.raises: [].} =
+  ## Test that v3 headers are read correctly with the old layout.
+  ## V3 layout: [6] = compression, [7] = encryption
+  var fakeV3 = newSeq[byte](16)
+  fakeV3[0] = 0xC0; fakeV3[1] = 0xDE; fakeV3[2] = 0x72
+  fakeV3[3] = 0xAC; fakeV3[4] = 0xE2
+  fakeV3[5] = 3  # version 3
+  fakeV3[6] = 1  # compression = cmZstd (old layout)
+  fakeV3[7] = 1  # encryption = emAes256Gcm (old layout)
+  doAssert hasCtfsMagic(fakeV3), "magic should be valid"
+  doAssert hasValidVersion(fakeV3), "v3 should be accepted"
+  doAssert readCompressionMethod(fakeV3) == cmZstd,
+    "v3 byte 6 should be read as compression"
+  doAssert readEncryptionMethod(fakeV3) == emAes256Gcm,
+    "v3 byte 7 should be read as encryption"
+  doAssert readMaxShards(fakeV3) == DefaultMaxShards,
+    "v3 files should return default max_shards"
+  echo "PASS: test_v3_backward_compat"
 
 proc test_add_file_and_write() {.raises: [].} =
   ## Test adding a file and writing data to it.
@@ -150,7 +175,8 @@ proc test_write_to_file_and_read_back() {.raises: [].} =
 
 # Run all tests
 test_create_and_magic()
-test_compression_encryption_fields()
+test_encryption_max_shards_fields()
+test_v3_backward_compat()
 test_add_file_and_write()
 test_multi_block_write()
 test_multiple_files()

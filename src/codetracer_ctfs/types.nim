@@ -10,8 +10,10 @@ export endians2
 
 const
   CtfsMagic*: array[5, byte] = [0xC0'u8, 0xDE, 0x72, 0xAC, 0xE2]
-  CtfsVersion*: uint8 = 3
-  CtfsVersionV2*: uint8 = 2  ## Previous version, accepted by v3 readers
+  CtfsVersion*: uint8 = 4
+  CtfsVersionV3*: uint8 = 3  ## Previous version, accepted by v4 readers
+  CtfsVersionV2*: uint8 = 2  ## Legacy version, accepted by v4 readers
+  DefaultMaxShards*: uint8 = 1  ## Default max_shards value
   DefaultBlockSize*: uint32 = 4096
   DefaultMaxRootEntries*: uint32 = 31
   HeaderSize* = 8
@@ -52,8 +54,8 @@ type
     blockSize*: uint32
     maxRootEntries*: uint32
     nextFreeBlock*: uint64  ## Next block to allocate
-    compression*: CtfsCompressionMethod  ## Header compression tag
-    encryption*: CtfsEncryptionMethod    ## Header encryption tag
+    encryption*: CtfsEncryptionMethod    ## Header encryption tag (byte 6)
+    maxShards*: uint8                    ## Max shards (byte 7)
     # Streaming support
     streaming*: bool        ## True if streaming writes to disk
     streamPath*: string     ## File path when streaming (empty if not)

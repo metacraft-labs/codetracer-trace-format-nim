@@ -13,14 +13,17 @@ import ./block_mapping
 proc createCtfs*(
     blockSize: uint32 = DefaultBlockSize,
     maxRootEntries: uint32 = DefaultMaxRootEntries,
-    compression: CtfsCompressionMethod = cmNone,
-    encryption: CtfsEncryptionMethod = emNone): Ctfs =
-  ## Create a new in-memory CTFS v3 container.
+    encryption: CtfsEncryptionMethod = emNone,
+    maxShards: uint8 = DefaultMaxShards): Ctfs =
+  ## Create a new in-memory CTFS v4 container.
+  ## Header layout (per spec):
+  ##   [0-4] magic  [5] version  [6] encryption  [7] max_shards
+  ## Compression is NOT in the header — it is per-stream in meta.dat.
   var c: Ctfs
   c.blockSize = blockSize
   c.maxRootEntries = maxRootEntries
-  c.compression = compression
   c.encryption = encryption
+  c.maxShards = maxShards
   c.data = newSeq[byte](int(blockSize))
   c.nextFreeBlock = 1  # Block 0 is the root block
 
@@ -31,8 +34,8 @@ proc createCtfs*(
   c.data[3] = CtfsMagic[3]
   c.data[4] = CtfsMagic[4]
   c.data[5] = CtfsVersion
-  c.data[6] = uint8(compression)  # compression method
-  c.data[7] = uint8(encryption)   # encryption method
+  c.data[6] = uint8(encryption)   # encryption method
+  c.data[7] = maxShards            # max shards
 
   # Write extended header (8 bytes)
   writeU32LE(c.data, 8, blockSize)
@@ -264,28 +267,61 @@ proc hasCtfsMagic*(data: openArray[byte]): bool =
   data[4] == CtfsMagic[4]
 
 proc hasValidVersion*(data: openArray[byte]): bool =
-  ## Check whether the version byte is v2 or v3 (both accepted by v3 readers).
+  ## Check whether the version byte is v2, v3, or v4 (all accepted by v4 readers).
   if data.len < 6:
     return false
-  data[5] == CtfsVersion or data[5] == CtfsVersionV2
+  data[5] == CtfsVersion or data[5] == CtfsVersionV3 or data[5] == CtfsVersionV2
 
 proc readCompressionMethod*(data: openArray[byte]): CtfsCompressionMethod =
   ## Read the compression method from a CTFS header.
-  ## Returns cmNone for v2 files (bytes 6-7 were reserved as 0x00).
+  ## V3 layout: byte 6 = compression, byte 7 = encryption.
+  ## V4 layout: compression is NOT in the header (per spec, it is per-stream in meta.dat).
+  ## Returns cmNone for v2 and v4+ files; reads byte 6 only for v3.
   if data.len < 7:
     return cmNone
-  case data[6]
-  of 0: cmNone
-  of 1: cmZstd
-  of 2: cmLz4
-  else: cmNone  # Unknown method, treat as none
+  let version = data[5]
+  if version == CtfsVersionV3:
+    # V3 (old layout): byte 6 was compression
+    case data[6]
+    of 0: cmNone
+    of 1: cmZstd
+    of 2: cmLz4
+    else: cmNone
+  else:
+    # V4+ and V2: no compression in header
+    cmNone
 
 proc readEncryptionMethod*(data: openArray[byte]): CtfsEncryptionMethod =
   ## Read the encryption method from a CTFS header.
+  ## V3 layout: byte 7 = encryption.
+  ## V4 layout: byte 6 = encryption.
   ## Returns emNone for v2 files.
-  if data.len < 8:
+  if data.len < 7:
     return emNone
-  case data[7]
-  of 0: emNone
-  of 1: emAes256Gcm
-  else: emNone
+  let version = data[5]
+  if version == CtfsVersionV3:
+    # V3 (old layout): byte 7 was encryption
+    if data.len < 8:
+      return emNone
+    case data[7]
+    of 0: emNone
+    of 1: emAes256Gcm
+    else: emNone
+  else:
+    # V4+ layout: byte 6 = encryption
+    case data[6]
+    of 0: emNone
+    of 1: emAes256Gcm
+    else: emNone
+
+proc readMaxShards*(data: openArray[byte]): uint8 =
+  ## Read the max_shards field from a CTFS v4+ header (byte 7).
+  ## Returns 1 for v2/v3 files (no max_shards in those versions).
+  if data.len < 8:
+    return DefaultMaxShards
+  let version = data[5]
+  if version >= CtfsVersion:
+    # V4+ layout: byte 7 = max_shards
+    data[7]
+  else:
+    DefaultMaxShards

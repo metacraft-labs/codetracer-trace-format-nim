@@ -228,12 +228,17 @@ proc prettyPrintCtfsHeader(data: openArray[byte]): seq[string] =
   result.add("magic: " & magicHex)
   # Version
   result.add("version: " & $data[5])
-  # Compression
-  let comp = readCompressionMethod(data)
-  result.add("compression: " & $comp)
   # Encryption
   let enc = readEncryptionMethod(data)
   result.add("encryption: " & $enc)
+  # Max shards (v4+) or compression (v3 backward compat)
+  let version = data[5]
+  if version == 3:
+    let comp = readCompressionMethod(data)
+    result.add("compression: " & $comp & " (v3 legacy)")
+  else:
+    let shards = readMaxShards(data)
+    result.add("max_shards: " & $shards)
   # Block size
   var bs4: array[4, byte]
   bs4[0] = data[8]; bs4[1] = data[9]; bs4[2] = data[10]; bs4[3] = data[11]
