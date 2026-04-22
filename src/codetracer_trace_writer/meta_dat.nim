@@ -189,3 +189,65 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
     ))
 
   ok(contents)
+
+# ---------------------------------------------------------------------------
+# Buffer-based writer (for FFI / standalone use)
+# ---------------------------------------------------------------------------
+
+proc appendU16LE(buf: var seq[byte], val: uint16) =
+  buf.add(byte(val and 0xFF))
+  buf.add(byte((val shr 8) and 0xFF))
+
+proc appendVarintStr(buf: var seq[byte], s: string) =
+  encodeVarint(uint64(s.len), buf)
+  for i in 0 ..< s.len:
+    buf.add(byte(s[i]))
+
+proc writeMetaDatToBuffer*(
+    meta: TraceMetadata,
+    paths: openArray[string],
+    recorderId: string = "",
+    mcrFields: Option[McrMetaFields] = none(McrMetaFields)
+): seq[byte] =
+  ## Serialize meta.dat to an in-memory byte buffer.
+  ## This is the same format as writeMetaDat but without needing a CTFS container.
+  result = newSeq[byte]()
+
+  # Magic
+  for b in MetaDatMagic:
+    result.add(b)
+
+  # Version
+  result.appendU16LE(MetaDatVersion)
+
+  # Flags
+  var flags: uint16 = 0
+  if mcrFields.isSome:
+    flags = flags or FlagHasMcrFields
+  result.appendU16LE(flags)
+
+  # Program
+  result.appendVarintStr(meta.program)
+
+  # Args
+  encodeVarint(uint64(meta.args.len), result)
+  for arg in meta.args:
+    result.appendVarintStr(arg)
+
+  # Workdir
+  result.appendVarintStr(meta.workdir)
+
+  # Recorder ID
+  result.appendVarintStr(recorderId)
+
+  # Paths
+  encodeVarint(uint64(paths.len), result)
+  for p in paths:
+    result.appendVarintStr(p)
+
+  # MCR fields
+  if mcrFields.isSome:
+    let mcr = mcrFields.get()
+    encodeVarint(uint64(ord(mcr.tickSource)), result)
+    encodeVarint(uint64(mcr.totalThreads), result)
+    encodeVarint(uint64(ord(mcr.atomicMode)), result)

@@ -33,8 +33,10 @@
 
 import codetracer_trace_writer
 import codetracer_trace_types
+import codetracer_trace_writer/meta_dat
 import std/tables
 import std/os
+import std/options
 
 # ---------------------------------------------------------------------------
 # Thread-local error buffer
@@ -533,6 +535,191 @@ proc trace_writer_close(handle: TraceWriterHandle): cint {.exportc, cdecl.} =
     setError(res.error)
     return 1.cint
   0.cint
+
+# ---------------------------------------------------------------------------
+# meta.dat — write via TraceWriter handle
+# ---------------------------------------------------------------------------
+
+proc ct_write_meta_dat(
+    handle: TraceWriterHandle,
+    recorder_id: ptr uint8,
+    recorder_id_len: csize_t
+): cint {.exportc, cdecl.} =
+  ## Write meta.dat to the trace's CTFS container using the metadata
+  ## and paths already registered via trace_writer_set_workdir,
+  ## trace_writer_start, and trace_writer_register_path.
+  ## recorder_id is optional (pass NULL/0 for empty).
+  ## Returns 0 on success.
+  if handle.isNil:
+    setError("NULL handle")
+    return 1.cint
+  if not handle.writerReady:
+    setError("writer not ready (call begin_events first)")
+    return 1.cint
+
+  var recId = ""
+  if not recorder_id.isNil and recorder_id_len > 0.csize_t:
+    recId = newString(int(recorder_id_len))
+    copyMem(addr recId[0], recorder_id, int(recorder_id_len))
+
+  let wRes = handle.writer.writeMetaDat(recorderId = recId)
+  if wRes.isErr:
+    setError(wRes.error)
+    return 1.cint
+
+  0.cint
+
+# ---------------------------------------------------------------------------
+# meta.dat — standalone buffer write
+# ---------------------------------------------------------------------------
+
+proc ct_write_meta_dat_to_buffer(
+    program: ptr uint8, program_len: csize_t,
+    workdir: ptr uint8, workdir_len: csize_t,
+    args: ptr ptr uint8, arg_lens: ptr csize_t, args_count: csize_t,
+    paths: ptr ptr uint8, path_lens: ptr csize_t, paths_count: csize_t,
+    recorder_id: ptr uint8, recorder_id_len: csize_t,
+    out_buf: ptr ptr uint8, out_len: ptr csize_t
+): cint {.exportc, cdecl.} =
+  ## Write meta.dat to a newly allocated buffer from explicit fields.
+  ## The caller must free the buffer with ct_free_buffer.
+  ## Returns 0 on success.
+  if out_buf.isNil or out_len.isNil:
+    setError("NULL output pointers")
+    return 1.cint
+
+  var progStr = ""
+  if not program.isNil and program_len > 0.csize_t:
+    progStr = newString(int(program_len))
+    copyMem(addr progStr[0], program, int(program_len))
+
+  var wdStr = ""
+  if not workdir.isNil and workdir_len > 0.csize_t:
+    wdStr = newString(int(workdir_len))
+    copyMem(addr wdStr[0], workdir, int(workdir_len))
+
+  var argSeq = newSeq[string](int(args_count))
+  for i in 0 ..< int(args_count):
+    let aPtr = cast[ptr UncheckedArray[ptr uint8]](args)[i]
+    let aLen = cast[ptr UncheckedArray[csize_t]](arg_lens)[i]
+    if not aPtr.isNil and aLen > 0.csize_t:
+      argSeq[i] = newString(int(aLen))
+      copyMem(addr argSeq[i][0], aPtr, int(aLen))
+
+  var pathSeq = newSeq[string](int(paths_count))
+  for i in 0 ..< int(paths_count):
+    let pPtr = cast[ptr UncheckedArray[ptr uint8]](paths)[i]
+    let pLen = cast[ptr UncheckedArray[csize_t]](path_lens)[i]
+    if not pPtr.isNil and pLen > 0.csize_t:
+      pathSeq[i] = newString(int(pLen))
+      copyMem(addr pathSeq[i][0], pPtr, int(pLen))
+
+  var recId = ""
+  if not recorder_id.isNil and recorder_id_len > 0.csize_t:
+    recId = newString(int(recorder_id_len))
+    copyMem(addr recId[0], recorder_id, int(recorder_id_len))
+
+  let meta = TraceMetadata(program: progStr, args: argSeq, workdir: wdStr)
+  let buf = writeMetaDatToBuffer(meta, pathSeq, recorderId = recId)
+
+  let outPtr = cast[ptr uint8](alloc(buf.len))
+  if outPtr.isNil:
+    setError("allocation failed")
+    return 1.cint
+  copyMem(outPtr, unsafeAddr buf[0], buf.len)
+  out_buf[] = outPtr
+  out_len[] = csize_t(buf.len)
+  0.cint
+
+proc ct_free_buffer(buf: ptr uint8) {.exportc, cdecl.} =
+  ## Free a buffer allocated by ct_write_meta_dat_to_buffer.
+  if not buf.isNil:
+    dealloc(buf)
+
+# ---------------------------------------------------------------------------
+# meta.dat — reader handle
+# ---------------------------------------------------------------------------
+
+type MetaDatReaderHandle = ptr MetaDatContents
+
+proc ct_read_meta_dat(
+    data: ptr uint8,
+    data_len: csize_t
+): MetaDatReaderHandle {.exportc, cdecl.} =
+  ## Parse meta.dat from raw bytes. Returns handle on success, nil on failure.
+  if data.isNil or data_len == 0.csize_t:
+    setError("NULL or empty data")
+    return nil
+
+  var buf = newSeq[byte](int(data_len))
+  copyMem(addr buf[0], data, int(data_len))
+
+  let res = readMetaDat(buf)
+  if res.isErr:
+    setError(res.error)
+    return nil
+
+  let h = cast[MetaDatReaderHandle](alloc0(sizeof(MetaDatContents)))
+  h[] = res.get()
+  return h
+
+proc ct_meta_dat_program(h: MetaDatReaderHandle, out_len: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+  ## Get the program string. Returns pointer valid until ct_meta_dat_free.
+  if h.isNil or out_len.isNil:
+    return nil
+  out_len[] = csize_t(h.program.len)
+  if h.program.len == 0:
+    return nil
+  return cast[ptr uint8](unsafeAddr h.program[0])
+
+proc ct_meta_dat_workdir(h: MetaDatReaderHandle, out_len: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+  if h.isNil or out_len.isNil:
+    return nil
+  out_len[] = csize_t(h.workdir.len)
+  if h.workdir.len == 0:
+    return nil
+  return cast[ptr uint8](unsafeAddr h.workdir[0])
+
+proc ct_meta_dat_args_count(h: MetaDatReaderHandle): csize_t {.exportc, cdecl.} =
+  if h.isNil:
+    return 0.csize_t
+  return csize_t(h.args.len)
+
+proc ct_meta_dat_arg(h: MetaDatReaderHandle, idx: csize_t, out_len: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+  if h.isNil or out_len.isNil or int(idx) >= h.args.len:
+    return nil
+  out_len[] = csize_t(h.args[int(idx)].len)
+  if h.args[int(idx)].len == 0:
+    return nil
+  return cast[ptr uint8](unsafeAddr h.args[int(idx)][0])
+
+proc ct_meta_dat_paths_count(h: MetaDatReaderHandle): csize_t {.exportc, cdecl.} =
+  if h.isNil:
+    return 0.csize_t
+  return csize_t(h.paths.len)
+
+proc ct_meta_dat_path(h: MetaDatReaderHandle, idx: csize_t, out_len: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+  if h.isNil or out_len.isNil or int(idx) >= h.paths.len:
+    return nil
+  out_len[] = csize_t(h.paths[int(idx)].len)
+  if h.paths[int(idx)].len == 0:
+    return nil
+  return cast[ptr uint8](unsafeAddr h.paths[int(idx)][0])
+
+proc ct_meta_dat_recorder_id(h: MetaDatReaderHandle, out_len: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+  if h.isNil or out_len.isNil:
+    return nil
+  out_len[] = csize_t(h.recorderId.len)
+  if h.recorderId.len == 0:
+    return nil
+  return cast[ptr uint8](unsafeAddr h.recorderId[0])
+
+proc ct_meta_dat_free(h: MetaDatReaderHandle) {.exportc, cdecl.} =
+  ## Free a MetaDatContents handle.
+  if h.isNil:
+    return
+  `=destroy`(h[])
+  dealloc(h)
 
 # ---------------------------------------------------------------------------
 # NimMain — required for static/shared lib initialization

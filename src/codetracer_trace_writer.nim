@@ -13,6 +13,7 @@ when defined(nimPreviewSlimSystem):
 ##   paths.json  — ["/path/to/file1.nim", ...]
 
 import std/json
+import std/options
 import results
 import codetracer_ctfs/types
 import codetracer_ctfs/container
@@ -22,6 +23,7 @@ import codetracer_ctfs/chunk_index
 import codetracer_ctfs/zstd_bindings
 import codetracer_trace_types
 import codetracer_trace_writer/split_binary
+import codetracer_trace_writer/meta_dat
 
 export results, codetracer_trace_types
 
@@ -210,6 +212,30 @@ proc sync*(w: var TraceWriter): Result[void, string] =
   if flushRes.isErr:
     return err("failed to flush chunk during sync: " & flushRes.error)
   w.ctfs.syncAllEntries()
+  ok()
+
+# ---------------------------------------------------------------------------
+# meta.dat — binary metadata
+# ---------------------------------------------------------------------------
+
+proc writeMetaDat*(w: var TraceWriter, recorderId: string = "",
+    mcrFields: Option[McrMetaFields] = none(McrMetaFields)
+): Result[void, string] =
+  ## Write binary meta.dat into the CTFS container using the writer's
+  ## current metadata and paths.
+  if w.closed:
+    return err("TraceWriter is already closed")
+
+  let fileRes = w.ctfs.addFile("meta.dat")
+  if fileRes.isErr:
+    return err("failed to add meta.dat: " & fileRes.error)
+  var metaFile = fileRes.get()
+
+  let wRes = meta_dat.writeMetaDat(w.ctfs, metaFile, w.metadata, w.paths,
+      recorderId = recorderId,
+      mcrFields = mcrFields)
+  if wRes.isErr:
+    return err("failed to write meta.dat: " & wRes.error)
   ok()
 
 # ---------------------------------------------------------------------------

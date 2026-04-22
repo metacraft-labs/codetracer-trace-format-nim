@@ -98,9 +98,9 @@ int main(void) {
     ASSERT(trace_writer_close(writer) == 0, "close should succeed");
     printf("[OK] trace_writer_close\n");
 
-    /* Verify the .ct file exists */
-    ASSERT(file_exists("test_program.ct"), "test_program.ct should exist");
-    printf("[OK] test_program.ct file exists\n");
+    /* Verify the .ct file exists (it's created in the same dir as events path) */
+    ASSERT(file_exists("/tmp/test_program.ct"), "test_program.ct should exist in /tmp");
+    printf("[OK] /tmp/test_program.ct file exists\n");
 
     /* Free the writer */
     trace_writer_free(writer);
@@ -113,8 +113,140 @@ int main(void) {
     printf("[OK] NULL handle safety\n");
 
     /* Clean up */
-    remove("test_program.ct");
+    remove("/tmp/test_program.ct");
 
-    printf("\n=== All tests passed! ===\n");
+    printf("\n=== All tests passed! ===\n\n");
+
+    /* ================================================================
+     * meta.dat roundtrip test: write to buffer, read back, verify
+     * ================================================================ */
+    printf("=== C FFI meta.dat roundtrip test ===\n\n");
+
+    {
+        const char* prog = "my_program";
+        const char* wd = "/home/user/project";
+        const char* arg_strs[] = { "--verbose", "-o", "out.txt" };
+        const uint8_t* arg_ptrs[] = {
+            (const uint8_t*)arg_strs[0],
+            (const uint8_t*)arg_strs[1],
+            (const uint8_t*)arg_strs[2]
+        };
+        size_t arg_lens[] = { strlen(arg_strs[0]), strlen(arg_strs[1]), strlen(arg_strs[2]) };
+
+        const char* path_strs[] = { "/src/main.c", "/src/util.c" };
+        const uint8_t* path_ptrs[] = {
+            (const uint8_t*)path_strs[0],
+            (const uint8_t*)path_strs[1]
+        };
+        size_t path_lens[] = { strlen(path_strs[0]), strlen(path_strs[1]) };
+
+        const char* rec_id = "test-recorder-v1";
+
+        uint8_t* buf = NULL;
+        size_t buf_len = 0;
+
+        int rc = ct_write_meta_dat_to_buffer(
+            (const uint8_t*)prog, strlen(prog),
+            (const uint8_t*)wd, strlen(wd),
+            arg_ptrs, arg_lens, 3,
+            path_ptrs, path_lens, 2,
+            (const uint8_t*)rec_id, strlen(rec_id),
+            &buf, &buf_len);
+        ASSERT(rc == 0, "ct_write_meta_dat_to_buffer should succeed");
+        ASSERT(buf != NULL, "output buffer should be non-NULL");
+        ASSERT(buf_len > 8, "output buffer should have at least header bytes");
+        printf("[OK] ct_write_meta_dat_to_buffer (len=%zu)\n", buf_len);
+
+        /* Check magic bytes */
+        ASSERT(buf[0] == 'C' && buf[1] == 'T' && buf[2] == 'M' && buf[3] == 'D',
+            "magic bytes should be CTMD");
+        printf("[OK] magic bytes\n");
+
+        /* Read back */
+        meta_dat_reader_t reader = ct_read_meta_dat(buf, buf_len);
+        ASSERT(reader != NULL, "ct_read_meta_dat should return non-NULL");
+        printf("[OK] ct_read_meta_dat\n");
+
+        /* Verify program */
+        size_t len;
+        const uint8_t* p = ct_meta_dat_program(reader, &len);
+        ASSERT(p != NULL && len == strlen(prog), "program length mismatch");
+        ASSERT(memcmp(p, prog, len) == 0, "program content mismatch");
+        printf("[OK] program = \"%.*s\"\n", (int)len, (const char*)p);
+
+        /* Verify workdir */
+        p = ct_meta_dat_workdir(reader, &len);
+        ASSERT(p != NULL && len == strlen(wd), "workdir length mismatch");
+        ASSERT(memcmp(p, wd, len) == 0, "workdir content mismatch");
+        printf("[OK] workdir = \"%.*s\"\n", (int)len, (const char*)p);
+
+        /* Verify args */
+        ASSERT(ct_meta_dat_args_count(reader) == 3, "args count should be 3");
+        for (size_t i = 0; i < 3; i++) {
+            p = ct_meta_dat_arg(reader, i, &len);
+            ASSERT(p != NULL && len == strlen(arg_strs[i]), "arg length mismatch");
+            ASSERT(memcmp(p, arg_strs[i], len) == 0, "arg content mismatch");
+            printf("[OK] arg[%zu] = \"%.*s\"\n", i, (int)len, (const char*)p);
+        }
+
+        /* Verify paths */
+        ASSERT(ct_meta_dat_paths_count(reader) == 2, "paths count should be 2");
+        for (size_t i = 0; i < 2; i++) {
+            p = ct_meta_dat_path(reader, i, &len);
+            ASSERT(p != NULL && len == strlen(path_strs[i]), "path length mismatch");
+            ASSERT(memcmp(p, path_strs[i], len) == 0, "path content mismatch");
+            printf("[OK] path[%zu] = \"%.*s\"\n", i, (int)len, (const char*)p);
+        }
+
+        /* Verify recorder_id */
+        p = ct_meta_dat_recorder_id(reader, &len);
+        ASSERT(p != NULL && len == strlen(rec_id), "recorder_id length mismatch");
+        ASSERT(memcmp(p, rec_id, len) == 0, "recorder_id content mismatch");
+        printf("[OK] recorder_id = \"%.*s\"\n", (int)len, (const char*)p);
+
+        /* Out of bounds arg/path should return NULL */
+        ASSERT(ct_meta_dat_arg(reader, 99, &len) == NULL, "out-of-bounds arg should be NULL");
+        ASSERT(ct_meta_dat_path(reader, 99, &len) == NULL, "out-of-bounds path should be NULL");
+        printf("[OK] out-of-bounds safety\n");
+
+        /* Free reader and buffer */
+        ct_meta_dat_free(reader);
+        ct_free_buffer(buf);
+        printf("[OK] ct_meta_dat_free + ct_free_buffer\n");
+
+        /* NULL safety */
+        ct_meta_dat_free(NULL);
+        ct_free_buffer(NULL);
+        ASSERT(ct_read_meta_dat(NULL, 0) == NULL, "read NULL data should return NULL");
+        printf("[OK] NULL safety\n");
+    }
+
+    /* Test ct_write_meta_dat via trace writer handle */
+    {
+        trace_writer_t w = trace_writer_new("meta_test_prog", FFI_TRACE_FORMAT_BINARY);
+        ASSERT(w != NULL, "trace_writer_new for meta_dat test");
+
+        trace_writer_set_workdir(w, "/tmp/meta_workdir");
+        ASSERT(trace_writer_begin_events(w, "/tmp/events.bin") == 0,
+            "begin_events for meta_dat test");
+
+        trace_writer_start(w, "/test/main.py", 1);
+        trace_writer_register_step(w, "/test/helper.py", 10);
+
+        const char* rec = "ffi-recorder";
+        int rc = ct_write_meta_dat(w, (const uint8_t*)rec, strlen(rec));
+        ASSERT(rc == 0, "ct_write_meta_dat should succeed");
+        printf("[OK] ct_write_meta_dat via trace writer handle\n");
+
+        ASSERT(trace_writer_close(w) == 0, "close for meta_dat test");
+        trace_writer_free(w);
+
+        /* Verify the .ct file was created (in /tmp, same dir as events path) */
+        ASSERT(file_exists("/tmp/meta_test_prog.ct"), "meta_test_prog.ct should exist in /tmp");
+        printf("[OK] /tmp/meta_test_prog.ct exists with meta.dat\n");
+        remove("/tmp/meta_test_prog.ct");
+    }
+
+    printf("\n=== All meta.dat tests passed! ===\n");
     return 0;
 }

@@ -149,6 +149,43 @@ void trace_writer_register_variable_raw(trace_writer_t handle,
 void trace_writer_register_special_event(trace_writer_t handle,
     int kind, const char* metadata, const char* content);
 
+/* --------------------------------------------------------------------------
+ * meta.dat — write via trace writer handle
+ * -------------------------------------------------------------------------- */
+
+int ct_write_meta_dat(trace_writer_t handle,
+                      const uint8_t* recorder_id, size_t recorder_id_len);
+
+/* --------------------------------------------------------------------------
+ * meta.dat — standalone buffer write
+ * -------------------------------------------------------------------------- */
+
+int ct_write_meta_dat_to_buffer(
+    const uint8_t* program, size_t program_len,
+    const uint8_t* workdir, size_t workdir_len,
+    const uint8_t* const* args, const size_t* arg_lens, size_t args_count,
+    const uint8_t* const* paths, const size_t* path_lens, size_t paths_count,
+    const uint8_t* recorder_id, size_t recorder_id_len,
+    uint8_t** out_buf, size_t* out_len);
+
+void ct_free_buffer(uint8_t* buf);
+
+/* --------------------------------------------------------------------------
+ * meta.dat — reader handle
+ * -------------------------------------------------------------------------- */
+
+typedef void* meta_dat_reader_t;
+
+meta_dat_reader_t ct_read_meta_dat(const uint8_t* data, size_t len);
+const uint8_t* ct_meta_dat_program(meta_dat_reader_t h, size_t* out_len);
+const uint8_t* ct_meta_dat_workdir(meta_dat_reader_t h, size_t* out_len);
+size_t ct_meta_dat_args_count(meta_dat_reader_t h);
+const uint8_t* ct_meta_dat_arg(meta_dat_reader_t h, size_t idx, size_t* out_len);
+size_t ct_meta_dat_paths_count(meta_dat_reader_t h);
+const uint8_t* ct_meta_dat_path(meta_dat_reader_t h, size_t idx, size_t* out_len);
+const uint8_t* ct_meta_dat_recorder_id(meta_dat_reader_t h, size_t* out_len);
+void ct_meta_dat_free(meta_dat_reader_t h);
+
 #ifdef __cplusplus
 }
 #endif
