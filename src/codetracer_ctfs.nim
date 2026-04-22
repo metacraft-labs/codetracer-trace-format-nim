@@ -25,6 +25,7 @@ import codetracer_ctfs/fixed_record_table
 import codetracer_ctfs/variable_record_table
 import codetracer_ctfs/zstd_bindings
 import codetracer_ctfs/seekable_zstd
+import codetracer_ctfs/chunked_compressed_table
 
 import codetracer_trace_types
 import codetracer_trace_writer/varint
@@ -40,6 +41,7 @@ export fixed_record_table
 export variable_record_table
 export zstd_bindings
 export seekable_zstd
+export chunked_compressed_table
 
 export codetracer_trace_types
 export varint

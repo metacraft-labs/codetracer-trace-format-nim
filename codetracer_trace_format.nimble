@@ -18,6 +18,7 @@ task test, "Run all tests":
   exec "nim c -r tests/test_fixed_record_table.nim"
   exec "nim c -r tests/test_variable_record_table.nim"
   exec "nim c -r tests/test_seekable_zstd.nim"
+  exec "nim c -r tests/test_chunked_compressed_table.nim"
   exec "nim c -r tests/test_trace_types.nim"
   exec "nim c -r tests/test_varint.nim"
   exec "nim c -r tests/test_split_binary.nim"
@@ -33,6 +34,7 @@ task regenerateFixtures, "Regenerate .expected golden fixture files":
 task bench, "Run benchmarks":
   exec "nim c -d:release -r tests/bench_seekable_zstd.nim"
   exec "nim c -d:release -r tests/bench_split_binary.nim"
+  exec "nim c -d:release -r tests/test_chunked_compressed_table.nim"
 
 task benchSplitBinary, "Run split-binary benchmarks":
   exec "nim c -d:release -r tests/bench_split_binary.nim"
