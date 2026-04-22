@@ -19,4 +19,6 @@ tests/bench_split_binary
 tests/bench_seekable_zstd
 tests/test_trace_reader
 tests/test_meta_dat
+tests/test_fixed_record_table
+tests/test_variable_record_table
 ct-print

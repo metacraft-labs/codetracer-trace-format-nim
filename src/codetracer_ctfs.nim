@@ -22,6 +22,7 @@ import codetracer_ctfs/container
 import codetracer_ctfs/streaming
 import codetracer_ctfs/chunk_index
 import codetracer_ctfs/fixed_record_table
+import codetracer_ctfs/variable_record_table
 import codetracer_ctfs/zstd_bindings
 import codetracer_ctfs/seekable_zstd
 
@@ -36,6 +37,7 @@ export container
 export streaming
 export chunk_index
 export fixed_record_table
+export variable_record_table
 export zstd_bindings
 export seekable_zstd
 
