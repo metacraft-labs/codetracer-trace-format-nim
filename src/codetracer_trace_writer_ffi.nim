@@ -34,6 +34,10 @@
 import codetracer_trace_writer
 import codetracer_trace_types
 import codetracer_trace_writer/meta_dat
+import codetracer_trace_writer/multi_stream_writer
+import codetracer_trace_writer/value_stream
+import codetracer_trace_writer/io_event_stream
+import codetracer_trace_writer/streaming_value_encoder
 import std/tables
 import std/os
 import std/options
@@ -72,8 +76,26 @@ type
     langType: string
 
   TraceWriterState = object
+    # Old writer (single-stream CTFS)
     writer: TraceWriter
     writerReady: bool  # true once .ct file has been created
+
+    # New writer (multi-stream CTFS)
+    msWriter: MultiStreamTraceWriter
+    msWriterReady: bool
+    useMultiStream: bool
+
+    # Pending step buffering for multi-stream mode:
+    # The old FFI registers step FIRST, then variables one-at-a-time.
+    # The multi-stream API writes step + all values together.
+    # So we buffer the step info and accumulate values, then flush
+    # on the next step or on close.
+    hasPendingStep: bool
+    pendingStepPathId: uint64
+    pendingStepLine: uint64
+    pendingValues: seq[VariableValue]
+
+    ctFilePath: string  # path to the .ct output file (set in begin_events)
     programName: string  # stored from trace_writer_new, used when creating .ct
     workdir: string
     started: bool
@@ -187,6 +209,9 @@ proc trace_writer_new(
   let state = cast[TraceWriterHandle](alloc0(sizeof(TraceWriterState)))
   state[] = TraceWriterState(
     writerReady: false,
+    msWriterReady: false,
+    useMultiStream: format == ffiBinary,
+    hasPendingStep: false,
     programName: prog,
     workdir: "",
     started: false,
@@ -202,8 +227,14 @@ proc trace_writer_free(handle: TraceWriterHandle) {.exportc, cdecl.} =
   if handle.isNil:
     return
   # Close if writer was actually created and not already closed
-  if handle.writerReady and not handle.writer.closed:
-    discard handle.writer.close()
+  if handle.useMultiStream:
+    if handle.msWriterReady:
+      # close() is idempotent — safe to call even if already closed
+      discard handle.msWriter.close()
+      handle.msWriter.closeCtfs()
+  else:
+    if handle.writerReady and not handle.writer.closed:
+      discard handle.writer.close()
   `=destroy`(handle[])
   dealloc(handle)
 
@@ -239,6 +270,27 @@ proc trace_writer_begin_events(
     setError("NULL handle")
     return 1.cint
 
+  if handle.useMultiStream:
+    if handle.msWriterReady:
+      return 0.cint
+
+    let eventsPath = toNimStr(path)
+    let outDir = parentDir(eventsPath)
+    let (_, progBase, _) = splitFile(handle.programName)
+    let ctPath = outDir / (progBase & ".ct")
+
+    let res = initMultiStreamWriter(ctPath, handle.programName)
+    if res.isErr:
+      setError(res.error)
+      return 1.cint
+
+    handle.msWriter = res.get()
+    handle.msWriter.metadata.workdir = handle.workdir
+    handle.msWriterReady = true
+    handle.ctFilePath = ctPath
+    return 0.cint
+
+  # Old single-stream path
   if handle.writerReady:
     # Already initialized — nothing to do (idempotent)
     return 0.cint
@@ -264,6 +316,9 @@ proc trace_writer_finish_events(handle: TraceWriterHandle): cint {.exportc, cdec
   if handle.isNil:
     setError("NULL handle")
     return 1.cint
+  if handle.useMultiStream:
+    # Multi-stream writer flushes on close; nothing to do here
+    return 0.cint
   if not handle.writerReady:
     return 0.cint
   # Flush (sync) current events
@@ -289,6 +344,26 @@ proc trace_writer_finish_paths(handle: TraceWriterHandle): cint {.exportc, cdecl
   0.cint
 
 # ---------------------------------------------------------------------------
+# Multi-stream helpers
+# ---------------------------------------------------------------------------
+
+proc flushPendingStep(handle: TraceWriterHandle): cint =
+  ## Flush the buffered pending step and its accumulated variable values
+  ## to the multi-stream writer. Returns 0 on success, 1 on error.
+  if not handle.hasPendingStep:
+    return 0.cint
+  let res = handle.msWriter.registerStep(
+    handle.pendingStepPathId,
+    handle.pendingStepLine,
+    handle.pendingValues)
+  if res.isErr:
+    setError(res.error)
+    return 1.cint
+  handle.pendingValues.setLen(0)
+  handle.hasPendingStep = false
+  0.cint
+
+# ---------------------------------------------------------------------------
 # Tracing primitives
 # ---------------------------------------------------------------------------
 
@@ -301,6 +376,21 @@ proc trace_writer_start(
   if handle.isNil:
     return
   let p = toNimStr(path)
+
+  if handle.useMultiStream:
+    if not handle.msWriterReady:
+      return
+    let pathIdRes = handle.msWriter.registerPath(p)
+    if pathIdRes.isErr:
+      return
+    let pathId = pathIdRes.get()
+    # Buffer this as the first pending step
+    handle.pendingStepPathId = pathId
+    handle.pendingStepLine = uint64(line)
+    handle.hasPendingStep = true
+    handle.started = true
+    return
+
   # Register path
   discard handle.writer.writePath(p)
   # Write the first step at pathId 0 (first registered path)
@@ -318,7 +408,10 @@ proc trace_writer_set_workdir(
     return
   handle.workdir = toNimStr(workdir)
   # Update the metadata in the writer if already created
-  if handle.writerReady:
+  if handle.useMultiStream:
+    if handle.msWriterReady:
+      handle.msWriter.metadata.workdir = handle.workdir
+  elif handle.writerReady:
     handle.writer.metadata.workdir = handle.workdir
 
 proc trace_writer_register_step(
@@ -330,6 +423,23 @@ proc trace_writer_register_step(
   if handle.isNil:
     return
   let p = toNimStr(path)
+
+  if handle.useMultiStream:
+    if not handle.msWriterReady:
+      return
+    # Flush the previous pending step (with its accumulated values)
+    discard flushPendingStep(handle)
+
+    let pathIdRes = handle.msWriter.registerPath(p)
+    if pathIdRes.isErr:
+      return
+    let pathId = pathIdRes.get()
+    # Buffer this as the new pending step
+    handle.pendingStepPathId = pathId
+    handle.pendingStepLine = uint64(line)
+    handle.hasPendingStep = true
+    return
+
   # Register path (dedup handled by paths list — emit every time like Rust)
   discard handle.writer.writePath(p)
   # pathId is the count of paths registered so far minus 1
@@ -357,9 +467,14 @@ proc trace_writer_ensure_function_id(
   handle.functions.add(FunctionEntry(name: n, path: p, line: line))
   handle.functionIndex[key] = id
 
-  # Emit function event: use pathId 0 for now (callers should register paths first)
-  # In practice recorders call ensure_function_id with the path they already registered
-  discard handle.writer.writeFunction(0'u64, line, n)
+  if handle.useMultiStream:
+    # Intern the function name in the multi-stream interning table
+    if handle.msWriterReady:
+      discard handle.msWriter.registerFunction(n)
+  else:
+    # Emit function event: use pathId 0 for now (callers should register paths first)
+    # In practice recorders call ensure_function_id with the path they already registered
+    discard handle.writer.writeFunction(0'u64, line, n)
 
   return id
 
@@ -383,15 +498,20 @@ proc trace_writer_ensure_type_id(
   handle.types.add(TypeEntry(kind: tk, langType: lt))
   handle.typeIndex[key] = id
 
-  # Emit type event
-  discard handle.writer.writeEvent(TraceLowLevelEvent(
-    kind: tleType,
-    typeRecord: TypeRecord(
-      kind: tk,
-      langType: lt,
-      specificInfo: TypeSpecificInfo(kind: tsikNone),
-    ),
-  ))
+  if handle.useMultiStream:
+    # Intern the type name in the multi-stream interning table
+    if handle.msWriterReady:
+      discard handle.msWriter.registerType(lt)
+  else:
+    # Emit type event
+    discard handle.writer.writeEvent(TraceLowLevelEvent(
+      kind: tleType,
+      typeRecord: TypeRecord(
+        kind: tk,
+        langType: lt,
+        specificInfo: TypeSpecificInfo(kind: tsikNone),
+      ),
+    ))
 
   return id
 
@@ -402,11 +522,18 @@ proc trace_writer_register_call(
   ## Register a call to the function identified by function_id.
   if handle.isNil:
     return
+  if handle.useMultiStream:
+    var emptyArgs: seq[seq[byte]]
+    discard handle.msWriter.registerCall(uint64(function_id), emptyArgs)
+    return
   discard handle.writer.writeCall(uint64(function_id))
 
 proc trace_writer_register_return(handle: TraceWriterHandle) {.exportc, cdecl.} =
   ## Register a function return with no explicit return value.
   if handle.isNil:
+    return
+  if handle.useMultiStream:
+    discard handle.msWriter.registerReturn()
     return
   discard handle.writer.writeReturn()
 
@@ -420,6 +547,15 @@ proc trace_writer_register_return_int(
   if handle.isNil:
     return
   let typeId = trace_writer_ensure_type_id(handle, type_kind, type_name)
+
+  if handle.useMultiStream:
+    # Encode the return value as CBOR bytes using the streaming encoder
+    var sve = StreamingValueEncoder.init()
+    discard sve.writeInt(value, uint64(typeId))
+    let retBytes = sve.getBytes()
+    discard handle.msWriter.registerReturn(retBytes)
+    return
+
   discard handle.writer.writeEvent(TraceLowLevelEvent(
     kind: tleReturn,
     returnRecord: ReturnRecord(
@@ -441,6 +577,14 @@ proc trace_writer_register_return_raw(
   if handle.isNil:
     return
   let typeId = trace_writer_ensure_type_id(handle, type_kind, type_name)
+
+  if handle.useMultiStream:
+    var sve = StreamingValueEncoder.init()
+    discard sve.writeRaw(toNimStr(value_repr), uint64(typeId))
+    let retBytes = sve.getBytes()
+    discard handle.msWriter.registerReturn(retBytes)
+    return
+
   discard handle.writer.writeEvent(TraceLowLevelEvent(
     kind: tleReturn,
     returnRecord: ReturnRecord(
@@ -463,6 +607,22 @@ proc trace_writer_register_variable_int(
   if handle.isNil:
     return
   let typeId = trace_writer_ensure_type_id(handle, type_kind, type_name)
+
+  if handle.useMultiStream:
+    # Intern the variable name
+    if handle.msWriterReady:
+      let vnIdRes = handle.msWriter.registerVarname(toNimStr(name))
+      if vnIdRes.isErr:
+        return
+      let vnId = vnIdRes.get()
+      # Encode the value as CBOR
+      var sve = StreamingValueEncoder.init()
+      discard sve.writeInt(value, uint64(typeId))
+      let data = sve.getBytes()
+      handle.pendingValues.add(VariableValue(
+        varnameId: vnId, typeId: uint64(typeId), data: data))
+    return
+
   # Emit variable name event
   discard handle.writer.writeEvent(TraceLowLevelEvent(
     kind: tleVariableName,
@@ -486,6 +646,22 @@ proc trace_writer_register_variable_raw(
   if handle.isNil:
     return
   let typeId = trace_writer_ensure_type_id(handle, type_kind, type_name)
+
+  if handle.useMultiStream:
+    # Intern the variable name
+    if handle.msWriterReady:
+      let vnIdRes = handle.msWriter.registerVarname(toNimStr(name))
+      if vnIdRes.isErr:
+        return
+      let vnId = vnIdRes.get()
+      # Encode the value as CBOR
+      var sve = StreamingValueEncoder.init()
+      discard sve.writeRaw(toNimStr(value_repr), uint64(typeId))
+      let data = sve.getBytes()
+      handle.pendingValues.add(VariableValue(
+        varnameId: vnId, typeId: uint64(typeId), data: data))
+    return
+
   # Emit variable name event
   discard handle.writer.writeEvent(TraceLowLevelEvent(
     kind: tleVariableName,
@@ -498,6 +674,20 @@ proc trace_writer_register_variable_raw(
     rawTypeId: TypeId(typeId),
   ))
 
+proc toIOEventKind(k: FfiEventLogKind): IOEventKind =
+  ## Map FFI event log kinds to multi-stream IOEventKind.
+  ## The multi-stream IO event stream has a simpler set of kinds.
+  case k
+  of ffiElkWrite, ffiElkWriteFile, ffiElkWriteOther:
+    ioStdout
+  of ffiElkRead, ffiElkReadFile, ffiElkReadOther, ffiElkReadDir,
+      ffiElkOpenDir, ffiElkCloseDir, ffiElkSocket, ffiElkOpen:
+    ioFileOp
+  of ffiElkError:
+    ioError
+  of ffiElkTraceLogEvent, ffiElkEvmEvent:
+    ioStderr
+
 proc trace_writer_register_special_event(
     handle: TraceWriterHandle,
     kind: FfiEventLogKind,
@@ -507,6 +697,16 @@ proc trace_writer_register_special_event(
   ## Register an I/O or special event with optional metadata.
   if handle.isNil:
     return
+
+  if handle.useMultiStream:
+    # Combine metadata + content into IO event data
+    let contentStr = toNimStr(content)
+    var data = newSeq[byte](contentStr.len)
+    for i in 0 ..< contentStr.len:
+      data[i] = byte(contentStr[i])
+    discard handle.msWriter.registerIOEvent(toIOEventKind(kind), data)
+    return
+
   discard handle.writer.writeEvent(TraceLowLevelEvent(
     kind: tleEvent,
     recordEvent: RecordEvent(
@@ -527,6 +727,31 @@ proc trace_writer_close(handle: TraceWriterHandle): cint {.exportc, cdecl.} =
   if handle.isNil:
     setError("NULL handle")
     return 1.cint
+
+  if handle.useMultiStream:
+    if not handle.msWriterReady:
+      return 0.cint
+    # Flush the last pending step
+    let flushRc = flushPendingStep(handle)
+    if flushRc != 0:
+      return flushRc
+    let closeRes = handle.msWriter.close()
+    if closeRes.isErr:
+      setError(closeRes.error)
+      return 1.cint
+    # Write the in-memory CTFS bytes to disk
+    let ctfsBytes = handle.msWriter.toBytes()
+    try:
+      var f = open(handle.ctFilePath, fmWrite)
+      if ctfsBytes.len > 0:
+        discard f.writeBuffer(unsafeAddr ctfsBytes[0], ctfsBytes.len)
+      f.close()
+    except IOError:
+      setError("failed to write .ct file: " & handle.ctFilePath)
+      return 1.cint
+    handle.msWriter.closeCtfs()
+    return 0.cint
+
   if not handle.writerReady:
     # Writer was never opened — nothing to close
     return 0.cint
@@ -553,6 +778,15 @@ proc ct_write_meta_dat(
   if handle.isNil:
     setError("NULL handle")
     return 1.cint
+
+  if handle.useMultiStream:
+    # Multi-stream writer writes meta.dat automatically during close().
+    # Nothing to do here — the metadata and paths are already tracked.
+    if not handle.msWriterReady:
+      setError("writer not ready (call begin_events first)")
+      return 1.cint
+    return 0.cint
+
   if not handle.writerReady:
     setError("writer not ready (call begin_events first)")
     return 1.cint
@@ -724,8 +958,6 @@ proc ct_meta_dat_free(h: MetaDatReaderHandle) {.exportc, cdecl.} =
 # ---------------------------------------------------------------------------
 # Streaming Value Encoder — C FFI
 # ---------------------------------------------------------------------------
-
-import codetracer_trace_writer/streaming_value_encoder
 
 type ValueEncoderHandle = ptr StreamingValueEncoder
 

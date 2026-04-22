@@ -328,6 +328,11 @@ proc encodeCborValueRecordInto*(buf: var SafeBuffer, v: ValueRecord) =
     buf.writeOpenArray(CborKeyTypeId2)
     buf.writeCborUint(uint64(v.charTypeId))
 
+  of vrkValueRef:
+    # CBOR tag: major type 6
+    buf.writeCborTypeAndValue(6, CborTagValueRef)
+    buf.writeCborUint(uint64(v.refId))
+
 proc encodeCborTypeSpecificInfoInto(buf: var SafeBuffer, si: TypeSpecificInfo) {.inline.} =
   case si.kind
   of tsikNone:

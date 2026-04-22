@@ -147,6 +147,25 @@ proc registerPath*(w: var MultiStreamTraceWriter,
   ok(id)
 
 # ---------------------------------------------------------------------------
+# Function / Type / Varname registration (interning)
+# ---------------------------------------------------------------------------
+
+proc registerFunction*(w: var MultiStreamTraceWriter,
+    name: string): Result[uint64, string] =
+  ## Register a function name and return its interned ID.
+  w.ctfs.ensureFunctionId(w.interning, name)
+
+proc registerType*(w: var MultiStreamTraceWriter,
+    name: string): Result[uint64, string] =
+  ## Register a type name and return its interned ID.
+  w.ctfs.ensureTypeId(w.interning, name)
+
+proc registerVarname*(w: var MultiStreamTraceWriter,
+    name: string): Result[uint64, string] =
+  ## Register a variable name and return its interned ID.
+  w.ctfs.ensureVarnameId(w.interning, name)
+
+# ---------------------------------------------------------------------------
 # Step registration
 # ---------------------------------------------------------------------------
 

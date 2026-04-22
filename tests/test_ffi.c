@@ -247,6 +247,99 @@ int main(void) {
         remove("/tmp/meta_test_prog.ct");
     }
 
-    printf("\n=== All meta.dat tests passed! ===\n");
+    printf("\n=== All meta.dat tests passed! ===\n\n");
+
+    /* ================================================================
+     * Old single-stream format test (BINARY_V0)
+     * Ensures backward compat: useMultiStream=false
+     * ================================================================ */
+    printf("=== Old format (BINARY_V0) backward-compat test ===\n\n");
+    {
+        trace_writer_t w = trace_writer_new("old_format_test", FFI_TRACE_FORMAT_BINARY_V0);
+        ASSERT(w != NULL, "trace_writer_new (old format)");
+
+        trace_writer_set_workdir(w, "/tmp/old_workdir");
+        ASSERT(trace_writer_begin_events(w, "/tmp/old_events.bin") == 0,
+            "begin_events (old format)");
+
+        trace_writer_start(w, "/test/old_main.py", 1);
+        trace_writer_register_step(w, "/test/old_main.py", 5);
+
+        size_t fn = trace_writer_ensure_function_id(w, "old_func", "/test/old_main.py", 10);
+        ASSERT(fn != (size_t)-1, "ensure_function_id (old format)");
+
+        size_t tid = trace_writer_ensure_type_id(w, FFI_TYPE_INT, "int");
+        ASSERT(tid != (size_t)-1, "ensure_type_id (old format)");
+
+        trace_writer_register_call(w, fn);
+        trace_writer_register_variable_int(w, "x", 99, FFI_TYPE_INT, "int");
+        trace_writer_register_return_int(w, 0, FFI_TYPE_INT, "int");
+
+        ASSERT(trace_writer_close(w) == 0, "close (old format)");
+        ASSERT(file_exists("/tmp/old_format_test.ct"), "old_format_test.ct should exist");
+        printf("[OK] old format roundtrip\n");
+
+        trace_writer_free(w);
+        remove("/tmp/old_format_test.ct");
+    }
+    printf("\n=== Old format test passed! ===\n\n");
+
+    /* ================================================================
+     * Multi-stream format test (BINARY = 2)
+     * Verifies the new multi-stream writer produces a valid .ct file
+     * ================================================================ */
+    printf("=== Multi-stream format test ===\n\n");
+    {
+        trace_writer_t w = trace_writer_new("ms_test", FFI_TRACE_FORMAT_BINARY);
+        ASSERT(w != NULL, "trace_writer_new (multi-stream)");
+
+        trace_writer_set_workdir(w, "/tmp/ms_workdir");
+        ASSERT(trace_writer_begin_events(w, "/tmp/ms_events.bin") == 0,
+            "begin_events (multi-stream)");
+
+        /* Start tracing */
+        trace_writer_start(w, "/test/ms_main.py", 1);
+        printf("[OK] ms: start\n");
+
+        /* Register steps with variables */
+        trace_writer_register_step(w, "/test/ms_main.py", 5);
+        trace_writer_register_variable_int(w, "counter", 42, FFI_TYPE_INT, "int");
+        trace_writer_register_variable_raw(w, "name", "\"alice\"", FFI_TYPE_STRING, "str");
+        printf("[OK] ms: step + variables\n");
+
+        /* Register another step */
+        trace_writer_register_step(w, "/test/ms_helper.py", 10);
+        trace_writer_register_variable_int(w, "result", 100, FFI_TYPE_INT, "int");
+        printf("[OK] ms: second step + variable\n");
+
+        /* Function call/return */
+        size_t fn = trace_writer_ensure_function_id(w, "compute", "/test/ms_helper.py", 8);
+        ASSERT(fn != (size_t)-1, "ensure_function_id (multi-stream)");
+        trace_writer_register_call(w, fn);
+        trace_writer_register_return_int(w, 42, FFI_TYPE_INT, "int");
+        printf("[OK] ms: call/return\n");
+
+        /* IO event */
+        trace_writer_register_special_event(w, FFI_EVENT_WRITE, "stdout", "Hello!\n");
+        printf("[OK] ms: special event\n");
+
+        /* Close — this flushes pending step and writes .ct file */
+        ASSERT(trace_writer_close(w) == 0, "close (multi-stream)");
+        ASSERT(file_exists("/tmp/ms_test.ct"), "ms_test.ct should exist");
+        printf("[OK] ms: close + file exists\n");
+
+        /* Verify file is non-empty */
+        {
+            struct stat st;
+            ASSERT(stat("/tmp/ms_test.ct", &st) == 0, "stat ms_test.ct");
+            ASSERT(st.st_size > 100, "ms_test.ct should be non-trivial size");
+            printf("[OK] ms: file size = %ld bytes\n", (long)st.st_size);
+        }
+
+        trace_writer_free(w);
+        remove("/tmp/ms_test.ct");
+    }
+    printf("\n=== Multi-stream format test passed! ===\n");
+
     return 0;
 }
