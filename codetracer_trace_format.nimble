@@ -42,6 +42,7 @@ task bench, "Run benchmarks":
   exec "nim c -d:release -r tests/bench_seekable_zstd.nim"
   exec "nim c -d:release -r tests/bench_split_binary.nim"
   exec "nim c -d:release -r tests/test_chunked_compressed_table.nim"
+  exec "nim c -d:release -r tests/bench_varint.nim"
 
 task benchSplitBinary, "Run split-binary benchmarks":
   exec "nim c -d:release -r tests/bench_split_binary.nim"

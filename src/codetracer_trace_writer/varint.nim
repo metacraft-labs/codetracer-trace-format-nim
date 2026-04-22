@@ -20,6 +20,21 @@ proc encodeVarint*(val: uint64, output: var seq[byte]) {.raises: [].} =
     if v == 0:
       break
 
+proc encodeVarintTo*(val: uint64, output: var openArray[byte], pos: var int) {.raises: [].} =
+  ## Encode an unsigned 64-bit integer as LEB128 into a pre-allocated buffer.
+  ## Advances pos past the written bytes. Caller must ensure enough space
+  ## (max 10 bytes per varint).
+  var v = val
+  while true:
+    var b = byte(v and 0x7F)
+    v = v shr 7
+    if v != 0:
+      b = b or 0x80
+    output[pos] = b
+    pos += 1
+    if v == 0:
+      break
+
 proc decodeVarint*(data: openArray[byte], pos: var int): Result[uint64, string] {.raises: [].} =
   ## Decode a LEB128 unsigned varint from data starting at pos.
   ## Advances pos past the consumed bytes.
