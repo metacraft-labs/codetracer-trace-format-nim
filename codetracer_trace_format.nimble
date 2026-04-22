@@ -35,6 +35,7 @@ task test, "Run all tests":
   exec "nim c -r -d:release -p:src tests/test_shard_writer.nim"
   exec "nim c -r -p:src tests/test_step_encoding.nim"
   exec "nim c -r -p:src tests/test_interning_table.nim"
+  exec "nim c -r -p:src tests/test_exec_stream.nim"
 
 task regenerateFixtures, "Regenerate .expected golden fixture files":
   exec "nim c -r tests/generate_golden_fixtures.nim"
@@ -44,6 +45,7 @@ task bench, "Run benchmarks":
   exec "nim c -d:release -r tests/bench_split_binary.nim"
   exec "nim c -d:release -r tests/test_chunked_compressed_table.nim"
   exec "nim c -d:release -r tests/bench_varint.nim"
+  exec "nim c -d:release -r -p:src tests/test_exec_stream.nim"
 
 task benchSplitBinary, "Run split-binary benchmarks":
   exec "nim c -d:release -r tests/bench_split_binary.nim"
