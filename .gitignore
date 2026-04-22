@@ -28,4 +28,13 @@ tests/test_sub_block_pool
 tests/test_namespace
 tests/test_ct_space
 tests/test_shard_writer
+tests/test_new_trace_reader
+tests/test_call_stream
+tests/test_exec_stream
+tests/test_interning_table
+tests/test_io_event_stream
+tests/test_multi_stream_integration
+tests/test_step_encoding
+tests/test_value_stream
+tests/bench_varint
 ct-print
