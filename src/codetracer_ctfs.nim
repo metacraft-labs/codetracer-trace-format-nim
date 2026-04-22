@@ -30,6 +30,8 @@ import codetracer_ctfs/namespace_descriptor
 import codetracer_ctfs/sub_block_pool
 import codetracer_ctfs/btree
 import codetracer_ctfs/namespace
+import codetracer_ctfs/shard_writer
+import codetracer_ctfs/sharded_namespace
 import codetracer_ctfs/space_analyzer
 
 import codetracer_trace_types
@@ -51,6 +53,8 @@ export namespace_descriptor
 export sub_block_pool
 export btree
 export namespace
+export shard_writer
+export sharded_namespace
 export space_analyzer
 
 export codetracer_trace_types

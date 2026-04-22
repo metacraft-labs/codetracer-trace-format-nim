@@ -32,6 +32,7 @@ task test, "Run all tests":
   exec "nim c -d:release -r tests/test_btree.nim"
   exec "nim c -r -d:release -p:src tests/test_namespace.nim"
   exec "nim c -r -d:release -p:src tests/test_ct_space.nim"
+  exec "nim c -r -d:release -p:src tests/test_shard_writer.nim"
 
 task regenerateFixtures, "Regenerate .expected golden fixture files":
   exec "nim c -r tests/generate_golden_fixtures.nim"

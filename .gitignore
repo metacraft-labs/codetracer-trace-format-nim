@@ -26,4 +26,6 @@ tests/test_namespace_descriptor
 tests/test_btree
 tests/test_sub_block_pool
 tests/test_namespace
+tests/test_ct_space
+tests/test_shard_writer
 ct-print
