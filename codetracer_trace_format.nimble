@@ -49,6 +49,7 @@ task test, "Run all tests":
   exec "nim c -r -d:release -p:src tests/test_linehits_builder.nim"
   exec "nim c -r -p:src tests/test_partial_trace_cache.nim"
   exec "nim c -r -d:release -p:src tests/test_ram_cache.nim"
+  exec "nim c -r -d:release -p:src tests/test_file_access.nim"
 
 task regenerateFixtures, "Regenerate .expected golden fixture files":
   exec "nim c -r tests/generate_golden_fixtures.nim"
@@ -59,6 +60,9 @@ task bench, "Run benchmarks":
   exec "nim c -d:release -r tests/test_chunked_compressed_table.nim"
   exec "nim c -d:release -r tests/bench_varint.nim"
   exec "nim c -d:release -r -p:src tests/test_exec_stream.nim"
+
+task benchSuite, "Run unified benchmark regression suite":
+  exec "nim c -d:release -r -p:src tests/bench_regression_suite.nim"
 
 task benchSplitBinary, "Run split-binary benchmarks":
   exec "nim c -d:release -r tests/bench_split_binary.nim"
