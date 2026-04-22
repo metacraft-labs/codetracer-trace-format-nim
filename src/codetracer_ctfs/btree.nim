@@ -211,3 +211,33 @@ proc rangeScan*(tree: BTree, lo, hi: uint64,
     output[count] = entry
     count += 1
   count
+
+# -----------------------------------------------------------------------------
+# Stats accessors (for space analyzer)
+# -----------------------------------------------------------------------------
+
+proc depth*(tree: BTree): int =
+  ## Compute the depth of the B-tree (1 = root is leaf).
+  var d = 1
+  var node = tree.root
+  while not node.isLeaf:
+    d += 1
+    if node.children.len > 0:
+      node = node.children[0]
+    else:
+      break
+  d
+
+proc nodeCount*(tree: BTree): int =
+  ## Count total number of nodes in the B-tree (BFS traversal).
+  var count = 0
+  var stack: seq[BTreeNode]
+  stack.add(tree.root)
+  while stack.len > 0:
+    let node = stack[^1]
+    stack.setLen(stack.len - 1)
+    count += 1
+    if not node.isLeaf:
+      for child in node.children:
+        stack.add(child)
+  count

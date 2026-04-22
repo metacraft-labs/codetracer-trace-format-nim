@@ -246,6 +246,46 @@ proc promote*(pm: var SubBlockPoolManager, oldAlloc: SubBlockAllocation,
 
   ok(newAlloc)
 
+# -----------------------------------------------------------------------------
+# Stats accessors (for space analyzer)
+# -----------------------------------------------------------------------------
+
+proc totalAllocatedSlots*(pm: SubBlockPoolManager, poolClass: uint8): int =
+  ## Total number of slots (allocated + free) for the given pool class.
+  if poolClass >= uint8(NumPoolClasses):
+    return 0
+  let pc = int(poolClass)
+  int(pm.blockCounts[pc]) * SlotsPerBlock[pc]
+
+proc totalFreeSlots*(pm: SubBlockPoolManager, poolClass: uint8): int =
+  ## Count free slots by walking the free list for the given pool class.
+  if poolClass >= uint8(NumPoolClasses):
+    return 0
+  let pc = int(poolClass)
+  if pm.freeListHeads[pc].isEmpty:
+    return 0
+  var count = 0
+  var blockIdx = pm.freeListHeads[pc].blockIdx
+  var slotIdx = pm.freeListHeads[pc].slotIndex
+  # Walk the free list until we hit the sentinel (0, 0).
+  # Guard against infinite loops with a max iteration count.
+  let maxIter = totalAllocatedSlots(pm, poolClass) + 1
+  while count < maxIter:
+    count += 1
+    let off = slotOffset(poolClass, blockIdx, slotIdx)
+    if off + NextPtrSize > pm.buffers[pc].len:
+      break
+    let (nextBlock, nextSlot) = readNextPtr(pm.buffers[pc], off)
+    if nextBlock == 0 and nextSlot == 0:
+      break
+    blockIdx = nextBlock
+    slotIdx = nextSlot
+  count
+
+proc poolClassBlockCounts*(pm: SubBlockPoolManager): array[7, uint32] =
+  ## Return the block counts per pool class.
+  pm.blockCounts
+
 proc graduate*(pm: var SubBlockPoolManager, oldAlloc: SubBlockAllocation): Result[seq[byte], string] =
   ## Graduate an entry from sub-block to a standalone byte sequence.
   ## Returns the data copied from the sub-block slot. The old slot is freed.

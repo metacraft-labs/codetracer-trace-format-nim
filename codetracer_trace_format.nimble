@@ -31,6 +31,7 @@ task test, "Run all tests":
   exec "nim c -d:release -r tests/test_sub_block_pool.nim"
   exec "nim c -d:release -r tests/test_btree.nim"
   exec "nim c -r -d:release -p:src tests/test_namespace.nim"
+  exec "nim c -r -d:release -p:src tests/test_ct_space.nim"
 
 task regenerateFixtures, "Regenerate .expected golden fixture files":
   exec "nim c -r tests/generate_golden_fixtures.nim"
@@ -45,6 +46,9 @@ task benchSplitBinary, "Run split-binary benchmarks":
 
 task buildCtPrint, "Build ct-print utility":
   exec "nim c -d:release --mm:arc -p:src -o:ct-print src/codetracer_ct_print.nim"
+
+task buildCtSpace, "Build ct-space utility":
+  exec "nim c -d:release --mm:arc -p:src -o:ct-space src/codetracer_ct_space.nim"
 
 task testReader, "Run trace reader tests":
   exec "nim c -r -p:src tests/test_trace_reader.nim"

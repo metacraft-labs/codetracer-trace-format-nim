@@ -30,6 +30,7 @@ import codetracer_ctfs/namespace_descriptor
 import codetracer_ctfs/sub_block_pool
 import codetracer_ctfs/btree
 import codetracer_ctfs/namespace
+import codetracer_ctfs/space_analyzer
 
 import codetracer_trace_types
 import codetracer_trace_writer/varint
@@ -50,6 +51,7 @@ export namespace_descriptor
 export sub_block_pool
 export btree
 export namespace
+export space_analyzer
 
 export codetracer_trace_types
 export varint

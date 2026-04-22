@@ -40,6 +40,14 @@ proc initNamespace*(name: string, leafType: LeafType = ltTypeA): Namespace =
 proc count*(ns: Namespace): uint64 {.inline.} =
   ns.entryCount
 
+proc tree*(ns: Namespace): BTree {.inline.} =
+  ## Access the namespace's B-tree (for analysis).
+  ns.tree
+
+proc pool*(ns: Namespace): SubBlockPoolManager {.inline.} =
+  ## Access the namespace's pool manager (for analysis).
+  ns.pool
+
 proc append*(ns: var Namespace, key: uint64,
     data: openArray[byte]): Result[void, string] =
   ## Append a key-value entry to the namespace.
