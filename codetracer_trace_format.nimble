@@ -28,7 +28,9 @@ task test, "Run all tests":
   exec "nim c -r tests/test_cross_compat.nim"
   exec "nim c -r tests/test_meta_dat.nim"
   exec "nim c -r tests/test_namespace_descriptor.nim"
+  exec "nim c -d:release -r tests/test_sub_block_pool.nim"
   exec "nim c -d:release -r tests/test_btree.nim"
+  exec "nim c -r -d:release -p:src tests/test_namespace.nim"
 
 task regenerateFixtures, "Regenerate .expected golden fixture files":
   exec "nim c -r tests/generate_golden_fixtures.nim"

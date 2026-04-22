@@ -27,7 +27,9 @@ import codetracer_ctfs/zstd_bindings
 import codetracer_ctfs/seekable_zstd
 import codetracer_ctfs/chunked_compressed_table
 import codetracer_ctfs/namespace_descriptor
+import codetracer_ctfs/sub_block_pool
 import codetracer_ctfs/btree
+import codetracer_ctfs/namespace
 
 import codetracer_trace_types
 import codetracer_trace_writer/varint
@@ -45,7 +47,9 @@ export zstd_bindings
 export seekable_zstd
 export chunked_compressed_table
 export namespace_descriptor
+export sub_block_pool
 export btree
+export namespace
 
 export codetracer_trace_types
 export varint
