@@ -22,6 +22,7 @@ import ./io_event_stream
 import ./step_encoding
 import ./global_line_index
 import ./varint
+import ./linehits_builder
 import ../codetracer_trace_types
 
 export results, value_stream.VariableValue, io_event_stream.IOEventKind
@@ -54,6 +55,9 @@ type
     # Global line index (rebuilt when paths change)
     gli: GlobalLineIndex
     gliDirty: bool
+
+    # Optional linehits builder
+    linehitsBuilder: Option[LinehitsBuilder]
 
     # State tracking
     stepCount*: uint64
@@ -130,6 +134,18 @@ proc initMultiStreamWriter*(path: string, program: string,
   ok(w)
 
 # ---------------------------------------------------------------------------
+# Linehits (optional)
+# ---------------------------------------------------------------------------
+
+proc enableLinehits*(w: var MultiStreamTraceWriter) =
+  ## Enable the linehits builder. Must be called before writing steps.
+  w.linehitsBuilder = some(initLinehitsBuilder())
+
+proc linehits*(w: var MultiStreamTraceWriter): var LinehitsBuilder =
+  ## Access the linehits builder. Raises if not enabled.
+  w.linehitsBuilder.get()
+
+# ---------------------------------------------------------------------------
 # Path registration
 # ---------------------------------------------------------------------------
 
@@ -200,6 +216,10 @@ proc registerStep*(w: var MultiStreamTraceWriter, pathId: uint64,
   let valRes = w.ctfs.writeStepValues(w.valueWriter, values)
   if valRes.isErr:
     return err("failed to write step values: " & valRes.error)
+
+  # Record linehit if enabled
+  if w.linehitsBuilder.isSome:
+    w.linehitsBuilder.get().recordHit(gli, w.stepCount)
 
   w.lastGlobalLineIndex = gli
   w.lastPathId = pathId
@@ -361,6 +381,12 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   ## After close, the CTFS bytes can be retrieved via toBytes().
   if w.closed:
     return ok()
+
+  # Finalize linehits if enabled
+  if w.linehitsBuilder.isSome:
+    let lhRes = w.linehitsBuilder.get().finalize()
+    if lhRes.isErr:
+      return err("failed to finalize linehits: " & lhRes.error)
 
   # Flush exec stream
   let flushRes = w.ctfs.flush(w.execWriter)
