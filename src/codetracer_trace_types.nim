@@ -135,6 +135,7 @@ type
     vrkCell
     vrkBigInt
     vrkChar
+    vrkValueRef  ## Reference to a previously-encoded compound value
 
   ValueRecord* = object
     case kind*: ValueRecordKind
@@ -186,6 +187,8 @@ type
     of vrkChar:
       charVal*: char
       charTypeId*: TypeId
+    of vrkValueRef:
+      refId*: uint32
 
 const NoneValue*: ValueRecord = ValueRecord(kind: vrkNone, noneTypeId: NoneTypeId)
 
@@ -430,6 +433,7 @@ proc `==`*(a, b: ValueRecord): bool =
   of vrkCell: a.cellPlace == b.cellPlace
   of vrkBigInt: a.bigIntBytes == b.bigIntBytes and a.negative == b.negative and a.bigIntTypeId == b.bigIntTypeId
   of vrkChar: a.charVal == b.charVal and a.charTypeId == b.charTypeId
+  of vrkValueRef: a.refId == b.refId
 
 proc `==`*(a, b: FieldTypeRecord): bool =
   a.name == b.name and a.typeId == b.typeId

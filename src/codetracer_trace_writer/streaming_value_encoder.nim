@@ -122,6 +122,13 @@ proc writeRaw*(sve: var StreamingValueEncoder, rawStr: string, typeId: uint64): 
   sve.enc.writeUint(typeId)
   ok()
 
+proc writeRef*(sve: var StreamingValueEncoder, refId: uint32): Result[void, string] =
+  ## Write a ValueRef — CBOR tag 256 + unsigned int ref_id.
+  ## References a previously-encoded compound value.
+  sve.enc.writeTag(CborTagValueRef)
+  sve.enc.writeUint(uint64(refId))
+  ok()
+
 proc writeError*(sve: var StreamingValueEncoder, msg: string, typeId: uint64): Result[void, string] =
   ## map(3) { "kind":"Error", "msg": textString, "type_id": typeId }
   sve.enc.writeMapHeader(3)

@@ -221,7 +221,13 @@ proc writeFloat64*(enc: var CborEncoder, value: float64) {.inline.} =
 proc writeKey*(enc: var CborEncoder, key: string) {.inline.} =
   enc.writeTextString(key)
 
+proc writeTag*(enc: var CborEncoder, tag: uint64) {.inline.} =
+  ## CBOR major type 6: semantic tag.
+  enc.writeTypeAndValue(6, tag)
+
 {.pop.} # checks: off, boundChecks: off
+
+const CborTagValueRef*: uint64 = 256
 
 # ===========================================================================
 # CborDecoder
@@ -313,6 +319,18 @@ proc readTypeAndValue(dec: var CborDecoder): Result[(byte, uint64), string] =
     ok((majorType, uint64(v)))
   else:
     err("cbor: unsupported additional info: " & $additional)
+
+proc peekMajorType*(dec: CborDecoder): Result[byte, string] =
+  ## Peek at the major type of the next CBOR item without consuming it.
+  let b = ?dec.peekByte()
+  ok(b shr 5)
+
+proc readTag*(dec: var CborDecoder): Result[uint64, string] =
+  ## Read a CBOR tag (major type 6).
+  let (mt, v) = ?dec.readTypeAndValue()
+  if mt != 6:
+    return err("cbor: expected tag (major 6), got major " & $mt)
+  ok(v)
 
 proc readUint*(dec: var CborDecoder): Result[uint64, string] =
   let (mt, v) = ?dec.readTypeAndValue()
@@ -589,6 +607,10 @@ proc encodeCborValueRecordImpl(enc: var CborEncoder, v: ValueRecord) =
     enc.writePrecomputed(CborKeyTypeId)
     enc.writeUint(uint64(v.charTypeId))
 
+  of vrkValueRef:
+    enc.writeTag(CborTagValueRef)
+    enc.writeUint(uint64(v.refId))
+
 proc encodeCborValueRecord*(enc: var CborEncoder, v: ValueRecord) =
   encodeCborValueRecordImpl(enc, v)
 
@@ -731,6 +753,15 @@ proc decodeCborValueRecordImpl(dec: var CborDecoder): Result[ValueRecord, string
     err("cbor: unknown ValueRecord kind: '" & kindStr & "'")
 
 proc decodeCborValueRecord*(dec: var CborDecoder): Result[ValueRecord, string] =
+  # Check for CBOR tag (major type 6) — used for ValueRef
+  let mt = ?dec.peekMajorType()
+  if mt == 6:
+    let tag = ?dec.readTag()
+    if tag == CborTagValueRef:
+      let refId = ?dec.readUint()
+      return ok(ValueRecord(kind: vrkValueRef, refId: uint32(refId)))
+    else:
+      return err("cbor: unknown CBOR tag in ValueRecord: " & $tag)
   decodeCborValueRecordImpl(dec)
 
 # ---- TypeRecord ----
