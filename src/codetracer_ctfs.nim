@@ -33,6 +33,7 @@ import codetracer_ctfs/namespace
 import codetracer_ctfs/shard_writer
 import codetracer_ctfs/sharded_namespace
 import codetracer_ctfs/space_analyzer
+import codetracer_ctfs/partial_trace_cache
 
 import codetracer_trace_types
 import codetracer_trace_writer/varint
@@ -61,6 +62,7 @@ export namespace
 export shard_writer
 export sharded_namespace
 export space_analyzer
+export partial_trace_cache
 
 export codetracer_trace_types
 export varint
