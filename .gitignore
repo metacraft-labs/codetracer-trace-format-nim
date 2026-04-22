@@ -22,4 +22,6 @@ tests/test_meta_dat
 tests/test_fixed_record_table
 tests/test_variable_record_table
 tests/test_chunked_compressed_table
+tests/test_namespace_descriptor
+tests/test_btree
 ct-print
