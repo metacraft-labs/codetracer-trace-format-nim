@@ -38,3 +38,4 @@ tests/test_step_encoding
 tests/test_value_stream
 tests/bench_varint
 ct-print
+tests/macro_sourcemap_test_*.json
