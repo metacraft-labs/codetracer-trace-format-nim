@@ -18,6 +18,7 @@ import codetracer_ctfs/chunk_index
 import codetracer_ctfs/zstd_bindings
 import codetracer_trace_types
 import codetracer_trace_writer/split_binary
+import codetracer_trace_writer/meta_dat
 
 export results, codetracer_trace_types
 
@@ -188,52 +189,64 @@ proc openTrace*(path: string): Result[TraceReader, string] =
     eventCount: 0,
   )
 
-  # Parse meta.json
-  let metaRes = readInternalFile(data, "meta.json", blockSize, maxEntries)
-  if metaRes.isOk:
-    let metaStr = bytesToString(metaRes.get())
-    try:
-      let node = parseJson(metaStr)
-      reader.metadata.program = node.getOrDefault("program").getStr("")
-      reader.metadata.workdir = node.getOrDefault("workdir").getStr("")
-      let argsNode = node.getOrDefault("args")
-      if argsNode != nil and argsNode.kind == JArray:
-        for item in argsNode:
-          reader.metadata.args.add(item.getStr(""))
-    except JsonParsingError:
-      return err("failed to parse meta.json")
-    except KeyError:
-      return err("unexpected key error in meta.json")
-    except IOError:
-      return err("IO error parsing meta.json")
-    except OSError:
-      return err("OS error parsing meta.json")
-    except ValueError:
-      return err("value error parsing meta.json")
-    except Exception:
-      return err("unexpected error parsing meta.json")
+  # Try meta.dat first (new binary format), fall back to meta.json + paths.json
+  let metaDatRes = readInternalFile(data, "meta.dat", blockSize, maxEntries)
+  if metaDatRes.isOk:
+    let parsed = readMetaDat(metaDatRes.get())
+    if parsed.isOk:
+      let contents = parsed.get()
+      reader.metadata.program = contents.program
+      reader.metadata.workdir = contents.workdir
+      reader.metadata.args = contents.args
+      reader.paths = contents.paths
+    else:
+      return err("meta.dat present but corrupt: " & parsed.error)
+  else:
+    # Fall back to meta.json + paths.json (old format)
+    let metaRes = readInternalFile(data, "meta.json", blockSize, maxEntries)
+    if metaRes.isOk:
+      let metaStr = bytesToString(metaRes.get())
+      try:
+        let node = parseJson(metaStr)
+        reader.metadata.program = node.getOrDefault("program").getStr("")
+        reader.metadata.workdir = node.getOrDefault("workdir").getStr("")
+        let argsNode = node.getOrDefault("args")
+        if argsNode != nil and argsNode.kind == JArray:
+          for item in argsNode:
+            reader.metadata.args.add(item.getStr(""))
+      except JsonParsingError:
+        return err("failed to parse meta.json")
+      except KeyError:
+        return err("unexpected key error in meta.json")
+      except IOError:
+        return err("IO error parsing meta.json")
+      except OSError:
+        return err("OS error parsing meta.json")
+      except ValueError:
+        return err("value error parsing meta.json")
+      except Exception:
+        return err("unexpected error parsing meta.json")
 
-  # Parse paths.json
-  let pathsRes = readInternalFile(data, "paths.json", blockSize, maxEntries)
-  if pathsRes.isOk:
-    let pathsStr = bytesToString(pathsRes.get())
-    try:
-      let arr = parseJson(pathsStr)
-      if arr.kind == JArray:
-        for item in arr:
-          reader.paths.add(item.getStr(""))
-    except JsonParsingError:
-      return err("failed to parse paths.json")
-    except KeyError:
-      return err("unexpected key error in paths.json")
-    except IOError:
-      return err("IO error parsing paths.json")
-    except OSError:
-      return err("OS error parsing paths.json")
-    except ValueError:
-      return err("value error parsing paths.json")
-    except Exception:
-      return err("unexpected error parsing paths.json")
+    let pathsRes = readInternalFile(data, "paths.json", blockSize, maxEntries)
+    if pathsRes.isOk:
+      let pathsStr = bytesToString(pathsRes.get())
+      try:
+        let arr = parseJson(pathsStr)
+        if arr.kind == JArray:
+          for item in arr:
+            reader.paths.add(item.getStr(""))
+      except JsonParsingError:
+        return err("failed to parse paths.json")
+      except KeyError:
+        return err("unexpected key error in paths.json")
+      except IOError:
+        return err("IO error parsing paths.json")
+      except OSError:
+        return err("OS error parsing paths.json")
+      except ValueError:
+        return err("value error parsing paths.json")
+      except Exception:
+        return err("unexpected error parsing paths.json")
 
   ok(reader)
 

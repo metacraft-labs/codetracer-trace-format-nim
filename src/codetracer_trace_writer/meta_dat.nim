@@ -28,6 +28,16 @@ const
   MetaDatVersion*: uint16 = 1
   FlagHasMcrFields*: uint16 = 1  # bit 0
 
+type
+  MetaDatContents* = object
+    version*: uint16
+    program*: string
+    workdir*: string
+    args*: seq[string]
+    recorderId*: string
+    paths*: seq[string]
+    mcrFields*: Option[McrMetaFields]
+
 proc writeRawBytes(
     c: var Ctfs, f: var CtfsInternalFile,
     data: openArray[byte]): Result[void, string] =
@@ -103,3 +113,79 @@ proc writeMetaDat*(
     ? c.writeVarint(f, uint64(ord(mcr.atomicMode)))
 
   ok()
+
+# ---------------------------------------------------------------------------
+# Reader
+# ---------------------------------------------------------------------------
+
+proc readU16LE(data: openArray[byte], offset: int): uint16 =
+  uint16(data[offset]) or (uint16(data[offset + 1]) shl 8)
+
+proc readString(data: openArray[byte], pos: var int): Result[string, string] =
+  let lenVal = ? decodeVarint(data, pos)
+  let sLen = int(lenVal)
+  if pos + sLen > data.len:
+    return err("meta.dat: string extends past end of data")
+  var s = newString(sLen)
+  for i in 0 ..< sLen:
+    s[i] = char(data[pos + i])
+  pos += sLen
+  ok(s)
+
+proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
+  ## Parse binary meta.dat from raw bytes.
+  ## Validates magic and version, returns MetaDatContents or an error.
+  if data.len < 8:
+    return err("meta.dat too short: need at least 8 bytes, got " & $data.len)
+
+  # Check magic
+  if data[0] != MetaDatMagic[0] or data[1] != MetaDatMagic[1] or
+      data[2] != MetaDatMagic[2] or data[3] != MetaDatMagic[3]:
+    return err("meta.dat: bad magic bytes")
+
+  let version = readU16LE(data, 4)
+  if version != MetaDatVersion:
+    return err("meta.dat: unsupported version " & $version & ", expected " & $MetaDatVersion)
+
+  let flags = readU16LE(data, 6)
+  var pos = 8
+
+  var contents = MetaDatContents(version: version)
+
+  # Program
+  contents.program = ? readString(data, pos)
+
+  # Args
+  let argsCount = ? decodeVarint(data, pos)
+  for i in 0'u64 ..< argsCount:
+    contents.args.add(? readString(data, pos))
+
+  # Workdir
+  contents.workdir = ? readString(data, pos)
+
+  # Recorder ID
+  contents.recorderId = ? readString(data, pos)
+
+  # Paths
+  let pathsCount = ? decodeVarint(data, pos)
+  for i in 0'u64 ..< pathsCount:
+    contents.paths.add(? readString(data, pos))
+
+  # MCR fields
+  if (flags and FlagHasMcrFields) != 0:
+    let tickSourceVal = ? decodeVarint(data, pos)
+    let totalThreadsVal = ? decodeVarint(data, pos)
+    let atomicModeVal = ? decodeVarint(data, pos)
+
+    if tickSourceVal > uint64(high(TickSource).ord):
+      return err("meta.dat: invalid tick_source value " & $tickSourceVal)
+    if atomicModeVal > uint64(high(AtomicMode).ord):
+      return err("meta.dat: invalid atomic_mode value " & $atomicModeVal)
+
+    contents.mcrFields = some(McrMetaFields(
+      tickSource: TickSource(tickSourceVal),
+      totalThreads: uint32(totalThreadsVal),
+      atomicMode: AtomicMode(atomicModeVal),
+    ))
+
+  ok(contents)

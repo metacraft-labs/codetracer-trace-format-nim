@@ -1,13 +1,14 @@
 {.push raises: [].}
 
-## Tests for binary meta.dat writer.
+## Tests for binary meta.dat writer and reader.
 
-import std/options
+import std/[options, os, strutils]
 import results
 import codetracer_ctfs
 import codetracer_trace_types
 import codetracer_trace_writer/meta_dat
 import codetracer_trace_writer/varint
+import codetracer_trace_reader
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -251,7 +252,260 @@ proc test_meta_dat_empty_fields() {.raises: [].} =
   echo "PASS: test_meta_dat_empty_fields"
 
 
+proc test_meta_dat_roundtrip() {.raises: [].} =
+  ## Write meta.dat, then read it back with readMetaDat and verify all fields.
+  var c = createCtfs()
+  let fileRes = c.addFile("meta.dat")
+  doAssert fileRes.isOk, "addFile failed"
+  var f = fileRes.get()
+
+  let meta = TraceMetadata(
+    program: "/usr/bin/myapp",
+    args: @["--verbose", "-o", "output.txt"],
+    workdir: "/home/user/project"
+  )
+  let paths = @["/src/main.nim", "/src/utils.nim", "/src/lib.nim"]
+  let recorderId = "nim-recorder-v1"
+
+  let wRes = c.writeMetaDat(f, meta, paths, recorderId = recorderId)
+  doAssert wRes.isOk, "writeMetaDat failed: " & wRes.unsafeError
+
+  let raw = extractFileBytes(c, f)
+  let parsed = readMetaDat(raw)
+  doAssert parsed.isOk, "readMetaDat failed: " & parsed.unsafeError
+
+  let contents = parsed.get()
+  doAssert contents.version == 1, "version mismatch"
+  doAssert contents.program == "/usr/bin/myapp", "program mismatch: " & contents.program
+  doAssert contents.workdir == "/home/user/project", "workdir mismatch"
+  doAssert contents.args.len == 3, "args count mismatch"
+  doAssert contents.args[0] == "--verbose", "arg0 mismatch"
+  doAssert contents.args[1] == "-o", "arg1 mismatch"
+  doAssert contents.args[2] == "output.txt", "arg2 mismatch"
+  doAssert contents.recorderId == "nim-recorder-v1", "recorderId mismatch"
+  doAssert contents.paths.len == 3, "paths count mismatch"
+  doAssert contents.paths[0] == "/src/main.nim", "path0 mismatch"
+  doAssert contents.paths[1] == "/src/utils.nim", "path1 mismatch"
+  doAssert contents.paths[2] == "/src/lib.nim", "path2 mismatch"
+  doAssert contents.mcrFields.isNone, "mcrFields should be None"
+
+  c.closeCtfs()
+  echo "PASS: test_meta_dat_roundtrip"
+
+
+proc test_meta_dat_roundtrip_with_mcr() {.raises: [].} =
+  ## Roundtrip with MCR fields present.
+  var c = createCtfs()
+  let fileRes = c.addFile("meta.dat")
+  doAssert fileRes.isOk, "addFile failed"
+  var f = fileRes.get()
+
+  let meta = TraceMetadata(
+    program: "mcr_prog",
+    args: @["a"],
+    workdir: "/w"
+  )
+  let paths = @["/p1"]
+  let mcr = McrMetaFields(
+    tickSource: tsMonotonic,
+    totalThreads: 8,
+    atomicMode: amSeqCst,
+  )
+
+  let wRes = c.writeMetaDat(f, meta, paths, recorderId = "mcr-rec",
+                            mcrFields = some(mcr))
+  doAssert wRes.isOk, "writeMetaDat failed: " & wRes.unsafeError
+
+  let raw = extractFileBytes(c, f)
+  let parsed = readMetaDat(raw)
+  doAssert parsed.isOk, "readMetaDat failed: " & parsed.unsafeError
+
+  let contents = parsed.get()
+  doAssert contents.program == "mcr_prog"
+  doAssert contents.args == @["a"]
+  doAssert contents.workdir == "/w"
+  doAssert contents.recorderId == "mcr-rec"
+  doAssert contents.paths == @["/p1"]
+  doAssert contents.mcrFields.isSome, "mcrFields should be present"
+
+  let m = contents.mcrFields.get()
+  doAssert m.tickSource == tsMonotonic, "tickSource mismatch"
+  doAssert m.totalThreads == 8, "totalThreads mismatch"
+  doAssert m.atomicMode == amSeqCst, "atomicMode mismatch"
+
+  c.closeCtfs()
+  echo "PASS: test_meta_dat_roundtrip_with_mcr"
+
+
+proc test_meta_dat_read_bad_magic() {.raises: [].} =
+  ## readMetaDat should reject data with wrong magic.
+  let badData: array[8, byte] = [0x00'u8, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00]
+  let res = readMetaDat(badData)
+  doAssert res.isErr, "should fail on bad magic"
+  doAssert "bad magic" in res.unsafeError, "error should mention bad magic"
+  echo "PASS: test_meta_dat_read_bad_magic"
+
+
+proc test_meta_dat_read_too_short() {.raises: [].} =
+  ## readMetaDat should reject data shorter than 8 bytes.
+  let shortData: array[4, byte] = [0x43'u8, 0x54, 0x4D, 0x44]
+  let res = readMetaDat(shortData)
+  doAssert res.isErr, "should fail on short data"
+  doAssert "too short" in res.unsafeError, "error should mention too short"
+  echo "PASS: test_meta_dat_read_too_short"
+
+
+proc writeJsonString(c: var Ctfs, f: var CtfsInternalFile,
+                    s: string): Result[void, string] =
+  ## Helper to write a string as bytes to an internal file.
+  if s.len > 0:
+    let bytes = cast[seq[byte]](s)
+    ? c.writeToFile(f, bytes)
+  ok()
+
+
+proc test_meta_dat_backward_compat() {.raises: [].} =
+  ## Create a CTFS container with meta.json + paths.json (old format),
+  ## write to a temp file, open with openTrace, verify it reads correctly.
+  var c = createCtfs()
+
+  # Add meta.json
+  let metaFileRes = c.addFile("meta.json")
+  doAssert metaFileRes.isOk, "addFile meta.json failed"
+  var metaFile = metaFileRes.get()
+
+  let metaJson = """{"program":"/bin/old_prog","args":["--old","flag"],"workdir":"/old/dir"}"""
+  let wRes1 = writeJsonString(c, metaFile, metaJson)
+  doAssert wRes1.isOk, "write meta.json failed"
+
+  # Add paths.json
+  let pathsFileRes = c.addFile("paths.json")
+  doAssert pathsFileRes.isOk, "addFile paths.json failed"
+  var pathsFile = pathsFileRes.get()
+
+  let pathsJson = """["/old/src/a.nim","/old/src/b.nim"]"""
+  let wRes2 = writeJsonString(c, pathsFile, pathsJson)
+  doAssert wRes2.isOk, "write paths.json failed"
+
+  # Write to temp file
+  let tmpPath = getTempDir() / "test_meta_dat_compat.ct"
+  let saveRes = c.writeCtfsToFile(tmpPath)
+  doAssert saveRes.isOk, "writeCtfsToFile failed: " & saveRes.unsafeError
+  c.closeCtfs()
+
+  # Open with openTrace — should fall back to JSON
+  let traceRes = openTrace(tmpPath)
+  doAssert traceRes.isOk, "openTrace failed: " & traceRes.unsafeError
+
+  let reader = traceRes.get()
+  doAssert reader.metadata.program == "/bin/old_prog",
+    "program mismatch: " & reader.metadata.program
+  doAssert reader.metadata.workdir == "/old/dir",
+    "workdir mismatch: " & reader.metadata.workdir
+  doAssert reader.metadata.args.len == 2, "args count mismatch"
+  doAssert reader.metadata.args[0] == "--old", "arg0 mismatch"
+  doAssert reader.metadata.args[1] == "flag", "arg1 mismatch"
+  doAssert reader.paths.len == 2, "paths count mismatch"
+  doAssert reader.paths[0] == "/old/src/a.nim", "path0 mismatch"
+  doAssert reader.paths[1] == "/old/src/b.nim", "path1 mismatch"
+
+  # Clean up
+  try: removeFile(tmpPath)
+  except OSError: discard
+
+  echo "PASS: test_meta_dat_backward_compat"
+
+
+proc test_meta_dat_openTrace_binary() {.raises: [].} =
+  ## Create a CTFS container with meta.dat (new format),
+  ## write to a temp file, open with openTrace, verify it reads correctly.
+  ## Also compare toJson output with a JSON-based container to verify identical format.
+  var c = createCtfs()
+
+  let metaDatFileRes = c.addFile("meta.dat")
+  doAssert metaDatFileRes.isOk, "addFile meta.dat failed"
+  var metaDatFile = metaDatFileRes.get()
+
+  let meta = TraceMetadata(
+    program: "/bin/test_prog",
+    args: @["--flag", "value"],
+    workdir: "/tmp/test"
+  )
+  let paths = @["/src/main.nim", "/src/lib.nim"]
+
+  let wRes = c.writeMetaDat(metaDatFile, meta, paths, recorderId = "test-rec")
+  doAssert wRes.isOk, "writeMetaDat failed: " & wRes.unsafeError
+
+  let tmpPath = getTempDir() / "test_meta_dat_binary.ct"
+  let saveRes = c.writeCtfsToFile(tmpPath)
+  doAssert saveRes.isOk, "writeCtfsToFile failed: " & saveRes.unsafeError
+  c.closeCtfs()
+
+  # Open with openTrace — should use meta.dat path
+  let traceRes = openTrace(tmpPath)
+  doAssert traceRes.isOk, "openTrace failed: " & traceRes.unsafeError
+
+  let reader = traceRes.get()
+  doAssert reader.metadata.program == "/bin/test_prog",
+    "program mismatch: " & reader.metadata.program
+  doAssert reader.metadata.workdir == "/tmp/test",
+    "workdir mismatch: " & reader.metadata.workdir
+  doAssert reader.metadata.args.len == 2, "args count mismatch"
+  doAssert reader.metadata.args[0] == "--flag", "arg0 mismatch"
+  doAssert reader.metadata.args[1] == "value", "arg1 mismatch"
+  doAssert reader.paths.len == 2, "paths count mismatch"
+  doAssert reader.paths[0] == "/src/main.nim", "path0 mismatch"
+  doAssert reader.paths[1] == "/src/lib.nim", "path1 mismatch"
+
+  # Now create an equivalent JSON-based container and compare toJson output
+  var cJson = createCtfs()
+
+  let metaJsonFileRes = cJson.addFile("meta.json")
+  doAssert metaJsonFileRes.isOk
+  var metaJsonFile = metaJsonFileRes.get()
+  let metaJsonStr = """{"program":"/bin/test_prog","args":["--flag","value"],"workdir":"/tmp/test"}"""
+  let w1 = writeJsonString(cJson, metaJsonFile, metaJsonStr)
+  doAssert w1.isOk
+
+  let pathsJsonFileRes = cJson.addFile("paths.json")
+  doAssert pathsJsonFileRes.isOk
+  var pathsJsonFile = pathsJsonFileRes.get()
+  let pathsJsonStr = """["/src/main.nim","/src/lib.nim"]"""
+  let w2 = writeJsonString(cJson, pathsJsonFile, pathsJsonStr)
+  doAssert w2.isOk
+
+  let tmpPathJson = getTempDir() / "test_meta_dat_json_compare.ct"
+  let saveRes2 = cJson.writeCtfsToFile(tmpPathJson)
+  doAssert saveRes2.isOk
+  cJson.closeCtfs()
+
+  let traceResJson = openTrace(tmpPathJson)
+  doAssert traceResJson.isOk, "openTrace JSON failed: " & traceResJson.unsafeError
+
+  let readerJson = traceResJson.get()
+
+  # Compare toJson output — should be identical
+  let jsonBinary = reader.toJson()
+  let jsonFallback = readerJson.toJson()
+  doAssert jsonBinary == jsonFallback,
+    "toJson output differs between binary and JSON metadata"
+
+  # Clean up
+  try: removeFile(tmpPath)
+  except OSError: discard
+  try: removeFile(tmpPathJson)
+  except OSError: discard
+
+  echo "PASS: test_meta_dat_openTrace_binary"
+
+
 # Run all tests
 test_meta_dat_write_layout()
 test_meta_dat_with_mcr_fields()
 test_meta_dat_empty_fields()
+test_meta_dat_roundtrip()
+test_meta_dat_roundtrip_with_mcr()
+test_meta_dat_read_bad_magic()
+test_meta_dat_read_too_short()
+test_meta_dat_backward_compat()
+test_meta_dat_openTrace_binary()
