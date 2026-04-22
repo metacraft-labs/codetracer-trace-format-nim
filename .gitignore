@@ -39,3 +39,11 @@ tests/test_value_stream
 tests/bench_varint
 ct-print
 tests/macro_sourcemap_test_*.json
+tests/test_linehits_builder
+tests/test_multi_stream_writer
+tests/test_partial_trace_cache
+tests/test_ram_cache
+tests/test_reader_calls_events
+tests/test_reader_integration
+tests/test_streaming_value_encoder
+tests/test_value_ref
