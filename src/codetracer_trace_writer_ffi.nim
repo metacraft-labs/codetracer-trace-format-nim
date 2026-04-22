@@ -235,7 +235,10 @@ proc trace_writer_free(handle: TraceWriterHandle) {.exportc, cdecl.} =
   else:
     if handle.writerReady and not handle.writer.closed:
       discard handle.writer.close()
-  `=destroy`(handle[])
+  try:
+    `=destroy`(handle[])
+  except:
+    discard
   dealloc(handle)
 
 # ---------------------------------------------------------------------------
