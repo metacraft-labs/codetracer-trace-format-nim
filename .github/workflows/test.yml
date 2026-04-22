@@ -27,17 +27,54 @@ jobs:
 
       - name: Run all tests (--mm:${{ matrix.mm }})
         run: |
-          nim c -r --mm:${{ matrix.mm }} -p:src tests/test_base40.nim
-          nim c -r --mm:${{ matrix.mm }} -p:src tests/test_container.nim
-          nim c -r --mm:${{ matrix.mm }} -p:src tests/test_streaming.nim
-          nim c -r --mm:${{ matrix.mm }} -p:src tests/test_chunk_index.nim
-          nim c -r --mm:${{ matrix.mm }} -p:src tests/test_seekable_zstd.nim
-          nim c -r --mm:${{ matrix.mm }} -p:src tests/test_trace_types.nim
-          nim c -r --mm:${{ matrix.mm }} -p:src tests/test_varint.nim
-          nim c -r --mm:${{ matrix.mm }} -p:src tests/test_split_binary.nim
-          nim c -r --mm:${{ matrix.mm }} -p:src tests/test_trace_writer.nim
-          nim c -r --mm:${{ matrix.mm }} -p:src tests/test_golden_fixtures.nim
-          nim c -r --mm:${{ matrix.mm }} -p:src tests/test_cross_compat.nim
+          MM="--mm:${{ matrix.mm }}"
+          # Basic container/codec tests
+          nim c -r $MM -p:src tests/test_base40.nim
+          nim c -r $MM -p:src tests/test_container.nim
+          nim c -r $MM -p:src tests/test_streaming.nim
+          nim c -r $MM -p:src tests/test_chunk_index.nim
+          nim c -r $MM -p:src tests/test_fixed_record_table.nim
+          nim c -r $MM -p:src tests/test_variable_record_table.nim
+          nim c -r $MM -p:src tests/test_seekable_zstd.nim
+          nim c -r $MM -p:src tests/test_chunked_compressed_table.nim
+          nim c -r $MM -p:src tests/test_trace_types.nim
+          nim c -r $MM -p:src tests/test_varint.nim
+          nim c -r $MM -p:src tests/test_split_binary.nim
+          nim c -r $MM -p:src tests/test_trace_writer.nim
+          nim c -r $MM -p:src tests/test_trace_reader.nim
+          nim c -r $MM -p:src tests/test_golden_fixtures.nim
+          nim c -r $MM -p:src tests/test_cross_compat.nim
+          nim c -r $MM -p:src tests/test_meta_dat.nim
+          nim c -r $MM -p:src tests/test_namespace_descriptor.nim
+          # Tests requiring -d:release
+          nim c -r $MM -d:release -p:src tests/test_sub_block_pool.nim
+          nim c -r $MM -d:release -p:src tests/test_btree.nim
+          nim c -r $MM -d:release -p:src tests/test_namespace.nim
+          nim c -r $MM -d:release -p:src tests/test_ct_space.nim
+          nim c -r $MM -d:release -p:src tests/test_shard_writer.nim
+          # Multi-stream and encoding tests
+          nim c -r $MM -p:src tests/test_step_encoding.nim
+          nim c -r $MM -p:src tests/test_interning_table.nim
+          nim c -r $MM -p:src tests/test_exec_stream.nim
+          nim c -r $MM -p:src tests/test_value_stream.nim
+          nim c -r $MM -p:src tests/test_call_stream.nim
+          nim c -r $MM -p:src tests/test_io_event_stream.nim
+          nim c -r $MM -d:release -p:src tests/test_multi_stream_integration.nim
+          nim c -r $MM -d:release -p:src tests/test_new_trace_reader.nim
+          nim c -r $MM -d:release -p:src tests/test_reader_calls_events.nim
+          nim c -r $MM -d:release -p:src tests/test_reader_integration.nim
+          nim c -r $MM -p:src tests/test_streaming_value_encoder.nim
+          nim c -r $MM -p:src tests/test_value_ref.nim
+          nim c -r $MM -d:release -p:src tests/test_multi_stream_writer.nim
+          nim c -r $MM -d:release -p:src tests/test_linehits_builder.nim
+          nim c -r $MM -p:src tests/test_partial_trace_cache.nim
+          nim c -r $MM -d:release -p:src tests/test_ram_cache.nim
+          nim c -r $MM -d:release -p:src tests/test_file_access.nim
+          # Cross-format and network tests
+          nim c -r $MM -d:release -p:src tests/test_cross_format.nim
+          nim c -r $MM -p:src tests/test_query_protocol.nim
+          nim c -r $MM -p:src tests/test_network_reader.nim
+          nim c -r $MM -p:src tests/test_replication.nim
 
       - name: Verify library compiles as static lib (GC-free)
         run: nim c --mm:arc --app:staticlib --noMain -p:src src/codetracer_ctfs.nim

@@ -34,6 +34,11 @@ import codetracer_ctfs/shard_writer
 import codetracer_ctfs/sharded_namespace
 import codetracer_ctfs/space_analyzer
 import codetracer_ctfs/partial_trace_cache
+import codetracer_ctfs/ram_cache
+import codetracer_ctfs/cached_trace_reader
+import codetracer_ctfs/query_protocol
+import codetracer_ctfs/network_reader
+import codetracer_ctfs/replication
 
 import codetracer_trace_types
 import codetracer_trace_writer/varint
@@ -63,6 +68,11 @@ export shard_writer
 export sharded_namespace
 export space_analyzer
 export partial_trace_cache
+export ram_cache
+export cached_trace_reader
+export query_protocol
+export network_reader
+export replication
 
 export codetracer_trace_types
 export varint
