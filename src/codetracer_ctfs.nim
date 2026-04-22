@@ -38,6 +38,7 @@ import codetracer_trace_types
 import codetracer_trace_writer/varint
 import codetracer_trace_writer/split_binary
 import codetracer_trace_writer/interning_table
+import codetracer_trace_writer/value_stream
 
 export base40
 export types
@@ -62,3 +63,4 @@ export codetracer_trace_types
 export varint
 export split_binary
 export interning_table
+export value_stream

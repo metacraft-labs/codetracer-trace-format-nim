@@ -36,6 +36,7 @@ task test, "Run all tests":
   exec "nim c -r -p:src tests/test_step_encoding.nim"
   exec "nim c -r -p:src tests/test_interning_table.nim"
   exec "nim c -r -p:src tests/test_exec_stream.nim"
+  exec "nim c -r -p:src tests/test_value_stream.nim"
 
 task regenerateFixtures, "Regenerate .expected golden fixture files":
   exec "nim c -r tests/generate_golden_fixtures.nim"
