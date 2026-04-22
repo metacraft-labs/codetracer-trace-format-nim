@@ -48,6 +48,7 @@ task test, "Run all tests":
   exec "nim c -r -d:release -p:src tests/test_multi_stream_writer.nim"
   exec "nim c -r -d:release -p:src tests/test_linehits_builder.nim"
   exec "nim c -r -p:src tests/test_partial_trace_cache.nim"
+  exec "nim c -r -d:release -p:src tests/test_ram_cache.nim"
 
 task regenerateFixtures, "Regenerate .expected golden fixture files":
   exec "nim c -r tests/generate_golden_fixtures.nim"
