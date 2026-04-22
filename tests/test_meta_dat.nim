@@ -191,6 +191,35 @@ proc test_meta_dat_with_mcr_fields() {.raises: [].} =
   let atomicMd = decodeVarint(raw, pos)
   doAssert atomicMd.isOk and atomicMd.get() == 0, "atomic_mode should be 0 (relaxed)"
 
+  let totalEv = decodeVarint(raw, pos)
+  doAssert totalEv.isOk and totalEv.get() == 0, "total_events should be 0"
+
+  let totalCp = decodeVarint(raw, pos)
+  doAssert totalCp.isOk and totalCp.get() == 0, "total_checkpoints should be 0"
+
+  let startTime = decodeVarint(raw, pos)
+  doAssert startTime.isOk and startTime.get() == 0, "start_time_unix_us should be 0"
+
+  # platform (empty string)
+  let platStr = decodeString(raw, pos)
+  doAssert platStr.isOk and platStr.get() == "", "platform should be empty"
+
+  # tickGranularity (empty string)
+  let tgStr = decodeString(raw, pos)
+  doAssert tgStr.isOk and tgStr.get() == "", "tickGranularity should be empty"
+
+  # tickSourceStr (empty string)
+  let tsStr = decodeString(raw, pos)
+  doAssert tsStr.isOk and tsStr.get() == "", "tickSourceStr should be empty"
+
+  # atomicModeStr (empty string)
+  let amStr = decodeString(raw, pos)
+  doAssert amStr.isOk and amStr.get() == "", "atomicModeStr should be empty"
+
+  # startTimeStr (empty string)
+  let stStr = decodeString(raw, pos)
+  doAssert stStr.isOk and stStr.get() == "", "startTimeStr should be empty"
+
   doAssert pos == raw.len, "trailing bytes: consumed " & $pos & " of " & $raw.len
 
   c.closeCtfs()
@@ -310,6 +339,9 @@ proc test_meta_dat_roundtrip_with_mcr() {.raises: [].} =
     tickSource: tsMonotonic,
     totalThreads: 8,
     atomicMode: amSeqCst,
+    totalEvents: 42000,
+    totalCheckpoints: 5,
+    startTimeUnixUs: 1700000000_000000'u64,
   )
 
   let wRes = c.writeMetaDat(f, meta, paths, recorderId = "mcr-rec",
@@ -332,6 +364,9 @@ proc test_meta_dat_roundtrip_with_mcr() {.raises: [].} =
   doAssert m.tickSource == tsMonotonic, "tickSource mismatch"
   doAssert m.totalThreads == 8, "totalThreads mismatch"
   doAssert m.atomicMode == amSeqCst, "atomicMode mismatch"
+  doAssert m.totalEvents == 42000, "totalEvents mismatch"
+  doAssert m.totalCheckpoints == 5, "totalCheckpoints mismatch"
+  doAssert m.startTimeUnixUs == 1700000000_000000'u64, "startTimeUnixUs mismatch"
 
   c.closeCtfs()
   echo "PASS: test_meta_dat_roundtrip_with_mcr"

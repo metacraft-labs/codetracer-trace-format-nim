@@ -111,6 +111,14 @@ proc writeMetaDat*(
     ? c.writeVarint(f, uint64(ord(mcr.tickSource)))
     ? c.writeVarint(f, uint64(mcr.totalThreads))
     ? c.writeVarint(f, uint64(ord(mcr.atomicMode)))
+    ? c.writeVarint(f, mcr.totalEvents)
+    ? c.writeVarint(f, uint64(mcr.totalCheckpoints))
+    ? c.writeVarint(f, mcr.startTimeUnixUs)
+    ? c.writeVarintString(f, mcr.platform)
+    ? c.writeVarintString(f, mcr.tickGranularity)
+    ? c.writeVarintString(f, mcr.tickSourceStr)
+    ? c.writeVarintString(f, mcr.atomicModeStr)
+    ? c.writeVarintString(f, mcr.startTimeStr)
 
   ok()
 
@@ -182,10 +190,27 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
     if atomicModeVal > uint64(high(AtomicMode).ord):
       return err("meta.dat: invalid atomic_mode value " & $atomicModeVal)
 
+    let totalEventsVal = ? decodeVarint(data, pos)
+    let totalCheckpointsVal = ? decodeVarint(data, pos)
+    let startTimeUnixUsVal = ? decodeVarint(data, pos)
+    let platformStr = ? readString(data, pos)
+    let tickGranularityStr = ? readString(data, pos)
+    let tickSourceStr = ? readString(data, pos)
+    let atomicModeStr = ? readString(data, pos)
+    let startTimeStr = ? readString(data, pos)
+
     contents.mcrFields = some(McrMetaFields(
       tickSource: TickSource(tickSourceVal),
       totalThreads: uint32(totalThreadsVal),
       atomicMode: AtomicMode(atomicModeVal),
+      totalEvents: totalEventsVal,
+      totalCheckpoints: uint32(totalCheckpointsVal),
+      startTimeUnixUs: startTimeUnixUsVal,
+      platform: platformStr,
+      tickGranularity: tickGranularityStr,
+      tickSourceStr: tickSourceStr,
+      atomicModeStr: atomicModeStr,
+      startTimeStr: startTimeStr,
     ))
 
   ok(contents)
@@ -251,3 +276,11 @@ proc writeMetaDatToBuffer*(
     encodeVarint(uint64(ord(mcr.tickSource)), result)
     encodeVarint(uint64(mcr.totalThreads), result)
     encodeVarint(uint64(ord(mcr.atomicMode)), result)
+    encodeVarint(mcr.totalEvents, result)
+    encodeVarint(uint64(mcr.totalCheckpoints), result)
+    encodeVarint(mcr.startTimeUnixUs, result)
+    result.appendVarintStr(mcr.platform)
+    result.appendVarintStr(mcr.tickGranularity)
+    result.appendVarintStr(mcr.tickSourceStr)
+    result.appendVarintStr(mcr.atomicModeStr)
+    result.appendVarintStr(mcr.startTimeStr)

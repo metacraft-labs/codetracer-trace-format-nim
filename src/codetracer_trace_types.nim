@@ -318,6 +318,14 @@ type
     tickSource*: TickSource
     totalThreads*: uint32
     atomicMode*: AtomicMode
+    totalEvents*: uint64
+    totalCheckpoints*: uint32
+    startTimeUnixUs*: uint64
+    platform*: string
+    tickGranularity*: string
+    tickSourceStr*: string     ## Raw string form (preserved for roundtrip)
+    atomicModeStr*: string     ## Raw string form (preserved for roundtrip)
+    startTimeStr*: string      ## ISO 8601 timestamp (preserved for roundtrip)
 
 # ---------------------------------------------------------------------------
 # TraceLowLevelEvent — the main tagged union

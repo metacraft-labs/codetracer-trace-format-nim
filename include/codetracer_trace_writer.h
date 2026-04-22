@@ -146,6 +146,15 @@ void trace_writer_register_variable_raw(trace_writer_t handle,
                                         int type_kind,
                                         const char* type_name);
 
+void trace_writer_register_variable_cbor(trace_writer_t handle,
+    const char* name,
+    const uint8_t* cbor_data,
+    size_t cbor_len);
+
+void trace_writer_register_return_cbor(trace_writer_t handle,
+    const uint8_t* cbor_data,
+    size_t cbor_len);
+
 void trace_writer_register_special_event(trace_writer_t handle,
     int kind, const char* metadata, const char* content);
 
@@ -204,6 +213,7 @@ int ct_value_write_string(value_encoder_t h, const uint8_t* data, size_t len, ui
 int ct_value_write_none(value_encoder_t h);
 int ct_value_write_none_typed(value_encoder_t h, uint64_t type_id);
 int ct_value_write_raw(value_encoder_t h, const uint8_t* data, size_t len, uint64_t type_id);
+int ct_value_write_error(value_encoder_t h, const uint8_t* data, size_t len, uint64_t type_id);
 
 int ct_value_begin_struct(value_encoder_t h, uint64_t type_id, int field_count);
 int ct_value_begin_sequence(value_encoder_t h, uint64_t type_id, int element_count);

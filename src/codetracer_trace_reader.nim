@@ -389,6 +389,9 @@ proc valueRecordToJson(v: ValueRecord): JsonNode =
     result["kind"] = newJString("Char")
     result["c"] = newJString($v.charVal)
     result["type_id"] = newJInt(int64(uint64(v.charTypeId)))
+  of vrkValueRef:
+    result["kind"] = newJString("ValueRef")
+    result["ref_id"] = newJInt(int64(v.refId))
 
 proc eventToJson(event: TraceLowLevelEvent): JsonNode =
   result = newJObject()

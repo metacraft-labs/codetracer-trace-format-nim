@@ -677,6 +677,74 @@ proc trace_writer_register_variable_raw(
     rawTypeId: TypeId(typeId),
   ))
 
+proc trace_writer_register_variable_cbor(
+    handle: TraceWriterHandle,
+    name: cstring,
+    cbor_data: ptr uint8,
+    cbor_len: csize_t,
+) {.exportc, cdecl.} =
+  ## Register a variable with pre-encoded CBOR value bytes (from the streaming
+  ## encoder). This avoids the intermediate ValueRecord tree for complex values
+  ## like sequences, tuples, and dicts — the caller encodes directly to CBOR
+  ## via the ct_value_* C API, then passes the result here.
+  if handle.isNil:
+    return
+
+  if handle.useMultiStream:
+    if handle.msWriterReady:
+      let vnIdRes = handle.msWriter.registerVarname(toNimStr(name))
+      if vnIdRes.isErr:
+        return
+      let vnId = vnIdRes.get()
+      var data = newSeq[byte](int(cbor_len))
+      if not cbor_data.isNil and cbor_len > 0.csize_t:
+        copyMem(addr data[0], cbor_data, int(cbor_len))
+      # Use type_id 0 — the actual type is already encoded in the CBOR bytes
+      handle.pendingValues.add(VariableValue(
+        varnameId: vnId, typeId: 0'u64, data: data))
+    return
+
+  # Legacy path: fall back to raw representation (extract is not feasible from
+  # opaque CBOR, so emit the CBOR length as a placeholder).
+  discard handle.writer.writeEvent(TraceLowLevelEvent(
+    kind: tleVariableName,
+    varName: toNimStr(name),
+  ))
+  discard handle.writer.writeValue(0'u64, ValueRecord(
+    kind: vrkRaw,
+    rawStr: "<cbor:" & $cbor_len & ">",
+    rawTypeId: TypeId(0),
+  ))
+
+proc trace_writer_register_return_cbor(
+    handle: TraceWriterHandle,
+    cbor_data: ptr uint8,
+    cbor_len: csize_t,
+) {.exportc, cdecl.} =
+  ## Register a function return with pre-encoded CBOR value bytes.
+  ## Same rationale as trace_writer_register_variable_cbor.
+  if handle.isNil:
+    return
+
+  if handle.useMultiStream:
+    var data = newSeq[byte](int(cbor_len))
+    if not cbor_data.isNil and cbor_len > 0.csize_t:
+      copyMem(addr data[0], cbor_data, int(cbor_len))
+    discard handle.msWriter.registerReturn(data)
+    return
+
+  # Legacy path: emit a raw return placeholder
+  discard handle.writer.writeEvent(TraceLowLevelEvent(
+    kind: tleReturn,
+    returnRecord: ReturnRecord(
+      returnValue: ValueRecord(
+        kind: vrkRaw,
+        rawStr: "<cbor:" & $cbor_len & ">",
+        rawTypeId: TypeId(0),
+      ),
+    ),
+  ))
+
 proc toIOEventKind(k: FfiEventLogKind): IOEventKind =
   ## Map FFI event log kinds to multi-stream IOEventKind.
   ## The multi-stream IO event stream has a simpler set of kinds.
@@ -1067,6 +1135,21 @@ proc ct_value_write_raw(h: ValueEncoderHandle, data: ptr uint8, len: csize_t, ty
     s = newString(int(len))
     copyMem(addr s[0], data, int(len))
   let r = h[].writeRaw(s, type_id)
+  if r.isErr:
+    setError(r.error)
+    return 1.cint
+  0.cint
+
+proc ct_value_write_error(h: ValueEncoderHandle, data: ptr uint8, len: csize_t, type_id: uint64): cint {.exportc, cdecl.} =
+  ## Write an error value with the given message and type ID.
+  if h.isNil:
+    setError("NULL handle")
+    return 1.cint
+  var s = ""
+  if not data.isNil and len > 0.csize_t:
+    s = newString(int(len))
+    copyMem(addr s[0], data, int(len))
+  let r = h[].writeError(s, type_id)
   if r.isErr:
     setError(r.error)
     return 1.cint
