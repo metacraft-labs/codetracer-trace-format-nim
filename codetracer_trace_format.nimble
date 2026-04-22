@@ -15,6 +15,7 @@ task test, "Run all tests":
   exec "nim c -r tests/test_container.nim"
   exec "nim c -r tests/test_streaming.nim"
   exec "nim c -r tests/test_chunk_index.nim"
+  exec "nim c -r tests/test_fixed_record_table.nim"
   exec "nim c -r tests/test_seekable_zstd.nim"
   exec "nim c -r tests/test_trace_types.nim"
   exec "nim c -r tests/test_varint.nim"

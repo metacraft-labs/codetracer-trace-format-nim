@@ -159,6 +159,100 @@ proc readCtfsFromFile*(path: string): Result[seq[byte], string] =
   except OSError:
     err("OS error reading CTFS file: " & path)
 
+proc readInternalFile*(data: openArray[byte], name: string,
+    blockSize: uint32 = DefaultBlockSize,
+    maxEntries: uint32 = DefaultMaxRootEntries): Result[seq[byte], string] =
+  ## Read the complete content of an internal CTFS file by following the block mapping.
+  let encoded = base40Encode(name)
+  var fileSize: uint64 = 0
+  var mapBlock: uint64 = 0
+  block findEntry:
+    for i in 0 ..< int(maxEntries):
+      let off = HeaderSize + ExtHeaderSize + i * FileEntrySize
+      if off + FileEntrySize > data.len:
+        break
+      let entrySize = readU64LE(data, off)
+      let entryMap = readU64LE(data, off + 8)
+      let entryName = readU64LE(data, off + 16)
+      if entryName == encoded:
+        fileSize = entrySize
+        mapBlock = entryMap
+        break findEntry
+    return err("internal file not found: " & name)
+
+  if fileSize == 0:
+    return ok(newSeq[byte](0))
+
+  var fileBytes = newSeq[byte](int(fileSize))
+  let usable = uint64(blockSize) div 8 - 1
+
+  var remaining = int(fileSize)
+  var destPos = 0
+  var blockIdx: uint64 = 0
+
+  while remaining > 0:
+    var idx = blockIdx
+    var currentLevelBlock = mapBlock
+    var level: uint32 = 1
+
+    block findLevel:
+      while true:
+        var cap: uint64 = 1
+        for l in 0'u32 ..< level:
+          cap = cap * usable
+        if idx < cap:
+          break findLevel
+        idx -= cap
+        level += 1
+        if level > MaxChainLevels:
+          return err("block index too large for mapping")
+        let chainOff = int(currentLevelBlock) * int(blockSize) + int(usable) * 8
+        if chainOff + 8 > data.len:
+          return err("chain pointer out of bounds")
+        let chainPtr = readU64LE(data, chainOff)
+        if chainPtr == 0:
+          return err("missing chain pointer at level " & $level)
+        currentLevelBlock = chainPtr
+
+    var navBlock = currentLevelBlock
+    var navLevel = level
+    var navIdx = idx
+    while navLevel > 1:
+      var subCap: uint64 = 1
+      for l in 0'u32 ..< (navLevel - 1):
+        subCap = subCap * usable
+      let entryIdx = navIdx div subCap
+      let subIdx = navIdx mod subCap
+      let childOff = int(navBlock) * int(blockSize) + int(entryIdx) * 8
+      if childOff + 8 > data.len:
+        return err("child pointer out of bounds")
+      let childBlock = readU64LE(data, childOff)
+      if childBlock == 0:
+        return err("missing child block at level " & $navLevel)
+      navBlock = childBlock
+      navIdx = subIdx
+      navLevel -= 1
+
+    let ptrOff = int(navBlock) * int(blockSize) + int(navIdx) * 8
+    if ptrOff + 8 > data.len:
+      return err("data block pointer out of bounds")
+    let dataBlock = readU64LE(data, ptrOff)
+    if dataBlock == 0:
+      return err("null data block at index " & $blockIdx)
+
+    let blockOff = int(dataBlock) * int(blockSize)
+    let toCopy = min(remaining, int(blockSize))
+    if blockOff + toCopy > data.len:
+      return err("data block content out of bounds")
+    for i in 0 ..< toCopy:
+      fileBytes[destPos + i] = data[blockOff + i]
+
+    destPos += toCopy
+    remaining -= toCopy
+    blockIdx += 1
+
+  ok(fileBytes)
+
 proc hasCtfsMagic*(data: openArray[byte]): bool =
   ## Check whether the first bytes match the CTFS magic.
   if data.len < 5:
