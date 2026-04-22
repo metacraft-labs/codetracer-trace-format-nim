@@ -23,6 +23,7 @@ task test, "Run all tests":
   exec "nim c -r tests/test_trace_reader.nim"
   exec "nim c -r tests/test_golden_fixtures.nim"
   exec "nim c -r tests/test_cross_compat.nim"
+  exec "nim c -r tests/test_meta_dat.nim"
 
 task regenerateFixtures, "Regenerate .expected golden fixture files":
   exec "nim c -r tests/generate_golden_fixtures.nim"

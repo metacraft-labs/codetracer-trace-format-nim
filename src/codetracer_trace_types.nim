@@ -302,6 +302,20 @@ type
     program*: string
     args*: seq[string]
 
+  TickSource* = enum
+    tsRdtsc = 0
+    tsMonotonic = 1
+    tsPerfCounter = 2
+
+  AtomicMode* = enum
+    amRelaxed = 0
+    amSeqCst = 1
+
+  McrMetaFields* = object
+    tickSource*: TickSource
+    totalThreads*: uint32
+    atomicMode*: AtomicMode
+
 # ---------------------------------------------------------------------------
 # TraceLowLevelEvent — the main tagged union
 # ---------------------------------------------------------------------------
