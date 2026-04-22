@@ -199,6 +199,28 @@ proc callCount*(r: var NewTraceReader): Result[uint64, string] =
   ?r.ensureCallReader()
   ok(r.callReader.count())
 
+iterator callRange*(r: var NewTraceReader, start, count: uint64): CallRecord =
+  ## Yields call records in [start, start+count).
+  let _ = r.ensureCallReader()
+  for i in start ..< start + count:
+    let res = r.callReader.readCall(i)
+    if res.isOk:
+      yield res.get()
+
+proc callRange*(r: var NewTraceReader, start, count: uint64,
+                output: var openArray[CallRecord]): int =
+  ## Fill output buffer with call records starting at `start`.
+  ## Returns the number of records written.
+  let _ = r.ensureCallReader()
+  var written = 0
+  for i in start ..< start + count:
+    if written >= output.len: break
+    let res = r.callReader.readCall(i)
+    if res.isOk:
+      output[written] = res.get()
+      written += 1
+  written
+
 # ---------------------------------------------------------------------------
 # IO event access (lazy init)
 # ---------------------------------------------------------------------------
@@ -218,3 +240,26 @@ proc ioEvent*(r: var NewTraceReader, index: uint64): Result[IOEvent, string] =
 proc ioEventCount*(r: var NewTraceReader): Result[uint64, string] =
   ?r.ensureIOEventReader()
   ok(r.ioEventReader.count())
+
+iterator events*(r: var NewTraceReader, start, count: uint64): IOEvent =
+  ## Yields IO events in [start, start+count).
+  let _ = r.ensureIOEventReader()
+  for i in start ..< start + count:
+    let res = r.ioEventReader.readEvent(i)
+    if res.isOk:
+      yield res.get()
+
+proc events*(
+    r: var NewTraceReader, start, count: uint64,
+    output: var openArray[IOEvent]): int =
+  ## Fill output buffer with IO events starting at `start`.
+  ## Returns the number of events written.
+  let _ = r.ensureIOEventReader()
+  var written = 0
+  for i in start ..< start + count:
+    if written >= output.len: break
+    let res = r.ioEventReader.readEvent(i)
+    if res.isOk:
+      output[written] = res.get()
+      written += 1
+  written
