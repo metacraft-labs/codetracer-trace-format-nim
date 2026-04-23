@@ -275,6 +275,75 @@ proc bench_namespace_space_utilization() =
 
   echo "PASS: bench_namespace_space_utilization"
 
+proc test_namespace_serialize_deserialize() =
+  ## Create namespace with 10K entries, serialize, deserialize,
+  ## verify all lookups return the original data.
+  const N = 10_000
+  var ns = initNamespace("ser_test_ns", ltTypeA)
+  var rng = Rng(state: 888'u64)
+
+  var entries = newSeq[seq[byte]](N)
+  for i in 0 ..< N:
+    let data = rng.randomData(8, 32)
+    entries[i] = data
+    let res = ns.append(uint64(i), data)
+    doAssert res.isOk, "append failed at i=" & $i & ": " & res.error
+
+  doAssert ns.count == uint64(N)
+
+  # Serialize.
+  let data = ns.serialize()
+  doAssert data.len > 0, "serialize produced empty output"
+
+  # Deserialize.
+  let res = deserializeNamespace(data, ltTypeA)
+  doAssert res.isOk, "deserialize failed: " & res.error
+  let restored = res.get()
+
+  doAssert restored.count == uint64(N),
+    "count mismatch: " & $restored.count & " vs " & $N
+  doAssert restored.name == "ser_test_ns",
+    "name mismatch: got " & restored.name
+
+  # Verify every entry.
+  for i in 0 ..< N:
+    let lres = restored.lookup(uint64(i))
+    doAssert lres.isOk, "lookup failed for key=" & $i & ": " & lres.error
+    doAssert lres.get() == entries[i],
+      "data mismatch for key=" & $i
+
+  # Verify missing key.
+  let miss = restored.lookup(uint64(N + 1))
+  doAssert miss.isErr, "expected miss for key beyond range"
+
+  echo "PASS: test_namespace_serialize_deserialize"
+
+proc test_namespace_serialize_type_b() =
+  ## Same test with Type B.
+  const N = 1_000
+  var ns = initNamespace("ser_test_b", ltTypeB)
+  var rng = Rng(state: 777'u64)
+
+  var entries = newSeq[seq[byte]](N)
+  for i in 0 ..< N:
+    let data = rng.randomData(8, 32)
+    entries[i] = data
+    let res = ns.append(uint64(i), data)
+    doAssert res.isOk, "append failed at i=" & $i & ": " & res.error
+
+  let data = ns.serialize()
+  let res = deserializeNamespace(data, ltTypeB)
+  doAssert res.isOk, "deserialize failed: " & res.error
+  let restored = res.get()
+
+  doAssert restored.count == uint64(N)
+  for i in 0 ..< N:
+    let lres = restored.lookup(uint64(i))
+    doAssert lres.isOk, "lookup failed for key=" & $i
+    doAssert lres.get() == entries[i], "data mismatch for key=" & $i
+
+  echo "PASS: test_namespace_serialize_type_b"
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -285,6 +354,8 @@ when isMainModule:
   test_namespace_range_scan()
   test_namespace_empty_data_rejected()
   test_namespace_large_data_rejected()
+  test_namespace_serialize_deserialize()
+  test_namespace_serialize_type_b()
   bench_namespace_create_append_1m()
   bench_namespace_lookup_latency()
   bench_namespace_space_utilization()

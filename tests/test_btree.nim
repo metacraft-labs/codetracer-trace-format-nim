@@ -165,9 +165,72 @@ proc bench_btree_lookup_latency() =
 
   echo "PASS: bench_btree_lookup_latency"
 
+proc test_btree_serialize_deserialize() =
+  ## Insert 10K keys, serialize, deserialize, verify all lookups still work.
+  const N = 10_000
+  var rng = Rng(state: 99'u64)
+
+  # Test with both Type A (8-byte) and Type B (16-byte) descriptors.
+  for descSize in [8, 16]:
+    var tree = initBTree(descSize)
+
+    # Insert keys in random order.
+    var keys = newSeq[uint64](N)
+    for i in 0 ..< N:
+      keys[i] = uint64(i) * 13 + 7
+    # Shuffle.
+    for i in countdown(N - 1, 1):
+      let j = int(rng.next() mod uint64(i + 1))
+      swap(keys[i], keys[j])
+
+    for key in keys:
+      tree.insert(key, keyToDescriptor(key, descSize))
+
+    doAssert tree.count == uint64(N)
+
+    # Serialize.
+    let data = tree.serialize()
+    doAssert data.len > 0, "serialize produced empty output"
+
+    # Verify block alignment: payload after 16-byte header should be multiple
+    # of 4096.
+    doAssert (data.len - 16) mod 4096 == 0,
+      "serialized data not block-aligned"
+
+    # Deserialize.
+    let res = deserialize(data, descSize)
+    doAssert res.isOk, "deserialize failed: " & res.error
+
+    let restored = res.get()
+    doAssert restored.count == uint64(N),
+      "count mismatch: " & $restored.count & " vs " & $N
+
+    # Verify every key lookup returns the correct descriptor.
+    for key in keys:
+      let lres = restored.lookup(key)
+      doAssert lres.isOk, "lookup failed for key=" & $key & " (descSize=" & $descSize & ")"
+      doAssert lres.get() == keyToDescriptor(key, descSize),
+        "descriptor mismatch for key=" & $key
+
+    # Verify a missing key is still missing.
+    let miss = restored.lookup(1'u64)  # 1 is not in the key set (keys are 7 + 13*i)
+    doAssert miss.isErr, "expected miss for key=1 (descSize=" & $descSize & ")"
+
+    # Verify range scan works on deserialized tree.
+    var rangeResults: seq[BTreeEntry]
+    for entry in restored.rangeIter(100'u64, 500'u64):
+      rangeResults.add(entry)
+    doAssert rangeResults.len > 0, "range scan on deserialized tree returned nothing"
+    for i in 1 ..< rangeResults.len:
+      doAssert rangeResults[i].key > rangeResults[i - 1].key,
+        "range scan not sorted after deserialize"
+
+  echo "PASS: test_btree_serialize_deserialize"
+
 when isMainModule:
   test_btree_insert_lookup_1m()
   test_btree_range_scan()
   test_btree_unsorted_insert()
+  test_btree_serialize_deserialize()
   bench_btree_lookup_latency()
   echo "All B-tree tests passed."
