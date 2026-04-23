@@ -128,12 +128,9 @@ proc test_ctfs_magic_version_blocksize() =
   # Rust: pub const CTFS_VERSION: u8 = 3;
   doAssert data[5] == 4'u8, "version should be 4, got: " & $data[5]
 
-  # Compression method at offset 6: 0 = None at container level
-  # (Zstd compression is applied per-chunk within events.log, not at CTFS level)
-  doAssert data[6] == 0'u8, "compression should be 0 (None), got: " & $data[6]
-
-  # Encryption method at offset 7: 0 = None
-  doAssert data[7] == 0'u8, "encryption should be 0 (None), got: " & $data[7]
+  # V4 layout: byte 6 = encryption (0 = None), byte 7 = max_shards (1 = default)
+  doAssert data[6] == 0'u8, "encryption should be 0 (None), got: " & $data[6]
+  doAssert data[7] == 1'u8, "max_shards should be 1, got: " & $data[7]
 
   # Block size at offset 8: 4096 as u32 LE
   # Rust: pub const DEFAULT_BLOCK_SIZE: u32 = 4096;
