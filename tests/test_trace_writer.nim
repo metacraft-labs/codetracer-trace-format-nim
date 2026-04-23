@@ -466,7 +466,7 @@ proc test_rust_reader_format() =
   doAssert data[4] == 0xE2'u8
 
   # 2. Version byte = 3
-  doAssert data[5] == 3, "version should be 3, got: " & $data[5]
+  doAssert data[5] == 4, "version should be 4, got: " & $data[5]
 
   # 3. Block size = 4096 at offset 8
   var bsArr: array[4, byte]
