@@ -36,8 +36,11 @@ import codetracer_trace_types
 import codetracer_trace_writer/meta_dat
 import codetracer_trace_writer/multi_stream_writer
 import codetracer_trace_writer/value_stream
+import codetracer_trace_writer/call_stream
 import codetracer_trace_writer/io_event_stream
+import codetracer_trace_writer/step_encoding
 import codetracer_trace_writer/streaming_value_encoder
+import codetracer_trace_writer/new_trace_reader
 import std/tables
 import std/os
 import std/options
@@ -1205,6 +1208,325 @@ proc ct_value_get_bytes(h: ValueEncoderHandle, out_len: ptr csize_t): ptr uint8 
   if buf.len == 0:
     return nil
   return cast[ptr uint8](unsafeAddr buf[0])
+
+# ===========================================================================
+# Reader FFI — C interface to NewTraceReader
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# JSON helpers (no-exception, manual string building)
+# ---------------------------------------------------------------------------
+
+proc bytesToJsonArray(data: seq[byte]): string =
+  ## Render byte sequence as JSON array of integers.
+  result = "["
+  for i, b in data:
+    if i > 0: result.add(",")
+    result.add($int(b))
+  result.add("]")
+
+proc stepEventToJson(ev: StepEvent): string =
+  ## Serialize a StepEvent to JSON.
+  case ev.kind
+  of sekAbsoluteStep:
+    "{\"kind\":\"absolute_step\",\"global_line_index\":" & $ev.globalLineIndex & "}"
+  of sekDeltaStep:
+    "{\"kind\":\"delta_step\",\"line_delta\":" & $ev.lineDelta & "}"
+  of sekRaise:
+    "{\"kind\":\"raise\",\"exception_type_id\":" & $ev.exceptionTypeId &
+      ",\"message\":" & bytesToJsonArray(ev.message) & "}"
+  of sekCatch:
+    "{\"kind\":\"catch\",\"exception_type_id\":" & $ev.catchExceptionTypeId & "}"
+  of sekThreadSwitch:
+    "{\"kind\":\"thread_switch\",\"thread_id\":" & $ev.threadId & "}"
+
+proc variableValueToJson(v: VariableValue): string =
+  "{\"varname_id\":" & $v.varnameId &
+    ",\"type_id\":" & $v.typeId &
+    ",\"data\":" & bytesToJsonArray(v.data) & "}"
+
+proc variableValuesToJson(vs: seq[VariableValue]): string =
+  result = "["
+  for i, v in vs:
+    if i > 0: result.add(",")
+    result.add(variableValueToJson(v))
+  result.add("]")
+
+proc callRecordToJson(rec: call_stream.CallRecord): string =
+  result = "{\"function_id\":" & $rec.functionId &
+    ",\"parent_call_key\":" & $rec.parentCallKey &
+    ",\"entry_step\":" & $rec.entryStep &
+    ",\"exit_step\":" & $rec.exitStep &
+    ",\"depth\":" & $rec.depth
+  # args
+  result.add(",\"args\":[")
+  for i, arg in rec.args:
+    if i > 0: result.add(",")
+    result.add(bytesToJsonArray(arg))
+  result.add("]")
+  # return value
+  result.add(",\"return_value\":" & bytesToJsonArray(rec.returnValue))
+  # exception
+  result.add(",\"exception\":" & bytesToJsonArray(rec.exception))
+  # children
+  result.add(",\"children\":[")
+  for i, c in rec.children:
+    if i > 0: result.add(",")
+    result.add($c)
+  result.add("]}")
+
+proc ioEventToJson(ev: IOEvent): string =
+  let kindStr = case ev.kind
+    of ioStdout: "stdout"
+    of ioStderr: "stderr"
+    of ioFileOp: "file_op"
+    of ioError: "error"
+  "{\"kind\":\"" & kindStr & "\",\"step_id\":" & $ev.stepId &
+    ",\"data\":" & bytesToJsonArray(ev.data) & "}"
+
+# ---------------------------------------------------------------------------
+# Reader handle
+# ---------------------------------------------------------------------------
+
+type
+  TraceReaderHandle = ptr NewTraceReader
+
+proc allocJsonResult(s: string, outLen: ptr csize_t): ptr uint8 =
+  ## Allocate a copy of the JSON string and set outLen. Caller frees
+  ## with ct_free_buffer.
+  if outLen.isNil:
+    return nil
+  let n = s.len
+  outLen[] = csize_t(n)
+  if n == 0:
+    return nil
+  let buf = cast[ptr uint8](alloc(n))
+  if buf.isNil:
+    return nil
+  copyMem(buf, unsafeAddr s[0], n)
+  return buf
+
+proc allocStringResult(s: string, outLen: ptr csize_t): ptr uint8 =
+  ## Return a pointer into a heap-copied string. Caller frees with ct_free_buffer.
+  if outLen.isNil:
+    return nil
+  let n = s.len
+  outLen[] = csize_t(n)
+  if n == 0:
+    return nil
+  let buf = cast[ptr uint8](alloc(n))
+  if buf.isNil:
+    return nil
+  copyMem(buf, unsafeAddr s[0], n)
+  return buf
+
+# ---------------------------------------------------------------------------
+# Reader lifecycle
+# ---------------------------------------------------------------------------
+
+proc ct_reader_open(path: cstring): pointer {.exportc, cdecl.} =
+  ## Open a .ct trace file. Returns opaque reader handle or nil on failure.
+  ## Check trace_writer_last_error() for error message on failure.
+  if path.isNil:
+    setError("NULL path")
+    return nil
+  let p = $path
+  let res = openNewTrace(p)
+  if res.isErr:
+    setError(res.error)
+    return nil
+  let h = cast[TraceReaderHandle](alloc0(sizeof(NewTraceReader)))
+  h[] = res.get()
+  return cast[pointer](h)
+
+proc ct_reader_close(h: pointer) {.exportc, cdecl.} =
+  ## Close and free a reader handle. Passing NULL is a no-op.
+  if h.isNil:
+    return
+  let rh = cast[TraceReaderHandle](h)
+  try:
+    `=destroy`(rh[])
+  except:
+    discard
+  dealloc(rh)
+
+# ---------------------------------------------------------------------------
+# Counts
+# ---------------------------------------------------------------------------
+
+proc ct_reader_step_count(h: pointer): uint64 {.exportc, cdecl.} =
+  if h.isNil: return 0
+  let rh = cast[TraceReaderHandle](h)
+  let res = rh[].stepCount()
+  if res.isErr:
+    setError(res.error)
+    return 0
+  res.get()
+
+proc ct_reader_call_count(h: pointer): uint64 {.exportc, cdecl.} =
+  if h.isNil: return 0
+  let rh = cast[TraceReaderHandle](h)
+  let res = rh[].callCount()
+  if res.isErr:
+    setError(res.error)
+    return 0
+  res.get()
+
+proc ct_reader_event_count(h: pointer): uint64 {.exportc, cdecl.} =
+  if h.isNil: return 0
+  let rh = cast[TraceReaderHandle](h)
+  let res = rh[].ioEventCount()
+  if res.isErr:
+    setError(res.error)
+    return 0
+  res.get()
+
+# ---------------------------------------------------------------------------
+# Interning
+# ---------------------------------------------------------------------------
+
+proc ct_reader_path(h: pointer, id: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+  ## Get path string by id. Caller must free result with ct_free_buffer.
+  if h.isNil or outLen.isNil: return nil
+  let rh = cast[TraceReaderHandle](h)
+  let res = rh[].path(id)
+  if res.isErr:
+    setError(res.error)
+    return nil
+  allocStringResult(res.get(), outLen)
+
+proc ct_reader_function(h: pointer, id: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+  ## Get function name by id. Caller must free result with ct_free_buffer.
+  if h.isNil or outLen.isNil: return nil
+  let rh = cast[TraceReaderHandle](h)
+  let res = rh[].function(id)
+  if res.isErr:
+    setError(res.error)
+    return nil
+  allocStringResult(res.get(), outLen)
+
+proc ct_reader_type_name(h: pointer, id: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+  ## Get type name by id. Caller must free result with ct_free_buffer.
+  if h.isNil or outLen.isNil: return nil
+  let rh = cast[TraceReaderHandle](h)
+  let res = rh[].typeName(id)
+  if res.isErr:
+    setError(res.error)
+    return nil
+  allocStringResult(res.get(), outLen)
+
+proc ct_reader_varname(h: pointer, id: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+  ## Get variable name by id. Caller must free result with ct_free_buffer.
+  if h.isNil or outLen.isNil: return nil
+  let rh = cast[TraceReaderHandle](h)
+  let res = rh[].varname(id)
+  if res.isErr:
+    setError(res.error)
+    return nil
+  allocStringResult(res.get(), outLen)
+
+proc ct_reader_path_count(h: pointer): uint64 {.exportc, cdecl.} =
+  if h.isNil: return 0
+  let rh = cast[TraceReaderHandle](h)
+  rh[].pathCount()
+
+proc ct_reader_function_count(h: pointer): uint64 {.exportc, cdecl.} =
+  if h.isNil: return 0
+  let rh = cast[TraceReaderHandle](h)
+  rh[].functionCount()
+
+proc ct_reader_type_count(h: pointer): uint64 {.exportc, cdecl.} =
+  if h.isNil: return 0
+  let rh = cast[TraceReaderHandle](h)
+  rh[].typeCount()
+
+proc ct_reader_varname_count(h: pointer): uint64 {.exportc, cdecl.} =
+  if h.isNil: return 0
+  let rh = cast[TraceReaderHandle](h)
+  rh[].varnameCount()
+
+# ---------------------------------------------------------------------------
+# Step access — returns JSON-encoded step event
+# ---------------------------------------------------------------------------
+
+proc ct_reader_step(h: pointer, n: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+  ## Returns step event N as JSON bytes. Caller must free with ct_free_buffer.
+  if h.isNil or outLen.isNil: return nil
+  let rh = cast[TraceReaderHandle](h)
+  let res = rh[].step(n)
+  if res.isErr:
+    setError(res.error)
+    return nil
+  allocJsonResult(stepEventToJson(res.get()), outLen)
+
+# ---------------------------------------------------------------------------
+# Value access — returns JSON-encoded values array
+# ---------------------------------------------------------------------------
+
+proc ct_reader_values(h: pointer, n: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+  ## Returns variable values for step N as JSON array. Caller must free with ct_free_buffer.
+  if h.isNil or outLen.isNil: return nil
+  let rh = cast[TraceReaderHandle](h)
+  let res = rh[].values(n)
+  if res.isErr:
+    setError(res.error)
+    return nil
+  allocJsonResult(variableValuesToJson(res.get()), outLen)
+
+# ---------------------------------------------------------------------------
+# Call access — returns JSON-encoded call record
+# ---------------------------------------------------------------------------
+
+proc ct_reader_call(h: pointer, key: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+  ## Returns call record by key as JSON. Caller must free with ct_free_buffer.
+  if h.isNil or outLen.isNil: return nil
+  let rh = cast[TraceReaderHandle](h)
+  let res = rh[].call(key)
+  if res.isErr:
+    setError(res.error)
+    return nil
+  allocJsonResult(callRecordToJson(res.get()), outLen)
+
+proc ct_reader_call_for_step(h: pointer, stepId: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+  ## Returns the innermost call record enclosing the given step as JSON.
+  ## Caller must free with ct_free_buffer.
+  if h.isNil or outLen.isNil: return nil
+  let rh = cast[TraceReaderHandle](h)
+  let res = rh[].callForStep(stepId)
+  if res.isErr:
+    setError(res.error)
+    return nil
+  allocJsonResult(callRecordToJson(res.get()), outLen)
+
+# ---------------------------------------------------------------------------
+# IO Event access — returns JSON-encoded IO event
+# ---------------------------------------------------------------------------
+
+proc ct_reader_event(h: pointer, index: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+  ## Returns IO event by index as JSON. Caller must free with ct_free_buffer.
+  if h.isNil or outLen.isNil: return nil
+  let rh = cast[TraceReaderHandle](h)
+  let res = rh[].ioEvent(index)
+  if res.isErr:
+    setError(res.error)
+    return nil
+  allocJsonResult(ioEventToJson(res.get()), outLen)
+
+# ---------------------------------------------------------------------------
+# Metadata
+# ---------------------------------------------------------------------------
+
+proc ct_reader_program(h: pointer, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+  ## Get program name from trace metadata. Caller must free with ct_free_buffer.
+  if h.isNil or outLen.isNil: return nil
+  let rh = cast[TraceReaderHandle](h)
+  allocStringResult(rh[].meta.program, outLen)
+
+proc ct_reader_workdir(h: pointer, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+  ## Get workdir from trace metadata. Caller must free with ct_free_buffer.
+  if h.isNil or outLen.isNil: return nil
+  let rh = cast[TraceReaderHandle](h)
+  allocStringResult(rh[].meta.workdir, outLen)
 
 # ---------------------------------------------------------------------------
 # NimMain — required for static/shared lib initialization
