@@ -199,6 +199,85 @@ proc callCount*(r: var NewTraceReader): Result[uint64, string] =
   ?r.ensureCallReader()
   ok(r.callReader.count())
 
+proc callForStep*(r: var NewTraceReader, stepId: uint64): Result[CallRecord, string] =
+  ## Find the innermost enclosing call record for the given step using
+  ## proportional (interpolation) search on call records sorted by entryStep.
+  ## Call records store [entryStep, exitStep] ranges. The search exploits
+  ## the approximate uniform distribution of step IDs across calls,
+  ## giving O(log log C) convergence -- typically 2-3 iterations.
+  ?r.ensureCallReader()
+  let totalCalls = r.callReader.count()
+  if totalCalls == 0:
+    return err("no call records")
+
+  var lo: uint64 = 0
+  var hi: uint64 = totalCalls - 1
+
+  # Best match: deepest (most nested) call containing stepId
+  var bestCall: CallRecord
+  var bestFound = false
+
+  for iteration in 0 ..< 20:  # safety bound
+    if lo > hi:
+      break
+
+    # Read boundary calls
+    let loCall = ?r.callReader.readCall(lo)
+    let hiCall = ?r.callReader.readCall(hi)
+
+    if stepId < loCall.entryStep:
+      break
+    if stepId > hiCall.exitStep:
+      break
+
+    # Check if lo contains our step
+    if stepId >= loCall.entryStep and stepId <= loCall.exitStep:
+      if not bestFound or loCall.depth > bestCall.depth:
+        bestCall = loCall
+        bestFound = true
+      # Narrow from the left to find deeper calls
+      lo = lo + 1
+      if lo > hi: break
+      continue
+
+    # Check if hi contains our step
+    if lo != hi and stepId >= hiCall.entryStep and stepId <= hiCall.exitStep:
+      if not bestFound or hiCall.depth > bestCall.depth:
+        bestCall = hiCall
+        bestFound = true
+      hi = hi - 1
+      if lo > hi: break
+      continue
+
+    if lo == hi:
+      break
+
+    # Interpolate position based on entryStep distribution
+    let rangeSteps = hiCall.entryStep - loCall.entryStep
+    if rangeSteps == 0:
+      break
+    let offset = stepId - loCall.entryStep
+    let estimate = lo + (hi - lo) * offset div rangeSteps
+    let mid = max(lo + 1, min(estimate, hi - 1))
+
+    let midCall = ?r.callReader.readCall(mid)
+    if stepId >= midCall.entryStep and stepId <= midCall.exitStep:
+      if not bestFound or midCall.depth > bestCall.depth:
+        bestCall = midCall
+        bestFound = true
+      # Continue searching for deeper calls
+      lo = mid + 1
+      continue
+    elif stepId < midCall.entryStep:
+      hi = mid - 1
+    else:
+      lo = mid + 1
+
+  if bestFound:
+    ok(bestCall)
+  else:
+    err("step " & $stepId & " not found in any call")
+
 iterator callRange*(r: var NewTraceReader, start, count: uint64): CallRecord =
   ## Yields call records in [start, start+count).
   let _ = r.ensureCallReader()

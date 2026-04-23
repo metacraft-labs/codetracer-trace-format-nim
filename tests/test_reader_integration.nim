@@ -466,9 +466,136 @@ proc test_reader_cache_eviction() {.raises: [].} =
   echo "PASS: test_reader_cache_eviction"
 
 # ---------------------------------------------------------------------------
+# test_proportional_call_search
+# ---------------------------------------------------------------------------
+
+proc writeTraceWithSortedCalls(): seq[byte] {.raises: [].} =
+  ## Write a trace with 1000 steps and 50 calls, sorted by entryStep.
+  ## Each call covers ~20 steps. Calls are non-overlapping leaf calls
+  ## wrapped by one root call spanning all steps.
+  var ctfs = createCtfs()
+
+  let metaFileRes = ctfs.addFile("meta.dat")
+  doAssert metaFileRes.isOk
+  var metaFile = metaFileRes.get()
+  let meta = TraceMetadata(program: "search_test", args: @[], workdir: "/tmp")
+  let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/main.py"])
+  doAssert metaWr.isOk
+
+  let tabRes = initTraceInterningTables(ctfs)
+  doAssert tabRes.isOk
+  var tab = tabRes.get()
+  discard ctfs.ensurePathId(tab, "/src/main.py")
+  discard ctfs.ensureFunctionId(tab, "main")
+  discard ctfs.ensureFunctionId(tab, "work")
+  discard ctfs.ensureTypeId(tab, "int")
+  discard ctfs.ensureVarnameId(tab, "i")
+
+  let execRes = initExecStreamWriter(ctfs, chunkSize = 64)
+  doAssert execRes.isOk
+  var execW = execRes.get()
+
+  let valRes = initValueStreamWriter(ctfs)
+  doAssert valRes.isOk
+  var valW = valRes.get()
+
+  let callRes = initCallStreamWriter(ctfs)
+  doAssert callRes.isOk
+  var callW = callRes.get()
+
+  # Write 1000 steps
+  for i in 0 ..< 1000:
+    var ev: StepEvent
+    if i == 0:
+      ev = StepEvent(kind: sekAbsoluteStep, globalLineIndex: 0)
+    else:
+      ev = StepEvent(kind: sekDeltaStep, lineDelta: 1)
+    let wr = ctfs.writeEvent(execW, ev)
+    doAssert wr.isOk
+    let vr = ctfs.writeStepValues(valW, @[
+      VariableValue(varnameId: 0, typeId: 0, data: intToStr(i).toBytes)])
+    doAssert vr.isOk
+
+  # Call 0: root call spanning all steps (depth 0)
+  var childKeys: seq[uint64]
+  for i in 1 .. 50:
+    childKeys.add(uint64(i))
+  let cw0 = ctfs.writeCall(callW, call_stream.CallRecord(
+    functionId: 0, parentCallKey: -1,
+    entryStep: 0, exitStep: 999, depth: 0,
+    args: @[], returnValue: @[VoidReturnMarker], exception: @[],
+    children: childKeys))
+  doAssert cw0.isOk
+
+  # Calls 1-50: leaf calls, each covering 20 steps, sorted by entryStep.
+  # Call i covers steps [(i-1)*20, (i-1)*20+19].
+  for i in 1 .. 50:
+    let entry = uint64((i - 1) * 20)
+    let exit = entry + 19
+    let cw = ctfs.writeCall(callW, call_stream.CallRecord(
+      functionId: 1, parentCallKey: 0,
+      entryStep: entry, exitStep: exit, depth: 1,
+      args: @[], returnValue: intToStr(i).toBytes, exception: @[],
+      children: @[]))
+    doAssert cw.isOk
+
+  let flushRes = ctfs.flush(execW)
+  doAssert flushRes.isOk
+
+  result = ctfs.toBytes()
+  ctfs.closeCtfs()
+
+proc test_proportional_call_search() {.raises: [].} =
+  let data = writeTraceWithSortedCalls()
+  let readerRes = openNewTraceFromBytes(data)
+  doAssert readerRes.isOk, "open failed: " & readerRes.error
+  var reader = readerRes.get()
+
+  let cc = reader.callCount()
+  doAssert cc.isOk and cc.get() == 51, "expected 51 calls, got " & $cc.get()
+
+  # Test every step finds its enclosing call, and the call range contains that step.
+  for stepIdx in 0'u64 ..< 1000'u64:
+    let res = reader.callForStep(stepIdx)
+    doAssert res.isOk, "callForStep(" & $stepIdx & ") failed: " & res.error
+    let c = res.get()
+    doAssert stepIdx >= c.entryStep and stepIdx <= c.exitStep,
+      "step " & $stepIdx & " not in call range [" &
+      $c.entryStep & ", " & $c.exitStep & "]"
+
+  # Verify specific steps land in expected leaf calls (depth 1).
+  # Step 0 should be in call with entryStep=0 (call 1), depth 1.
+  let r0 = reader.callForStep(0)
+  doAssert r0.isOk
+  doAssert r0.get().entryStep == 0 and r0.get().exitStep == 19, "step 0 call"
+  doAssert r0.get().depth == 1, "step 0 should find leaf call (depth 1)"
+
+  # Step 25 should be in call with entryStep=20, exitStep=39
+  let r25 = reader.callForStep(25)
+  doAssert r25.isOk
+  doAssert r25.get().entryStep == 20 and r25.get().exitStep == 39, "step 25 call"
+
+  # Step 999 should be in call with entryStep=980, exitStep=999
+  let r999 = reader.callForStep(999)
+  doAssert r999.isOk
+  doAssert r999.get().entryStep == 980 and r999.get().exitStep == 999, "step 999 call"
+
+  # Step 500 should be in call with entryStep=500, exitStep=519
+  let r500 = reader.callForStep(500)
+  doAssert r500.isOk
+  doAssert r500.get().entryStep == 500 and r500.get().exitStep == 519, "step 500 call"
+
+  # Out-of-range step should fail
+  let rOob = reader.callForStep(1000)
+  doAssert rOob.isErr, "step 1000 should fail"
+
+  echo "PASS: test_proportional_call_search"
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 
 test_reader_full_integration()
 test_reader_cache_eviction()
+test_proportional_call_search()
 echo "ALL PASS: test_reader_integration"
