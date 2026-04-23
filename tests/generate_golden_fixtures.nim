@@ -25,7 +25,7 @@ proc generateSplitBinaryEvents(): seq[byte] =
   enc.encodeEvent(TraceLowLevelEvent(kind: tleFunction,
     functionRecord: FunctionRecord(pathId: PathId(0), line: Line(1), name: "main")))
   enc.encodeEvent(TraceLowLevelEvent(kind: tleCall,
-    callRecord: CallRecord(functionId: FunctionId(0), args: @[])))
+    callRecord: codetracer_trace_types.CallRecord(functionId: FunctionId(0), args: @[])))
   enc.encodeEvent(TraceLowLevelEvent(kind: tleStep,
     step: StepRecord(pathId: PathId(0), line: Line(5))))
   enc.encodeEvent(TraceLowLevelEvent(kind: tleValue,

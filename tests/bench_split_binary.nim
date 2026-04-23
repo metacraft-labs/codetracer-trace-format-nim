@@ -34,7 +34,7 @@ proc generateMixedEvents(): seq[TraceLowLevelEvent] =
         step: StepRecord(pathId: PathId(uint64(i mod 50)), line: Line(int64(i mod 1000))))
     of 1:
       result[idx] = TraceLowLevelEvent(kind: tleCall,
-        callRecord: CallRecord(functionId: FunctionId(uint64(i mod 100)), args: @[]))
+        callRecord: codetracer_trace_types.CallRecord(functionId: FunctionId(uint64(i mod 100)), args: @[]))
     of 2:
       result[idx] = TraceLowLevelEvent(kind: tleReturn,
         returnRecord: ReturnRecord(

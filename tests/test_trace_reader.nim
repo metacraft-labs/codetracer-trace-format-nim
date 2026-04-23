@@ -299,7 +299,7 @@ proc test_reader_roundtrip_all_event_types() =
     functionRecord: FunctionRecord(pathId: PathId(0), line: Line(10), name: "doWork")))
   # Call
   originalEvents.add(TraceLowLevelEvent(kind: tleCall,
-    callRecord: CallRecord(functionId: FunctionId(1), args: @[])))
+    callRecord: codetracer_trace_types.CallRecord(functionId: FunctionId(1), args: @[])))
   # Value (Int)
   originalEvents.add(TraceLowLevelEvent(kind: tleValue,
     fullValue: FullValueRecord(variableId: VariableId(0),

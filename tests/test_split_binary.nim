@@ -73,7 +73,7 @@ proc test_tag_numbers()  =
 
   enc.clear()
   enc.encodeEvent(TraceLowLevelEvent(kind: tleCall,
-    callRecord: CallRecord(functionId: FunctionId(0), args: @[])))
+    callRecord: codetracer_trace_types.CallRecord(functionId: FunctionId(0), args: @[])))
   doAssert enc.getBytes()[0] == 7
 
   enc.clear()
@@ -240,12 +240,12 @@ proc test_roundtrip_function()  =
 proc test_roundtrip_call()  =
   # Empty args
   assertRoundtrip(TraceLowLevelEvent(kind: tleCall,
-    callRecord: CallRecord(functionId: FunctionId(1), args: @[])),
+    callRecord: codetracer_trace_types.CallRecord(functionId: FunctionId(1), args: @[])),
     "Call(empty)")
 
   # With args
   assertRoundtrip(TraceLowLevelEvent(kind: tleCall,
-    callRecord: CallRecord(functionId: FunctionId(3), args: @[
+    callRecord: codetracer_trace_types.CallRecord(functionId: FunctionId(3), args: @[
       FullValueRecord(variableId: VariableId(1),
         value: ValueRecord(kind: vrkInt, intVal: 10, intTypeId: TypeId(7))),
       FullValueRecord(variableId: VariableId(2),
@@ -376,7 +376,7 @@ proc test_mixed_sequence()  =
   events.add(TraceLowLevelEvent(kind: tleStep,
     step: StepRecord(pathId: PathId(0), line: Line(1))))
   events.add(TraceLowLevelEvent(kind: tleCall,
-    callRecord: CallRecord(functionId: FunctionId(1), args: @[
+    callRecord: codetracer_trace_types.CallRecord(functionId: FunctionId(1), args: @[
       FullValueRecord(variableId: VariableId(0),
         value: ValueRecord(kind: vrkInt, intVal: 42, intTypeId: TypeId(0)))])))
   events.add(TraceLowLevelEvent(kind: tleStep,

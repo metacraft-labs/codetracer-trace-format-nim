@@ -397,7 +397,7 @@ proc test_split_binary_tag_ordering() =
   # Call: tag 7
   enc.clear()
   enc.encodeEvent(TraceLowLevelEvent(kind: tleCall,
-    callRecord: CallRecord(functionId: FunctionId(0), args: @[])))
+    callRecord: codetracer_trace_types.CallRecord(functionId: FunctionId(0), args: @[])))
   doAssert enc.getBytes()[0] == 7'u8, "Call tag should be 7"
 
   # Return: tag 8
@@ -554,7 +554,7 @@ proc test_cbor_payload_envelope() =
   # --- Call event: tag=7, then 8-byte function_id, then 4-byte payload len, then CBOR ---
   enc.clear()
   enc.encodeEvent(TraceLowLevelEvent(kind: tleCall,
-    callRecord: CallRecord(functionId: FunctionId(5), args: @[])))
+    callRecord: codetracer_trace_types.CallRecord(functionId: FunctionId(5), args: @[])))
   let callBytes = enc.getBytes()
 
   doAssert callBytes[0] == 7'u8, "Call tag"
@@ -587,7 +587,7 @@ proc test_encode_decode_roundtrip() =
     TraceLowLevelEvent(kind: tleFunction,
       functionRecord: FunctionRecord(pathId: PathId(3), line: Line(1), name: "main")),
     TraceLowLevelEvent(kind: tleCall,
-      callRecord: CallRecord(functionId: FunctionId(0), args: @[])),
+      callRecord: codetracer_trace_types.CallRecord(functionId: FunctionId(0), args: @[])),
     TraceLowLevelEvent(kind: tleValue,
       fullValue: FullValueRecord(variableId: VariableId(1),
         value: ValueRecord(kind: vrkInt, intVal: 42, intTypeId: TypeId(7)))),
