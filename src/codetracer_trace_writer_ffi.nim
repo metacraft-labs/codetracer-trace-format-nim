@@ -1528,6 +1528,209 @@ proc ct_reader_workdir(h: pointer, outLen: ptr csize_t): ptr uint8 {.exportc, cd
   let rh = cast[TraceReaderHandle](h)
   allocStringResult(rh[].meta.workdir, outLen)
 
+# ===========================================================================
+# Structured reader FFI — binary accessors that avoid JSON parsing
+# ===========================================================================
+#
+# These functions return data through output pointer parameters rather than
+# JSON strings, eliminating allocation and parsing overhead on the hot path.
+# The Rust caller populates Db arrays directly from these.
+
+# ---------------------------------------------------------------------------
+# Global line index resolution helper
+# ---------------------------------------------------------------------------
+#
+# The multi-stream writer encodes steps as globalLineIndex values using a
+# prefix-sum over per-file line counts (DefaultLinesPerFile = 100_000 per
+# file). To convert back to (path_id, line), the reader must reconstruct
+# the same prefix-sum. We build it lazily from the path count.
+
+import codetracer_trace_writer/global_line_index
+
+proc getOrBuildGli(rh: TraceReaderHandle): GlobalLineIndex =
+  ## Build a GlobalLineIndex from the reader's path count, using the same
+  ## DefaultLinesPerFile constant the writer uses.
+  let pathCount = rh[].pathCount()
+  var counts = newSeq[uint64](int(pathCount))
+  for i in 0 ..< int(pathCount):
+    counts[i] = DefaultLinesPerFile
+  buildGlobalLineIndex(counts)
+
+# ---------------------------------------------------------------------------
+# ct_reader_step_location — resolve step N to (path_id, line)
+# ---------------------------------------------------------------------------
+
+proc ct_reader_step_location(
+    h: pointer, n: uint64,
+    outPathId: ptr uint64, outLine: ptr uint64
+): cint {.exportc, cdecl.} =
+  ## Resolve step N to its source location (path_id, line).
+  ## Returns 0 on success, non-zero on failure.
+  ##
+  ## Internally, steps are stored as globalLineIndex values (a prefix-sum
+  ## encoding of path_id + line). This function resolves deltas within
+  ## the exec stream chunk and then maps the absolute GLI back to
+  ## (path_id, line) using the same DefaultLinesPerFile the writer used.
+  if h.isNil or outPathId.isNil or outLine.isNil:
+    setError("NULL parameter")
+    return 1.cint
+  let rh = cast[TraceReaderHandle](h)
+
+  # Get the absolute global line index (handles delta resolution)
+  let gliRes = rh[].stepAbsoluteGlobalLineIndex(n)
+  if gliRes.isErr:
+    setError(gliRes.error)
+    return 1.cint
+  let globalIdx = gliRes.get()
+
+  # Resolve GLI to (path_id, line) using the same prefix-sum the writer used
+  let gli = getOrBuildGli(rh)
+  let (pathId, line) = gli.resolve(globalIdx)
+  outPathId[] = uint64(pathId)
+  outLine[] = line
+  0.cint
+
+# ---------------------------------------------------------------------------
+# ct_reader_step_value_count / ct_reader_step_value — structured value access
+# ---------------------------------------------------------------------------
+
+proc ct_reader_step_value_count(
+    h: pointer, n: uint64
+): uint64 {.exportc, cdecl.} =
+  ## Returns the number of variable values at step N.
+  ## Returns 0 on failure.
+  if h.isNil: return 0
+  let rh = cast[TraceReaderHandle](h)
+  let res = rh[].values(n)
+  if res.isErr:
+    setError(res.error)
+    return 0
+  uint64(res.get().len)
+
+proc ct_reader_step_value(
+    h: pointer, n: uint64, valueIdx: uint64,
+    outVarnameId: ptr uint64, outTypeId: ptr uint64,
+    outData: ptr ptr uint8, outDataLen: ptr csize_t
+): cint {.exportc, cdecl.} =
+  ## Returns the variable value at (step N, value index valueIdx).
+  ## The data pointer points to a heap-allocated copy that the caller
+  ## must free with ct_free_buffer.
+  ## Returns 0 on success, non-zero on failure.
+  if h.isNil or outVarnameId.isNil or outTypeId.isNil or
+      outData.isNil or outDataLen.isNil:
+    setError("NULL parameter")
+    return 1.cint
+  let rh = cast[TraceReaderHandle](h)
+  let res = rh[].values(n)
+  if res.isErr:
+    setError(res.error)
+    return 1.cint
+  let vals = res.get()
+  if int(valueIdx) >= vals.len:
+    setError("value index " & $valueIdx & " out of range (count=" & $vals.len & ")")
+    return 1.cint
+  let v = vals[int(valueIdx)]
+  outVarnameId[] = v.varnameId
+  outTypeId[] = v.typeId
+  if v.data.len == 0:
+    outData[] = nil
+    outDataLen[] = 0.csize_t
+  else:
+    let buf = cast[ptr uint8](alloc(v.data.len))
+    if buf.isNil:
+      setError("allocation failed")
+      return 1.cint
+    copyMem(buf, unsafeAddr v.data[0], v.data.len)
+    outData[] = buf
+    outDataLen[] = csize_t(v.data.len)
+  0.cint
+
+# ---------------------------------------------------------------------------
+# ct_reader_call_fields / ct_reader_call_child — structured call access
+# ---------------------------------------------------------------------------
+
+proc ct_reader_call_fields(
+    h: pointer, key: uint64,
+    outFunctionId: ptr uint64, outParentKey: ptr int64,
+    outEntryStep: ptr uint64, outExitStep: ptr uint64,
+    outDepth: ptr uint32, outChildrenCount: ptr uint64
+): cint {.exportc, cdecl.} =
+  ## Returns the scalar fields of call record `key`.
+  ## Returns 0 on success, non-zero on failure.
+  if h.isNil or outFunctionId.isNil or outParentKey.isNil or
+      outEntryStep.isNil or outExitStep.isNil or
+      outDepth.isNil or outChildrenCount.isNil:
+    setError("NULL parameter")
+    return 1.cint
+  let rh = cast[TraceReaderHandle](h)
+  let res = rh[].call(key)
+  if res.isErr:
+    setError(res.error)
+    return 1.cint
+  let rec = res.get()
+  outFunctionId[] = rec.functionId
+  outParentKey[] = rec.parentCallKey
+  outEntryStep[] = rec.entryStep
+  outExitStep[] = rec.exitStep
+  outDepth[] = uint32(rec.depth)
+  outChildrenCount[] = uint64(rec.children.len)
+  0.cint
+
+proc ct_reader_call_child(
+    h: pointer, key: uint64, childIdx: uint64
+): uint64 {.exportc, cdecl.} =
+  ## Returns the call_key of child at index `childIdx` within call `key`.
+  ## Returns uint64.high on failure.
+  if h.isNil: return high(uint64)
+  let rh = cast[TraceReaderHandle](h)
+  let res = rh[].call(key)
+  if res.isErr:
+    setError(res.error)
+    return high(uint64)
+  let rec = res.get()
+  if int(childIdx) >= rec.children.len:
+    setError("child index " & $childIdx & " out of range")
+    return high(uint64)
+  rec.children[int(childIdx)]
+
+# ---------------------------------------------------------------------------
+# ct_reader_event_fields — structured IO event access
+# ---------------------------------------------------------------------------
+
+proc ct_reader_event_fields(
+    h: pointer, index: uint64,
+    outKind: ptr uint8, outStepId: ptr uint64,
+    outData: ptr ptr uint8, outDataLen: ptr csize_t
+): cint {.exportc, cdecl.} =
+  ## Returns the fields of IO event at `index`.
+  ## The data pointer is heap-allocated; caller must free with ct_free_buffer.
+  ## kind values: 0=stdout, 1=stderr, 2=file_op, 3=error.
+  ## Returns 0 on success, non-zero on failure.
+  if h.isNil or outKind.isNil or outStepId.isNil or
+      outData.isNil or outDataLen.isNil:
+    setError("NULL parameter")
+    return 1.cint
+  let rh = cast[TraceReaderHandle](h)
+  let res = rh[].ioEvent(index)
+  if res.isErr:
+    setError(res.error)
+    return 1.cint
+  let ev = res.get()
+  outKind[] = uint8(ev.kind)
+  outStepId[] = ev.stepId
+  if ev.data.len == 0:
+    outData[] = nil
+    outDataLen[] = 0.csize_t
+  else:
+    let buf = cast[ptr uint8](alloc(ev.data.len))
+    if buf.isNil:
+      setError("allocation failed")
+      return 1.cint
+    copyMem(buf, unsafeAddr ev.data[0], ev.data.len)
+    outData[] = buf
+    outDataLen[] = csize_t(ev.data.len)
+  0.cint
+
 # ---------------------------------------------------------------------------
 # NimMain — required for static/shared lib initialization
 # ---------------------------------------------------------------------------

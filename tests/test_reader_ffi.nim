@@ -235,6 +235,106 @@ proc test_reader_ffi_lifecycle() =
   removeFile(tmpPath)
   echo "PASS: test_reader_ffi_lifecycle (complete)"
 
+proc test_reader_ffi_structured_accessors() =
+  ## Test the new structured FFI functions (no JSON parsing).
+  let tmpPath = "/tmp/test_reader_ffi_structured.ct"
+  writeTestTrace(tmpPath)
+
+  let h = ct_reader_open(cstring(tmpPath))
+  doAssert h != nil, "ct_reader_open failed: " & $trace_writer_last_error()
+
+  # -- Step locations --
+  # The test trace writes:
+  #   step 0: AbsoluteStep(globalLineIndex=1) -> path 0, line 1
+  #   step 1: DeltaStep(+1) -> GLI=2 -> path 0, line 2
+  #   step 2: DeltaStep(+2) -> GLI=4 -> path 0, line 4
+  # With 2 paths and DefaultLinesPerFile=100_000, path 0 covers GLI [0, 99999].
+  var pathId, line: uint64
+
+  doAssert ct_reader_step_location(h, 0, addr pathId, addr line) == 0
+  doAssert pathId == 0, "step 0 pathId: " & $pathId
+  doAssert line == 1, "step 0 line: " & $line
+
+  doAssert ct_reader_step_location(h, 1, addr pathId, addr line) == 0
+  doAssert pathId == 0, "step 1 pathId: " & $pathId
+  doAssert line == 2, "step 1 line: " & $line
+
+  doAssert ct_reader_step_location(h, 2, addr pathId, addr line) == 0
+  doAssert pathId == 0, "step 2 pathId: " & $pathId
+  doAssert line == 4, "step 2 line: " & $line
+  echo "PASS: step_location"
+
+  # -- Step values (structured) --
+  doAssert ct_reader_step_value_count(h, 0) == 2
+  doAssert ct_reader_step_value_count(h, 1) == 1
+  doAssert ct_reader_step_value_count(h, 2) == 0
+
+  var varnameId, typeId: uint64
+  var dataPtr: ptr uint8
+  var dataLen: csize_t
+
+  doAssert ct_reader_step_value(h, 0, 0, addr varnameId, addr typeId, addr dataPtr, addr dataLen) == 0
+  doAssert varnameId == 0, "val 0,0 varnameId: " & $varnameId
+  doAssert typeId == 0, "val 0,0 typeId: " & $typeId
+  doAssert dataLen == 2.csize_t, "val 0,0 dataLen: " & $dataLen  # "42"
+  if not dataPtr.isNil:
+    ct_free_buffer(dataPtr)
+
+  doAssert ct_reader_step_value(h, 0, 1, addr varnameId, addr typeId, addr dataPtr, addr dataLen) == 0
+  doAssert varnameId == 1, "val 0,1 varnameId: " & $varnameId
+  doAssert typeId == 1, "val 0,1 typeId: " & $typeId
+  doAssert dataLen == 5.csize_t, "val 0,1 dataLen: " & $dataLen  # "hello"
+  if not dataPtr.isNil:
+    ct_free_buffer(dataPtr)
+
+  # Out of range should fail
+  doAssert ct_reader_step_value(h, 0, 99, addr varnameId, addr typeId, addr dataPtr, addr dataLen) != 0
+  echo "PASS: step_value"
+
+  # -- Call fields (structured) --
+  var functionId: uint64
+  var parentKey: int64
+  var entryStep, exitStep: uint64
+  var depth: uint32
+  var childrenCount: uint64
+
+  doAssert ct_reader_call_fields(h, 0, addr functionId, addr parentKey,
+    addr entryStep, addr exitStep, addr depth, addr childrenCount) == 0
+  doAssert functionId == 0, "call 0 functionId: " & $functionId
+  doAssert parentKey == -1, "call 0 parentKey: " & $parentKey
+  doAssert entryStep == 0, "call 0 entryStep: " & $entryStep
+  doAssert exitStep == 2, "call 0 exitStep: " & $exitStep
+  doAssert depth == 0, "call 0 depth: " & $depth
+  doAssert childrenCount == 1, "call 0 childrenCount: " & $childrenCount
+
+  # Call child
+  doAssert ct_reader_call_child(h, 0, 0) == 1
+
+  doAssert ct_reader_call_fields(h, 1, addr functionId, addr parentKey,
+    addr entryStep, addr exitStep, addr depth, addr childrenCount) == 0
+  doAssert functionId == 1, "call 1 functionId: " & $functionId
+  doAssert parentKey == 0, "call 1 parentKey: " & $parentKey
+  doAssert depth == 1, "call 1 depth: " & $depth
+  doAssert childrenCount == 0, "call 1 childrenCount: " & $childrenCount
+  echo "PASS: call_fields"
+
+  # -- Event fields (structured) --
+  var kind: uint8
+  var stepId: uint64
+
+  doAssert ct_reader_event_fields(h, 0, addr kind, addr stepId,
+    addr dataPtr, addr dataLen) == 0
+  doAssert kind == 0, "event 0 kind: " & $kind  # ioStdout = 0
+  doAssert stepId == 1, "event 0 stepId: " & $stepId
+  doAssert dataLen == 7.csize_t, "event 0 dataLen: " & $dataLen  # "output\n"
+  if not dataPtr.isNil:
+    ct_free_buffer(dataPtr)
+  echo "PASS: event_fields"
+
+  ct_reader_close(h)
+  removeFile(tmpPath)
+  echo "PASS: test_reader_ffi_structured_accessors (complete)"
+
 proc test_reader_ffi_null_safety() =
   # NimMain already called by Nim's own startup for this executable
 
@@ -252,6 +352,28 @@ proc test_reader_ffi_null_safety() =
   doAssert ct_reader_event(nil, 0, addr outLen) == nil
   doAssert ct_reader_program(nil, addr outLen) == nil
 
+  # Structured accessors null safety
+  var pathId, lineVal: uint64
+  doAssert ct_reader_step_location(nil, 0, addr pathId, addr lineVal) != 0
+  doAssert ct_reader_step_value_count(nil, 0) == 0
+
+  var vn, ti: uint64
+  var dp: ptr uint8
+  var dl: csize_t
+  doAssert ct_reader_step_value(nil, 0, 0, addr vn, addr ti, addr dp, addr dl) != 0
+
+  var fi: uint64
+  var pk: int64
+  var es, xs: uint64
+  var d: uint32
+  var cc: uint64
+  doAssert ct_reader_call_fields(nil, 0, addr fi, addr pk, addr es, addr xs, addr d, addr cc) != 0
+  doAssert ct_reader_call_child(nil, 0, 0) == high(uint64)
+
+  var k: uint8
+  var si: uint64
+  doAssert ct_reader_event_fields(nil, 0, addr k, addr si, addr dp, addr dl) != 0
+
   ct_reader_close(nil)
   echo "PASS: test_reader_ffi_null_safety"
 
@@ -260,5 +382,6 @@ proc test_reader_ffi_null_safety() =
 # ---------------------------------------------------------------------------
 
 test_reader_ffi_lifecycle()
+test_reader_ffi_structured_accessors()
 test_reader_ffi_null_safety()
 echo "ALL PASS: test_reader_ffi"

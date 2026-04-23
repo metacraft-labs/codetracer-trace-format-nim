@@ -48,7 +48,7 @@ type
 
   ExecStreamReader* = object
     data: seq[byte]            ## raw steps.dat content
-    chunkSize: uint32
+    chunkSize*: uint32
     offsets: seq[uint64]       ## chunk byte offsets from steps.idx
     totalEventsVal: uint64
     # Cache for last decompressed chunk

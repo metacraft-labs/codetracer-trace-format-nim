@@ -138,6 +138,34 @@ proc step*(r: var NewTraceReader, n: uint64): Result[StepEvent, string] =
   ?r.ensureExecReader()
   r.execReader.readEvent(n)
 
+proc stepAbsoluteGlobalLineIndex*(r: var NewTraceReader,
+    n: uint64): Result[uint64, string] =
+  ## Return the absolute global line index for step N.
+  ##
+  ## The exec stream stores steps as a mix of AbsoluteStep and DeltaStep
+  ## events. Each chunk starts with an AbsoluteStep, and subsequent events
+  ## may be DeltaStep (relative to the previous). This method scans from
+  ## the start of the chunk containing step N, accumulating deltas, to
+  ## produce the absolute global line index.
+  ?r.ensureExecReader()
+
+  let chunkSize = uint64(r.execReader.chunkSize)
+  let chunkStart = (n div chunkSize) * chunkSize
+  var currentGli: uint64 = 0
+
+  for i in chunkStart .. n:
+    let ev = ?r.execReader.readEvent(i)
+    case ev.kind
+    of sekAbsoluteStep:
+      currentGli = ev.globalLineIndex
+    of sekDeltaStep:
+      currentGli = uint64(int64(currentGli) + ev.lineDelta)
+    else:
+      # Non-step events (raise, catch, thread_switch) don't change GLI
+      discard
+
+  ok(currentGli)
+
 proc stepCount*(r: var NewTraceReader): Result[uint64, string] =
   ?r.ensureExecReader()
   ok(r.execReader.totalEvents)
