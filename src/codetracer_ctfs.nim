@@ -39,6 +39,7 @@ import codetracer_ctfs/cached_trace_reader
 import codetracer_ctfs/query_protocol
 import codetracer_ctfs/network_reader
 import codetracer_ctfs/replication
+import codetracer_ctfs/split_trace
 
 import codetracer_trace_types
 import codetracer_trace_writer/varint
@@ -73,6 +74,7 @@ export cached_trace_reader
 export query_protocol
 export network_reader
 export replication
+export split_trace
 
 export codetracer_trace_types
 export varint
