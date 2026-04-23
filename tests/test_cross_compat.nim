@@ -126,7 +126,7 @@ proc test_ctfs_magic_version_blocksize() =
 
   # Version: 3
   # Rust: pub const CTFS_VERSION: u8 = 3;
-  doAssert data[5] == 3'u8, "version should be 3, got: " & $data[5]
+  doAssert data[5] == 4'u8, "version should be 4, got: " & $data[5]
 
   # Compression method at offset 6: 0 = None at container level
   # (Zstd compression is applied per-chunk within events.log, not at CTFS level)
@@ -650,7 +650,7 @@ proc test_full_ct_file_structure() =
 
   # 1. Magic + version
   doAssert hasCtfsMagic(data)
-  doAssert data[5] == 3'u8
+  doAssert data[5] == 4'u8
 
   # 2. All internal files present
   for name in ["events.log", "events.fmt", "meta.json", "paths.json"]:

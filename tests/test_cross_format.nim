@@ -347,7 +347,7 @@ proc test_both_formats_produce_valid_ctfs() =
 
   # Verify old format CTFS magic
   doAssert hasCtfsMagic(oldData), "old format missing CTFS magic"
-  doAssert oldData[5] == 3'u8, "old format version mismatch"
+  doAssert oldData[5] == 4'u8, "old format version mismatch"
 
   # New format: write and verify CTFS magic
   var ctfs = createCtfs()
@@ -388,7 +388,7 @@ proc test_both_formats_produce_valid_ctfs() =
   doAssert newData[2] == 0x72'u8, "new format magic[2]"
   doAssert newData[3] == 0xAC'u8, "new format magic[3]"
   doAssert newData[4] == 0xE2'u8, "new format magic[4]"
-  doAssert newData[5] == 3'u8, "new format version mismatch"
+  doAssert newData[5] == 4'u8, "new format version mismatch"
 
   # Both use the same block size
   let oldBlockSize = readU32LE(oldData, 8)
