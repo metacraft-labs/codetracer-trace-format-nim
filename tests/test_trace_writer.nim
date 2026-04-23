@@ -321,7 +321,7 @@ proc test_roundtrip_events() =
   originalEvents.add(TraceLowLevelEvent(kind: tleStep,
     step: StepRecord(pathId: PathId(0), line: Line(1))))
   originalEvents.add(TraceLowLevelEvent(kind: tleCall,
-    callRecord: CallRecord(functionId: FunctionId(0), args: @[])))
+    callRecord: codetracer_trace_types.CallRecord(functionId: FunctionId(0), args: @[])))
   originalEvents.add(TraceLowLevelEvent(kind: tleStep,
     step: StepRecord(pathId: PathId(0), line: Line(5))))
   originalEvents.add(TraceLowLevelEvent(kind: tleValue,
