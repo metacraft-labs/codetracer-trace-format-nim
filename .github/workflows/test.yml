@@ -15,9 +15,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: jiro4989/setup-nim-action@v2
-        with:
-          nim-version: "2.2.x"
+      - name: Install Nim
+        run: |
+          curl https://nim-lang.org/choosenim/init.sh -sSf | sh -s -- -y
+          echo "$HOME/.nimble/bin" >> $GITHUB_PATH
 
       - name: Install system dependencies
         run: sudo apt-get install -y libzstd-dev
