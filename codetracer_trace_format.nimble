@@ -78,12 +78,14 @@ task testReader, "Run trace reader tests":
   exec "nim c -r -p:src tests/test_trace_reader.nim"
 
 task buildStaticLib, "Build static library (C FFI)":
-  exec "nim c --app:staticlib --mm:arc --noMain -d:release -p:src -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim"
+  # --passC:"-fPIC" is required so the static lib can be linked into shared
+  # objects (e.g. Python's .so extension via maturin/PyO3).
+  exec "nim c --app:staticlib --mm:arc --noMain -d:release --passC:\"-fPIC\" -p:src -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim"
 
 task buildSharedLib, "Build shared library (C FFI)":
   exec "nim c --app:lib --mm:arc --noMain -d:release -p:src -o:libcodetracer_trace_writer.so src/codetracer_trace_writer_ffi.nim"
 
 task testFfi, "Build and run C FFI test":
-  exec "nim c --app:staticlib --mm:arc --noMain -d:release -p:src -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim"
+  exec "nim c --app:staticlib --mm:arc --noMain -d:release --passC:\"-fPIC\" -p:src -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim"
   exec "gcc -o tests/test_ffi tests/test_ffi.c -L. -lcodetracer_trace_writer -lzstd -lm -I include"
   exec "./tests/test_ffi"
