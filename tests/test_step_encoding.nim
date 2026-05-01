@@ -83,6 +83,12 @@ proc test_delta_step_encode_decode() {.raises: [].} =
     of sekThreadSwitch:
       doAssert ev.threadId == orig.threadId,
         "threadId mismatch at event " & $i
+    of sekThreadStart:
+      doAssert ev.startThreadId == orig.startThreadId,
+        "startThreadId mismatch at event " & $i
+    of sekThreadExit:
+      doAssert ev.exitThreadId == orig.exitThreadId,
+        "exitThreadId mismatch at event " & $i
 
   doAssert pos == buf.len, "did not consume all bytes"
 

@@ -159,6 +159,20 @@ void trace_writer_register_special_event(trace_writer_t handle,
     int kind, const char* metadata, const char* content);
 
 /* --------------------------------------------------------------------------
+ * Thread lifecycle events
+ *
+ * Recorders that observe multi-threaded program execution emit ThreadStart /
+ * ThreadExit / ThreadSwitch through these entry points.  Earlier versions of
+ * the Nim backend dropped these events when they came in via the Rust shim's
+ * ``TraceWriter::add_event(TraceLowLevelEvent::ThreadStart{,Exit,Switch})``
+ * dispatch — see incidents 1.21 / 1.22 / 1.27.
+ * -------------------------------------------------------------------------- */
+
+void trace_writer_register_thread_start(trace_writer_t handle, uint64_t thread_id);
+void trace_writer_register_thread_exit(trace_writer_t handle, uint64_t thread_id);
+void trace_writer_register_thread_switch(trace_writer_t handle, uint64_t thread_id);
+
+/* --------------------------------------------------------------------------
  * meta.dat — write via trace writer handle
  * -------------------------------------------------------------------------- */
 

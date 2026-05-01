@@ -99,6 +99,14 @@ proc test_exec_stream_write_read() {.raises: [].} =
       doAssert got.kind == sekThreadSwitch, "expected ThreadSwitch at " & $i
       doAssert got.threadId == orig.threadId,
         "threadId mismatch at " & $i
+    of sekThreadStart:
+      doAssert got.kind == sekThreadStart, "expected ThreadStart at " & $i
+      doAssert got.startThreadId == orig.startThreadId,
+        "startThreadId mismatch at " & $i
+    of sekThreadExit:
+      doAssert got.kind == sekThreadExit, "expected ThreadExit at " & $i
+      doAssert got.exitThreadId == orig.exitThreadId,
+        "exitThreadId mismatch at " & $i
 
   echo "PASS: test_exec_stream_write_read"
 
@@ -154,6 +162,10 @@ proc test_exec_stream_raise_catch() {.raises: [].} =
       doAssert ev.catchExceptionTypeId == orig.catchExceptionTypeId
     of sekThreadSwitch:
       doAssert ev.threadId == orig.threadId
+    of sekThreadStart:
+      doAssert ev.startThreadId == orig.startThreadId
+    of sekThreadExit:
+      doAssert ev.exitThreadId == orig.exitThreadId
 
   echo "PASS: test_exec_stream_raise_catch"
 

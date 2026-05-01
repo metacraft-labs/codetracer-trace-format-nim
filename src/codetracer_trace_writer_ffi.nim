@@ -838,6 +838,92 @@ proc trace_writer_register_special_event(
   ))
 
 # ---------------------------------------------------------------------------
+# Thread lifecycle events
+# ---------------------------------------------------------------------------
+#
+# Recorders that need to record multi-threaded program execution call these
+# entry points to emit ThreadStart / ThreadExit / ThreadSwitch events.  Prior
+# to their introduction, the Rust ``TraceWriter::add_event`` shim on the Nim
+# backend dropped these events silently — see incidents 1.21 / 1.22 / 1.27 in
+# ../../codetracer/HANDOFF.md and the Ruby recorder's three add_event call
+# sites that previously vanished into the void.
+#
+# Multi-stream path: events go to the exec stream as new step-event kinds
+# (TagThreadStart=0x05, TagThreadExit=0x06, TagThreadSwitch=0x04) and bump
+# stepCount so the value stream stays aligned (each event is paired with an
+# empty values record).  Legacy single-stream path: events are written
+# verbatim as TraceLowLevelEvent kinds tleThreadStart / tleThreadExit /
+# tleThreadSwitch.
+
+proc trace_writer_register_thread_start(
+    handle: TraceWriterHandle,
+    thread_id: uint64,
+) {.exportc, cdecl.} =
+  ## Register a ThreadStart event (a new thread came into existence).
+  if handle.isNil:
+    return
+
+  if handle.useMultiStream:
+    if not handle.msWriterReady:
+      return
+    # Flush any buffered step before we emit the thread event so the
+    # exec / value streams stay in lock-step.
+    discard flushPendingStep(handle)
+    discard handle.msWriter.registerThreadStart(thread_id)
+    return
+
+  if not handle.writerReady:
+    return
+  discard handle.writer.writeEvent(TraceLowLevelEvent(
+    kind: tleThreadStart,
+    threadStartId: ThreadId(thread_id),
+  ))
+
+proc trace_writer_register_thread_exit(
+    handle: TraceWriterHandle,
+    thread_id: uint64,
+) {.exportc, cdecl.} =
+  ## Register a ThreadExit event (a thread terminated).
+  if handle.isNil:
+    return
+
+  if handle.useMultiStream:
+    if not handle.msWriterReady:
+      return
+    discard flushPendingStep(handle)
+    discard handle.msWriter.registerThreadExit(thread_id)
+    return
+
+  if not handle.writerReady:
+    return
+  discard handle.writer.writeEvent(TraceLowLevelEvent(
+    kind: tleThreadExit,
+    threadExitId: ThreadId(thread_id),
+  ))
+
+proc trace_writer_register_thread_switch(
+    handle: TraceWriterHandle,
+    thread_id: uint64,
+) {.exportc, cdecl.} =
+  ## Register a ThreadSwitch event (the active thread changed).
+  if handle.isNil:
+    return
+
+  if handle.useMultiStream:
+    if not handle.msWriterReady:
+      return
+    discard flushPendingStep(handle)
+    discard handle.msWriter.registerThreadSwitch(thread_id)
+    return
+
+  if not handle.writerReady:
+    return
+  discard handle.writer.writeEvent(TraceLowLevelEvent(
+    kind: tleThreadSwitch,
+    threadSwitchId: ThreadId(thread_id),
+  ))
+
+# ---------------------------------------------------------------------------
 # Close
 # ---------------------------------------------------------------------------
 
@@ -1286,6 +1372,10 @@ proc stepEventToJson(ev: StepEvent): string =
     "{\"kind\":\"catch\",\"exception_type_id\":" & $ev.catchExceptionTypeId & "}"
   of sekThreadSwitch:
     "{\"kind\":\"thread_switch\",\"thread_id\":" & $ev.threadId & "}"
+  of sekThreadStart:
+    "{\"kind\":\"thread_start\",\"thread_id\":" & $ev.startThreadId & "}"
+  of sekThreadExit:
+    "{\"kind\":\"thread_exit\",\"thread_id\":" & $ev.exitThreadId & "}"
 
 proc variableValueToJson(v: VariableValue): string =
   "{\"varname_id\":" & $v.varnameId &

@@ -376,6 +376,81 @@ proc registerCatch*(w: var MultiStreamTraceWriter,
   ok()
 
 # ---------------------------------------------------------------------------
+# Thread events
+# ---------------------------------------------------------------------------
+#
+# ThreadStart / ThreadExit / ThreadSwitch are emitted as exec-stream step
+# events (parallel to Raise / Catch).  Each thread event is paired with an
+# empty values record so the value stream stays in lock-step with the exec
+# stream.  This mirrors registerRaise / registerCatch and lets readers walk
+# `step(n)` / `values(n)` without special-casing the thread events.
+#
+# Recorders that route TraceLowLevelEvent::ThreadStart / ThreadExit /
+# ThreadSwitch through TraceWriter::add_event end up here via the FFI's
+# trace_writer_register_thread_start / _exit / _switch entry points.  Before
+# the dedicated entry points existed, add_event was a silent no-op on the
+# Nim multi-stream backend — the cause of the 1.21 / 1.22 / 1.27 incidents
+# and the reason the Ruby recorder's three add_event call sites could not
+# capture thread lifecycle events.
+
+proc registerThreadSwitch*(w: var MultiStreamTraceWriter,
+    threadId: uint64): Result[void, string] =
+  ## Register a thread-switch event in the execution stream.
+  ## Also writes an empty value record to keep the value stream in sync.
+  if w.closed:
+    return err("writer is closed")
+
+  let ev = StepEvent(kind: sekThreadSwitch, threadId: threadId)
+  let res = w.ctfs.writeEvent(w.execWriter, ev)
+  if res.isErr:
+    return err("failed to write thread_switch event: " & res.error)
+
+  let valRes = w.ctfs.writeStepValues(w.valueWriter, @[])
+  if valRes.isErr:
+    return err("failed to write thread_switch values: " & valRes.error)
+
+  w.stepCount += 1
+  ok()
+
+proc registerThreadStart*(w: var MultiStreamTraceWriter,
+    threadId: uint64): Result[void, string] =
+  ## Register a thread-start event (a new thread came into existence).
+  ## Also writes an empty value record to keep the value stream in sync.
+  if w.closed:
+    return err("writer is closed")
+
+  let ev = StepEvent(kind: sekThreadStart, startThreadId: threadId)
+  let res = w.ctfs.writeEvent(w.execWriter, ev)
+  if res.isErr:
+    return err("failed to write thread_start event: " & res.error)
+
+  let valRes = w.ctfs.writeStepValues(w.valueWriter, @[])
+  if valRes.isErr:
+    return err("failed to write thread_start values: " & valRes.error)
+
+  w.stepCount += 1
+  ok()
+
+proc registerThreadExit*(w: var MultiStreamTraceWriter,
+    threadId: uint64): Result[void, string] =
+  ## Register a thread-exit event (a thread terminated).
+  ## Also writes an empty value record to keep the value stream in sync.
+  if w.closed:
+    return err("writer is closed")
+
+  let ev = StepEvent(kind: sekThreadExit, exitThreadId: threadId)
+  let res = w.ctfs.writeEvent(w.execWriter, ev)
+  if res.isErr:
+    return err("failed to write thread_exit event: " & res.error)
+
+  let valRes = w.ctfs.writeStepValues(w.valueWriter, @[])
+  if valRes.isErr:
+    return err("failed to write thread_exit values: " & valRes.error)
+
+  w.stepCount += 1
+  ok()
+
+# ---------------------------------------------------------------------------
 # Close
 # ---------------------------------------------------------------------------
 

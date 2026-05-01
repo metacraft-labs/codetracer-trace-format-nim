@@ -15,6 +15,8 @@ const
   TagRaise*: byte = 0x02
   TagCatch*: byte = 0x03
   TagThreadSwitch*: byte = 0x04
+  TagThreadStart*: byte = 0x05
+  TagThreadExit*: byte = 0x06
 
 type
   StepEventKind* = enum
@@ -23,6 +25,8 @@ type
     sekRaise
     sekCatch
     sekThreadSwitch
+    sekThreadStart
+    sekThreadExit
 
   StepEvent* = object
     case kind*: StepEventKind
@@ -37,6 +41,10 @@ type
       catchExceptionTypeId*: uint64
     of sekThreadSwitch:
       threadId*: uint64
+    of sekThreadStart:
+      startThreadId*: uint64
+    of sekThreadExit:
+      exitThreadId*: uint64
 
 proc encodeStepEvent*(event: StepEvent, output: var seq[byte]) =
   ## Encode a step event to binary.
@@ -58,6 +66,12 @@ proc encodeStepEvent*(event: StepEvent, output: var seq[byte]) =
   of sekThreadSwitch:
     output.add(TagThreadSwitch)
     encodeVarint(event.threadId, output)
+  of sekThreadStart:
+    output.add(TagThreadStart)
+    encodeVarint(event.startThreadId, output)
+  of sekThreadExit:
+    output.add(TagThreadExit)
+    encodeVarint(event.exitThreadId, output)
 
 proc decodeStepEvent*(data: openArray[byte], pos: var int): Result[StepEvent, string] =
   ## Decode one step event from data starting at pos.
@@ -88,5 +102,11 @@ proc decodeStepEvent*(data: openArray[byte], pos: var int): Result[StepEvent, st
   of TagThreadSwitch:
     let tid = ?decodeVarint(data, pos)
     ok(StepEvent(kind: sekThreadSwitch, threadId: tid))
+  of TagThreadStart:
+    let tid = ?decodeVarint(data, pos)
+    ok(StepEvent(kind: sekThreadStart, startThreadId: tid))
+  of TagThreadExit:
+    let tid = ?decodeVarint(data, pos)
+    ok(StepEvent(kind: sekThreadExit, exitThreadId: tid))
   else:
     err("unknown step event tag: " & $tag)
