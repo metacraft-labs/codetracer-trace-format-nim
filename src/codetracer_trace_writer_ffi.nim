@@ -98,6 +98,14 @@ type
     pendingStepLine: uint64
     pendingValues: seq[VariableValue]
 
+    # Pending call arguments for multi-stream mode:
+    # The recorder calls trace_writer_register_call_arg once per arg
+    # *immediately* before trace_writer_register_call. We accumulate
+    # them here and consume them on register_call so the arguments are
+    # carried on the call record (used by the frontend to render the
+    # call's argument names + values in the calltrace pane).
+    pendingCallArgs: seq[CallArg]
+
     ctFilePath: string  # path to the .ct output file (set in begin_events)
     programName: string  # stored from trace_writer_new, used when creating .ct
     workdir: string
@@ -521,17 +529,56 @@ proc trace_writer_ensure_type_id(
 
   return id
 
+proc trace_writer_register_call_arg(
+    handle: TraceWriterHandle,
+    name: cstring,
+    cbor_data: ptr uint8,
+    cbor_len: csize_t,
+) {.exportc, cdecl.} =
+  ## Stage a single argument (name + CBOR-encoded value) for the next
+  ## ``trace_writer_register_call`` invocation. Recorders should call this
+  ## once per parameter immediately before ``trace_writer_register_call``.
+  ##
+  ## The arguments are consumed (and the buffer cleared) by the next
+  ## register_call. Calling ``trace_writer_register_call`` without staging
+  ## any args is still valid and yields a call record with empty ``args``.
+  ##
+  ## Only meaningful in multi-stream (CTFS) mode. In legacy single-stream
+  ## mode this is a no-op.
+  if handle.isNil:
+    return
+  if not handle.useMultiStream:
+    return
+  if not handle.msWriterReady:
+    return
+  let nameStr = toNimStr(name)
+  let varnameRes = handle.msWriter.registerVarname(nameStr)
+  if varnameRes.isErr:
+    return
+  let vnId = varnameRes.get()
+  var data = newSeq[byte](int(cbor_len))
+  if not cbor_data.isNil and cbor_len > 0.csize_t:
+    copyMem(addr data[0], cbor_data, int(cbor_len))
+  handle.pendingCallArgs.add(CallArg(varnameId: vnId, value: data))
+
 proc trace_writer_register_call(
     handle: TraceWriterHandle,
     function_id: csize_t,
 ) {.exportc, cdecl.} =
   ## Register a call to the function identified by function_id.
+  ##
+  ## Any arguments staged via ``trace_writer_register_call_arg`` since the
+  ## previous call/return are attached to the new call record and the
+  ## staging buffer is cleared.
   if handle.isNil:
     return
   if handle.useMultiStream:
-    var emptyArgs: seq[seq[byte]]
-    discard handle.msWriter.registerCall(uint64(function_id), emptyArgs)
+    discard handle.msWriter.registerCall(uint64(function_id),
+        handle.pendingCallArgs)
+    handle.pendingCallArgs.setLen(0)
     return
+  # Legacy single-stream path doesn't support call args yet.
+  handle.pendingCallArgs.setLen(0)
   discard handle.writer.writeCall(uint64(function_id))
 
 proc trace_writer_register_return(handle: TraceWriterHandle) {.exportc, cdecl.} =
@@ -1262,7 +1309,8 @@ proc callRecordToJson(rec: call_stream.CallRecord): string =
   result.add(",\"args\":[")
   for i, arg in rec.args:
     if i > 0: result.add(",")
-    result.add(bytesToJsonArray(arg))
+    result.add("{\"varname_id\":" & $arg.varnameId &
+      ",\"value\":" & bytesToJsonArray(arg.value) & "}")
   result.add("]")
   # return value
   result.add(",\"return_value\":" & bytesToJsonArray(rec.returnValue))
@@ -1692,6 +1740,56 @@ proc ct_reader_call_child(
     setError("child index " & $childIdx & " out of range")
     return high(uint64)
   rec.children[int(childIdx)]
+
+proc ct_reader_call_arg_count(
+    h: pointer, key: uint64
+): uint64 {.exportc, cdecl.} =
+  ## Returns the number of arguments captured for call ``key``.
+  ## Returns 0 on failure (and sets the last error).
+  if h.isNil:
+    setError("NULL handle")
+    return 0
+  let rh = cast[TraceReaderHandle](h)
+  let res = rh[].call(key)
+  if res.isErr:
+    setError(res.error)
+    return 0
+  uint64(res.get().args.len)
+
+proc ct_reader_call_arg(
+    h: pointer, key: uint64, argIdx: uint64,
+    outVarnameId: ptr uint64,
+    outData: ptr ptr uint8, outDataLen: ptr csize_t
+): cint {.exportc, cdecl.} =
+  ## Returns the (varname_id, CBOR-encoded value) pair of argument ``argIdx``
+  ## within call ``key``. The data pointer is heap-allocated; caller must free
+  ## with ``ct_free_buffer``. Returns 0 on success, non-zero on failure.
+  if h.isNil or outVarnameId.isNil or outData.isNil or outDataLen.isNil:
+    setError("NULL parameter")
+    return 1.cint
+  let rh = cast[TraceReaderHandle](h)
+  let res = rh[].call(key)
+  if res.isErr:
+    setError(res.error)
+    return 1.cint
+  let rec = res.get()
+  if int(argIdx) >= rec.args.len:
+    setError("arg index " & $argIdx & " out of range")
+    return 1.cint
+  let arg = rec.args[int(argIdx)]
+  outVarnameId[] = arg.varnameId
+  if arg.value.len == 0:
+    outData[] = nil
+    outDataLen[] = 0.csize_t
+  else:
+    let buf = cast[ptr uint8](alloc(arg.value.len))
+    if buf.isNil:
+      setError("allocation failed")
+      return 1.cint
+    copyMem(buf, unsafeAddr arg.value[0], arg.value.len)
+    outData[] = buf
+    outDataLen[] = csize_t(arg.value.len)
+  0.cint
 
 # ---------------------------------------------------------------------------
 # ct_reader_event_fields — structured IO event access

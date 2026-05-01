@@ -238,14 +238,20 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
   # Call 1 (add): entry=2, exit=2, depth=1, args=[42,10], return=52
   let cw1 = ctfs.writeCall(callWriter, call_stream.CallRecord(
     functionId: 1, parentCallKey: 0, entryStep: 2, exitStep: 2,
-    depth: 1, args: @["42".toBytes, "10".toBytes],
+    depth: 1, args: @[
+      CallArg(varnameId: 0, value: "42".toBytes),
+      CallArg(varnameId: 1, value: "10".toBytes),
+    ],
     returnValue: "52".toBytes, exception: @[], children: @[]))
   doAssert cw1.isOk, "call1 failed: " & cw1.error
 
   # Call 2 (divide): entry=5, exit=6, depth=1, exception="ZeroDivisionError"
   let cw2 = ctfs.writeCall(callWriter, call_stream.CallRecord(
     functionId: 2, parentCallKey: 0, entryStep: 5, exitStep: 6,
-    depth: 1, args: @["10".toBytes, "0".toBytes],
+    depth: 1, args: @[
+      CallArg(varnameId: 0, value: "10".toBytes),
+      CallArg(varnameId: 1, value: "0".toBytes),
+    ],
     returnValue: @[VoidReturnMarker],
     exception: "ZeroDivisionError".toBytes, children: @[]))
   doAssert cw2.isOk, "call2 failed: " & cw2.error

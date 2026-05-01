@@ -120,7 +120,8 @@ proc writeTestTrace(path: string) =
   # Call 1: helper() covering step 1
   doAssert ctfs.writeCall(callW, call_stream.CallRecord(
     functionId: 1, parentCallKey: 0, entryStep: 1, exitStep: 1,
-    depth: 1, args: @["42".toBytes], returnValue: "43".toBytes,
+    depth: 1, args: @[CallArg(varnameId: 0, value: "42".toBytes)],
+    returnValue: "43".toBytes,
     exception: @[], children: @[])).isOk
 
   # IO event

@@ -39,7 +39,7 @@ type
     entryStep: uint64
     depth: uint32
     parentCallKey: int64
-    args: seq[seq[byte]]
+    args: seq[CallArg]
     children: seq[uint64]
 
   MultiStreamTraceWriter* = object
@@ -232,9 +232,12 @@ proc registerStep*(w: var MultiStreamTraceWriter, pathId: uint64,
 # ---------------------------------------------------------------------------
 
 proc registerCall*(w: var MultiStreamTraceWriter, functionId: uint64,
-    args: openArray[seq[byte]]): Result[void, string] =
+    args: openArray[CallArg]): Result[void, string] =
   ## Register a function call entry. Pushes onto the internal call stack.
   ## The call record is written when registerReturn is called.
+  ##
+  ## ``args`` carries one (varname_id, CBOR value) entry per parameter so the
+  ## frontend can render the call's argument names alongside their values.
   if w.closed:
     return err("writer is closed")
 
@@ -244,7 +247,7 @@ proc registerCall*(w: var MultiStreamTraceWriter, functionId: uint64,
     else:
       -1'i64
 
-  var argsSeq = newSeq[seq[byte]](args.len)
+  var argsSeq = newSeq[CallArg](args.len)
   for i in 0 ..< args.len:
     argsSeq[i] = args[i]
 

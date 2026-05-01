@@ -147,7 +147,10 @@ proc writeSmallTrace(): seq[byte] {.raises: [].} =
 
   let cw1 = ctfs.writeCall(callW, call_stream.CallRecord(
     functionId: 1, parentCallKey: 0, entryStep: 2, exitStep: 2,
-    depth: 1, args: @["42".toBytes, "10".toBytes],
+    depth: 1, args: @[
+      CallArg(varnameId: 0, value: "42".toBytes),
+      CallArg(varnameId: 1, value: "10".toBytes),
+    ],
     returnValue: "52".toBytes, exception: @[], children: @[]))
   doAssert cw1.isOk
 

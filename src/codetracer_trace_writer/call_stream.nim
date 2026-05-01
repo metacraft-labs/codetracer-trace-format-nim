@@ -10,7 +10,7 @@
 ##   varint exitStep
 ##   varint depth
 ##   varint args_count
-##     for each arg: varint len + bytes
+##     for each arg: varint varname_id, varint value_len + bytes
 ##   varint return_value_len + bytes (single byte 0xFF for VoidReturn)
 ##   varint exception_len + bytes (0 if no exception)
 ##   varint children_count
@@ -24,13 +24,17 @@ import ./varint
 const VoidReturnMarker*: byte = 0xFF  ## 1-byte marker for void returns
 
 type
+  CallArg* = object
+    varnameId*: uint64        ## interned variable name id
+    value*: seq[byte]         ## CBOR-encoded argument value (may be empty)
+
   CallRecord* = object
     functionId*: uint64
     parentCallKey*: int64   ## -1 for root calls
     entryStep*: uint64
     exitStep*: uint64
     depth*: uint32
-    args*: seq[seq[byte]]      ## CBOR-encoded argument values
+    args*: seq[CallArg]        ## per-argument (varname_id, CBOR value) pairs
     returnValue*: seq[byte]    ## CBOR-encoded return value, or [VoidReturnMarker]
     exception*: seq[byte]      ## CBOR-encoded exception, empty if none
     children*: seq[uint64]     ## child call_keys
@@ -54,8 +58,9 @@ proc encodeCallRecord*(rec: CallRecord): seq[byte] {.raises: [].} =
   # args
   encodeVarint(uint64(rec.args.len), buf)
   for arg in rec.args:
-    encodeVarint(uint64(arg.len), buf)
-    buf.add(arg)
+    encodeVarint(arg.varnameId, buf)
+    encodeVarint(uint64(arg.value.len), buf)
+    buf.add(arg.value)
 
   # return value
   encodeVarint(uint64(rec.returnValue.len), buf)
@@ -85,16 +90,17 @@ proc decodeCallRecord*(data: openArray[byte]): Result[CallRecord, string] {.rais
 
   # args
   let argsCount = int(?decodeVarint(data, pos))
-  rec.args = newSeq[seq[byte]](argsCount)
+  rec.args = newSeq[CallArg](argsCount)
   for i in 0 ..< argsCount:
+    let varnameId = ?decodeVarint(data, pos)
     let argLen = int(?decodeVarint(data, pos))
     if pos + argLen > data.len:
       return err("truncated arg data")
-    var arg = newSeq[byte](argLen)
+    var value = newSeq[byte](argLen)
     for j in 0 ..< argLen:
-      arg[j] = data[pos + j]
+      value[j] = data[pos + j]
     pos += argLen
-    rec.args[i] = arg
+    rec.args[i] = CallArg(varnameId: varnameId, value: value)
 
   # return value
   let retLen = int(?decodeVarint(data, pos))

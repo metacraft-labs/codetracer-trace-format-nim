@@ -140,7 +140,7 @@ proc writeFullTrace(): seq[byte] {.raises: [].} =
       functionId: 1, parentCallKey: 0,
       entryStep: uint64(i * 10), exitStep: uint64(i * 10 + 9),
       depth: 1,
-      args: @[intToStr(i).toBytes],
+      args: @[CallArg(varnameId: 0, value: intToStr(i).toBytes)],
       returnValue: intToStr(i * 100).toBytes,
       exception: @[],
       children: children))
@@ -154,7 +154,10 @@ proc writeFullTrace(): seq[byte] {.raises: [].} =
       entryStep: uint64(parentIdx * 10 + 2),
       exitStep: uint64(parentIdx * 10 + 5),
       depth: 2,
-      args: @[intToStr(parentIdx).toBytes, "10".toBytes],
+      args: @[
+        CallArg(varnameId: 0, value: intToStr(parentIdx).toBytes),
+        CallArg(varnameId: 1, value: "10".toBytes),
+      ],
       returnValue: intToStr(parentIdx * 10).toBytes,
       exception: @[],
       children: @[]))

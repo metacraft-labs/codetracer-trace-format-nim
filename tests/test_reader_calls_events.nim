@@ -104,7 +104,7 @@ proc writeCallsAndEventsTrace(numCalls: int, numEvents: int): seq[byte] {.raises
       entryStep: uint64(i),
       exitStep: uint64(i + 1),
       depth: depth,
-      args: @[intToStr(i).toBytes],
+      args: @[CallArg(varnameId: 0, value: intToStr(i).toBytes)],
       returnValue: intToStr(i * 10).toBytes,
       exception: @[],
       children: children))

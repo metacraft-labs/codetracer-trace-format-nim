@@ -140,7 +140,7 @@ proc test_new_format_write_read_roundtrip() =
 
   let cw1 = ctfs.writeCall(callW, call_stream.CallRecord(
     functionId: 1, parentCallKey: 0, entryStep: 1, exitStep: 2,
-    depth: 1, args: @["42".toBytes],
+    depth: 1, args: @[CallArg(varnameId: 0, value: "42".toBytes)],
     returnValue: "hello".toBytes, exception: @[], children: @[]))
   doAssert cw1.isOk
 
