@@ -265,6 +265,46 @@ proc test_reader_ffi_structured_accessors() =
   doAssert line == 4, "step 2 line: " & $line
   echo "PASS: step_location"
 
+  # -- Bulk step locations (mission goal #1 perf path) --
+  # The bulk variant must produce results identical to the per-step
+  # accessor.  We intentionally request more than the available count
+  # so the truncation path is exercised.
+  block:
+    var bulkPids: array[8, uint64]
+    var bulkLines: array[8, uint64]
+    let written = ct_reader_step_locations(h, 0'u64, 8'u64,
+      cast[ptr uint64](addr bulkPids[0]),
+      cast[ptr uint64](addr bulkLines[0]))
+    doAssert written == 3'u64, "bulk step_locations written: " & $written
+    doAssert bulkPids[0] == 0 and bulkLines[0] == 1
+    doAssert bulkPids[1] == 0 and bulkLines[1] == 2
+    doAssert bulkPids[2] == 0 and bulkLines[2] == 4
+
+    # Mid-range request: start at step 1 and ask for 2.  Must match the
+    # per-step accessor so that the bulk and per-step paths are
+    # interchangeable for the db-backend hot loop.
+    var midPids: array[2, uint64]
+    var midLines: array[2, uint64]
+    let mid = ct_reader_step_locations(h, 1'u64, 2'u64,
+      cast[ptr uint64](addr midPids[0]),
+      cast[ptr uint64](addr midLines[0]))
+    doAssert mid == 2'u64, "bulk step_locations mid written: " & $mid
+    doAssert midPids[0] == 0 and midLines[0] == 2
+    doAssert midPids[1] == 0 and midLines[1] == 4
+
+    # startN past total events should report zero entries written.
+    var dummyPid: uint64
+    var dummyLine: uint64
+    let oob = ct_reader_step_locations(h, 99'u64, 4'u64,
+      addr dummyPid, addr dummyLine)
+    doAssert oob == 0'u64, "bulk step_locations OOB: " & $oob
+
+    # NULL safety
+    let nullRc = ct_reader_step_locations(nil, 0'u64, 1'u64,
+      addr dummyPid, addr dummyLine)
+    doAssert nullRc == high(uint64), "bulk step_locations NULL: " & $nullRc
+  echo "PASS: step_locations (bulk)"
+
   # -- Step values (structured) --
   doAssert ct_reader_step_value_count(h, 0) == 2
   doAssert ct_reader_step_value_count(h, 1) == 1

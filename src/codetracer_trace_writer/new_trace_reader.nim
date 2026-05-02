@@ -170,6 +170,81 @@ proc stepCount*(r: var NewTraceReader): Result[uint64, string] =
   ?r.ensureExecReader()
   ok(r.execReader.totalEvents)
 
+proc stepAbsoluteGlobalLineIndices*(r: var NewTraceReader,
+    startN: uint64, count: uint64,
+    output: var openArray[uint64]): Result[uint64, string] =
+  ## Bulk variant of [stepAbsoluteGlobalLineIndex].
+  ##
+  ## Resolves the absolute global line index for steps in
+  ## ``[startN, startN + count)`` and writes them into ``output``.  Returns
+  ## the number of step entries actually written (always equal to
+  ## ``min(count, total_events - startN, output.len)``).
+  ##
+  ## Why this helper exists: the per-step accessor re-scans from the start
+  ## of the chunk containing each requested step, which gives the loop
+  ## ``for n in 0 ..< N: stepAbsoluteGlobalLineIndex(n)`` an O(N²/chunk)
+  ## decode cost — every step inside a chunk re-decodes every prior step
+  ## of that chunk.  This bulk routine streams events through each chunk
+  ## exactly once, accumulating the running ``currentGli`` across delta
+  ## events, which is O(N) and removes the per-step Rust→Nim FFI overhead
+  ## entirely.  Non-step events (Raise, Catch, ThreadStart/Exit/Switch)
+  ## carry no GLI delta so the running GLI is left untouched, mirroring
+  ## [stepAbsoluteGlobalLineIndex].
+  ?r.ensureExecReader()
+
+  if count == 0'u64 or output.len == 0:
+    return ok(0'u64)
+
+  let totalEvents = r.execReader.totalEvents
+  if startN >= totalEvents:
+    return ok(0'u64)
+
+  let endN = min(startN + count, totalEvents)
+  let want = endN - startN
+  let writable = min(uint64(output.len), want)
+  if writable == 0'u64:
+    return ok(0'u64)
+  let stopN = startN + writable
+
+  let chunkSize = uint64(r.execReader.chunkSize)
+  if chunkSize == 0'u64:
+    return err("execReader has zero chunkSize")
+
+  var currentGli: uint64 = 0
+  var events: seq[StepEvent] = @[]
+  var n = startN
+  while n < stopN:
+    let chunkIdx = int(n div chunkSize)
+    # Stream all events of the chunk through the cache exactly once.
+    # ``readChunkEvents`` returns the chunk's first global event index
+    # so we can map seq positions back to absolute step indices.
+    let firstIdxRes = r.execReader.readChunkEvents(chunkIdx, events)
+    if firstIdxRes.isErr:
+      return err(firstIdxRes.error)
+    let firstIdx = firstIdxRes.get()
+
+    for offset, ev in events:
+      let absIdx = firstIdx + uint64(offset)
+      case ev.kind
+      of sekAbsoluteStep:
+        currentGli = ev.globalLineIndex
+      of sekDeltaStep:
+        currentGli = uint64(int64(currentGli) + ev.lineDelta)
+      else:
+        discard
+      if absIdx >= n and absIdx < stopN:
+        output[int(absIdx - startN)] = currentGli
+
+    # Advance ``n`` to the next chunk boundary so the outer loop picks
+    # the correct chunk on the next iteration.
+    n = firstIdx + uint64(events.len)
+    if events.len == 0:
+      # Defensive: should never happen on a well-formed trace, but break
+      # rather than spin if a chunk decodes to zero events.
+      break
+
+  ok(writable)
+
 # ---------------------------------------------------------------------------
 # Value access (lazy init)
 # ---------------------------------------------------------------------------

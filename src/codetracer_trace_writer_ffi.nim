@@ -1729,6 +1729,59 @@ proc ct_reader_step_location(
   0.cint
 
 # ---------------------------------------------------------------------------
+# ct_reader_step_locations — bulk step-location accessor (mission goal #1
+# perf — see codetracer §5.2(o) / §1.69).
+# ---------------------------------------------------------------------------
+#
+# Per-step ct_reader_step_location bridges Rust→Nim once for every step,
+# and inside the Nim reader the per-step accessor re-scans from the
+# chunk boundary — so populating Db.steps for a 2400-step trace incurs
+# ~5 ms × 2400 calls plus quadratic chunk re-scan.  This bulk variant
+# lets the caller drain a contiguous range of step locations in a single
+# FFI hop, walking each chunk exactly once internally.
+
+proc ct_reader_step_locations(
+    h: pointer, startN: uint64, count: uint64,
+    outPathIds: ptr uint64, outLines: ptr uint64
+): uint64 {.exportc, cdecl.} =
+  ## Resolve steps ``[startN, startN + count)`` to ``(path_id, line)``
+  ## pairs, writing the results into the caller-allocated parallel
+  ## buffers ``outPathIds`` and ``outLines``.  Returns the number of
+  ## entries actually written (always ``min(count,
+  ## total_events - startN)``).  Returns ``UINT64_MAX`` (i.e. ``not 0``)
+  ## on error and sets ``trace_writer_last_error``.
+  ##
+  ## Both output buffers must hold at least ``count`` entries.  Passing
+  ## NULL for any pointer or NULL ``h`` yields the error sentinel.
+  if h.isNil or outPathIds.isNil or outLines.isNil:
+    setError("NULL parameter")
+    return high(uint64)
+  if count == 0'u64:
+    return 0
+  let rh = cast[TraceReaderHandle](h)
+
+  var glis = newSeq[uint64](int(count))
+  let writtenRes = rh[].stepAbsoluteGlobalLineIndices(startN, count, glis)
+  if writtenRes.isErr:
+    setError(writtenRes.error)
+    return high(uint64)
+  let written = writtenRes.get()
+  if written == 0'u64:
+    return 0
+
+  # Resolve each GLI with the shared prefix-sum.  The GlobalLineIndex
+  # is rebuilt once for the whole batch (the per-step accessor rebuilds
+  # it once per step), which is also a measurable saving.
+  let gli = getOrBuildGli(rh)
+  let pidArr = cast[ptr UncheckedArray[uint64]](outPathIds)
+  let lineArr = cast[ptr UncheckedArray[uint64]](outLines)
+  for i in 0 ..< int(written):
+    let (pathId, line) = gli.resolve(glis[i])
+    pidArr[i] = uint64(pathId)
+    lineArr[i] = line
+  written
+
+# ---------------------------------------------------------------------------
 # ct_reader_step_value_count / ct_reader_step_value — structured value access
 # ---------------------------------------------------------------------------
 

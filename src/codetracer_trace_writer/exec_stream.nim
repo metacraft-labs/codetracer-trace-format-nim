@@ -344,3 +344,47 @@ proc readEvent*(r: var ExecStreamReader,
 
   # Decode the target event
   decodeStepEvent(r.cachedChunk, pos)
+
+proc readChunkEvents*(r: var ExecStreamReader,
+    chunkIdx: int,
+    output: var seq[StepEvent]): Result[uint64, string] =
+  ## Decode every event of chunk ``chunkIdx`` into ``output`` (cleared
+  ## first), returning the chunk's first global event index.
+  ##
+  ## This is the streaming counterpart to [readEvent]: it pays the
+  ## chunk's decode cost exactly once and yields all events in order,
+  ## avoiding the O(eventInChunk) re-scan that ``readEvent`` performs
+  ## per call.  Bulk readers (FFI bulk accessors, postprocess-style
+  ## streamers) should walk chunks via this helper instead of looping
+  ## ``readEvent``.
+  if chunkIdx < 0 or chunkIdx >= r.offsets.len:
+    return err("chunk index out of range: " & $chunkIdx)
+
+  ?r.decompressChunk(chunkIdx)
+
+  let firstEventIdx = uint64(chunkIdx) * uint64(r.chunkSize)
+  let eventCount = int(r.cachedChunkEventCount)
+  output.setLen(0)
+  if eventCount == 0:
+    return ok(firstEventIdx)
+  output = newSeqOfCap[StepEvent](eventCount)
+
+  var pos = 4
+  for i in 0 ..< eventCount:
+    let evRes = decodeStepEvent(r.cachedChunk, pos)
+    if evRes.isErr:
+      return err("failed to decode event " & $i & " while streaming chunk " &
+        $chunkIdx & ": " & evRes.error)
+    output.add(evRes.get())
+
+  ok(firstEventIdx)
+
+proc chunkIndexFor*(r: ExecStreamReader, eventIndex: uint64): int =
+  ## Map a global event index to its containing chunk index.  Useful
+  ## for bulk readers that walk full chunks at a time and need to
+  ## compute chunk boundaries without divmod-ing in callers.
+  int(eventIndex div uint64(r.chunkSize))
+
+proc chunkCount*(r: ExecStreamReader): int =
+  ## Number of compressed chunks in this exec stream.
+  r.offsets.len
