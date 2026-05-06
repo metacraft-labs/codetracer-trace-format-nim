@@ -1,5 +1,5 @@
-import std/[options, tables, unittest]
-import codetracer_ctfs/[managed_sender, trace_storage_config]
+import std/[json, options, tables, unittest]
+import codetracer_ctfs/[managed_sender, managed_sender_ci, trace_storage_config]
 
 type
   TestBackend = ref object of ManagedSenderBackend
@@ -7,6 +7,7 @@ type
     failFinalizes: int
     uploaded: seq[string]
     finalized: seq[string]
+    finalizedSliceCounts: seq[int]
 
 method uploadSlice(backend: TestBackend,
     item: ManagedUploadObject): tuple[ok: bool, receipt: ManagedUploadReceipt, err: ManagedSenderError] =
@@ -41,6 +42,7 @@ method finalize(backend: TestBackend,
     dec backend.failFinalizes
     return (false, ManagedSenderError(retryable: true, message: "transient finalize failure"))
   backend.finalized.add(request.idempotencyKey)
+  backend.finalizedSliceCounts.add(request.manifest.source.segments.len)
   (true, ManagedSenderError())
 
 suite "managed shared sender":
@@ -83,6 +85,18 @@ suite "managed shared sender":
       retention: dsRetained,
       replication: ReplicationState(targetReplicas: 1, completedReplicas: 1))
     manifest.source.kind = tskSplitCtfs
+    manifest.source.segments = @[CtfsSegment(
+      index: 0,
+      geidStart: 1,
+      geidEnd: 11,
+      file: PlacedObject(
+        objectId: "traces/tenant/recording/slice_0000.ct",
+        uri: "local://codetracer-ci/storage-service/traces/tenant/recording/slice_0000.ct",
+        sizeBytes: 128,
+        sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        placement: Placement(pool: "shared-local", serverId: "local-storage-1"),
+        upload: usUploaded,
+        dataState: dsRetained))]
 
     let request = ManagedFinalizeRequest(totalSlices: 1, totalEvents: 10, manifest: manifest, idempotencyKey: "finalize-m32")
     check not state.finalizeManagedUpload(backend, request).ok
@@ -90,3 +104,58 @@ suite "managed shared sender":
     check state.finalizeManagedUpload(backend, request).ok
     check backend.uploaded.len == 2
     check backend.finalized == @["finalize-m32"]
+    check backend.finalizedSliceCounts == @[1]
+
+  test "codetracer_ci_finalize_payload_includes_mcr_slice_metadata_nim":
+    let backend = newCodetracerCiSenderBackend(CodetracerCiSenderConfig(
+      baseUrl: "http://127.0.0.1:8080",
+      tenantId: "tenant-a",
+      bearerToken: "token",
+      platform: "native",
+      serviceName: "checkout",
+      instanceId: "ct-mcr"))
+    var manifest = TraceStorageManifest(
+      schema: traceStorageSchema,
+      recordingId: "recording",
+      service: ServiceIdentity(serviceName: "checkout", environment: "test", instanceId: "ct-mcr", tenantId: "tenant-a"),
+      lifecycle: lsUploaded,
+      retry: RetryState(attempt: 0, nextRetryAt: none(string), lastError: none(string)),
+      finalize: FinalizeState(finalized: false, finalizedAt: none(string), idempotencyKey: "finalize-m32"),
+      retention: dsRetained,
+      replication: ReplicationState(targetReplicas: 1, completedReplicas: 1))
+    manifest.source.kind = tskSplitCtfs
+    manifest.source.segments = @[
+      CtfsSegment(
+        index: 0,
+        geidStart: 10,
+        geidEnd: 20,
+        file: PlacedObject(
+          objectId: "traces/tenant-a/session/slice_0000.ct",
+          uri: "local://codetracer-ci/storage-service/traces/tenant-a/session/slice_0000.ct",
+          sizeBytes: 4096,
+          sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          placement: Placement(pool: "shared-local", serverId: "local-storage-1"),
+          upload: usUploaded,
+          dataState: dsRetained))]
+
+    let request = ManagedFinalizeRequest(
+      totalSlices: 1,
+      totalEvents: 55,
+      manifest: manifest,
+      idempotencyKey: "finalize-m32")
+    let payload = backend.finalizePayloadJson(request)
+    let slices = payload["recordingManifest"]["mcrSlices"]
+    check slices.kind == JArray
+    check slices.len == 1
+    check slices[0]["key"].getStr() == "traces/tenant-a/session/slice_0000.ct"
+    check slices[0]["index"].getInt() == 0
+    check slices[0]["order"].getInt() == 0
+    check slices[0]["sizeBytes"].getInt() == 4096
+    check slices[0]["sha256"].getStr() == "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    check slices[0]["retentionStatus"].getStr() == "retained"
+    check slices[0]["uploadState"].getStr() == "uploaded"
+    check slices[0]["sourceKind"].getStr() == "split_ctfs"
+    check slices[0]["timeRange"]["geidStart"].getInt() == 10
+    check slices[0]["timeRange"]["geidEnd"].getInt() == 20
+    check payload["recordingManifest"]["timeRange"]["geidStart"].getInt() == 10
+    check payload["recordingManifest"]["timeRange"]["geidEnd"].getInt() == 20

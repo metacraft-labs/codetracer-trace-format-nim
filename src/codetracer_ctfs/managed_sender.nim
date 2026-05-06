@@ -109,6 +109,15 @@ proc uploadWithBackend*(
       if response.err.retryable: usRetryableFailure else: usFatalFailure
   response
 
+proc tryUploadWithBackend*(state: var ManagedSenderState,
+    backend: ManagedSenderBackend,
+    item: ManagedUploadObject): tuple[ok: bool, receipt: ManagedUploadReceipt, err: ManagedSenderError] {.raises: [].} =
+  try:
+    {.cast(raises: []).}:
+      result = state.uploadWithBackend(backend, item)
+  except CatchableError as e:
+    result = (false, ManagedUploadReceipt(), ManagedSenderError(retryable: true, message: e.msg))
+
 proc retryPending*(state: var ManagedSenderState,
     backend: ManagedSenderBackend): seq[ManagedUploadReceipt] =
   for _, entry in state.objects:
@@ -128,3 +137,12 @@ proc finalizeManagedUpload*(state: var ManagedSenderState,
     state.finalized = true
     state.idempotencyKey = request.idempotencyKey
   response
+
+proc tryFinalizeManagedUpload*(state: var ManagedSenderState,
+    backend: ManagedSenderBackend,
+    request: ManagedFinalizeRequest): tuple[ok: bool, err: ManagedSenderError] {.raises: [].} =
+  try:
+    {.cast(raises: []).}:
+      result = state.finalizeManagedUpload(backend, request)
+  except CatchableError as e:
+    result = (false, ManagedSenderError(retryable: true, message: e.msg))
