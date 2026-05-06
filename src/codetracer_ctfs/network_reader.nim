@@ -9,10 +9,12 @@
 ## The transport is a simple callback: `proc(request: seq[byte]): Result[seq[byte], string]`.
 ## This allows testing with in-memory mocks and later swapping in real TCP/TLS.
 
+import std/tables
 import results
 import ./query_protocol
 import ./partial_trace_cache
 import ./cached_trace_reader
+import ./trace_storage_config
 
 type
   Transport* = proc(request: seq[byte]): Result[seq[byte], string] {.closure, raises: [].}
@@ -23,6 +25,14 @@ type
     transport: Transport
     reader: CachedBlockReader
     fetchCount*: int  ## Number of times the transport was actually called
+
+  PlacedObjectTransportFactory* = proc(obj: PlacedObject): Transport {.closure, raises: [].}
+
+  NetworkPlacedObjectReader* = object
+    transportFactory: PlacedObjectTransportFactory
+    fetchers: Table[string, ref NetworkBlockFetcher]
+    ramMaxBytes: uint64
+    diskMaxBytes: uint64
 
 proc makeBlockFetcher(nf: var NetworkBlockFetcher): BlockFetcher =
   ## Create a BlockFetcher closure that uses the network transport.
@@ -85,3 +95,39 @@ proc ramHitRate*(nf: NetworkBlockFetcher): float =
 
 proc ramCacheCount*(nf: NetworkBlockFetcher): int =
   nf.reader.ramCacheCount()
+
+proc initNetworkPlacedObjectReader*(transportFactory: PlacedObjectTransportFactory,
+    ramMaxBytes: uint64 = 256 * 1024 * 1024,
+    diskMaxBytes: uint64 = 1024 * 1024 * 1024): NetworkPlacedObjectReader =
+  ## Create a manifest-aware network block reader. Each placed object gets its
+  ## own cached fetcher so replicated/sharded manifests can retry replicas
+  ## without losing per-object cache locality.
+  NetworkPlacedObjectReader(
+    transportFactory: transportFactory,
+    fetchers: initTable[string, ref NetworkBlockFetcher](),
+    ramMaxBytes: ramMaxBytes,
+    diskMaxBytes: diskMaxBytes)
+
+proc readerKey(obj: PlacedObject): string =
+  if obj.objectId.len > 0:
+    obj.objectId
+  else:
+    obj.uri
+
+proc readBlock*(reader: var NetworkPlacedObjectReader,
+    obj: PlacedObject,
+    blockId: uint64): Result[seq[byte], string] =
+  let key = obj.readerKey()
+  if key.len == 0:
+    return err("placed object has no object id or URI")
+  var fetcher = reader.fetchers.getOrDefault(key)
+  if fetcher.isNil:
+    var newFetcher: ref NetworkBlockFetcher
+    new(newFetcher)
+    newFetcher[] = initNetworkBlockFetcher(
+      reader.transportFactory(obj),
+      ramMaxBytes = reader.ramMaxBytes,
+      diskMaxBytes = reader.diskMaxBytes)
+    reader.fetchers[key] = newFetcher
+    fetcher = newFetcher
+  fetcher[].readBlock(blockId)

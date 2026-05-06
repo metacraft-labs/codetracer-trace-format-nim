@@ -8,6 +8,7 @@
 import results
 import codetracer_ctfs/query_protocol
 import codetracer_ctfs/network_reader
+import codetracer_ctfs/trace_storage_config
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -149,6 +150,43 @@ proc test_out_of_range_error() {.raises: [].} =
 
   echo "PASS: test_out_of_range_error"
 
+proc test_manifest_placed_object_reader_reuses_object_fetchers() {.raises: [].} =
+  var blocks: seq[seq[byte]]
+  for i in 0 ..< 4:
+    blocks.add(makeBlock(i, BlockSize))
+
+  let callCount = CallCounter(value: 0)
+  let factoryCallCount = CallCounter(value: 0)
+  let obj = PlacedObject(
+    objectId: "segment-0",
+    uri: "ctfs://store-a/segment-0.ct",
+    sizeBytes: uint64(BlockSize * blocks.len),
+    sha256: "",
+    placement: Placement(pool: "ctfs-hot", serverId: "store-a"),
+    upload: usUploaded,
+    dataState: dsRetained)
+
+  let factory = proc(placed: PlacedObject): Transport {.raises: [].} =
+    factoryCallCount.value += 1
+    doAssert placed.objectId == obj.objectId
+    makeMockTransport(blocks, callCount)
+
+  var reader = initNetworkPlacedObjectReader(factory,
+    ramMaxBytes = 64 * 1024,
+    diskMaxBytes = 256 * 1024)
+
+  let first = reader.readBlock(obj, 2)
+  doAssert first.isOk, "placed object first read failed: " & first.error
+  let second = reader.readBlock(obj, 2)
+  doAssert second.isOk, "placed object cached read failed: " & second.error
+  doAssert first.get() == blocks[2]
+  doAssert second.get() == blocks[2]
+  doAssert factoryCallCount.value == 1,
+    "placed object reader should construct a transport only on cache miss"
+  doAssert callCount.value == 1, "placed object reader should reuse cached fetcher"
+
+  echo "PASS: test_manifest_placed_object_reader_reuses_object_fetchers"
+
 # ---------------------------------------------------------------------------
 # Run all
 # ---------------------------------------------------------------------------
@@ -157,3 +195,4 @@ test_basic_read()
 test_caching()
 test_multiple_blocks()
 test_out_of_range_error()
+test_manifest_placed_object_reader_reuses_object_fetchers()
