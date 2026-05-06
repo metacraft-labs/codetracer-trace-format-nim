@@ -19,6 +19,11 @@ type
     leafType*: LeafType
     tree: BTree
     pool: SubBlockPoolManager
+    graduated: seq[seq[byte]]
+      ## Entries that outgrow the 2048-byte sub-block pool. The descriptor's
+      ## mapBlock field stores index+1 in this in-memory/self-contained
+      ## namespace representation; block 0 stays reserved as the sub-block
+      ## discriminator, matching the CTFS namespace spec.
     entryCount: uint64
 
   NamespaceEntry* = object
@@ -34,6 +39,7 @@ proc initNamespace*(name: string, leafType: LeafType = ltTypeA): Namespace =
     leafType: leafType,
     tree: initBTree(descSize),
     pool: initSubBlockPoolManager(),
+    graduated: @[],
     entryCount: 0,
   )
 
@@ -47,6 +53,38 @@ proc tree*(ns: Namespace): BTree {.inline.} =
 proc pool*(ns: Namespace): SubBlockPoolManager {.inline.} =
   ## Access the namespace's pool manager (for analysis).
   ns.pool
+
+proc graduatedCount*(ns: Namespace): int {.inline.} =
+  ## Number of large namespace values stored outside the sub-block pools.
+  ns.graduated.len
+
+proc encodeGraduatedDescriptor(ns: var Namespace, data: openArray[byte]):
+    Result[seq[byte], string] =
+  let slot = ns.graduated.len + 1
+  if slot == 0:
+    return err("graduated namespace slot overflow")
+  ns.graduated.add(@data)
+
+  case ns.leafType
+  of ltTypeA:
+    if data.len > int(uint32.high):
+      return err("Type A graduated entry exceeds 4 GiB")
+    if slot > int((1'u64 shl 31) - 1):
+      return err("Type A graduated map_block index overflow")
+    let desc = encodeTypeAGraduated(uint32(slot), uint32(data.len))
+    var outp = newSeq[byte](8)
+    let raw = desc.raw
+    for i in 0 ..< 8:
+      outp[i] = byte((raw shr (i * 8)) and 0xFF)
+    ok(outp)
+  of ltTypeB:
+    let desc = encodeTypeBGraduated(uint64(slot), uint64(data.len))
+    var outp = newSeq[byte](16)
+    for i in 0 ..< 8:
+      outp[i] = byte((desc.word0 shr (i * 8)) and 0xFF)
+    for i in 0 ..< 8:
+      outp[8 + i] = byte((desc.word1 shr (i * 8)) and 0xFF)
+    ok(outp)
 
 proc append*(ns: var Namespace, key: uint64,
     data: openArray[byte]): Result[void, string] =
@@ -67,7 +105,12 @@ proc append*(ns: var Namespace, key: uint64,
 
   if dataLen > poolSize(6) or
       dataLen > int((1'u16 shl usedBytesBits(6)) - 1):
-    return err("data too large for sub-block pools")
+    let descRes = ns.encodeGraduatedDescriptor(data)
+    if descRes.isErr:
+      return err(descRes.error)
+    ns.tree.insert(key, descRes.get())
+    ns.entryCount = ns.tree.count()
+    return ok()
 
   # Allocate slot.
   let allocRes = ns.pool.allocate(poolClass)
@@ -101,8 +144,20 @@ proc append*(ns: var Namespace, key: uint64,
 
   # Insert into B-tree.
   ns.tree.insert(key, descriptor)
-  ns.entryCount += 1
+  ns.entryCount = ns.tree.count()
   ok()
+
+proc lookupGraduated(ns: Namespace, mapBlock, dataSize: uint64):
+    Result[seq[byte], string] =
+  if mapBlock == 0:
+    return err("invalid graduated map block 0")
+  let idx = int(mapBlock - 1)
+  if idx < 0 or idx >= ns.graduated.len:
+    return err("graduated entry index out of range: " & $mapBlock)
+  if uint64(ns.graduated[idx].len) < dataSize:
+    return err("graduated entry truncated: need " & $dataSize &
+      " got " & $ns.graduated[idx].len)
+  ok(ns.graduated[idx][0 ..< int(dataSize)])
 
 proc lookupTypeA(ns: Namespace,
     descriptor: seq[byte]): Result[seq[byte], string] =
@@ -111,7 +166,8 @@ proc lookupTypeA(ns: Namespace,
     raw = raw or (uint64(descriptor[i]) shl (i * 8))
   let desc = TypeADescriptor(raw: raw)
   if desc.isGraduated:
-    return err("graduated entries not yet supported in lookup")
+    let grad = decodeTypeAGraduated(desc)
+    return ns.lookupGraduated(uint64(grad.mapBlock), uint64(grad.dataSize))
   let sub = decodeTypeASubBlock(desc)
   let alloc = SubBlockAllocation(
     blockNum: sub.blockNum,
@@ -135,7 +191,8 @@ proc lookupTypeB(ns: Namespace,
     w1 = w1 or (uint64(descriptor[8 + i]) shl (i * 8))
   let desc = TypeBDescriptor(word0: w0, word1: w1)
   if desc.isGraduated:
-    return err("graduated entries not yet supported in lookup")
+    let grad = decodeTypeBGraduated(desc)
+    return ns.lookupGraduated(grad.mapBlock, grad.dataSize)
   let sub = decodeTypeBSubBlock(desc)
   let alloc = SubBlockAllocation(
     blockNum: sub.blockNum,
@@ -196,10 +253,11 @@ proc rangeScan*(ns: Namespace, lo, hi: uint64,
 #     Bytes 16-19:  nameLen (uint32 LE)
 #     Bytes 20-23:  btreeLen (uint32 LE) — length of serialized B-tree
 #     Bytes 24-27:  poolDataLen (uint32 LE) — length of serialized pool section
-#     Bytes 28-31:  reserved (0)
+#     Bytes 28-31:  graduatedDataLen (uint32 LE, v2; reserved 0 in v1)
 #   [name: nameLen bytes]
 #   [B-tree bytes: btreeLen bytes]
 #   [Pool data section: poolDataLen bytes]
+#   [Graduated data section: graduatedDataLen bytes] (v2 only)
 #
 # Pool data section format:
 #   For each of the 7 pool classes (in order 0..6):
@@ -247,19 +305,25 @@ proc serialize*(ns: Namespace): seq[byte] =
     poolDataLen += 4 + FreeListHeadSize  # blockCount + freeListHead
     poolDataLen += ns.pool.buffers[pc].len
 
-  let totalSize = NsHeaderSize + nameBytes + btreeBytes.len + poolDataLen
+  var graduatedDataLen = 4
+  for item in ns.graduated:
+    graduatedDataLen += 8 + item.len
+
+  let totalSize = NsHeaderSize + nameBytes + btreeBytes.len + poolDataLen +
+    graduatedDataLen
   result = newSeq[byte](totalSize)
 
   # Header.
   result[0] = byte('N')
   result[1] = byte('S')
-  result[2] = 1  # version
+  result[2] = 2  # version: adds graduated large-entry payload section
   result[3] = 0
   result[4] = uint8(ns.leafType)
   writeU64LE(result, 8, ns.entryCount)
   writeU32LE(result, 16, uint32(nameBytes))
   writeU32LE(result, 20, uint32(btreeBytes.len))
   writeU32LE(result, 24, uint32(poolDataLen))
+  writeU32LE(result, 28, uint32(graduatedDataLen))
 
   var offset = NsHeaderSize
 
@@ -290,6 +354,15 @@ proc serialize*(ns: Namespace): seq[byte] =
       result[offset + i] = ns.pool.buffers[pc][i]
     offset += ns.pool.buffers[pc].len
 
+  writeU32LE(result, offset, uint32(ns.graduated.len))
+  offset += 4
+  for item in ns.graduated:
+    writeU64LE(result, offset, uint64(item.len))
+    offset += 8
+    for i in 0 ..< item.len:
+      result[offset + i] = item[i]
+    offset += item.len
+
 proc deserializeNamespace*(data: openArray[byte],
     leafType: LeafType): Result[Namespace, string] =
   ## Deserialize a namespace from bytes produced by serialize().
@@ -297,8 +370,9 @@ proc deserializeNamespace*(data: openArray[byte],
     return err("data too short for namespace header")
 
   if data[0] != byte('N') or data[1] != byte('S') or
-      data[2] != 1 or data[3] != 0:
+      data[3] != 0 or not (data[2] == 1 or data[2] == 2):
     return err("invalid namespace magic")
+  let version = data[2]
 
   let storedLeafType = int(data[4])
   if storedLeafType != int(leafType):
@@ -309,8 +383,10 @@ proc deserializeNamespace*(data: openArray[byte],
   let nameLen = int(readU32LE(data, 16))
   let btreeLen = int(readU32LE(data, 20))
   let poolDataLen = int(readU32LE(data, 24))
+  let graduatedDataLen = if version >= 2: int(readU32LE(data, 28)) else: 0
 
-  let expectedSize = NsHeaderSize + nameLen + btreeLen + poolDataLen
+  let expectedSize = NsHeaderSize + nameLen + btreeLen + poolDataLen +
+    graduatedDataLen
   if data.len < expectedSize:
     return err("data too short: need " & $expectedSize & " got " & $data.len)
 
@@ -362,11 +438,32 @@ proc deserializeNamespace*(data: openArray[byte],
       pool.buffers[pc][i] = data[offset + i]
     offset += bufLen
 
+  var graduated: seq[seq[byte]] = @[]
+  if version >= 2:
+    let graduatedEnd = offset + graduatedDataLen
+    if graduatedDataLen < 4 or graduatedEnd > data.len:
+      return err("graduated data section truncated")
+    let graduatedCount = int(readU32LE(data, offset))
+    offset += 4
+    graduated = newSeq[seq[byte]](graduatedCount)
+    for i in 0 ..< graduatedCount:
+      if offset + 8 > graduatedEnd:
+        return err("graduated data length table truncated")
+      let itemLen = int(readU64LE(data, offset))
+      offset += 8
+      if offset + itemLen > graduatedEnd:
+        return err("graduated data item truncated")
+      graduated[i] = newSeq[byte](itemLen)
+      for j in 0 ..< itemLen:
+        graduated[i][j] = data[offset + j]
+      offset += itemLen
+
   var ns = Namespace(
     name: name,
     leafType: leafType,
     tree: btreeRes.get(),
     pool: pool,
+    graduated: graduated,
     entryCount: entryCount,
   )
   ok(ns)

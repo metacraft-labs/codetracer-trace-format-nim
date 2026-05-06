@@ -159,14 +159,39 @@ proc test_namespace_empty_data_rejected() =
 
   echo "PASS: test_namespace_empty_data_rejected"
 
-proc test_namespace_large_data_rejected() =
-  ## Verify that data exceeding 2048 bytes is rejected.
+proc test_namespace_large_data_graduates_type_a() =
+  ## Verify that data exceeding the 2048-byte sub-block ceiling graduates
+  ## to the large-entry storage path for Type A descriptors.
   var ns = initNamespace("large_ns", ltTypeA)
-  var bigData = newSeq[byte](2049)
+  var bigData = newSeq[byte](8193)
+  for i in 0 ..< bigData.len:
+    bigData[i] = byte(i mod 251)
   let res = ns.append(0'u64, bigData)
-  doAssert res.isErr, "expected error for oversized data"
+  doAssert res.isOk, "large append failed: " & res.error
+  doAssert ns.graduatedCount == 1, "expected one graduated entry"
 
-  echo "PASS: test_namespace_large_data_rejected"
+  let lres = ns.lookup(0'u64)
+  doAssert lres.isOk, "large lookup failed: " & lres.error
+  doAssert lres.get() == bigData, "large payload mismatch"
+
+  echo "PASS: test_namespace_large_data_graduates_type_a"
+
+proc test_namespace_large_data_graduates_type_b() =
+  ## Same graduation path for Type B descriptors, which are intended for
+  ## fewer keys with larger values.
+  var ns = initNamespace("large_ns_b", ltTypeB)
+  var bigData = newSeq[byte](70_000)
+  for i in 0 ..< bigData.len:
+    bigData[i] = byte((i * 17) mod 253)
+  let res = ns.append(42'u64, bigData)
+  doAssert res.isOk, "large Type B append failed: " & res.error
+  doAssert ns.graduatedCount == 1, "expected one Type B graduated entry"
+
+  let lres = ns.lookup(42'u64)
+  doAssert lres.isOk, "large Type B lookup failed: " & lres.error
+  doAssert lres.get() == bigData, "large Type B payload mismatch"
+
+  echo "PASS: test_namespace_large_data_graduates_type_b"
 
 # ---------------------------------------------------------------------------
 # Benchmarks
@@ -390,6 +415,28 @@ proc test_namespace_serialize_deserialize() =
 
   echo "PASS: test_namespace_serialize_deserialize"
 
+proc test_namespace_serialize_graduated_type_a() =
+  ## Verify Type A graduated entries survive namespace serialization.
+  var ns = initNamespace("ser_large_a", ltTypeA)
+  var smallData = @[1'u8, 2, 3, 4]
+  var bigData = newSeq[byte](32_000)
+  for i in 0 ..< bigData.len:
+    bigData[i] = byte((i * 13) mod 251)
+
+  doAssert ns.append(1'u64, smallData).isOk
+  doAssert ns.append(2'u64, bigData).isOk
+  doAssert ns.graduatedCount == 1
+
+  let encoded = ns.serialize()
+  let res = deserializeNamespace(encoded, ltTypeA)
+  doAssert res.isOk, "deserialize graduated Type A failed: " & res.error
+  let restored = res.get()
+  doAssert restored.graduatedCount == 1
+  doAssert restored.lookup(1'u64).get() == smallData
+  doAssert restored.lookup(2'u64).get() == bigData
+
+  echo "PASS: test_namespace_serialize_graduated_type_a"
+
 proc test_namespace_serialize_type_b() =
   ## Same test with Type B.
   const N = 1_000
@@ -416,6 +463,25 @@ proc test_namespace_serialize_type_b() =
 
   echo "PASS: test_namespace_serialize_type_b"
 
+proc test_namespace_serialize_graduated_type_b() =
+  ## Verify Type B graduated entries survive namespace serialization.
+  var ns = initNamespace("ser_large_b", ltTypeB)
+  var bigData = newSeq[byte](96_000)
+  for i in 0 ..< bigData.len:
+    bigData[i] = byte((i * 19) mod 241)
+
+  doAssert ns.append(99'u64, bigData).isOk
+  doAssert ns.graduatedCount == 1
+
+  let encoded = ns.serialize()
+  let res = deserializeNamespace(encoded, ltTypeB)
+  doAssert res.isOk, "deserialize graduated Type B failed: " & res.error
+  let restored = res.get()
+  doAssert restored.graduatedCount == 1
+  doAssert restored.lookup(99'u64).get() == bigData
+
+  echo "PASS: test_namespace_serialize_graduated_type_b"
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -425,10 +491,13 @@ when isMainModule:
   test_namespace_type_b()
   test_namespace_range_scan()
   test_namespace_empty_data_rejected()
-  test_namespace_large_data_rejected()
+  test_namespace_large_data_graduates_type_a()
+  test_namespace_large_data_graduates_type_b()
   test_free_list_persistence()
   test_namespace_serialize_deserialize()
+  test_namespace_serialize_graduated_type_a()
   test_namespace_serialize_type_b()
+  test_namespace_serialize_graduated_type_b()
   bench_namespace_create_append_1m()
   bench_namespace_lookup_latency()
   bench_namespace_space_utilization()
