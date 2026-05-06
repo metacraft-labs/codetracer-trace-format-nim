@@ -1,6 +1,8 @@
-import std/[options, os, strformat, unittest]
+import std/[options, os, strformat, strutils, unittest]
 
 import codetracer_ctfs/trace_storage_config
+import codetracer_ctfs/trace_storage_reader
+import results
 
 proc fixturePath(name: string): string =
   var dir = getCurrentDir()
@@ -63,6 +65,56 @@ proc manifestJson(
   "replication": {{ "target_replicas": 2, "completed_replicas": 1 }}
 }}
 """
+
+proc placedObject(objectId, serverId: string): PlacedObject =
+  PlacedObject(
+    objectId: objectId,
+    uri: "ctfs://" & serverId & "/" & objectId & ".cts",
+    sizeBytes: 4096'u64,
+    sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    placement: Placement(pool: "ctfs-hot", serverId: serverId),
+    upload: usUploaded,
+    dataState: dsRetained)
+
+proc shardedManifest(recordingId: string, segmentCount: int): TraceStorageManifest =
+  var source = TraceSource(kind: tskShardedSplitCtfs)
+  for segmentIndex in 0 ..< segmentCount:
+    source.shardedSegments.add(ShardedCtfsSegment(
+      index: segmentIndex,
+      geidStart: uint64(1 + segmentIndex * 100),
+      geidEnd: uint64(100 + segmentIndex * 100),
+      shards: @[
+        CtfsShard(
+          shardIndex: 0,
+          blockStart: 0'u64,
+          blockEnd: 63'u64,
+          replicas: @[
+            placedObject(recordingId & "-segment-" & $segmentIndex & "-shard-low-a", "store-a"),
+            placedObject(recordingId & "-segment-" & $segmentIndex & "-shard-low-b", "store-b")]),
+        CtfsShard(
+          shardIndex: 1,
+          blockStart: 64'u64,
+          blockEnd: 127'u64,
+          replicas: @[
+            placedObject(recordingId & "-segment-" & $segmentIndex & "-shard-high-a", "store-a"),
+            placedObject(recordingId & "-segment-" & $segmentIndex & "-shard-high-b", "store-b")])
+      ]))
+  TraceStorageManifest(
+    schema: traceStorageSchema,
+    recordingId: recordingId,
+    service: ServiceIdentity(serviceName: "checkout", environment: "test",
+      instanceId: "checkout-1", tenantId: "tenant-a"),
+    source: source,
+    lifecycle: lsFinalized,
+    retry: RetryState(attempt: 0),
+    finalize: FinalizeState(finalized: true, finalizedAt: some("2026-05-06T00:00:00Z"),
+      idempotencyKey: "finalize-" & recordingId),
+    retention: dsRetained,
+    replication: ReplicationState(targetReplicas: 2, completedReplicas: 2))
+
+proc blockBytes(objectId: string, blockId: uint64): seq[byte] =
+  for ch in objectId & ":" & $blockId:
+    result.add(byte(ord(ch)))
 
 suite "shared trace storage config":
   test "test_shared_trace_storage_config_roundtrip_nim":
@@ -144,6 +196,71 @@ suite "shared trace storage config":
     let reparsed = parseTraceStorageManifest(sharded.toJsonString())
     check reparsed.source.kind == tskShardedSplitCtfs
     check reparsed.source.shardedSegments[0].shards[0].replicas[1].placement.serverId == "store-b"
+
+  test "test_manifest_models_split_files_and_block_shards_orthogonally":
+    let single = parseTraceStorageManifest(readFile(fixturePath("manifest.single_ctfs.json")))
+    let split = parseTraceStorageManifest(readFile(fixturePath("manifest.split_ctfs.json")))
+    let shardedSingle = shardedManifest("single-sharded", 1)
+    let shardedSplit = shardedManifest("split-sharded", 2)
+
+    check single.segmentCount() == 1
+    check split.segmentCount() == 2
+    check shardedSingle.segmentCount() == 1
+    check shardedSplit.segmentCount() == 2
+
+    check single.resolveLogicalCtfsBlock(0, 7'u64).get().replicas[0].objectId == "ctfs-single"
+    check split.resolveLogicalCtfsBlock(1, 7'u64).get().replicas[0].objectId == "ctfs-split-1"
+    check shardedSingle.resolveLogicalCtfsBlock(0, 7'u64).get().replicas[0].objectId == "single-sharded-segment-0-shard-low-a"
+    check shardedSplit.resolveLogicalCtfsBlock(1, 70'u64).get().replicas[0].objectId == "split-sharded-segment-1-shard-high-a"
+
+    var failedOnce = false
+    var calls: seq[string]
+    let reader: ObjectBlockReader = proc(obj: PlacedObject, blockId: uint64): Result[seq[byte], string] {.raises: [].} =
+      calls.add(obj.objectId & ":" & $blockId)
+      if obj.objectId == "split-sharded-segment-1-shard-high-a" and not failedOnce:
+        failedOnce = true
+        return err("replica unavailable")
+      ok(blockBytes(obj.objectId, blockId))
+
+    let bytes = shardedSplit.readLogicalCtfsBlock(1, 70'u64, reader).get()
+    check bytes == blockBytes("split-sharded-segment-1-shard-high-b", 70'u64)
+    check calls == @[
+      "split-sharded-segment-1-shard-high-a:70",
+      "split-sharded-segment-1-shard-high-b:70"]
+
+    let materialized = parseTraceStorageManifest(readFile(fixturePath("manifest.python_materialized.json")))
+    check materialized.resolveLogicalCtfsBlock(0, 0'u64).isErr
+
+  test "test_shard_replica_failure_during_replay":
+    let manifest = shardedManifest("replicated", 1)
+    var calls: seq[string]
+    let reader: ObjectBlockReader = proc(obj: PlacedObject, blockId: uint64): Result[seq[byte], string] {.raises: [].} =
+      calls.add(obj.placement.serverId)
+      if obj.placement.serverId == "store-a":
+        return err("storage node stopped")
+      ok(blockBytes(obj.objectId, blockId))
+
+    let blockData = manifest.readLogicalCtfsBlock(0, 70'u64, reader).get()
+    check blockData == blockBytes("replicated-segment-0-shard-high-b", 70'u64)
+    check calls == @["store-a", "store-b"]
+
+  test "test_shared_manifest_models_materialized_artifacts_without_ctfs_shards":
+    for fixture in ["manifest.python_materialized.json", "manifest.ruby_materialized.json", "manifest.javascript_materialized.json"]:
+      let manifest = parseTraceStorageManifest(readFile(fixturePath(fixture)))
+      check manifest.source.kind == tskMaterializedArtifact
+      check manifest.segmentCount() == 0
+      check manifest.source.artifact.placement.pool == "artifacts-hot"
+      check manifest.source.artifact.dataState == dsRetained
+      check manifest.replication.targetReplicas == 2
+      check manifest.retention == dsRetained
+      check manifest.source.artifacts.len == 0
+      let json = manifest.toJsonString()
+      check not json.contains("shards")
+      check not json.contains("block_start")
+      check not json.contains("geid_start")
+      let reparsed = parseTraceStorageManifest(json)
+      check reparsed.source.kind == tskMaterializedArtifact
+      check reparsed.replication.targetReplicas == manifest.replication.targetReplicas
 
   test "test_shared_manifest_roundtrips_upload_lifecycle_data_retry_and_finalize_states_nim":
     type Case = object

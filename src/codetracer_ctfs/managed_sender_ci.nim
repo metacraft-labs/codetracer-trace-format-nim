@@ -167,6 +167,36 @@ proc segmentSliceJson(segment: CtfsSegment, sourceKind: TraceSourceKind): JsonNo
     "storageEndpointUri": segment.file.uri,
   }
 
+proc shardedSegmentJson(segment: ShardedCtfsSegment): JsonNode =
+  let shards = newJArray()
+  for shard in segment.shards:
+    let replicas = newJArray()
+    for replicaIndex, replica in shard.replicas:
+      replicas.add(%*{
+        "replicaIndex": replicaIndex,
+        "objectKey": replica.uri.replace("local://", ""),
+        "storagePoolId": replica.placement.pool,
+        "storageServerId": replica.placement.serverId,
+        "storageEndpointUri": replica.uri,
+        "contentLength": replica.sizeBytes,
+        "contentHash": replica.sha256,
+        "uploadCompletionState": "complete",
+        "retentionStatus": "available",
+      })
+    shards.add(%*{
+      "shardIndex": shard.shardIndex,
+      "blockStart": shard.blockStart,
+      "blockEnd": shard.blockEnd,
+      "replicas": replicas,
+    })
+  %*{
+    "segmentIndex": segment.index,
+    "order": segment.index,
+    "geidStart": segment.geidStart,
+    "geidEnd": segment.geidEnd,
+    "shards": shards,
+  }
+
 proc mcrSlicesJson(manifest: TraceStorageManifest): JsonNode =
   result = newJArray()
   if manifest.source.kind != tskSplitCtfs:
@@ -174,13 +204,31 @@ proc mcrSlicesJson(manifest: TraceStorageManifest): JsonNode =
   for segment in manifest.source.segments:
     result.add(segment.segmentSliceJson(manifest.source.kind))
 
+proc shardedMcrSegmentsJson(manifest: TraceStorageManifest): JsonNode =
+  result = newJArray()
+  if manifest.source.kind != tskShardedSplitCtfs:
+    return
+  for segment in manifest.source.shardedSegments:
+    result.add(segment.shardedSegmentJson())
+
 proc mcrTimeRangeJson(manifest: TraceStorageManifest): JsonNode =
   result = newJObject()
-  if manifest.source.kind != tskSplitCtfs or manifest.source.segments.len == 0:
+  if manifest.source.kind == tskSplitCtfs and manifest.source.segments.len > 0:
+    var geidStart = manifest.source.segments[0].geidStart
+    var geidEnd = manifest.source.segments[0].geidEnd
+    for segment in manifest.source.segments:
+      if segment.geidStart < geidStart:
+        geidStart = segment.geidStart
+      if segment.geidEnd > geidEnd:
+        geidEnd = segment.geidEnd
+    result["geidStart"] = %geidStart
+    result["geidEnd"] = %geidEnd
     return
-  var geidStart = manifest.source.segments[0].geidStart
-  var geidEnd = manifest.source.segments[0].geidEnd
-  for segment in manifest.source.segments:
+  if manifest.source.kind != tskShardedSplitCtfs or manifest.source.shardedSegments.len == 0:
+    return
+  var geidStart = manifest.source.shardedSegments[0].geidStart
+  var geidEnd = manifest.source.shardedSegments[0].geidEnd
+  for segment in manifest.source.shardedSegments:
     if segment.geidStart < geidStart:
       geidStart = segment.geidStart
     if segment.geidEnd > geidEnd:
@@ -192,6 +240,7 @@ proc mcrManifestJson(backend: CodetracerCiSenderBackend, request: ManagedFinaliz
   let manifestKey = backend.s3KeyPrefix.strip(leading = false, trailing = true, chars = {'/'}) & "/manifest.json"
   let finalizedAt = now().utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'")
   let mcrSlices = request.manifest.mcrSlicesJson()
+  let shardedMcrSegments = request.manifest.shardedMcrSegmentsJson()
   let timeRange = request.manifest.mcrTimeRangeJson()
   %*{
     "kind": "mcr_slices",
@@ -202,6 +251,7 @@ proc mcrManifestJson(backend: CodetracerCiSenderBackend, request: ManagedFinaliz
     "retentionStatus": "available",
     "missingSliceKeys": [],
     "mcrSlices": mcrSlices,
+    "shardedMcrSegments": shardedMcrSegments,
     "materializedTraceArtifacts": [],
     "totalSlices": request.totalSlices,
     "totalEvents": request.totalEvents,
@@ -222,16 +272,30 @@ proc finalizePayloadJson*(backend: CodetracerCiSenderBackend,
 proc canFinalizeComplete(request: ManagedFinalizeRequest): bool =
   if request.totalSlices <= 0:
     return false
-  if request.manifest.source.kind != tskSplitCtfs:
-    return false
-  if request.manifest.source.segments.len != request.totalSlices:
-    return false
-  for i, segment in request.manifest.source.segments:
-    if segment.file.objectId.len == 0 or segment.file.sizeBytes == 0 or
-        segment.file.sha256.len == 0 or segment.file.upload != usUploaded:
+  if request.manifest.source.kind == tskSplitCtfs:
+    if request.manifest.source.segments.len != request.totalSlices:
       return false
-    if segment.index != i:
+    for i, segment in request.manifest.source.segments:
+      if segment.file.objectId.len == 0 or segment.file.sizeBytes == 0 or
+          segment.file.sha256.len == 0 or segment.file.upload != usUploaded:
+        return false
+      if segment.index != i:
+        return false
+    return true
+  if request.manifest.source.kind != tskShardedSplitCtfs:
+    return false
+  if request.manifest.source.shardedSegments.len != request.totalSlices:
+    return false
+  for i, segment in request.manifest.source.shardedSegments:
+    if segment.index != i or segment.shards.len == 0:
       return false
+    for shard in segment.shards:
+      if shard.blockEnd < shard.blockStart or shard.replicas.len == 0:
+        return false
+      for replica in shard.replicas:
+        if replica.objectId.len == 0 or replica.sizeBytes == 0 or
+            replica.sha256.len == 0 or replica.upload != usUploaded:
+          return false
   true
 
 method finalize*(backend: CodetracerCiSenderBackend,

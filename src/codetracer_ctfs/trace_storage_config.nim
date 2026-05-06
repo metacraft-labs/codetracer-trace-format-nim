@@ -135,6 +135,7 @@ type
     shardedSegments*: seq[ShardedCtfsSegment]
     language*: MaterializedLanguage
     artifact*: PlacedObject
+    artifacts*: seq[PlacedObject]
     replayStart*: ReplayStart
 
   RetryState* = object
@@ -461,6 +462,11 @@ proc parseTraceSource(node: JsonNode): TraceSource =
   of tskMaterializedArtifact:
     result.language = parseMaterializedLanguage(node.requiredString("language"))
     result.artifact = parsePlacedObject(node.requiredObject("artifact"))
+    if node.kind == JObject and node.hasKey("artifacts"):
+      if node["artifacts"].kind != JArray:
+        raise newException(ValueError, "artifacts must be an array")
+      for artifact in node["artifacts"]:
+        result.artifacts.add(parsePlacedObject(artifact))
     result.replayStart = parseReplayStart(node.requiredObject("replay_start"))
 
 proc parseRetryState(node: JsonNode): RetryState =
@@ -653,6 +659,11 @@ proc toJson*(source: TraceSource): JsonNode =
   of tskMaterializedArtifact:
     result["language"] = %source.language.materializedLanguageName
     result["artifact"] = source.artifact.toJson()
+    if source.artifacts.len > 0:
+      let artifacts = newJArray()
+      for artifact in source.artifacts:
+        artifacts.add(artifact.toJson())
+      result["artifacts"] = artifacts
     result["replay_start"] = source.replayStart.toJson()
 
 proc toJson*(retry: RetryState): JsonNode =
