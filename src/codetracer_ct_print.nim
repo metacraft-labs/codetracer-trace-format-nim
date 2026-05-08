@@ -33,6 +33,8 @@ import codetracer_trace_writer/global_line_index
 import codetracer_trace_writer/multi_stream_writer  # for DefaultLinesPerFile
 import codetracer_trace_writer/cbor
 import codetracer_trace_types
+import codetracer_ctfs/container as ctfs_container
+import native_decoder
 
 # ---------------------------------------------------------------------------
 # Global line index resolution for v4 traces
@@ -1016,6 +1018,12 @@ Usage:
   ct-print --strip-paths --full <f.ct>   Replace absolute workdir/tmp prefixes
                                           with placeholders for diff-stable
                                           snapshots across machines.
+  ct-print --native <file.ct>            Force the native MCR shard decoder
+                                          (multi-thread CTFS bundles produced
+                                          by codetracer-native-recorder).
+                                          Without this flag the same layout
+                                          is auto-detected; pass --no-native
+                                          to disable auto-detection.
 
 Output for --full / --events:
   Single JSON document with these top-level keys (deterministic ordering):
@@ -1039,12 +1047,65 @@ Output for --full / --events:
 # Main
 # ---------------------------------------------------------------------------
 
+proc emitNativeFull(filePath: string, format: string, stripPaths: bool) =
+  ## Decode a CodeTracer **native recorder** multi-thread shard bundle (the
+  ## layout written by `codetracer-native-recorder/ct_recorder/trace_writer`).
+  ## On any decode failure we `quit` with a specific error so callers see
+  ## what the decoder didn't understand — never a silent empty document.
+  let docRes = decodeNativeFromFile(filePath,
+    NativeOpts(stripPaths: stripPaths))
+  if docRes.isErr:
+    quit("ct-print: native decode failed: " & docRes.error)
+  let doc = docRes.get()
+  case format
+  of "events":
+    var header = newJObject()
+    for k, v in doc.pairs:
+      if k != "events":
+        header[k] = v
+    echo $header
+    let events = doc{"events"}
+    if events != nil and events.kind == JArray:
+      for ev in events.elems:
+        echo $ev
+  else:
+    try:
+      echo pretty(doc, indent = 2)
+    except ValueError:
+      echo $doc
+
+type
+  AutoDetectKind = enum
+    adkUnreadable    ## file does not exist / cannot be opened
+    adkNotCtfs       ## file exists but lacks CTFS magic — let v2/v3 path try
+    adkCtfsCorrupt   ## CTFS magic OK but root header looks broken — hard error
+    adkNative        ## CTFS + meta.json with recordingMode → native decoder
+    adkV4MultiStream ## CTFS without meta.json → existing v4 path
+
+proc detectAutoKind(filePath: string): (AutoDetectKind, string) =
+  ## Inspect the file once and decide which decode path should claim it.
+  ## Returning a (kind, detail) pair lets the caller emit a precise error
+  ## message instead of silently falling through to an empty document.
+  let dataR = ctfs_container.readCtfsFromFile(filePath)
+  if dataR.isErr:
+    return (adkUnreadable, dataR.error)
+  let data = dataR.get()
+  if data.len < 16 or not ctfs_container.hasCtfsMagic(data):
+    return (adkNotCtfs, "no CTFS magic — not a .ct bundle")
+  let infoR = detectNativeBundle(data)
+  if infoR.isErr:
+    return (adkCtfsCorrupt, infoR.error)
+  if isNativeBundle(data):
+    return (adkNative, "")
+  (adkV4MultiStream, "")
+
 proc main() =
   var format = "text"
   var filePath = ""
   var follow = false
   var pollMs = 200
   var stripPaths = false
+  var nativeMode = "auto"  # "auto" | "force" | "off"
 
   for kind, key, val in getopt():
     case kind
@@ -1058,6 +1119,8 @@ proc main() =
       of "events": format = "events"
       of "follow": follow = true
       of "strip-paths": stripPaths = true
+      of "native": nativeMode = "force"
+      of "no-native": nativeMode = "off"
       of "help", "h": printHelp(); return
       of "poll-interval":
         try:
@@ -1079,6 +1142,36 @@ proc main() =
     quit(1)
 
   let opts = FullOpts(stripPaths: stripPaths)
+
+  # ----- Native MCR shard path (auto-detect or --native) -----
+  # The native recorder writes a CTFS shard with per-thread `tNNNN` streams
+  # and a `meta.json` (vs the v4 layout's `meta.dat` + interning tables).
+  # Without this branch ct-print used to silently emit `-1` sentinel counts.
+  if nativeMode == "force":
+    emitNativeFull(filePath, format, stripPaths)
+    return
+
+  if nativeMode == "auto" and not follow:
+    let (autoKind, detail) = detectAutoKind(filePath)
+    case autoKind
+    of adkNative:
+      emitNativeFull(filePath, format, stripPaths)
+      return
+    of adkCtfsCorrupt:
+      # CTFS magic OK but the bundle is broken — refuse instead of letting
+      # the v4 reader produce a degenerate empty document.
+      quit("ct-print: refusing to decode broken CTFS bundle: " & detail)
+    of adkNotCtfs:
+      # File exists but is not a CTFS .ct bundle. The legacy v2/v3 reader
+      # used to accept arbitrary bytes here and produce a degenerate empty
+      # document — refuse instead. (Legacy callers that want the old text
+      # path can still use --no-native + a real v2/v3 file.)
+      if format == "full" or format == "events" or format == "summary":
+        quit(
+          "ct-print: not a recognised .ct file: " & detail &
+          " (path=" & filePath & ")")
+    of adkV4MultiStream, adkUnreadable:
+      discard  # fall through to v4 reader (or v2/v3 reader if v4 fails)
 
   # Try v4 multi-stream reader first
   let newReaderRes = openNewTrace(filePath)

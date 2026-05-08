@@ -1,0 +1,100 @@
+{
+  "metadata": {
+    "program": "<program>",
+    "args": ["--demo", "fixture"],
+    "workdir": "",
+    "recorder": "native-mcr",
+    "recording_mode": "hook",
+    "platform": "linux",
+    "tick_source": "none",
+    "tick_definition": "edge",
+    "hook_profile": "test",
+    "ctfs_version": "4",
+    "hook_strategies": ["ldpreload"]
+  },
+  "paths": [],
+  "functions": [],
+  "varnames": [],
+  "types": [],
+  "counts": {
+    "paths": 0,
+    "functions": 0,
+    "varnames": 0,
+    "types": 0,
+    "steps": 0,
+    "calls": 0,
+    "values": 0,
+    "io_events": 1,
+    "thread_events": 3,
+    "thread_streams": 2
+  },
+  "threads": [
+    {
+      "thread_id": 0,
+      "stream_name": "t00000000000"
+    },
+    {
+      "thread_id": 1,
+      "stream_name": "t00000000001"
+    }
+  ],
+  "events": [
+    {
+      "kind": "thread_event",
+      "thread_id": 0,
+      "event_type": "evSyncLockAcquireBegin",
+      "event_type_id": 0,
+      "geid": 1,
+      "tick": 100,
+      "ct_tid": 0,
+      "size": 26,
+      "payload": {
+        "len": 0,
+        "b64": ""
+      }
+    },
+    {
+      "kind": "thread_event",
+      "thread_id": 0,
+      "event_type": "evSyncLockAcquireSuccess",
+      "event_type_id": 1,
+      "geid": 2,
+      "tick": 110,
+      "ct_tid": 0,
+      "size": 26,
+      "payload": {
+        "len": 0,
+        "b64": ""
+      }
+    },
+    {
+      "kind": "thread_event",
+      "thread_id": 1,
+      "event_type": "evOsWrite",
+      "event_type_id": 20,
+      "geid": 3,
+      "tick": 200,
+      "ct_tid": 1,
+      "size": 29,
+      "payload": {
+        "len": 3,
+        "b64": "aGkK",
+        "text": "hi\n"
+      }
+    },
+    {
+      "kind": "os_event",
+      "os_kind": "elkWrite",
+      "os_kind_id": 0,
+      "thread_id": 1,
+      "geid": 3,
+      "tick": 200,
+      "fd": 1,
+      "return_value": 3,
+      "metadata": "stdout",
+      "content_len": 3,
+      "content_b64": "aGkK",
+      "content_text": "hi\n"
+    }
+  ]
+}
