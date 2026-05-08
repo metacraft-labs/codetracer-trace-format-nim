@@ -4,14 +4,23 @@ when defined(nimPreviewSlimSystem):
 ## ct-print: Convert .ct trace files to human-readable formats.
 ##
 ## Usage:
-##   ct-print <file.ct>                  # Print as text (default)
-##   ct-print --json <file.ct>           # Print as JSON
-##   ct-print --json-events <file.ct>    # Print only events as JSON array
-##   ct-print --summary <file.ct>        # Print metadata and event counts only
-##   ct-print --follow <file.ct>         # Follow mode (NDJSON, polls for new events)
-##   ct-print --follow --poll-interval=500 <file.ct>  # Follow with custom poll interval
+##   ct-print <file.ct>                     # Print as text (default)
+##   ct-print --json <file.ct>              # Print as JSON (legacy: no value content)
+##   ct-print --json-events <file.ct>       # Print only events as JSON array (legacy)
+##   ct-print --summary <file.ct>           # Print metadata and event counts only
+##   ct-print --follow <file.ct>            # Follow mode (NDJSON, polls for new events)
+##   ct-print --full <file.ct>              # Pretty JSON dump with full value content
+##   ct-print --events <file.ct>            # JSONL (one event per line) with full values
+##   ct-print --full --strip-paths <file.ct># Strip absolute path prefixes for portability
+##
+## --full and --events modes decode CBOR-encoded variable values into a
+## structured JSON form suitable for golden-snapshot verification:
+##   - integers: {"kind": "Int", "i": 42, "type_id": 7}
+##   - strings: {"kind": "String", "text": "hello", "type_id": 9}
+##   - structs/sequences/tuples/variants/refs: full nested decode
+##   - all variants of ValueRecord are surfaced; nothing is hex-blob'd.
 
-import std/[os, parseopt, json, strutils]
+import std/[os, parseopt, json, strutils, base64]
 import results
 import codetracer_trace_reader
 import codetracer_trace_writer/new_trace_reader
@@ -22,6 +31,8 @@ import codetracer_trace_writer/io_event_stream
 import codetracer_trace_writer/value_stream
 import codetracer_trace_writer/global_line_index
 import codetracer_trace_writer/multi_stream_writer  # for DefaultLinesPerFile
+import codetracer_trace_writer/cbor
+import codetracer_trace_types
 
 # ---------------------------------------------------------------------------
 # Global line index resolution for v4 traces
@@ -66,11 +77,10 @@ proc bytesToUtf8(data: seq[byte]): string =
     result[i] = char(data[i])
 
 proc dataToJsonValue(data: seq[byte]): string =
-  ## Best-effort conversion of CBOR-encoded value bytes to a JSON-friendly string.
-  ## For now, try to interpret as UTF-8; otherwise hex-encode.
+  ## Best-effort conversion of CBOR-encoded value bytes to a JSON-friendly
+  ## string. Used by legacy --json mode only.
   if data.len == 0:
     return "\"\""
-  # Try as UTF-8 string
   var allPrintable = true
   for b in data:
     if b < 0x20 and b != 0x0A and b != 0x0D and b != 0x09:
@@ -84,6 +94,151 @@ proc dataToJsonValue(data: seq[byte]): string =
       hex.add(toHex(int(b), 2).toLowerAscii())
     hex.add("\"")
     return hex
+
+# ---------------------------------------------------------------------------
+# ValueRecord -> JsonNode
+# ---------------------------------------------------------------------------
+
+proc valueRecordToJson*(v: ValueRecord): JsonNode =
+  ## Convert a decoded ValueRecord into a structured JSON node, surfacing
+  ## every variant of the tagged union. Output is deterministic — keys
+  ## appear in a fixed order so golden snapshots stay stable.
+  result = newJObject()
+  case v.kind
+  of vrkInt:
+    result["kind"] = newJString("Int")
+    result["i"] = newJInt(v.intVal)
+    result["type_id"] = newJInt(int64(uint64(v.intTypeId)))
+  of vrkFloat:
+    result["kind"] = newJString("Float")
+    result["f"] = newJFloat(v.floatVal)
+    result["type_id"] = newJInt(int64(uint64(v.floatTypeId)))
+  of vrkBool:
+    result["kind"] = newJString("Bool")
+    result["b"] = newJBool(v.boolVal)
+    result["type_id"] = newJInt(int64(uint64(v.boolTypeId)))
+  of vrkString:
+    result["kind"] = newJString("String")
+    result["text"] = newJString(v.text)
+    result["type_id"] = newJInt(int64(uint64(v.strTypeId)))
+  of vrkSequence:
+    result["kind"] = newJString("Sequence")
+    var elems = newJArray()
+    for e in v.seqElements:
+      elems.add(valueRecordToJson(e))
+    result["elements"] = elems
+    result["is_slice"] = newJBool(v.isSlice)
+    result["type_id"] = newJInt(int64(uint64(v.seqTypeId)))
+  of vrkTuple:
+    result["kind"] = newJString("Tuple")
+    var elems = newJArray()
+    for e in v.tupleElements:
+      elems.add(valueRecordToJson(e))
+    result["elements"] = elems
+    result["type_id"] = newJInt(int64(uint64(v.tupleTypeId)))
+  of vrkStruct:
+    result["kind"] = newJString("Struct")
+    var fields = newJArray()
+    for e in v.fieldValues:
+      fields.add(valueRecordToJson(e))
+    result["field_values"] = fields
+    result["type_id"] = newJInt(int64(uint64(v.structTypeId)))
+  of vrkVariant:
+    result["kind"] = newJString("Variant")
+    result["discriminator"] = newJString(v.discriminator)
+    if v.contents.len > 0:
+      result["contents"] = valueRecordToJson(v.contents[0])
+    else:
+      result["contents"] = newJNull()
+    result["type_id"] = newJInt(int64(uint64(v.variantTypeId)))
+  of vrkReference:
+    result["kind"] = newJString("Reference")
+    if v.dereferenced.len > 0:
+      result["dereferenced"] = valueRecordToJson(v.dereferenced[0])
+    else:
+      result["dereferenced"] = newJNull()
+    result["address"] = newJInt(int64(v.address))
+    result["mutable"] = newJBool(v.mutable)
+    result["type_id"] = newJInt(int64(uint64(v.refTypeId)))
+  of vrkRaw:
+    result["kind"] = newJString("Raw")
+    result["r"] = newJString(v.rawStr)
+    result["type_id"] = newJInt(int64(uint64(v.rawTypeId)))
+  of vrkError:
+    result["kind"] = newJString("Error")
+    result["msg"] = newJString(v.errorMsg)
+    result["type_id"] = newJInt(int64(uint64(v.errorTypeId)))
+  of vrkNone:
+    result["kind"] = newJString("None")
+    result["type_id"] = newJInt(int64(uint64(v.noneTypeId)))
+  of vrkCell:
+    result["kind"] = newJString("Cell")
+    result["place"] = newJInt(int64(v.cellPlace))
+  of vrkBigInt:
+    result["kind"] = newJString("BigInt")
+    result["b"] = newJString(base64.encode(v.bigIntBytes))
+    var biHex = ""
+    for byteVal in v.bigIntBytes:
+      biHex.add(toHex(int(byteVal), 2).toLowerAscii())
+    result["b_hex"] = newJString(biHex)
+    result["negative"] = newJBool(v.negative)
+    result["type_id"] = newJInt(int64(uint64(v.bigIntTypeId)))
+  of vrkChar:
+    result["kind"] = newJString("Char")
+    result["c"] = newJString($v.charVal)
+    result["type_id"] = newJInt(int64(uint64(v.charTypeId)))
+  of vrkValueRef:
+    result["kind"] = newJString("ValueRef")
+    result["ref_id"] = newJInt(int64(v.refId))
+
+proc decodeValueBytesToJson*(data: seq[byte]): JsonNode =
+  ## Decode CBOR-encoded value bytes into a structured JSON node.
+  ## On decode error, returns a fallback {"kind":"Undecodable","raw":...}.
+  if data.len == 0:
+    var node = newJObject()
+    node["kind"] = newJString("Empty")
+    return node
+  # Special case: void return marker (single 0xFF byte) used in call_stream.
+  if data.len == 1 and data[0] == VoidReturnMarker:
+    var node = newJObject()
+    node["kind"] = newJString("Void")
+    return node
+  var dec = CborDecoder.init(data)
+  let res = decodeCborValueRecord(dec)
+  if res.isOk:
+    return valueRecordToJson(res.get())
+  else:
+    var node = newJObject()
+    node["kind"] = newJString("Undecodable")
+    # Avoid `.error` (results' getter may have side-effect-permitting raise).
+    # Use `errorOr`-equivalent pattern via unsafeError which is plain readonly.
+    node["error"] = newJString(res.unsafeError)
+    var hex = ""
+    for b in data:
+      hex.add(toHex(int(b), 2).toLowerAscii())
+    node["raw_hex"] = newJString(hex)
+    return node
+
+# ---------------------------------------------------------------------------
+# Path normalization
+# ---------------------------------------------------------------------------
+
+proc normalizePath(s: string, stripWorkdir: string, stripPaths: bool): string =
+  ## If --strip-paths is set, strip leading workdir prefix and any
+  ## /tmp/... or absolute path prefixes so traces are diff-friendly.
+  if not stripPaths:
+    return s
+  if stripWorkdir.len > 0 and s.startsWith(stripWorkdir):
+    var rest = s[stripWorkdir.len .. ^1]
+    if rest.len > 0 and rest[0] == '/':
+      rest = rest[1 .. ^1]
+    return "<workdir>/" & rest
+  # Strip /tmp/<random>/ prefix
+  if s.startsWith("/tmp/"):
+    let parts = s.split('/')
+    if parts.len >= 4:
+      return "<tmp>/" & parts[3 .. ^1].join("/")
+  s
 
 # ---------------------------------------------------------------------------
 # V4 summary
@@ -123,7 +278,7 @@ proc printSummaryV4(reader: var NewTraceReader) =
   echo lines.join("\n")
 
 # ---------------------------------------------------------------------------
-# V4 JSON (full dump)
+# V4 JSON (full dump - legacy, value bytes are passed through as text)
 # ---------------------------------------------------------------------------
 
 proc printJsonV4(reader: var NewTraceReader) =
@@ -242,7 +397,7 @@ proc printJsonV4(reader: var NewTraceReader) =
     echo $root
 
 # ---------------------------------------------------------------------------
-# V4 JSON events (unified, interleaved by step)
+# V4 JSON events (legacy, interleaved by step, no full values)
 # ---------------------------------------------------------------------------
 
 proc stepEventToJson(reader: var NewTraceReader, gli: GlobalLineIndex,
@@ -372,6 +527,265 @@ proc printJsonEventsV4(reader: var NewTraceReader) =
     echo $eventsArr
 
 # ---------------------------------------------------------------------------
+# V4 FULL: complete content-faithful JSON dump (with decoded values).
+# ---------------------------------------------------------------------------
+
+type FullOpts = object
+  stripPaths: bool
+
+proc buildFullDocument(reader: var NewTraceReader,
+    opts: FullOpts): JsonNode =
+  ## Build the deterministic JSON document for `--full` and `--events` modes.
+  ## The shape is:
+  ##   { metadata, paths, functions, varnames, types,
+  ##     events: [ {kind: "...", ...}, ... ] }
+  ## All variable values and call args/returns are decoded from CBOR into
+  ## structured JSON objects matching the ValueRecord variant layout.
+  let gli = buildGliFromMeta(reader.meta)
+  var root = newJObject()
+
+  # ----- metadata -----
+  var meta = newJObject()
+  meta["program"] = newJString(reader.meta.program)
+  var argsArr = newJArray()
+  for a in reader.meta.args:
+    argsArr.add(newJString(a))
+  meta["args"] = argsArr
+  meta["workdir"] = newJString(
+    if opts.stripPaths and reader.meta.workdir.len > 0: "<workdir>"
+    else: reader.meta.workdir)
+  meta["recorder"] = newJString(reader.meta.recorderId)
+  root["metadata"] = meta
+
+  # ----- paths -----
+  var pathsArr = newJArray()
+  for i in 0'u64 ..< reader.pathCount():
+    let p = reader.path(i)
+    let s = if p.isOk: p.get() else: "(error)"
+    pathsArr.add(newJString(
+      normalizePath(s, reader.meta.workdir, opts.stripPaths)))
+  root["paths"] = pathsArr
+
+  # ----- functions -----
+  var funcsArr = newJArray()
+  for i in 0'u64 ..< reader.functionCount():
+    let f = reader.function(i)
+    funcsArr.add(newJString(if f.isOk: f.get() else: "(error)"))
+  root["functions"] = funcsArr
+
+  # ----- varnames -----
+  var vnArr = newJArray()
+  for i in 0'u64 ..< reader.varnameCount():
+    let vn = reader.varname(i)
+    vnArr.add(newJString(if vn.isOk: vn.get() else: "(error)"))
+  root["varnames"] = vnArr
+
+  # ----- types -----
+  var typesArr = newJArray()
+  for i in 0'u64 ..< reader.typeCount():
+    let tn = reader.typeName(i)
+    typesArr.add(newJString(if tn.isOk: tn.get() else: "(error)"))
+  root["types"] = typesArr
+
+  # ----- counts (for golden anchoring) -----
+  var counts = newJObject()
+  counts["paths"] = newJInt(int64(reader.pathCount()))
+  counts["functions"] = newJInt(int64(reader.functionCount()))
+  counts["varnames"] = newJInt(int64(reader.varnameCount()))
+  counts["types"] = newJInt(int64(reader.typeCount()))
+  let scR = reader.stepCount()
+  counts["steps"] = newJInt(if scR.isOk: int64(scR.get()) else: -1)
+  let ccR = reader.callCount()
+  counts["calls"] = newJInt(if ccR.isOk: int64(ccR.get()) else: -1)
+  let vcR = reader.valueCount()
+  counts["values"] = newJInt(if vcR.isOk: int64(vcR.get()) else: -1)
+  let icR = reader.ioEventCount()
+  counts["io_events"] = newJInt(if icR.isOk: int64(icR.get()) else: -1)
+  root["counts"] = counts
+
+  # ----- events (interleaved, source-order) -----
+  # Collection helpers: pre-load IO events and call entries indexed by step.
+  var ioByStep: seq[(uint64, IOEvent, uint64)]
+  let icRes = reader.ioEventCount()
+  if icRes.isOk:
+    for i in 0'u64 ..< icRes.get():
+      let ev = reader.ioEvent(i)
+      if ev.isOk:
+        ioByStep.add((ev.get().stepId, ev.get(), i))
+
+  var callsByEntry: seq[(uint64, v4calls.CallRecord, uint64)]
+  var callsByExit: seq[(uint64, v4calls.CallRecord, uint64)]
+  let ccRes = reader.callCount()
+  if ccRes.isOk:
+    for i in 0'u64 ..< ccRes.get():
+      let c = reader.call(i)
+      if c.isOk:
+        callsByEntry.add((c.get().entryStep, c.get(), i))
+        callsByExit.add((c.get().exitStep, c.get(), i))
+
+  var eventsArr = newJArray()
+
+  let scRes = reader.stepCount()
+  if scRes.isOk:
+    for stepIdx in 0'u64 ..< scRes.get():
+      # 1. Emit call entry events at this step (deterministic depth-asc order).
+      for (es, rec, ck) in callsByEntry:
+        if es == stepIdx:
+          var callObj = newJObject()
+          callObj["kind"] = newJString("call_entry")
+          callObj["call_key"] = newJInt(int64(ck))
+          callObj["function_id"] = newJInt(int64(rec.functionId))
+          let fn = reader.function(rec.functionId)
+          if fn.isOk:
+            callObj["function"] = newJString(fn.get())
+          callObj["entry_step"] = newJInt(int64(rec.entryStep))
+          callObj["exit_step"] = newJInt(int64(rec.exitStep))
+          callObj["depth"] = newJInt(int64(rec.depth))
+          callObj["parent_call_key"] = newJInt(rec.parentCallKey)
+          var argsJson = newJArray()
+          for arg in rec.args:
+            var argObj = newJObject()
+            argObj["varname_id"] = newJInt(int64(arg.varnameId))
+            let argVn = reader.varname(arg.varnameId)
+            if argVn.isOk:
+              argObj["varname"] = newJString(argVn.get())
+            argObj["value"] = decodeValueBytesToJson(arg.value)
+            argsJson.add(argObj)
+          callObj["args"] = argsJson
+          var childrenJson = newJArray()
+          for c in rec.children:
+            childrenJson.add(newJInt(int64(c)))
+          callObj["children"] = childrenJson
+          eventsArr.add(callObj)
+
+      # 2. Emit the step event itself.
+      var stepObj = newJObject()
+      stepObj["kind"] = newJString("step")
+      stepObj["step_index"] = newJInt(int64(stepIdx))
+      let absGli = reader.stepAbsoluteGlobalLineIndex(stepIdx)
+      var pathIdResolved = -1
+      if absGli.isOk:
+        let (pathId, line) = resolveGli(gli, absGli.get())
+        pathIdResolved = pathId
+        stepObj["path_id"] = newJInt(int64(pathId))
+        stepObj["line"] = newJInt(int64(line))
+        let pStr = reader.path(uint64(pathId))
+        if pStr.isOk:
+          stepObj["path"] = newJString(
+            normalizePath(pStr.get(), reader.meta.workdir, opts.stripPaths))
+      else:
+        discard pathIdResolved  # silence "unused" warning under strict modes
+      let stepEv = reader.step(stepIdx)
+      if stepEv.isOk:
+        let se = stepEv.get()
+        stepObj["step_kind"] = newJString($se.kind)
+        case se.kind
+        of sekRaise:
+          stepObj["exception_type_id"] = newJInt(int64(se.exceptionTypeId))
+          stepObj["exception_message"] = newJString(bytesToUtf8(se.message))
+        of sekCatch:
+          stepObj["catch_exception_type_id"] = newJInt(int64(se.catchExceptionTypeId))
+        of sekThreadStart:
+          stepObj["thread_id"] = newJInt(int64(se.startThreadId))
+        of sekThreadExit:
+          stepObj["thread_id"] = newJInt(int64(se.exitThreadId))
+        of sekThreadSwitch:
+          stepObj["thread_id"] = newJInt(int64(se.threadId))
+        else:
+          discard
+      let callForStep = reader.callForStep(stepIdx)
+      if callForStep.isOk:
+        let cs = callForStep.get()
+        stepObj["function_id"] = newJInt(int64(cs.functionId))
+        let fn = reader.function(cs.functionId)
+        if fn.isOk:
+          stepObj["function"] = newJString(fn.get())
+        stepObj["depth"] = newJInt(int64(cs.depth))
+      # Variable values (decoded)
+      var valsArr = newJArray()
+      let vals = reader.values(stepIdx)
+      if vals.isOk:
+        for v in vals.get():
+          var vObj = newJObject()
+          vObj["varname_id"] = newJInt(int64(v.varnameId))
+          let vn = reader.varname(v.varnameId)
+          if vn.isOk:
+            vObj["varname"] = newJString(vn.get())
+          vObj["type_id"] = newJInt(int64(v.typeId))
+          let tn = reader.typeName(v.typeId)
+          if tn.isOk:
+            vObj["type_name"] = newJString(tn.get())
+          vObj["value"] = decodeValueBytesToJson(v.data)
+          valsArr.add(vObj)
+      stepObj["vars"] = valsArr
+      eventsArr.add(stepObj)
+
+      # 3. Emit IO events at this step.
+      for (sid, ev, idx) in ioByStep:
+        if sid == stepIdx:
+          var ioObj = newJObject()
+          ioObj["kind"] = newJString("io")
+          ioObj["io_kind"] = newJString($ev.kind)
+          ioObj["io_index"] = newJInt(int64(idx))
+          ioObj["step_id"] = newJInt(int64(ev.stepId))
+          # Surface both UTF-8 (best-effort) and base64 (exact bytes) so
+          # binary payloads are diff-friendly without losing fidelity.
+          var allPrintable = true
+          for b in ev.data:
+            if b < 0x20 and b != 0x0A and b != 0x0D and b != 0x09:
+              allPrintable = false
+              break
+          if allPrintable:
+            ioObj["text"] = newJString(bytesToUtf8(ev.data))
+          ioObj["bytes_b64"] = newJString(base64.encode(ev.data))
+          ioObj["bytes_len"] = newJInt(int64(ev.data.len))
+          eventsArr.add(ioObj)
+
+      # 4. Emit call exit events at this step.
+      for (es, rec, ck) in callsByExit:
+        if es == stepIdx:
+          var exitObj = newJObject()
+          exitObj["kind"] = newJString("call_exit")
+          exitObj["call_key"] = newJInt(int64(ck))
+          exitObj["function_id"] = newJInt(int64(rec.functionId))
+          let fn = reader.function(rec.functionId)
+          if fn.isOk:
+            exitObj["function"] = newJString(fn.get())
+          exitObj["exit_step"] = newJInt(int64(rec.exitStep))
+          exitObj["depth"] = newJInt(int64(rec.depth))
+          exitObj["return_value"] = decodeValueBytesToJson(rec.returnValue)
+          if rec.exception.len > 0:
+            exitObj["exception"] = decodeValueBytesToJson(rec.exception)
+          eventsArr.add(exitObj)
+
+  root["events"] = eventsArr
+  return root
+
+proc printFullV4(reader: var NewTraceReader, opts: FullOpts) =
+  let root = buildFullDocument(reader, opts)
+  try:
+    echo pretty(root, indent = 2)
+  except ValueError:
+    echo $root
+
+proc printEventsJsonlV4(reader: var NewTraceReader, opts: FullOpts) =
+  ## Emit one JSON object per line. The first line is the header
+  ## (metadata + interning tables). Subsequent lines are one event each.
+  let root = buildFullDocument(reader, opts)
+
+  # Header line: everything except `events`
+  var header = newJObject()
+  for k, v in root.pairs:
+    if k != "events":
+      header[k] = v
+  echo $header
+
+  let events = root["events"]
+  if events.kind == JArray:
+    for ev in events.elems:
+      echo $ev
+
+# ---------------------------------------------------------------------------
 # V4 text output (human-readable)
 # ---------------------------------------------------------------------------
 
@@ -438,7 +852,12 @@ proc printTextV4(reader: var NewTraceReader) =
         let tn = reader.typeName(v.typeId)
         if tn.isOk:
           tnStr = tn.get()
-        var dataStr = bytesToUtf8(v.data)
+        let dataJson = decodeValueBytesToJson(v.data)
+        var dataStr: string
+        try:
+          dataStr = $dataJson
+        except ValueError:
+          dataStr = bytesToUtf8(v.data)
         if tnStr.len > 0:
           echo "  " & vnStr & ": " & tnStr & " = " & dataStr
         else:
@@ -469,7 +888,6 @@ proc followV4(filePath: string, pollMs: int) =
   while true:
     let readerRes = openNewTrace(filePath)
     if readerRes.isErr:
-      # File might not exist yet during recording startup
       try:
         sleep(pollMs)
       except:
@@ -483,7 +901,6 @@ proc followV4(filePath: string, pollMs: int) =
     let gli = buildGliFromMeta(reader.meta)
     var hadNewEvents = false
 
-    # New steps
     let sc = reader.stepCount()
     if sc.isOk and sc.get() > lastStepCount:
       for stepIdx in lastStepCount ..< sc.get():
@@ -507,7 +924,6 @@ proc followV4(filePath: string, pollMs: int) =
           if fn.isOk:
             stepObj["function"] = newJString(fn.get())
 
-        # Values
         let vals = reader.values(stepIdx)
         if vals.isOk and vals.get().len > 0:
           var valArr = newJArray()
@@ -518,7 +934,7 @@ proc followV4(filePath: string, pollMs: int) =
             if vn.isOk:
               valObj["varname"] = newJString(vn.get())
             valObj["type_id"] = newJInt(int64(v.typeId))
-            valObj["data"] = newJString(bytesToUtf8(v.data))
+            valObj["value"] = decodeValueBytesToJson(v.data)
             valArr.add(valObj)
           stepObj["values"] = valArr
 
@@ -526,7 +942,6 @@ proc followV4(filePath: string, pollMs: int) =
         hadNewEvents = true
       lastStepCount = sc.get()
 
-    # New IO events
     let ic = reader.ioEventCount()
     if ic.isOk and ic.get() > lastIoCount:
       for i in lastIoCount ..< ic.get():
@@ -543,7 +958,6 @@ proc followV4(filePath: string, pollMs: int) =
           hadNewEvents = true
       lastIoCount = ic.get()
 
-    # New calls
     let cc = reader.callCount()
     if cc.isOk and cc.get() > lastCallCount:
       for i in lastCallCount ..< cc.get():
@@ -578,6 +992,50 @@ proc followV4(filePath: string, pollMs: int) =
       discard
 
 # ---------------------------------------------------------------------------
+# Help
+# ---------------------------------------------------------------------------
+
+proc printHelp() =
+  echo """
+ct-print: Convert .ct trace files to human-readable formats.
+
+Usage:
+  ct-print <file.ct>                     Print trace as text (default)
+  ct-print --summary <file.ct>           Print metadata + counts only
+  ct-print --json <file.ct>              JSON dump (legacy: variable values
+                                          are NOT decoded; use --full instead)
+  ct-print --json-events <file.ct>       JSON events array (legacy)
+  ct-print --full <file.ct>              Pretty-printed JSON dump with FULL
+                                          decoded variable values, call args,
+                                          return values, IO bytes, etc.
+                                          Suitable for golden snapshots.
+  ct-print --events <file.ct>            JSONL: header line + one event per
+                                          line (compact, diff-friendly).
+  ct-print --follow <file.ct>            Tail the trace as it is written
+                                          (NDJSON output).
+  ct-print --strip-paths --full <f.ct>   Replace absolute workdir/tmp prefixes
+                                          with placeholders for diff-stable
+                                          snapshots across machines.
+
+Output for --full / --events:
+  Single JSON document with these top-level keys (deterministic ordering):
+    metadata, paths, functions, varnames, types, counts, events
+  Each entry of `events` has a `kind` field:
+    - "call_entry":   call_key, function_id, function, entry_step, exit_step,
+                      depth, parent_call_key, args[], children[]
+    - "step":         step_index, path_id, line, path, step_kind,
+                      function_id, function, depth, vars[]
+    - "io":           io_kind (stdout/stderr/file/error), io_index, step_id,
+                      bytes_b64, bytes_len, [text]
+    - "call_exit":    call_key, function_id, function, exit_step, depth,
+                      return_value, [exception]
+  Variable values, call args, and return values are decoded from CBOR into
+  structured JSON: {"kind":"Int","i":42,"type_id":7},
+  {"kind":"String","text":"hello",...}, structs/sequences/tuples nested,
+  references with addresses, BigInts as base64+hex, etc.
+"""
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -586,6 +1044,7 @@ proc main() =
   var filePath = ""
   var follow = false
   var pollMs = 200
+  var stripPaths = false
 
   for kind, key, val in getopt():
     case kind
@@ -595,7 +1054,11 @@ proc main() =
       of "json": format = "json"
       of "json-events": format = "json-events"
       of "summary": format = "summary"
+      of "full": format = "full"
+      of "events": format = "events"
       of "follow": follow = true
+      of "strip-paths": stripPaths = true
+      of "help", "h": printHelp(); return
       of "poll-interval":
         try:
           pollMs = parseInt(val)
@@ -607,11 +1070,15 @@ proc main() =
       of "j": format = "json"
       of "s": format = "summary"
       of "f": follow = true
+      of "h": printHelp(); return
       else: quit("Unknown option: " & key)
     of cmdEnd: discard
 
   if filePath == "":
-    quit("Usage: ct-print [--json|--json-events|--summary|--follow] <file.ct>")
+    printHelp()
+    quit(1)
+
+  let opts = FullOpts(stripPaths: stripPaths)
 
   # Try v4 multi-stream reader first
   let newReaderRes = openNewTrace(filePath)
@@ -624,6 +1091,8 @@ proc main() =
       of "summary": printSummaryV4(reader)
       of "json": printJsonV4(reader)
       of "json-events": printJsonEventsV4(reader)
+      of "full": printFullV4(reader, opts)
+      of "events": printEventsJsonlV4(reader, opts)
       else: printTextV4(reader)
     return
 
@@ -641,6 +1110,11 @@ proc main() =
   of "json": echo reader.toJson()
   of "json-events": echo reader.toJsonEvents()
   of "summary": echo reader.toSummary()
+  of "full":
+    # The legacy v2/v3 reader's toJson already includes full event content.
+    echo reader.toJson()
+  of "events":
+    echo reader.toJsonEvents()
   else: echo reader.toPrettyText()
 
 main()

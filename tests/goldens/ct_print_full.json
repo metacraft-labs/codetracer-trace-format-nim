@@ -1,0 +1,380 @@
+{
+  "metadata": {
+    "program": "ct_print_demo",
+    "args": ["--demo", "fixture"],
+    "workdir": "<workdir>",
+    "recorder": ""
+  },
+  "paths": ["<workdir>/main.py", "<workdir>/util.py"],
+  "functions": ["main", "compute"],
+  "varnames": [
+    "x",
+    "name",
+    "flag",
+    "pi",
+    "nothing",
+    "numbers",
+    "pair",
+    "point",
+    "shape",
+    "n"
+  ],
+  "types": [
+    "int",
+    "str",
+    "bool",
+    "float",
+    "None",
+    "List[int]",
+    "Tuple[str,int]",
+    "Point",
+    "Shape"
+  ],
+  "counts": {
+    "paths": 2,
+    "functions": 2,
+    "varnames": 10,
+    "types": 9,
+    "steps": 10,
+    "calls": 2,
+    "values": 10,
+    "io_events": 2
+  },
+  "events": [
+    {
+      "kind": "step",
+      "step_index": 0,
+      "path_id": 0,
+      "line": 1,
+      "path": "<workdir>/main.py",
+      "step_kind": "sekAbsoluteStep",
+      "vars": [
+        {
+          "varname_id": 0,
+          "varname": "x",
+          "type_id": 0,
+          "type_name": "int",
+          "value": {
+            "kind": "Int",
+            "i": 42,
+            "type_id": 0
+          }
+        }
+      ]
+    },
+    {
+      "kind": "call_entry",
+      "call_key": 1,
+      "function_id": 0,
+      "function": "main",
+      "entry_step": 1,
+      "exit_step": 9,
+      "depth": 0,
+      "parent_call_key": -1,
+      "args": [],
+      "children": [0]
+    },
+    {
+      "kind": "step",
+      "step_index": 1,
+      "path_id": 0,
+      "line": 2,
+      "path": "<workdir>/main.py",
+      "step_kind": "sekDeltaStep",
+      "vars": [
+        {
+          "varname_id": 1,
+          "varname": "name",
+          "type_id": 1,
+          "type_name": "str",
+          "value": {
+            "kind": "String",
+            "text": "hello",
+            "type_id": 1
+          }
+        }
+      ]
+    },
+    {
+      "kind": "step",
+      "step_index": 2,
+      "path_id": 0,
+      "line": 3,
+      "path": "<workdir>/main.py",
+      "step_kind": "sekDeltaStep",
+      "vars": [
+        {
+          "varname_id": 2,
+          "varname": "flag",
+          "type_id": 2,
+          "type_name": "bool",
+          "value": {
+            "kind": "Bool",
+            "b": true,
+            "type_id": 2
+          }
+        },
+        {
+          "varname_id": 3,
+          "varname": "pi",
+          "type_id": 3,
+          "type_name": "float",
+          "value": {
+            "kind": "Float",
+            "f": 3.14,
+            "type_id": 3
+          }
+        }
+      ]
+    },
+    {
+      "kind": "step",
+      "step_index": 3,
+      "path_id": 0,
+      "line": 4,
+      "path": "<workdir>/main.py",
+      "step_kind": "sekDeltaStep",
+      "vars": [
+        {
+          "varname_id": 4,
+          "varname": "nothing",
+          "type_id": 4,
+          "type_name": "None",
+          "value": {
+            "kind": "None",
+            "type_id": 4
+          }
+        },
+        {
+          "varname_id": 5,
+          "varname": "numbers",
+          "type_id": 5,
+          "type_name": "List[int]",
+          "value": {
+            "kind": "Sequence",
+            "elements": [
+              {
+                "kind": "Int",
+                "i": 1,
+                "type_id": 0
+              },
+              {
+                "kind": "Int",
+                "i": 2,
+                "type_id": 0
+              },
+              {
+                "kind": "Int",
+                "i": 3,
+                "type_id": 0
+              }
+            ],
+            "is_slice": false,
+            "type_id": 5
+          }
+        }
+      ]
+    },
+    {
+      "kind": "step",
+      "step_index": 4,
+      "path_id": 0,
+      "line": 5,
+      "path": "<workdir>/main.py",
+      "step_kind": "sekDeltaStep",
+      "vars": [
+        {
+          "varname_id": 6,
+          "varname": "pair",
+          "type_id": 6,
+          "type_name": "Tuple[str,int]",
+          "value": {
+            "kind": "Tuple",
+            "elements": [
+              {
+                "kind": "String",
+                "text": "answer",
+                "type_id": 1
+              },
+              {
+                "kind": "Int",
+                "i": 42,
+                "type_id": 0
+              }
+            ],
+            "type_id": 6
+          }
+        }
+      ]
+    },
+    {
+      "kind": "step",
+      "step_index": 5,
+      "path_id": 0,
+      "line": 6,
+      "path": "<workdir>/main.py",
+      "step_kind": "sekDeltaStep",
+      "vars": []
+    },
+    {
+      "kind": "io",
+      "io_kind": "ioStdout",
+      "io_index": 0,
+      "step_id": 5,
+      "text": "computing...\n",
+      "bytes_b64": "Y29tcHV0aW5nLi4uCg==",
+      "bytes_len": 13
+    },
+    {
+      "kind": "call_entry",
+      "call_key": 0,
+      "function_id": 1,
+      "function": "compute",
+      "entry_step": 6,
+      "exit_step": 8,
+      "depth": 1,
+      "parent_call_key": -1,
+      "args": [
+        {
+          "varname_id": 9,
+          "varname": "n",
+          "value": {
+            "kind": "Int",
+            "i": 7,
+            "type_id": 0
+          }
+        }
+      ],
+      "children": []
+    },
+    {
+      "kind": "step",
+      "step_index": 6,
+      "path_id": 1,
+      "line": 1,
+      "path": "<workdir>/util.py",
+      "step_kind": "sekAbsoluteStep",
+      "function_id": 1,
+      "function": "compute",
+      "depth": 1,
+      "vars": [
+        {
+          "varname_id": 7,
+          "varname": "point",
+          "type_id": 7,
+          "type_name": "Point",
+          "value": {
+            "kind": "Struct",
+            "field_values": [
+              {
+                "kind": "Int",
+                "i": 1,
+                "type_id": 0
+              },
+              {
+                "kind": "Int",
+                "i": 2,
+                "type_id": 0
+              }
+            ],
+            "type_id": 7
+          }
+        }
+      ]
+    },
+    {
+      "kind": "step",
+      "step_index": 7,
+      "path_id": 1,
+      "line": 2,
+      "path": "<workdir>/util.py",
+      "step_kind": "sekDeltaStep",
+      "function_id": 1,
+      "function": "compute",
+      "depth": 1,
+      "vars": [
+        {
+          "varname_id": 8,
+          "varname": "shape",
+          "type_id": 8,
+          "type_name": "Shape",
+          "value": {
+            "kind": "Variant",
+            "discriminator": "Circle",
+            "contents": {
+              "kind": "Struct",
+              "field_values": [
+                {
+                  "kind": "Int",
+                  "i": 5,
+                  "type_id": 0
+                }
+              ],
+              "type_id": 7
+            },
+            "type_id": 8
+          }
+        }
+      ]
+    },
+    {
+      "kind": "step",
+      "step_index": 8,
+      "path_id": 1,
+      "line": 3,
+      "path": "<workdir>/util.py",
+      "step_kind": "sekDeltaStep",
+      "function_id": 1,
+      "function": "compute",
+      "depth": 1,
+      "vars": []
+    },
+    {
+      "kind": "io",
+      "io_kind": "ioStderr",
+      "io_index": 1,
+      "step_id": 8,
+      "text": "warning: nothing\n",
+      "bytes_b64": "d2FybmluZzogbm90aGluZwo=",
+      "bytes_len": 17
+    },
+    {
+      "kind": "call_exit",
+      "call_key": 0,
+      "function_id": 1,
+      "function": "compute",
+      "exit_step": 8,
+      "depth": 1,
+      "return_value": {
+        "kind": "Int",
+        "i": 49,
+        "type_id": 0
+      }
+    },
+    {
+      "kind": "step",
+      "step_index": 9,
+      "path_id": 0,
+      "line": 7,
+      "path": "<workdir>/main.py",
+      "step_kind": "sekAbsoluteStep",
+      "function_id": 0,
+      "function": "main",
+      "depth": 0,
+      "vars": []
+    },
+    {
+      "kind": "call_exit",
+      "call_key": 1,
+      "function_id": 0,
+      "function": "main",
+      "exit_step": 9,
+      "depth": 0,
+      "return_value": {
+        "kind": "Int",
+        "i": 0,
+        "type_id": 0
+      }
+    }
+  ]
+}
