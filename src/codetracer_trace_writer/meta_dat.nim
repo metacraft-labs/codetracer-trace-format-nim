@@ -2,7 +2,7 @@
 
 ## Binary meta.dat writer for CTFS trace metadata.
 ##
-## Layout:
+## Layout (version 2):
 ##   [4] magic "CTMD"
 ##   [2] version u16 LE
 ##   [2] flags u16 LE (bit 0: has_mcr_fields)
@@ -15,6 +15,24 @@
 ##     varint tick_source
 ##     varint total_threads
 ##     varint atomic_mode
+##     varint total_events
+##     varint total_checkpoints
+##     varint start_time_unix_us
+##     varint-prefixed platform string
+##     varint-prefixed tick_granularity string
+##     varint-prefixed tick_source_str string
+##     varint-prefixed atomic_mode_str string
+##     varint-prefixed start_time_str string
+##     varint-prefixed hook_profile string                      (v2)
+##     varint hook_strategies_count, then strings               (v2)
+##
+## Version history:
+##   v1 — initial release (no hook fields).  Removed before any external
+##        consumer shipped: F5a Phase A dual-wrote meta.json alongside
+##        meta.dat, and the meta.json carried hookProfile/hookStrategies
+##        until the schema gained them in v2.
+##   v2 — appended hookProfile + hookStrategies inside the MCR-fields
+##        block so meta.dat reaches parity with the legacy meta.json.
 
 import std/options
 import results
@@ -25,7 +43,7 @@ import ./varint
 
 const
   MetaDatMagic*: array[4, byte] = [0x43'u8, 0x54, 0x4D, 0x44]  # "CTMD"
-  MetaDatVersion*: uint16 = 1
+  MetaDatVersion*: uint16 = 2
   FlagHasMcrFields*: uint16 = 1  # bit 0
 
 type
@@ -119,6 +137,10 @@ proc writeMetaDat*(
     ? c.writeVarintString(f, mcr.tickSourceStr)
     ? c.writeVarintString(f, mcr.atomicModeStr)
     ? c.writeVarintString(f, mcr.startTimeStr)
+    ? c.writeVarintString(f, mcr.hookProfile)
+    ? c.writeVarint(f, uint64(mcr.hookStrategies.len))
+    for s in mcr.hookStrategies:
+      ? c.writeVarintString(f, s)
 
   ok()
 
@@ -198,6 +220,11 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
     let tickSourceStr = ? readString(data, pos)
     let atomicModeStr = ? readString(data, pos)
     let startTimeStr = ? readString(data, pos)
+    let hookProfileStr = ? readString(data, pos)
+    let hookStrategiesCount = ? decodeVarint(data, pos)
+    var hookStrategies: seq[string] = @[]
+    for i in 0'u64 ..< hookStrategiesCount:
+      hookStrategies.add(? readString(data, pos))
 
     contents.mcrFields = some(McrMetaFields(
       tickSource: TickSource(tickSourceVal),
@@ -211,6 +238,8 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
       tickSourceStr: tickSourceStr,
       atomicModeStr: atomicModeStr,
       startTimeStr: startTimeStr,
+      hookProfile: hookProfileStr,
+      hookStrategies: hookStrategies,
     ))
 
   ok(contents)
@@ -284,3 +313,7 @@ proc writeMetaDatToBuffer*(
     result.appendVarintStr(mcr.tickSourceStr)
     result.appendVarintStr(mcr.atomicModeStr)
     result.appendVarintStr(mcr.startTimeStr)
+    result.appendVarintStr(mcr.hookProfile)
+    encodeVarint(uint64(mcr.hookStrategies.len), result)
+    for s in mcr.hookStrategies:
+      result.appendVarintStr(s)

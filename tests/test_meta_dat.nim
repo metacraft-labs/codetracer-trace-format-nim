@@ -77,7 +77,7 @@ proc test_meta_dat_write_layout() {.raises: [].} =
   pos = 4
 
   # Version
-  doAssert readU16LEAt(raw, pos) == 1, "version mismatch"
+  doAssert readU16LEAt(raw, pos) == 2, "version mismatch"
   pos += 2
 
   # Flags
@@ -153,7 +153,7 @@ proc test_meta_dat_with_mcr_fields() {.raises: [].} =
   pos = 4
 
   # Version
-  doAssert readU16LEAt(raw, pos) == 1, "version mismatch"
+  doAssert readU16LEAt(raw, pos) == 2, "version mismatch"
   pos += 2
 
   # Flags — bit 0 should be set
@@ -220,6 +220,15 @@ proc test_meta_dat_with_mcr_fields() {.raises: [].} =
   let stStr = decodeString(raw, pos)
   doAssert stStr.isOk and stStr.get() == "", "startTimeStr should be empty"
 
+  # hookProfile (empty string, v2)
+  let hpStr = decodeString(raw, pos)
+  doAssert hpStr.isOk and hpStr.get() == "", "hookProfile should be empty"
+
+  # hookStrategies (count = 0, v2)
+  let hsCount = decodeVarint(raw, pos)
+  doAssert hsCount.isOk and hsCount.get() == 0,
+    "hookStrategies count should be 0"
+
   doAssert pos == raw.len, "trailing bytes: consumed " & $pos & " of " & $raw.len
 
   c.closeCtfs()
@@ -248,7 +257,7 @@ proc test_meta_dat_empty_fields() {.raises: [].} =
   # Magic + version + flags = 8 bytes
   doAssert raw[0] == 0x43 and raw[1] == 0x54 and raw[2] == 0x4D and raw[3] == 0x44
   pos = 4
-  doAssert readU16LEAt(raw, pos) == 1
+  doAssert readU16LEAt(raw, pos) == 2
   pos += 2
   doAssert readU16LEAt(raw, pos) == 0
   pos += 2
@@ -304,7 +313,7 @@ proc test_meta_dat_roundtrip() {.raises: [].} =
   doAssert parsed.isOk, "readMetaDat failed: " & parsed.unsafeError
 
   let contents = parsed.get()
-  doAssert contents.version == 1, "version mismatch"
+  doAssert contents.version == 2, "version mismatch"
   doAssert contents.program == "/usr/bin/myapp", "program mismatch: " & contents.program
   doAssert contents.workdir == "/home/user/project", "workdir mismatch"
   doAssert contents.args.len == 3, "args count mismatch"
@@ -342,6 +351,8 @@ proc test_meta_dat_roundtrip_with_mcr() {.raises: [].} =
     totalEvents: 42000,
     totalCheckpoints: 5,
     startTimeUnixUs: 1700000000_000000'u64,
+    hookProfile: "dotnet",
+    hookStrategies: @["ldpreload", "seccomp_unotify", "callsite_patch"],
   )
 
   let wRes = c.writeMetaDat(f, meta, paths, recorderId = "mcr-rec",
@@ -367,6 +378,10 @@ proc test_meta_dat_roundtrip_with_mcr() {.raises: [].} =
   doAssert m.totalEvents == 42000, "totalEvents mismatch"
   doAssert m.totalCheckpoints == 5, "totalCheckpoints mismatch"
   doAssert m.startTimeUnixUs == 1700000000_000000'u64, "startTimeUnixUs mismatch"
+  doAssert m.hookProfile == "dotnet", "hookProfile mismatch"
+  doAssert m.hookStrategies ==
+    @["ldpreload", "seccomp_unotify", "callsite_patch"],
+    "hookStrategies mismatch"
 
   c.closeCtfs()
   echo "PASS: test_meta_dat_roundtrip_with_mcr"

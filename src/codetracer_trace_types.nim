@@ -326,6 +326,10 @@ type
     tickSourceStr*: string     ## Raw string form (preserved for roundtrip)
     atomicModeStr*: string     ## Raw string form (preserved for roundtrip)
     startTimeStr*: string      ## ISO 8601 timestamp (preserved for roundtrip)
+    hookProfile*: string       ## Hook profile name (e.g. "default", "dotnet")
+    hookStrategies*: seq[string]
+      ## Active hook strategies (e.g. @["ldpreload",
+      ## "seccomp_unotify", "callsite_patch"])
 
 # ---------------------------------------------------------------------------
 # TraceLowLevelEvent — the main tagged union
