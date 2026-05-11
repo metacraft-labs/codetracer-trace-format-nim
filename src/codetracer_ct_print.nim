@@ -1094,6 +1094,11 @@ proc detectAutoKind(filePath: string): (AutoDetectKind, string) =
     return (adkNotCtfs, "no CTFS magic — not a .ct bundle")
   let infoR = detectNativeBundle(data)
   if infoR.isErr:
+    # A v4 multi-stream bundle has `meta.dat` and no `meta.json`, so
+    # detectNativeBundle errs with "meta.json missing" — that's the normal
+    # signal to route to the v4 reader, not a corruption indicator.
+    if infoR.error.startsWith("meta.json missing"):
+      return (adkV4MultiStream, "")
     return (adkCtfsCorrupt, infoR.error)
   if isNativeBundle(data):
     return (adkNative, "")
