@@ -123,9 +123,6 @@ type
 # Helpers
 # ---------------------------------------------------------------------------
 
-proc functionKey(name, path: string, line: int64): string =
-  name & "\x00" & path & "\x00" & $line
-
 proc typeKey(kind: TypeKind, langType: string): string =
   $ord(kind) & "\x00" & langType
 
@@ -471,7 +468,11 @@ proc trace_writer_ensure_function_id(
     return high(csize_t)
   let n = toNimStr(name)
   let p = toNimStr(path)
-  let key = functionKey(n, p, line)
+  # Key on name only so the FFI ID-space agrees with the multi-stream
+  # writer's `registerFunction`, which interns by name. The (path, line)
+  # parameters are still stored as FunctionEntry metadata for the first
+  # registration site.
+  let key = n
 
   let existing = handle.functionIndex.getOrDefault(key, high(csize_t))
   if existing != high(csize_t):
