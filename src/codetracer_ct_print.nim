@@ -454,6 +454,10 @@ proc stepEventToJson(reader: var NewTraceReader, gli: GlobalLineIndex,
       let tn = reader.typeName(v.typeId)
       if tn.isOk:
         valObj["type_name"] = newJString(tn.get())
+      # Decode the CBOR-encoded value bytes into a structured JSON object
+      # matching the ValueRecord variant layout.  Consumers that want the
+      # raw bytes can still get them under `data_bytes_utf8`.
+      valObj["value"] = decodeValueBytesToJson(v.data)
       valObj["data"] = newJString(bytesToUtf8(v.data))
       nodes.add(valObj)
 
@@ -492,6 +496,49 @@ proc printJsonEventsV4(reader: var NewTraceReader) =
         callEntries.add((c.get().entryStep, c.get(), i))
 
   var eventsArr = newJArray()
+
+  # Declaration events for paths / functions / varnames / types.  These are
+  # emitted up-front so consumers (e.g. ruby's recorder-comparison test) can
+  # observe every interned identifier the .ct file carries, in the same
+  # order the writer assigned IDs.  Without these, `--json-events` only
+  # emits steps/calls/values/io and the consumer has to reverse-engineer
+  # the interning tables from inlined name strings — which loses information
+  # when the same name is re-used at multiple sites.
+  for i in 0'u64 ..< reader.pathCount():
+    var obj = newJObject()
+    obj["type"] = newJString("path")
+    obj["path_id"] = newJInt(int64(i))
+    let p = reader.path(i)
+    if p.isOk:
+      obj["name"] = newJString(p.get())
+    eventsArr.add(obj)
+
+  for i in 0'u64 ..< reader.functionCount():
+    var obj = newJObject()
+    obj["type"] = newJString("function")
+    obj["function_id"] = newJInt(int64(i))
+    let f = reader.function(i)
+    if f.isOk:
+      obj["name"] = newJString(f.get())
+    eventsArr.add(obj)
+
+  for i in 0'u64 ..< reader.varnameCount():
+    var obj = newJObject()
+    obj["type"] = newJString("varname")
+    obj["varname_id"] = newJInt(int64(i))
+    let v = reader.varname(i)
+    if v.isOk:
+      obj["name"] = newJString(v.get())
+    eventsArr.add(obj)
+
+  for i in 0'u64 ..< reader.typeCount():
+    var obj = newJObject()
+    obj["type"] = newJString("type")
+    obj["type_id"] = newJInt(int64(i))
+    let t = reader.typeName(i)
+    if t.isOk:
+      obj["name"] = newJString(t.get())
+    eventsArr.add(obj)
 
   let sc = reader.stepCount()
   if sc.isOk:
