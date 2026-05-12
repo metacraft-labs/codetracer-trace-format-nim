@@ -55,7 +55,7 @@ var emptyStr {.threadvar.}: string
 proc setError(msg: string) =
   lastError = msg
 
-proc trace_writer_last_error(): cstring {.exportc, cdecl.} =
+proc trace_writer_last_error(): cstring {.exportc, cdecl, dynlib.} =
   ## Retrieve the last error message for the current thread.
   ## Returns a pointer valid until the next FFI call on the same thread.
   ## Returns an empty string when no error has occurred.
@@ -209,7 +209,7 @@ proc toEventLogKind(k: FfiEventLogKind): EventLogKind =
 proc trace_writer_new(
     program: cstring,
     format: FfiTraceFormat,
-): TraceWriterHandle {.exportc, cdecl.} =
+): TraceWriterHandle {.exportc, cdecl, dynlib.} =
   ## Create a new trace writer handle.
   ## The .ct file is NOT created here — it is deferred to trace_writer_begin_events
   ## which receives the output path from the Python recorder. This ensures the .ct
@@ -233,7 +233,7 @@ proc trace_writer_new(
   )
   return state
 
-proc trace_writer_free(handle: TraceWriterHandle) {.exportc, cdecl.} =
+proc trace_writer_free(handle: TraceWriterHandle) {.exportc, cdecl, dynlib.} =
   ## Free a trace writer handle. Passing NULL is a no-op.
   if handle.isNil:
     return
@@ -259,7 +259,7 @@ proc trace_writer_free(handle: TraceWriterHandle) {.exportc, cdecl.} =
 proc trace_writer_begin_metadata(
     handle: TraceWriterHandle,
     path: cstring,
-): cint {.exportc, cdecl.} =
+): cint {.exportc, cdecl, dynlib.} =
   ## Begin writing metadata. In the Nim CTFS implementation, metadata is
   ## written on close, so this is a no-op that records the path.
   if handle.isNil:
@@ -267,7 +267,7 @@ proc trace_writer_begin_metadata(
     return 1.cint
   0.cint
 
-proc trace_writer_finish_metadata(handle: TraceWriterHandle): cint {.exportc, cdecl.} =
+proc trace_writer_finish_metadata(handle: TraceWriterHandle): cint {.exportc, cdecl, dynlib.} =
   if handle.isNil:
     setError("NULL handle")
     return 1.cint
@@ -276,7 +276,7 @@ proc trace_writer_finish_metadata(handle: TraceWriterHandle): cint {.exportc, cd
 proc trace_writer_begin_events(
     handle: TraceWriterHandle,
     path: cstring,
-): cint {.exportc, cdecl.} =
+): cint {.exportc, cdecl, dynlib.} =
   ## Creates the .ct file in the same directory as the given events path.
   ## The .ct filename is derived from the program name stored at construction time.
   ## This is the point where the actual CTFS container file is opened on disk.
@@ -326,7 +326,7 @@ proc trace_writer_begin_events(
   handle.writerReady = true
   0.cint
 
-proc trace_writer_finish_events(handle: TraceWriterHandle): cint {.exportc, cdecl.} =
+proc trace_writer_finish_events(handle: TraceWriterHandle): cint {.exportc, cdecl, dynlib.} =
   if handle.isNil:
     setError("NULL handle")
     return 1.cint
@@ -345,13 +345,13 @@ proc trace_writer_finish_events(handle: TraceWriterHandle): cint {.exportc, cdec
 proc trace_writer_begin_paths(
     handle: TraceWriterHandle,
     path: cstring,
-): cint {.exportc, cdecl.} =
+): cint {.exportc, cdecl, dynlib.} =
   if handle.isNil:
     setError("NULL handle")
     return 1.cint
   0.cint
 
-proc trace_writer_finish_paths(handle: TraceWriterHandle): cint {.exportc, cdecl.} =
+proc trace_writer_finish_paths(handle: TraceWriterHandle): cint {.exportc, cdecl, dynlib.} =
   if handle.isNil:
     setError("NULL handle")
     return 1.cint
@@ -385,7 +385,7 @@ proc trace_writer_start(
     handle: TraceWriterHandle,
     path: cstring,
     line: int64,
-) {.exportc, cdecl.} =
+) {.exportc, cdecl, dynlib.} =
   ## Record the initial step (entry point).
   if handle.isNil:
     return
@@ -414,7 +414,7 @@ proc trace_writer_start(
 proc trace_writer_set_workdir(
     handle: TraceWriterHandle,
     workdir: cstring,
-) {.exportc, cdecl.} =
+) {.exportc, cdecl, dynlib.} =
   ## Override the working directory recorded in the trace metadata.
   ## Can be called before or after begin_events — the value is stored and
   ## propagated to the writer when/if it becomes ready.
@@ -432,7 +432,7 @@ proc trace_writer_register_step(
     handle: TraceWriterHandle,
     path: cstring,
     line: int64,
-) {.exportc, cdecl.} =
+) {.exportc, cdecl, dynlib.} =
   ## Register a step at the given source path and line.
   if handle.isNil:
     return
@@ -465,7 +465,7 @@ proc trace_writer_ensure_function_id(
     name: cstring,
     path: cstring,
     line: int64,
-): csize_t {.exportc, cdecl.} =
+): csize_t {.exportc, cdecl, dynlib.} =
   ## Register a function and return its ID. Returns SIZE_MAX on error.
   if handle.isNil:
     return high(csize_t)
@@ -496,7 +496,7 @@ proc trace_writer_ensure_type_id(
     handle: TraceWriterHandle,
     kind: FfiTypeKind,
     lang_type: cstring,
-): csize_t {.exportc, cdecl.} =
+): csize_t {.exportc, cdecl, dynlib.} =
   ## Register a type and return its ID. Returns SIZE_MAX on error.
   if handle.isNil:
     return high(csize_t)
@@ -534,7 +534,7 @@ proc trace_writer_register_call_arg(
     name: cstring,
     cbor_data: ptr uint8,
     cbor_len: csize_t,
-) {.exportc, cdecl.} =
+) {.exportc, cdecl, dynlib.} =
   ## Stage a single argument (name + CBOR-encoded value) for the next
   ## ``trace_writer_register_call`` invocation. Recorders should call this
   ## once per parameter immediately before ``trace_writer_register_call``.
@@ -564,7 +564,7 @@ proc trace_writer_register_call_arg(
 proc trace_writer_register_call(
     handle: TraceWriterHandle,
     function_id: csize_t,
-) {.exportc, cdecl.} =
+) {.exportc, cdecl, dynlib.} =
   ## Register a call to the function identified by function_id.
   ##
   ## Any arguments staged via ``trace_writer_register_call_arg`` since the
@@ -581,7 +581,7 @@ proc trace_writer_register_call(
   handle.pendingCallArgs.setLen(0)
   discard handle.writer.writeCall(uint64(function_id))
 
-proc trace_writer_register_return(handle: TraceWriterHandle) {.exportc, cdecl.} =
+proc trace_writer_register_return(handle: TraceWriterHandle) {.exportc, cdecl, dynlib.} =
   ## Register a function return with no explicit return value.
   if handle.isNil:
     return
@@ -595,7 +595,7 @@ proc trace_writer_register_return_int(
     value: int64,
     type_kind: FfiTypeKind,
     type_name: cstring,
-) {.exportc, cdecl.} =
+) {.exportc, cdecl, dynlib.} =
   ## Register a function return with an integer return value.
   if handle.isNil:
     return
@@ -625,7 +625,7 @@ proc trace_writer_register_return_raw(
     value_repr: cstring,
     type_kind: FfiTypeKind,
     type_name: cstring,
-) {.exportc, cdecl.} =
+) {.exportc, cdecl, dynlib.} =
   ## Register a function return with a string (raw) return value.
   if handle.isNil:
     return
@@ -655,7 +655,7 @@ proc trace_writer_register_variable_int(
     value: int64,
     type_kind: FfiTypeKind,
     type_name: cstring,
-) {.exportc, cdecl.} =
+) {.exportc, cdecl, dynlib.} =
   ## Register a variable with an integer value.
   if handle.isNil:
     return
@@ -694,7 +694,7 @@ proc trace_writer_register_variable_raw(
     value_repr: cstring,
     type_kind: FfiTypeKind,
     type_name: cstring,
-) {.exportc, cdecl.} =
+) {.exportc, cdecl, dynlib.} =
   ## Register a variable with a string (raw) value representation.
   if handle.isNil:
     return
@@ -732,7 +732,7 @@ proc trace_writer_register_variable_cbor(
     name: cstring,
     cbor_data: ptr uint8,
     cbor_len: csize_t,
-) {.exportc, cdecl.} =
+) {.exportc, cdecl, dynlib.} =
   ## Register a variable with pre-encoded CBOR value bytes (from the streaming
   ## encoder). This avoids the intermediate ValueRecord tree for complex values
   ## like sequences, tuples, and dicts — the caller encodes directly to CBOR
@@ -770,7 +770,7 @@ proc trace_writer_register_return_cbor(
     handle: TraceWriterHandle,
     cbor_data: ptr uint8,
     cbor_len: csize_t,
-) {.exportc, cdecl.} =
+) {.exportc, cdecl, dynlib.} =
   ## Register a function return with pre-encoded CBOR value bytes.
   ## Same rationale as trace_writer_register_variable_cbor.
   if handle.isNil:
@@ -814,7 +814,7 @@ proc trace_writer_register_special_event(
     kind: FfiEventLogKind,
     metadata: cstring,
     content: cstring,
-) {.exportc, cdecl.} =
+) {.exportc, cdecl, dynlib.} =
   ## Register an I/O or special event with optional metadata.
   if handle.isNil:
     return
@@ -858,7 +858,7 @@ proc trace_writer_register_special_event(
 proc trace_writer_register_thread_start(
     handle: TraceWriterHandle,
     thread_id: uint64,
-) {.exportc, cdecl.} =
+) {.exportc, cdecl, dynlib.} =
   ## Register a ThreadStart event (a new thread came into existence).
   if handle.isNil:
     return
@@ -882,7 +882,7 @@ proc trace_writer_register_thread_start(
 proc trace_writer_register_thread_exit(
     handle: TraceWriterHandle,
     thread_id: uint64,
-) {.exportc, cdecl.} =
+) {.exportc, cdecl, dynlib.} =
   ## Register a ThreadExit event (a thread terminated).
   if handle.isNil:
     return
@@ -904,7 +904,7 @@ proc trace_writer_register_thread_exit(
 proc trace_writer_register_thread_switch(
     handle: TraceWriterHandle,
     thread_id: uint64,
-) {.exportc, cdecl.} =
+) {.exportc, cdecl, dynlib.} =
   ## Register a ThreadSwitch event (the active thread changed).
   if handle.isNil:
     return
@@ -927,7 +927,7 @@ proc trace_writer_register_thread_switch(
 # Close
 # ---------------------------------------------------------------------------
 
-proc trace_writer_close(handle: TraceWriterHandle): cint {.exportc, cdecl.} =
+proc trace_writer_close(handle: TraceWriterHandle): cint {.exportc, cdecl, dynlib.} =
   ## Close the trace writer and flush all remaining data.
   ## Returns 0 on success, non-zero on failure.
   ## If the writer was never initialized (begin_events never called), this is a no-op.
@@ -976,7 +976,7 @@ proc ct_write_meta_dat(
     handle: TraceWriterHandle,
     recorder_id: ptr uint8,
     recorder_id_len: csize_t
-): cint {.exportc, cdecl.} =
+): cint {.exportc, cdecl, dynlib.} =
   ## Write meta.dat to the trace's CTFS container using the metadata
   ## and paths already registered via trace_writer_set_workdir,
   ## trace_writer_start, and trace_writer_register_path.
@@ -1021,7 +1021,7 @@ proc ct_write_meta_dat_to_buffer(
     paths: ptr ptr uint8, path_lens: ptr csize_t, paths_count: csize_t,
     recorder_id: ptr uint8, recorder_id_len: csize_t,
     out_buf: ptr ptr uint8, out_len: ptr csize_t
-): cint {.exportc, cdecl.} =
+): cint {.exportc, cdecl, dynlib.} =
   ## Write meta.dat to a newly allocated buffer from explicit fields.
   ## The caller must free the buffer with ct_free_buffer.
   ## Returns 0 on success.
@@ -1072,7 +1072,7 @@ proc ct_write_meta_dat_to_buffer(
   out_len[] = csize_t(buf.len)
   0.cint
 
-proc ct_free_buffer(buf: ptr uint8) {.exportc, cdecl.} =
+proc ct_free_buffer(buf: ptr uint8) {.exportc, cdecl, dynlib.} =
   ## Free a buffer allocated by ct_write_meta_dat_to_buffer.
   if not buf.isNil:
     dealloc(buf)
@@ -1086,7 +1086,7 @@ type MetaDatReaderHandle = ptr MetaDatContents
 proc ct_read_meta_dat(
     data: ptr uint8,
     data_len: csize_t
-): MetaDatReaderHandle {.exportc, cdecl.} =
+): MetaDatReaderHandle {.exportc, cdecl, dynlib.} =
   ## Parse meta.dat from raw bytes. Returns handle on success, nil on failure.
   if data.isNil or data_len == 0.csize_t:
     setError("NULL or empty data")
@@ -1104,7 +1104,7 @@ proc ct_read_meta_dat(
   h[] = res.get()
   return h
 
-proc ct_meta_dat_program(h: MetaDatReaderHandle, out_len: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+proc ct_meta_dat_program(h: MetaDatReaderHandle, out_len: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib.} =
   ## Get the program string. Returns pointer valid until ct_meta_dat_free.
   if h.isNil or out_len.isNil:
     return nil
@@ -1113,7 +1113,7 @@ proc ct_meta_dat_program(h: MetaDatReaderHandle, out_len: ptr csize_t): ptr uint
     return nil
   return cast[ptr uint8](unsafeAddr h.program[0])
 
-proc ct_meta_dat_workdir(h: MetaDatReaderHandle, out_len: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+proc ct_meta_dat_workdir(h: MetaDatReaderHandle, out_len: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib.} =
   if h.isNil or out_len.isNil:
     return nil
   out_len[] = csize_t(h.workdir.len)
@@ -1121,12 +1121,12 @@ proc ct_meta_dat_workdir(h: MetaDatReaderHandle, out_len: ptr csize_t): ptr uint
     return nil
   return cast[ptr uint8](unsafeAddr h.workdir[0])
 
-proc ct_meta_dat_args_count(h: MetaDatReaderHandle): csize_t {.exportc, cdecl.} =
+proc ct_meta_dat_args_count(h: MetaDatReaderHandle): csize_t {.exportc, cdecl, dynlib.} =
   if h.isNil:
     return 0.csize_t
   return csize_t(h.args.len)
 
-proc ct_meta_dat_arg(h: MetaDatReaderHandle, idx: csize_t, out_len: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+proc ct_meta_dat_arg(h: MetaDatReaderHandle, idx: csize_t, out_len: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib.} =
   if h.isNil or out_len.isNil or int(idx) >= h.args.len:
     return nil
   out_len[] = csize_t(h.args[int(idx)].len)
@@ -1134,12 +1134,12 @@ proc ct_meta_dat_arg(h: MetaDatReaderHandle, idx: csize_t, out_len: ptr csize_t)
     return nil
   return cast[ptr uint8](unsafeAddr h.args[int(idx)][0])
 
-proc ct_meta_dat_paths_count(h: MetaDatReaderHandle): csize_t {.exportc, cdecl.} =
+proc ct_meta_dat_paths_count(h: MetaDatReaderHandle): csize_t {.exportc, cdecl, dynlib.} =
   if h.isNil:
     return 0.csize_t
   return csize_t(h.paths.len)
 
-proc ct_meta_dat_path(h: MetaDatReaderHandle, idx: csize_t, out_len: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+proc ct_meta_dat_path(h: MetaDatReaderHandle, idx: csize_t, out_len: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib.} =
   if h.isNil or out_len.isNil or int(idx) >= h.paths.len:
     return nil
   out_len[] = csize_t(h.paths[int(idx)].len)
@@ -1147,7 +1147,7 @@ proc ct_meta_dat_path(h: MetaDatReaderHandle, idx: csize_t, out_len: ptr csize_t
     return nil
   return cast[ptr uint8](unsafeAddr h.paths[int(idx)][0])
 
-proc ct_meta_dat_recorder_id(h: MetaDatReaderHandle, out_len: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+proc ct_meta_dat_recorder_id(h: MetaDatReaderHandle, out_len: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib.} =
   if h.isNil or out_len.isNil:
     return nil
   out_len[] = csize_t(h.recorderId.len)
@@ -1155,7 +1155,7 @@ proc ct_meta_dat_recorder_id(h: MetaDatReaderHandle, out_len: ptr csize_t): ptr 
     return nil
   return cast[ptr uint8](unsafeAddr h.recorderId[0])
 
-proc ct_meta_dat_free(h: MetaDatReaderHandle) {.exportc, cdecl.} =
+proc ct_meta_dat_free(h: MetaDatReaderHandle) {.exportc, cdecl, dynlib.} =
   ## Free a MetaDatContents handle.
   if h.isNil:
     return
@@ -1168,26 +1168,26 @@ proc ct_meta_dat_free(h: MetaDatReaderHandle) {.exportc, cdecl.} =
 
 type ValueEncoderHandle = ptr StreamingValueEncoder
 
-proc ct_value_encoder_new(): ValueEncoderHandle {.exportc, cdecl.} =
+proc ct_value_encoder_new(): ValueEncoderHandle {.exportc, cdecl, dynlib.} =
   ## Create a new streaming value encoder. Returns NULL on allocation failure.
   let h = cast[ValueEncoderHandle](alloc0(sizeof(StreamingValueEncoder)))
   h[] = StreamingValueEncoder.init()
   return h
 
-proc ct_value_encoder_free(h: ValueEncoderHandle) {.exportc, cdecl.} =
+proc ct_value_encoder_free(h: ValueEncoderHandle) {.exportc, cdecl, dynlib.} =
   ## Free a value encoder handle. Passing NULL is a no-op.
   if h.isNil:
     return
   `=destroy`(h[])
   dealloc(h)
 
-proc ct_value_encoder_reset(h: ValueEncoderHandle) {.exportc, cdecl.} =
+proc ct_value_encoder_reset(h: ValueEncoderHandle) {.exportc, cdecl, dynlib.} =
   ## Reset the encoder for reuse (clears buffer, resets nesting stack).
   if h.isNil:
     return
   h[].reset()
 
-proc ct_value_write_int(h: ValueEncoderHandle, value: int64, type_id: uint64): cint {.exportc, cdecl.} =
+proc ct_value_write_int(h: ValueEncoderHandle, value: int64, type_id: uint64): cint {.exportc, cdecl, dynlib.} =
   if h.isNil:
     setError("NULL handle")
     return 1.cint
@@ -1197,7 +1197,7 @@ proc ct_value_write_int(h: ValueEncoderHandle, value: int64, type_id: uint64): c
     return 1.cint
   0.cint
 
-proc ct_value_write_float(h: ValueEncoderHandle, value: float64, type_id: uint64): cint {.exportc, cdecl.} =
+proc ct_value_write_float(h: ValueEncoderHandle, value: float64, type_id: uint64): cint {.exportc, cdecl, dynlib.} =
   if h.isNil:
     setError("NULL handle")
     return 1.cint
@@ -1207,7 +1207,7 @@ proc ct_value_write_float(h: ValueEncoderHandle, value: float64, type_id: uint64
     return 1.cint
   0.cint
 
-proc ct_value_write_bool(h: ValueEncoderHandle, value: cint): cint {.exportc, cdecl.} =
+proc ct_value_write_bool(h: ValueEncoderHandle, value: cint): cint {.exportc, cdecl, dynlib.} =
   if h.isNil:
     setError("NULL handle")
     return 1.cint
@@ -1218,7 +1218,7 @@ proc ct_value_write_bool(h: ValueEncoderHandle, value: cint): cint {.exportc, cd
     return 1.cint
   0.cint
 
-proc ct_value_write_bool_typed(h: ValueEncoderHandle, value: cint, type_id: uint64): cint {.exportc, cdecl.} =
+proc ct_value_write_bool_typed(h: ValueEncoderHandle, value: cint, type_id: uint64): cint {.exportc, cdecl, dynlib.} =
   if h.isNil:
     setError("NULL handle")
     return 1.cint
@@ -1228,7 +1228,7 @@ proc ct_value_write_bool_typed(h: ValueEncoderHandle, value: cint, type_id: uint
     return 1.cint
   0.cint
 
-proc ct_value_write_string(h: ValueEncoderHandle, data: ptr uint8, len: csize_t, type_id: uint64): cint {.exportc, cdecl.} =
+proc ct_value_write_string(h: ValueEncoderHandle, data: ptr uint8, len: csize_t, type_id: uint64): cint {.exportc, cdecl, dynlib.} =
   if h.isNil:
     setError("NULL handle")
     return 1.cint
@@ -1242,7 +1242,7 @@ proc ct_value_write_string(h: ValueEncoderHandle, data: ptr uint8, len: csize_t,
     return 1.cint
   0.cint
 
-proc ct_value_write_none(h: ValueEncoderHandle): cint {.exportc, cdecl.} =
+proc ct_value_write_none(h: ValueEncoderHandle): cint {.exportc, cdecl, dynlib.} =
   if h.isNil:
     setError("NULL handle")
     return 1.cint
@@ -1252,7 +1252,7 @@ proc ct_value_write_none(h: ValueEncoderHandle): cint {.exportc, cdecl.} =
     return 1.cint
   0.cint
 
-proc ct_value_write_none_typed(h: ValueEncoderHandle, type_id: uint64): cint {.exportc, cdecl.} =
+proc ct_value_write_none_typed(h: ValueEncoderHandle, type_id: uint64): cint {.exportc, cdecl, dynlib.} =
   if h.isNil:
     setError("NULL handle")
     return 1.cint
@@ -1262,7 +1262,7 @@ proc ct_value_write_none_typed(h: ValueEncoderHandle, type_id: uint64): cint {.e
     return 1.cint
   0.cint
 
-proc ct_value_write_raw(h: ValueEncoderHandle, data: ptr uint8, len: csize_t, type_id: uint64): cint {.exportc, cdecl.} =
+proc ct_value_write_raw(h: ValueEncoderHandle, data: ptr uint8, len: csize_t, type_id: uint64): cint {.exportc, cdecl, dynlib.} =
   if h.isNil:
     setError("NULL handle")
     return 1.cint
@@ -1276,7 +1276,7 @@ proc ct_value_write_raw(h: ValueEncoderHandle, data: ptr uint8, len: csize_t, ty
     return 1.cint
   0.cint
 
-proc ct_value_write_error(h: ValueEncoderHandle, data: ptr uint8, len: csize_t, type_id: uint64): cint {.exportc, cdecl.} =
+proc ct_value_write_error(h: ValueEncoderHandle, data: ptr uint8, len: csize_t, type_id: uint64): cint {.exportc, cdecl, dynlib.} =
   ## Write an error value with the given message and type ID.
   if h.isNil:
     setError("NULL handle")
@@ -1291,7 +1291,7 @@ proc ct_value_write_error(h: ValueEncoderHandle, data: ptr uint8, len: csize_t, 
     return 1.cint
   0.cint
 
-proc ct_value_begin_struct(h: ValueEncoderHandle, type_id: uint64, field_count: cint): cint {.exportc, cdecl.} =
+proc ct_value_begin_struct(h: ValueEncoderHandle, type_id: uint64, field_count: cint): cint {.exportc, cdecl, dynlib.} =
   if h.isNil:
     setError("NULL handle")
     return 1.cint
@@ -1301,7 +1301,7 @@ proc ct_value_begin_struct(h: ValueEncoderHandle, type_id: uint64, field_count: 
     return 1.cint
   0.cint
 
-proc ct_value_begin_sequence(h: ValueEncoderHandle, type_id: uint64, element_count: cint): cint {.exportc, cdecl.} =
+proc ct_value_begin_sequence(h: ValueEncoderHandle, type_id: uint64, element_count: cint): cint {.exportc, cdecl, dynlib.} =
   if h.isNil:
     setError("NULL handle")
     return 1.cint
@@ -1311,7 +1311,7 @@ proc ct_value_begin_sequence(h: ValueEncoderHandle, type_id: uint64, element_cou
     return 1.cint
   0.cint
 
-proc ct_value_begin_tuple(h: ValueEncoderHandle, type_id: uint64, element_count: cint): cint {.exportc, cdecl.} =
+proc ct_value_begin_tuple(h: ValueEncoderHandle, type_id: uint64, element_count: cint): cint {.exportc, cdecl, dynlib.} =
   if h.isNil:
     setError("NULL handle")
     return 1.cint
@@ -1321,7 +1321,7 @@ proc ct_value_begin_tuple(h: ValueEncoderHandle, type_id: uint64, element_count:
     return 1.cint
   0.cint
 
-proc ct_value_end_compound(h: ValueEncoderHandle): cint {.exportc, cdecl.} =
+proc ct_value_end_compound(h: ValueEncoderHandle): cint {.exportc, cdecl, dynlib.} =
   if h.isNil:
     setError("NULL handle")
     return 1.cint
@@ -1331,7 +1331,7 @@ proc ct_value_end_compound(h: ValueEncoderHandle): cint {.exportc, cdecl.} =
     return 1.cint
   0.cint
 
-proc ct_value_get_bytes(h: ValueEncoderHandle, out_len: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+proc ct_value_get_bytes(h: ValueEncoderHandle, out_len: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib.} =
   ## Get pointer to the encoded CBOR bytes. Valid until next reset/write/free.
   ## Sets *out_len to the byte count. Returns NULL on error.
   if h.isNil or out_len.isNil:
@@ -1462,7 +1462,7 @@ proc allocStringResult(s: string, outLen: ptr csize_t): ptr uint8 =
 # Reader lifecycle
 # ---------------------------------------------------------------------------
 
-proc ct_reader_open(path: cstring): pointer {.exportc, cdecl.} =
+proc ct_reader_open(path: cstring): pointer {.exportc, cdecl, dynlib.} =
   ## Open a .ct trace file. Returns opaque reader handle or nil on failure.
   ## Check trace_writer_last_error() for error message on failure.
   if path.isNil:
@@ -1477,7 +1477,7 @@ proc ct_reader_open(path: cstring): pointer {.exportc, cdecl.} =
   h[] = res.get()
   return cast[pointer](h)
 
-proc ct_reader_close(h: pointer) {.exportc, cdecl.} =
+proc ct_reader_close(h: pointer) {.exportc, cdecl, dynlib.} =
   ## Close and free a reader handle. Passing NULL is a no-op.
   if h.isNil:
     return
@@ -1492,7 +1492,7 @@ proc ct_reader_close(h: pointer) {.exportc, cdecl.} =
 # Counts
 # ---------------------------------------------------------------------------
 
-proc ct_reader_step_count(h: pointer): uint64 {.exportc, cdecl.} =
+proc ct_reader_step_count(h: pointer): uint64 {.exportc, cdecl, dynlib.} =
   if h.isNil: return 0
   let rh = cast[TraceReaderHandle](h)
   let res = rh[].stepCount()
@@ -1501,7 +1501,7 @@ proc ct_reader_step_count(h: pointer): uint64 {.exportc, cdecl.} =
     return 0
   res.get()
 
-proc ct_reader_call_count(h: pointer): uint64 {.exportc, cdecl.} =
+proc ct_reader_call_count(h: pointer): uint64 {.exportc, cdecl, dynlib.} =
   if h.isNil: return 0
   let rh = cast[TraceReaderHandle](h)
   let res = rh[].callCount()
@@ -1510,7 +1510,7 @@ proc ct_reader_call_count(h: pointer): uint64 {.exportc, cdecl.} =
     return 0
   res.get()
 
-proc ct_reader_event_count(h: pointer): uint64 {.exportc, cdecl.} =
+proc ct_reader_event_count(h: pointer): uint64 {.exportc, cdecl, dynlib.} =
   if h.isNil: return 0
   let rh = cast[TraceReaderHandle](h)
   let res = rh[].ioEventCount()
@@ -1523,7 +1523,7 @@ proc ct_reader_event_count(h: pointer): uint64 {.exportc, cdecl.} =
 # Interning
 # ---------------------------------------------------------------------------
 
-proc ct_reader_path(h: pointer, id: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+proc ct_reader_path(h: pointer, id: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib.} =
   ## Get path string by id. Caller must free result with ct_free_buffer.
   if h.isNil or outLen.isNil: return nil
   let rh = cast[TraceReaderHandle](h)
@@ -1533,7 +1533,7 @@ proc ct_reader_path(h: pointer, id: uint64, outLen: ptr csize_t): ptr uint8 {.ex
     return nil
   allocStringResult(res.get(), outLen)
 
-proc ct_reader_function(h: pointer, id: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+proc ct_reader_function(h: pointer, id: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib.} =
   ## Get function name by id. Caller must free result with ct_free_buffer.
   if h.isNil or outLen.isNil: return nil
   let rh = cast[TraceReaderHandle](h)
@@ -1543,7 +1543,7 @@ proc ct_reader_function(h: pointer, id: uint64, outLen: ptr csize_t): ptr uint8 
     return nil
   allocStringResult(res.get(), outLen)
 
-proc ct_reader_type_name(h: pointer, id: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+proc ct_reader_type_name(h: pointer, id: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib.} =
   ## Get type name by id. Caller must free result with ct_free_buffer.
   if h.isNil or outLen.isNil: return nil
   let rh = cast[TraceReaderHandle](h)
@@ -1553,7 +1553,7 @@ proc ct_reader_type_name(h: pointer, id: uint64, outLen: ptr csize_t): ptr uint8
     return nil
   allocStringResult(res.get(), outLen)
 
-proc ct_reader_varname(h: pointer, id: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+proc ct_reader_varname(h: pointer, id: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib.} =
   ## Get variable name by id. Caller must free result with ct_free_buffer.
   if h.isNil or outLen.isNil: return nil
   let rh = cast[TraceReaderHandle](h)
@@ -1563,22 +1563,22 @@ proc ct_reader_varname(h: pointer, id: uint64, outLen: ptr csize_t): ptr uint8 {
     return nil
   allocStringResult(res.get(), outLen)
 
-proc ct_reader_path_count(h: pointer): uint64 {.exportc, cdecl.} =
+proc ct_reader_path_count(h: pointer): uint64 {.exportc, cdecl, dynlib.} =
   if h.isNil: return 0
   let rh = cast[TraceReaderHandle](h)
   rh[].pathCount()
 
-proc ct_reader_function_count(h: pointer): uint64 {.exportc, cdecl.} =
+proc ct_reader_function_count(h: pointer): uint64 {.exportc, cdecl, dynlib.} =
   if h.isNil: return 0
   let rh = cast[TraceReaderHandle](h)
   rh[].functionCount()
 
-proc ct_reader_type_count(h: pointer): uint64 {.exportc, cdecl.} =
+proc ct_reader_type_count(h: pointer): uint64 {.exportc, cdecl, dynlib.} =
   if h.isNil: return 0
   let rh = cast[TraceReaderHandle](h)
   rh[].typeCount()
 
-proc ct_reader_varname_count(h: pointer): uint64 {.exportc, cdecl.} =
+proc ct_reader_varname_count(h: pointer): uint64 {.exportc, cdecl, dynlib.} =
   if h.isNil: return 0
   let rh = cast[TraceReaderHandle](h)
   rh[].varnameCount()
@@ -1587,7 +1587,7 @@ proc ct_reader_varname_count(h: pointer): uint64 {.exportc, cdecl.} =
 # Step access — returns JSON-encoded step event
 # ---------------------------------------------------------------------------
 
-proc ct_reader_step(h: pointer, n: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+proc ct_reader_step(h: pointer, n: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib.} =
   ## Returns step event N as JSON bytes. Caller must free with ct_free_buffer.
   if h.isNil or outLen.isNil: return nil
   let rh = cast[TraceReaderHandle](h)
@@ -1601,7 +1601,7 @@ proc ct_reader_step(h: pointer, n: uint64, outLen: ptr csize_t): ptr uint8 {.exp
 # Value access — returns JSON-encoded values array
 # ---------------------------------------------------------------------------
 
-proc ct_reader_values(h: pointer, n: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+proc ct_reader_values(h: pointer, n: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib.} =
   ## Returns variable values for step N as JSON array. Caller must free with ct_free_buffer.
   if h.isNil or outLen.isNil: return nil
   let rh = cast[TraceReaderHandle](h)
@@ -1615,7 +1615,7 @@ proc ct_reader_values(h: pointer, n: uint64, outLen: ptr csize_t): ptr uint8 {.e
 # Call access — returns JSON-encoded call record
 # ---------------------------------------------------------------------------
 
-proc ct_reader_call(h: pointer, key: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+proc ct_reader_call(h: pointer, key: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib.} =
   ## Returns call record by key as JSON. Caller must free with ct_free_buffer.
   if h.isNil or outLen.isNil: return nil
   let rh = cast[TraceReaderHandle](h)
@@ -1625,7 +1625,7 @@ proc ct_reader_call(h: pointer, key: uint64, outLen: ptr csize_t): ptr uint8 {.e
     return nil
   allocJsonResult(callRecordToJson(res.get()), outLen)
 
-proc ct_reader_call_for_step(h: pointer, stepId: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+proc ct_reader_call_for_step(h: pointer, stepId: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib.} =
   ## Returns the innermost call record enclosing the given step as JSON.
   ## Caller must free with ct_free_buffer.
   if h.isNil or outLen.isNil: return nil
@@ -1640,7 +1640,7 @@ proc ct_reader_call_for_step(h: pointer, stepId: uint64, outLen: ptr csize_t): p
 # IO Event access — returns JSON-encoded IO event
 # ---------------------------------------------------------------------------
 
-proc ct_reader_event(h: pointer, index: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+proc ct_reader_event(h: pointer, index: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib.} =
   ## Returns IO event by index as JSON. Caller must free with ct_free_buffer.
   if h.isNil or outLen.isNil: return nil
   let rh = cast[TraceReaderHandle](h)
@@ -1654,13 +1654,13 @@ proc ct_reader_event(h: pointer, index: uint64, outLen: ptr csize_t): ptr uint8 
 # Metadata
 # ---------------------------------------------------------------------------
 
-proc ct_reader_program(h: pointer, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+proc ct_reader_program(h: pointer, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib.} =
   ## Get program name from trace metadata. Caller must free with ct_free_buffer.
   if h.isNil or outLen.isNil: return nil
   let rh = cast[TraceReaderHandle](h)
   allocStringResult(rh[].meta.program, outLen)
 
-proc ct_reader_workdir(h: pointer, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl.} =
+proc ct_reader_workdir(h: pointer, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib.} =
   ## Get workdir from trace metadata. Caller must free with ct_free_buffer.
   if h.isNil or outLen.isNil: return nil
   let rh = cast[TraceReaderHandle](h)
@@ -1701,7 +1701,7 @@ proc getOrBuildGli(rh: TraceReaderHandle): GlobalLineIndex =
 proc ct_reader_step_location(
     h: pointer, n: uint64,
     outPathId: ptr uint64, outLine: ptr uint64
-): cint {.exportc, cdecl.} =
+): cint {.exportc, cdecl, dynlib.} =
   ## Resolve step N to its source location (path_id, line).
   ## Returns 0 on success, non-zero on failure.
   ##
@@ -1743,7 +1743,7 @@ proc ct_reader_step_location(
 proc ct_reader_step_locations(
     h: pointer, startN: uint64, count: uint64,
     outPathIds: ptr uint64, outLines: ptr uint64
-): uint64 {.exportc, cdecl.} =
+): uint64 {.exportc, cdecl, dynlib.} =
   ## Resolve steps ``[startN, startN + count)`` to ``(path_id, line)``
   ## pairs, writing the results into the caller-allocated parallel
   ## buffers ``outPathIds`` and ``outLines``.  Returns the number of
@@ -1787,7 +1787,7 @@ proc ct_reader_step_locations(
 
 proc ct_reader_step_value_count(
     h: pointer, n: uint64
-): uint64 {.exportc, cdecl.} =
+): uint64 {.exportc, cdecl, dynlib.} =
   ## Returns the number of variable values at step N.
   ## Returns 0 on failure.
   if h.isNil: return 0
@@ -1802,7 +1802,7 @@ proc ct_reader_step_value(
     h: pointer, n: uint64, valueIdx: uint64,
     outVarnameId: ptr uint64, outTypeId: ptr uint64,
     outData: ptr ptr uint8, outDataLen: ptr csize_t
-): cint {.exportc, cdecl.} =
+): cint {.exportc, cdecl, dynlib.} =
   ## Returns the variable value at (step N, value index valueIdx).
   ## The data pointer points to a heap-allocated copy that the caller
   ## must free with ct_free_buffer.
@@ -1845,7 +1845,7 @@ proc ct_reader_call_fields(
     outFunctionId: ptr uint64, outParentKey: ptr int64,
     outEntryStep: ptr uint64, outExitStep: ptr uint64,
     outDepth: ptr uint32, outChildrenCount: ptr uint64
-): cint {.exportc, cdecl.} =
+): cint {.exportc, cdecl, dynlib.} =
   ## Returns the scalar fields of call record `key`.
   ## Returns 0 on success, non-zero on failure.
   if h.isNil or outFunctionId.isNil or outParentKey.isNil or
@@ -1869,7 +1869,7 @@ proc ct_reader_call_fields(
 
 proc ct_reader_call_child(
     h: pointer, key: uint64, childIdx: uint64
-): uint64 {.exportc, cdecl.} =
+): uint64 {.exportc, cdecl, dynlib.} =
   ## Returns the call_key of child at index `childIdx` within call `key`.
   ## Returns uint64.high on failure.
   if h.isNil: return high(uint64)
@@ -1886,7 +1886,7 @@ proc ct_reader_call_child(
 
 proc ct_reader_call_arg_count(
     h: pointer, key: uint64
-): uint64 {.exportc, cdecl.} =
+): uint64 {.exportc, cdecl, dynlib.} =
   ## Returns the number of arguments captured for call ``key``.
   ## Returns 0 on failure (and sets the last error).
   if h.isNil:
@@ -1903,7 +1903,7 @@ proc ct_reader_call_arg(
     h: pointer, key: uint64, argIdx: uint64,
     outVarnameId: ptr uint64,
     outData: ptr ptr uint8, outDataLen: ptr csize_t
-): cint {.exportc, cdecl.} =
+): cint {.exportc, cdecl, dynlib.} =
   ## Returns the (varname_id, CBOR-encoded value) pair of argument ``argIdx``
   ## within call ``key``. The data pointer is heap-allocated; caller must free
   ## with ``ct_free_buffer``. Returns 0 on success, non-zero on failure.
@@ -1942,7 +1942,7 @@ proc ct_reader_event_fields(
     h: pointer, index: uint64,
     outKind: ptr uint8, outStepId: ptr uint64,
     outData: ptr ptr uint8, outDataLen: ptr csize_t
-): cint {.exportc, cdecl.} =
+): cint {.exportc, cdecl, dynlib.} =
   ## Returns the fields of IO event at `index`.
   ## The data pointer is heap-allocated; caller must free with ct_free_buffer.
   ## kind values: 0=stdout, 1=stderr, 2=file_op, 3=error.
@@ -1978,7 +1978,7 @@ proc ct_reader_event_fields(
 
 proc NimMain() {.importc.}
 
-proc codetracer_trace_writer_init() {.exportc, cdecl.} =
+proc codetracer_trace_writer_init() {.exportc, cdecl, dynlib.} =
   ## Call this once before using any other function if linking as a static lib.
   ## For shared libs (.so/.dylib), this is called automatically via a constructor.
   NimMain()
