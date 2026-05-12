@@ -5,7 +5,7 @@
 ##
 ## Migrated from codetracer-native-recorder/ct_recorder/tests/test_streaming_ctfs.nim
 
-import std/os
+import std/[os, strutils]
 import results
 import codetracer_ctfs
 
@@ -219,6 +219,92 @@ proc test_non_streaming_unchanged() {.raises: [].} =
 
   echo "PASS: test_non_streaming_unchanged"
 
+proc test_streaming_crosses_level_2_boundary() {.raises: [].} =
+  ## Regression test for M-CTFS-LargeFile.
+  ##
+  ## When a streaming write spills past the first-level mapping capacity
+  ## (usable = entries_per_block - 1 = 511 for the default 4096-byte block
+  ## size), the writer must allocate a level-2 chain block AND a level-1
+  ## child block, then flush the data block pointer it just wrote into the
+  ## child block.  Before the M-CTFS-LargeFile fix, only the root block and
+  ## the level-2 chain block were flushed, so the level-1 child block on
+  ## disk contained the zeros written by `flushBlock` immediately after
+  ## `allocBlock`.  Concurrent readers (and any post-mortem reader of a
+  ## crashed/unclosed recording) saw the data block pointer as 0 and
+  ## reported "unallocated block at index 511".
+  ##
+  ## This test reproduces the exact scenario: write >511 blocks of data,
+  ## DO NOT call `closeCtfs` (which would do a final full-buffer flush and
+  ## paper over the bug), then re-open the file from disk and verify
+  ## byte-for-byte round-trip for the entire file content.
+  let tmpDir = getTempDir()
+  let path = tmpDir / "test_streaming_level2_boundary.ctfs"
+
+  try:
+    removeFile(path)
+  except OSError:
+    discard
+
+  let ctfsRes = createCtfsStreaming(path)
+  doAssert ctfsRes.isOk, "createCtfsStreaming failed"
+  var c = ctfsRes.get()
+
+  let fileRes = c.addFile("big.dat")
+  doAssert fileRes.isOk, "addFile failed"
+  var f = fileRes.get()
+
+  # Write 600 blocks worth of data (~2.4 MB at 4096-byte blocks).
+  # 600 > usable=511, so we cross the level-1/level-2 boundary at block 511.
+  const blockCount = 600
+  let bs = int(DefaultBlockSize)
+  var bigData = newSeq[byte](blockCount * bs)
+  # Use a non-trivial pattern so a single zeroed block in the middle would
+  # be detected by byte-for-byte comparison.
+  for i in 0 ..< bigData.len:
+    bigData[i] = byte((i * 31 + 17) mod 251)
+
+  let wRes = c.writeToFile(f, bigData)
+  doAssert wRes.isOk, "writeToFile failed for big.dat: " & wRes.error
+
+  # Sync entries (updates the size field in block 0) — but DO NOT close.
+  # This mimics a live recording that was sampled mid-flight (or crashed
+  # before closeCtfs() could run).
+  c.syncAllEntries()
+
+  # Read the container from disk as a concurrent reader would.
+  let dataRes = readCtfsFromFile(path)
+  doAssert dataRes.isOk, "readCtfsFromFile failed: " & dataRes.error
+  let diskData = dataRes.get()
+  doAssert hasCtfsMagic(diskData), "CTFS magic not found on disk"
+
+  let readBack = readInternalFile(diskData, "big.dat")
+  doAssert readBack.isOk,
+    "readInternalFile failed: " & readBack.error
+  let bytes = readBack.get()
+  doAssert bytes.len == bigData.len,
+    "size mismatch: got " & $bytes.len & " want " & $bigData.len
+  for i in 0 ..< bigData.len:
+    doAssert bytes[i] == bigData[i],
+      "byte mismatch at offset " & $i &
+        " (block " & $(i div bs) & "): got 0x" & toHex(int(bytes[i]), 2) &
+        " want 0x" & toHex(int(bigData[i]), 2)
+
+  c.closeCtfs()
+
+  # Sanity check: re-read after close, must still match.
+  let finalRes = readCtfsFromFile(path)
+  doAssert finalRes.isOk
+  let finalBytes = readInternalFile(finalRes.get(), "big.dat")
+  doAssert finalBytes.isOk
+  doAssert finalBytes.get().len == bigData.len
+
+  try:
+    removeFile(path)
+  except OSError:
+    discard
+
+  echo "PASS: test_streaming_crosses_level_2_boundary"
+
 proc test_streaming_incremental_visibility() {.raises: [].} =
   ## Simulate incremental writes and verify that after each syncEntry,
   ## the file size field on disk reflects the latest data.
@@ -299,3 +385,4 @@ test_streaming_multiple_files()
 test_streaming_large_data()
 test_non_streaming_unchanged()
 test_streaming_incremental_visibility()
+test_streaming_crosses_level_2_boundary()

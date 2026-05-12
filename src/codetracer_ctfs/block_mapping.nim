@@ -85,9 +85,22 @@ proc navigateAndInsert*(c: var Ctfs, mappingBlock: uint64, level: uint32,
   ## Navigate within a level-k block to insert a data block pointer.
   ## For level 1: just write entries[idx] = dataBlock.
   ## For level k>1: find the sub-entry, follow/allocate, recurse.
+  ##
+  ## When the container is in streaming mode, every mapping block that we
+  ## modify here must be flushed to disk; otherwise concurrent readers and
+  ## post-crash inspectors will see stale (typically all-zero) contents and
+  ## conclude that the data block pointer is "unallocated".  This was the
+  ## bug behind M-CTFS-LargeFile: the writer flushed the root block and the
+  ## level-2 chain block in `insertDataBlock`, but not the intermediate L1
+  ## child block that was created and written here when crossing the first
+  ## multi-level mapping boundary (e.g. block index 511 with block size
+  ## 4096 — usable=511, so the 512th data block of a file is the first to
+  ## need a level-2 mapping).
   if level == 1:
     assert idxWithinLevel < usable
     c.writePtr(mappingBlock, idxWithinLevel, dataBlock)
+    if c.streaming:
+      c.flushBlock(mappingBlock)
     return ok()
 
   # Level k > 1: each entry covers levelCapacity(usable, level-1) data blocks.
@@ -99,10 +112,19 @@ proc navigateAndInsert*(c: var Ctfs, mappingBlock: uint64, level: uint32,
 
   # Read or allocate the sub-block.
   var childBlock = c.readPtr(mappingBlock, entryIdx)
+  var didAllocChild = false
   if childBlock == 0:
     childBlock = c.allocBlock()
     c.zeroBlock(childBlock)
     c.writePtr(mappingBlock, entryIdx, childBlock)
+    didAllocChild = true
+
+  # If we modified the current mapping block (by writing a new child pointer),
+  # flush it so the change is visible on disk.  This matches the flush done
+  # by `insertDataBlock` for the root and chain blocks, but extends the
+  # invariant to every intermediate level encountered during descent.
+  if didAllocChild and c.streaming:
+    c.flushBlock(mappingBlock)
 
   c.navigateAndInsert(childBlock, level - 1, subIdx, dataBlock, usable)
 
