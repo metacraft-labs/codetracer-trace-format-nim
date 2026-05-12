@@ -457,6 +457,12 @@ proc registerThreadExit*(w: var MultiStreamTraceWriter,
 proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   ## Flush all streams, write meta.dat, and finalize.
   ## After close, the CTFS bytes can be retrieved via toBytes().
+  ##
+  ## Drains any unclosed PendingCalls left on the call stack (LIFO,
+  ## innermost-first) so partial-trace recordings (panic, trap,
+  ## exit-without-return) still produce balanced call_entry/call_exit
+  ## pairs in the call stream rather than silently losing the deepest
+  ## un-popped frames.
   if w.closed:
     return ok()
 
@@ -465,6 +471,39 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
     let lhRes = w.linehitsBuilder.get().finalize()
     if lhRes.isErr:
       return err("failed to finalize linehits: " & lhRes.error)
+
+  # Drain any unclosed call frames before flushing the exec stream and
+  # writing meta. We mirror registerReturn's semantics: exitStep is the
+  # last produced step, returnValue is VoidReturnMarker, and child links
+  # are propagated up the stack so callKey ordering stays valid.
+  while w.callStack.len > 0:
+    let pending = w.callStack[^1]
+    w.callStack.setLen(w.callStack.len - 1)
+    if w.currentDepth > 0:
+      w.currentDepth -= 1
+
+    let callKey = w.callCount
+
+    if w.callStack.len > 0:
+      w.callStack[^1].children.add(callKey)
+
+    let rec = call_stream.CallRecord(
+      functionId: pending.functionId,
+      parentCallKey: pending.parentCallKey,
+      entryStep: pending.entryStep,
+      exitStep: if w.stepCount > 0: w.stepCount - 1 else: 0,
+      depth: pending.depth,
+      args: pending.args,
+      returnValue: @[VoidReturnMarker],
+      exception: @[],
+      children: pending.children,
+    )
+
+    let res = w.ctfs.writeCall(w.callWriter, rec)
+    if res.isErr:
+      return err("failed to flush unclosed call record: " & res.error)
+
+    w.callCount += 1
 
   # Flush exec stream
   let flushRes = w.ctfs.flush(w.execWriter)
