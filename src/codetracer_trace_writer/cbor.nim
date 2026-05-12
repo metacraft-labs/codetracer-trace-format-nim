@@ -461,11 +461,16 @@ proc encodeCborValueRecordImpl(enc: var CborEncoder, v: ValueRecord) =
     enc.writeUint(uint64(v.floatTypeId))
 
   of vrkBool:
-    enc.writeMapHeader(3)
+    # map(4) — `text` carries the printed boolean ("true"|"false") so ct-print
+    # and downstream decoders can surface it directly. Mirrored by the
+    # streaming encoder's `writeBool` (streaming_value_encoder.nim).
+    enc.writeMapHeader(4)
     enc.writePrecomputed(CborKeyKind)
     enc.writeTextString("Bool")
     enc.writePrecomputed(CborKeyB)
     enc.writeBool(v.boolVal)
+    enc.writePrecomputed(CborKeyText)
+    enc.writeTextString(if v.boolVal: "true" else: "false")
     enc.writePrecomputed(CborKeyTypeId)
     enc.writeUint(uint64(v.boolTypeId))
 
@@ -645,6 +650,8 @@ proc decodeCborValueRecordImpl(dec: var CborDecoder): Result[ValueRecord, string
   of "Bool":
     discard ?dec.readTextString()  # "b"
     let b = ?dec.readBool()
+    discard ?dec.readTextString()  # "text"
+    discard ?dec.readTextString()  # value of "text" — derived from b, discarded
     discard ?dec.readTextString()  # "type_id"
     let tid = ?dec.readUint()
     ok(ValueRecord(kind: vrkBool, boolVal: b, boolTypeId: TypeId(tid)))

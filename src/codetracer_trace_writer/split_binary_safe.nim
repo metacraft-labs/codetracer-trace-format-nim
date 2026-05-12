@@ -87,11 +87,15 @@ proc encodeCborValueRecordInto*(buf: var SafeBuffer, v: ValueRecord) =
     buf.writeCborUint(uint64(v.floatTypeId))
 
   of vrkBool:
-    buf.writeCborMapHeader(3)
+    # map(4) — `text` carries the printed boolean; mirrors cbor.nim and
+    # streaming_value_encoder.nim's writeBool.
+    buf.writeCborMapHeader(4)
     buf.writeOpenArray(CborKeyKind2)
     buf.writeCborTextString("Bool")
     buf.writeOpenArray(CborKeyB2)
     buf.writeCborBool(v.boolVal)
+    buf.writeOpenArray(CborKeyText2)
+    buf.writeCborTextString(if v.boolVal: "true" else: "false")
     buf.writeOpenArray(CborKeyTypeId2)
     buf.writeCborUint(uint64(v.boolTypeId))
 

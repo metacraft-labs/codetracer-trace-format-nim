@@ -81,12 +81,18 @@ proc writeFloat*(sve: var StreamingValueEncoder, value: float64, typeId: uint64)
   ok()
 
 proc writeBool*(sve: var StreamingValueEncoder, value: bool, typeId: uint64): Result[void, string] =
-  ## map(3) { "kind":"Bool", "b": value, "type_id": typeId }
-  sve.enc.writeMapHeader(3)
+  ## map(4) { "kind":"Bool", "b": value, "text": "true"|"false", "type_id": typeId }
+  ## The `text` field carries the printed boolean so ct-print / downstream
+  ## decoders can surface it without re-deriving from `b` — matching how
+  ## generic `wrap_value<bool>(true)` call args need `value.text == "true"`
+  ## (see codetracer-move-recorder test_generics_bool_arg_decodes_text).
+  sve.enc.writeMapHeader(4)
   sve.enc.writePrecomputed(CborKeyKind)
   sve.enc.writeTextString("Bool")
   sve.enc.writePrecomputed(CborKeyB)
   sve.enc.writeBool(value)
+  sve.enc.writePrecomputed(CborKeyText)
+  sve.enc.writeTextString(if value: "true" else: "false")
   sve.enc.writePrecomputed(CborKeyTypeId)
   sve.enc.writeUint(typeId)
   ok()

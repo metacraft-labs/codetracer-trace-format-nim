@@ -111,6 +111,7 @@
           "value": {
             "kind": "Bool",
             "b": true,
+            "text": "true",
             "type_id": 2
           }
         },

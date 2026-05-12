@@ -118,6 +118,10 @@ proc valueRecordToJson*(v: ValueRecord): JsonNode =
   of vrkBool:
     result["kind"] = newJString("Bool")
     result["b"] = newJBool(v.boolVal)
+    # `text` carries the printed boolean ("true"|"false") so consumers
+    # querying `value.text` get the printed form regardless of `kind`.
+    # Matches the 4-key CBOR map produced by writeBool / encodeCborValueRecord.
+    result["text"] = newJString(if v.boolVal: "true" else: "false")
     result["type_id"] = newJInt(int64(uint64(v.boolTypeId)))
   of vrkString:
     result["kind"] = newJString("String")
