@@ -1331,6 +1331,72 @@ proc ct_value_end_compound(h: ValueEncoderHandle): cint {.exportc, cdecl, dynlib
     return 1.cint
   0.cint
 
+proc ct_value_write_char(h: ValueEncoderHandle, codepoint: uint32, type_id: uint64): cint {.exportc, cdecl, dynlib.} =
+  ## Encode a Char value. The codepoint is interpreted as a single ASCII char
+  ## for now (the Nim-side writer accepts `char`, matching the existing
+  ## `vrkChar` CBOR layout used by ct-print). Wider chars round-trip through
+  ## the Char branch in the cbor.nim encoder via the Rust serde representation.
+  if h.isNil:
+    setError("NULL handle")
+    return 1.cint
+  let r = h[].writeChar(char(codepoint and 0xFF), type_id)
+  if r.isErr:
+    setError(r.error)
+    return 1.cint
+  0.cint
+
+proc ct_value_write_bigint(h: ValueEncoderHandle, data: ptr uint8, len: csize_t,
+                           negative: cint, type_id: uint64): cint {.exportc, cdecl, dynlib.} =
+  ## Encode a BigInt value. `data`/`len` is the big-endian unsigned magnitude;
+  ## `negative` is 0 for positive, non-zero for negative.
+  if h.isNil:
+    setError("NULL handle")
+    return 1.cint
+  if len > 0 and data.isNil:
+    setError("NULL data with non-zero len")
+    return 1.cint
+  var bytes: seq[byte]
+  if len > 0:
+    bytes = newSeq[byte](int(len))
+    copyMem(addr bytes[0], data, int(len))
+  let r = h[].writeBigInt(bytes, negative != 0, type_id)
+  if r.isErr:
+    setError(r.error)
+    return 1.cint
+  0.cint
+
+proc ct_value_begin_variant(h: ValueEncoderHandle, discriminator: ptr uint8, disc_len: csize_t,
+                            type_id: uint64): cint {.exportc, cdecl, dynlib.} =
+  ## Begin a Variant value. Followed by exactly one inner value encoding and
+  ## one `ct_value_end_compound` call.
+  if h.isNil:
+    setError("NULL handle")
+    return 1.cint
+  if disc_len > 0 and discriminator.isNil:
+    setError("NULL discriminator with non-zero len")
+    return 1.cint
+  var s = newString(int(disc_len))
+  if disc_len > 0:
+    copyMem(addr s[0], discriminator, int(disc_len))
+  let r = h[].beginVariant(s, type_id)
+  if r.isErr:
+    setError(r.error)
+    return 1.cint
+  0.cint
+
+proc ct_value_begin_reference(h: ValueEncoderHandle, address: uint64, mutable: cint,
+                              type_id: uint64): cint {.exportc, cdecl, dynlib.} =
+  ## Begin a Reference value. Followed by exactly one inner (dereferenced)
+  ## value encoding and one `ct_value_end_compound` call.
+  if h.isNil:
+    setError("NULL handle")
+    return 1.cint
+  let r = h[].beginReference(address, mutable != 0, type_id)
+  if r.isErr:
+    setError(r.error)
+    return 1.cint
+  0.cint
+
 proc ct_value_get_bytes(h: ValueEncoderHandle, out_len: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib.} =
   ## Get pointer to the encoded CBOR bytes. Valid until next reset/write/free.
   ## Sets *out_len to the byte count. Returns NULL on error.

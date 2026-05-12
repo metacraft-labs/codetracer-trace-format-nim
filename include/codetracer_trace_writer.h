@@ -232,7 +232,12 @@ int ct_value_write_error(value_encoder_t h, const uint8_t* data, size_t len, uin
 int ct_value_begin_struct(value_encoder_t h, uint64_t type_id, int field_count);
 int ct_value_begin_sequence(value_encoder_t h, uint64_t type_id, int element_count);
 int ct_value_begin_tuple(value_encoder_t h, uint64_t type_id, int element_count);
+int ct_value_begin_variant(value_encoder_t h, const uint8_t* discriminator, size_t disc_len, uint64_t type_id);
+int ct_value_begin_reference(value_encoder_t h, uint64_t address, int mutable, uint64_t type_id);
 int ct_value_end_compound(value_encoder_t h);
+
+int ct_value_write_char(value_encoder_t h, uint32_t codepoint, uint64_t type_id);
+int ct_value_write_bigint(value_encoder_t h, const uint8_t* data, size_t len, int negative, uint64_t type_id);
 
 const uint8_t* ct_value_get_bytes(value_encoder_t h, size_t* out_len);
 

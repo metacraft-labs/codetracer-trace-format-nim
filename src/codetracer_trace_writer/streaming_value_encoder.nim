@@ -19,16 +19,20 @@ const MaxNestingDepth* = 32
 
 type
   CompoundKind* = enum
-    ckStruct    ## CBOR map with "kind":"Struct", "field_values" array
-    ckSequence  ## CBOR map with "kind":"Sequence", "elements" array + "is_slice" + "type_id"
-    ckTuple     ## CBOR map with "kind":"Tuple", "elements" array + "type_id"
+    ckStruct      ## CBOR map with "kind":"Struct", "field_values" array
+    ckSequence    ## CBOR map with "kind":"Sequence", "elements" array + "is_slice" + "type_id"
+    ckTuple       ## CBOR map with "kind":"Tuple", "elements" array + "type_id"
+    ckVariant     ## CBOR map with "kind":"Variant", "discriminator", "contents" value, "type_id"
+    ckReference   ## CBOR map with "kind":"Reference", "dereferenced" value, "address", "mutable", "type_id"
 
   CompoundFrame = object
     kind: CompoundKind
     expectedCount: int
     writtenCount: int
     typeId: uint64
-    isSlice: bool  # only used for ckSequence
+    isSlice: bool   # only used for ckSequence
+    address: uint64 # only used for ckReference
+    mutable: bool   # only used for ckReference
 
   StreamingValueEncoder* = object
     enc*: CborEncoder
@@ -146,6 +150,34 @@ proc writeError*(sve: var StreamingValueEncoder, msg: string, typeId: uint64): R
   sve.enc.writeUint(typeId)
   ok()
 
+proc writeChar*(sve: var StreamingValueEncoder, c: char, typeId: uint64): Result[void, string] =
+  ## map(3) { "kind":"Char", "c": textString(1), "type_id": typeId }
+  ## Mirrors `encodeCborValueRecordImpl(vrkChar)` in cbor.nim — Rust serde
+  ## serializes `char` as a single-codepoint string.
+  sve.enc.writeMapHeader(3)
+  sve.enc.writePrecomputed(CborKeyKind)
+  sve.enc.writeTextString("Char")
+  sve.enc.writePrecomputed(CborKeyC)
+  sve.enc.writeTextString($c)
+  sve.enc.writePrecomputed(CborKeyTypeId)
+  sve.enc.writeUint(typeId)
+  ok()
+
+proc writeBigInt*(sve: var StreamingValueEncoder, bytes: openArray[byte], negative: bool,
+                  typeId: uint64): Result[void, string] =
+  ## map(4) { "kind":"BigInt", "b": byteString, "negative": bool, "type_id": typeId }
+  ## `b` carries the big-endian unsigned magnitude bytes; sign lives in `negative`.
+  sve.enc.writeMapHeader(4)
+  sve.enc.writePrecomputed(CborKeyKind)
+  sve.enc.writeTextString("BigInt")
+  sve.enc.writePrecomputed(CborKeyB)
+  sve.enc.writeByteString(bytes)
+  sve.enc.writePrecomputed(CborKeyNegative)
+  sve.enc.writeBool(negative)
+  sve.enc.writePrecomputed(CborKeyTypeId)
+  sve.enc.writeUint(typeId)
+  ok()
+
 # --- Compound value writers ---
 
 proc beginStruct*(sve: var StreamingValueEncoder, typeId: uint64, fieldCount: int): Result[void, string] =
@@ -179,6 +211,41 @@ proc beginSequence*(sve: var StreamingValueEncoder, typeId: uint64, elementCount
   sve.stack[sve.depth] = CompoundFrame(
     kind: ckSequence, expectedCount: elementCount, writtenCount: 0,
     typeId: typeId, isSlice: isSlice)
+  sve.depth += 1
+  ok()
+
+proc beginVariant*(sve: var StreamingValueEncoder, discriminator: string,
+                   typeId: uint64): Result[void, string] =
+  ## Begin a variant value. Write exactly one inner value, then call endCompound().
+  ## Layout: map(4) { "kind":"Variant", "discriminator": textString, "contents": value, "type_id": typeId }
+  if sve.depth >= MaxNestingDepth:
+    return err("nesting too deep (max " & $MaxNestingDepth & ")")
+  sve.enc.writeMapHeader(4)
+  sve.enc.writePrecomputed(CborKeyKind)
+  sve.enc.writeTextString("Variant")
+  sve.enc.writePrecomputed(CborKeyDiscriminator)
+  sve.enc.writeTextString(discriminator)
+  sve.enc.writePrecomputed(CborKeyContents)
+  # type_id is written by endCompound after the inner value
+  sve.stack[sve.depth] = CompoundFrame(
+    kind: ckVariant, expectedCount: 1, writtenCount: 0, typeId: typeId)
+  sve.depth += 1
+  ok()
+
+proc beginReference*(sve: var StreamingValueEncoder, address: uint64, mutable: bool,
+                     typeId: uint64): Result[void, string] =
+  ## Begin a reference value. Write exactly one inner (dereferenced) value, then call endCompound().
+  ## Layout: map(5) { "kind":"Reference", "dereferenced": value, "address": uint, "mutable": bool, "type_id": typeId }
+  if sve.depth >= MaxNestingDepth:
+    return err("nesting too deep (max " & $MaxNestingDepth & ")")
+  sve.enc.writeMapHeader(5)
+  sve.enc.writePrecomputed(CborKeyKind)
+  sve.enc.writeTextString("Reference")
+  sve.enc.writePrecomputed(CborKeyDereferenced)
+  # address, mutable, type_id are written by endCompound after the inner value
+  sve.stack[sve.depth] = CompoundFrame(
+    kind: ckReference, expectedCount: 1, writtenCount: 0, typeId: typeId,
+    address: address, mutable: mutable)
   sve.depth += 1
   ok()
 
@@ -218,6 +285,18 @@ proc endCompound*(sve: var StreamingValueEncoder): Result[void, string] =
     sve.enc.writeUint(frame.typeId)
   of ckTuple:
     # After elements array: write type_id
+    sve.enc.writePrecomputed(CborKeyTypeId)
+    sve.enc.writeUint(frame.typeId)
+  of ckVariant:
+    # After contents value: write type_id
+    sve.enc.writePrecomputed(CborKeyTypeId)
+    sve.enc.writeUint(frame.typeId)
+  of ckReference:
+    # After dereferenced value: write address, mutable, type_id
+    sve.enc.writePrecomputed(CborKeyAddress)
+    sve.enc.writeUint(frame.address)
+    sve.enc.writePrecomputed(CborKeyMutable)
+    sve.enc.writeBool(frame.mutable)
     sve.enc.writePrecomputed(CborKeyTypeId)
     sve.enc.writeUint(frame.typeId)
   ok()
