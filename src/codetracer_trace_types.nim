@@ -331,6 +331,15 @@ type
       ## Active hook strategies (e.g. @["ldpreload",
       ## "seccomp_unotify", "callsite_patch"])
 
+  ReplayLaunchFields* = object
+    ## M-RLP-1 (spec §6A.5): replay-launch address-space hardening fields.
+    ## Written when FlagHasReplayLaunchFields (bit 1) is set.  Recorded by
+    ## the Linux/FreeBSD fork+exec path after the child has issued
+    ## `personality(ADDR_NO_RANDOMIZE)` (or `procctl(PROC_ASLR_CTL,
+    ## PROC_ASLR_FORCE_DISABLE)` on FreeBSD) so the replay side can decide
+    ## whether to use hard-pin (=true) or soft-pin (=false; §6B.5) mode.
+    aslrDisabled*: bool
+
 # ---------------------------------------------------------------------------
 # TraceLowLevelEvent — the main tagged union
 # ---------------------------------------------------------------------------

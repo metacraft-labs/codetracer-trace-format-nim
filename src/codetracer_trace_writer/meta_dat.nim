@@ -5,7 +5,7 @@
 ## Layout (version 2):
 ##   [4] magic "CTMD"
 ##   [2] version u16 LE
-##   [2] flags u16 LE (bit 0: has_mcr_fields)
+##   [2] flags u16 LE (bit 0: has_mcr_fields, bit 1: has_replay_launch_fields)
 ##   varint-prefixed program string
 ##   varint args_count, then varint-prefixed arg strings
 ##   varint-prefixed workdir string
@@ -25,6 +25,8 @@
 ##     varint-prefixed start_time_str string
 ##     varint-prefixed hook_profile string                      (v2)
 ##     varint hook_strategies_count, then strings               (v2)
+##   if has_replay_launch_fields:                                (M-RLP-1)
+##     u8 aslr_disabled (0 = false, 1 = true)
 ##
 ## Version history:
 ##   v1 — initial release (no hook fields).  Removed before any external
@@ -33,6 +35,11 @@
 ##        until the schema gained them in v2.
 ##   v2 — appended hookProfile + hookStrategies inside the MCR-fields
 ##        block so meta.dat reaches parity with the legacy meta.json.
+##        M-RLP-1 (2026-05-12) added FlagHasReplayLaunchFields (bit 1)
+##        and a one-byte aslr_disabled block appended after the MCR
+##        block; readers that don't know about the bit simply stop after
+##        the MCR block, so this is a forward-compatible extension at
+##        version 2 (no schema bump needed — the flag bit gates parsing).
 
 import std/options
 import results
@@ -44,7 +51,8 @@ import ./varint
 const
   MetaDatMagic*: array[4, byte] = [0x43'u8, 0x54, 0x4D, 0x44]  # "CTMD"
   MetaDatVersion*: uint16 = 2
-  FlagHasMcrFields*: uint16 = 1  # bit 0
+  FlagHasMcrFields*: uint16 = 1            # bit 0
+  FlagHasReplayLaunchFields*: uint16 = 2   # bit 1 — M-RLP-1 (spec §6A.5)
 
 type
   MetaDatContents* = object
@@ -55,6 +63,7 @@ type
     recorderId*: string
     paths*: seq[string]
     mcrFields*: Option[McrMetaFields]
+    replayLaunchFields*: Option[ReplayLaunchFields]
 
 proc writeRawBytes(
     c: var Ctfs, f: var CtfsInternalFile,
@@ -88,7 +97,9 @@ proc writeMetaDat*(
     meta: TraceMetadata,
     paths: openArray[string],
     recorderId: string = "",
-    mcrFields: Option[McrMetaFields] = none(McrMetaFields)
+    mcrFields: Option[McrMetaFields] = none(McrMetaFields),
+    replayLaunchFields: Option[ReplayLaunchFields] =
+      none(ReplayLaunchFields)
 ): Result[void, string] =
   ## Write binary meta.dat to a CTFS internal file.
 
@@ -102,6 +113,8 @@ proc writeMetaDat*(
   var flags: uint16 = 0
   if mcrFields.isSome:
     flags = flags or FlagHasMcrFields
+  if replayLaunchFields.isSome:
+    flags = flags or FlagHasReplayLaunchFields
   ? c.writeU16LE(f, flags)
 
   # Program
@@ -141,6 +154,12 @@ proc writeMetaDat*(
     ? c.writeVarint(f, uint64(mcr.hookStrategies.len))
     for s in mcr.hookStrategies:
       ? c.writeVarintString(f, s)
+
+  # Replay-launch fields (M-RLP-1, spec §6A.5).  One u8 flag.
+  if replayLaunchFields.isSome:
+    let rl = replayLaunchFields.get()
+    let aslrByte: array[1, byte] = [byte(if rl.aslrDisabled: 1 else: 0)]
+    ? c.writeRawBytes(f, aslrByte)
 
   ok()
 
@@ -242,6 +261,16 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
       hookStrategies: hookStrategies,
     ))
 
+  # Replay-launch fields (M-RLP-1, spec §6A.5).
+  if (flags and FlagHasReplayLaunchFields) != 0:
+    if pos + 1 > data.len:
+      return err("meta.dat: replay_launch_fields aslr_disabled byte missing")
+    let aslr = data[pos] != 0
+    pos += 1
+    contents.replayLaunchFields = some(ReplayLaunchFields(
+      aslrDisabled: aslr,
+    ))
+
   ok(contents)
 
 # ---------------------------------------------------------------------------
@@ -261,7 +290,9 @@ proc writeMetaDatToBuffer*(
     meta: TraceMetadata,
     paths: openArray[string],
     recorderId: string = "",
-    mcrFields: Option[McrMetaFields] = none(McrMetaFields)
+    mcrFields: Option[McrMetaFields] = none(McrMetaFields),
+    replayLaunchFields: Option[ReplayLaunchFields] =
+      none(ReplayLaunchFields)
 ): seq[byte] =
   ## Serialize meta.dat to an in-memory byte buffer.
   ## This is the same format as writeMetaDat but without needing a CTFS container.
@@ -278,6 +309,8 @@ proc writeMetaDatToBuffer*(
   var flags: uint16 = 0
   if mcrFields.isSome:
     flags = flags or FlagHasMcrFields
+  if replayLaunchFields.isSome:
+    flags = flags or FlagHasReplayLaunchFields
   result.appendU16LE(flags)
 
   # Program
@@ -317,3 +350,8 @@ proc writeMetaDatToBuffer*(
     encodeVarint(uint64(mcr.hookStrategies.len), result)
     for s in mcr.hookStrategies:
       result.appendVarintStr(s)
+
+  # Replay-launch fields (M-RLP-1, spec §6A.5).  One u8 flag.
+  if replayLaunchFields.isSome:
+    let rl = replayLaunchFields.get()
+    result.add(byte(if rl.aslrDisabled: 1 else: 0))
