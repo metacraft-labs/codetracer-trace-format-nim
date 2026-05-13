@@ -340,6 +340,30 @@ type
     ## whether to use hard-pin (=true) or soft-pin (=false; §6B.5) mode.
     aslrDisabled*: bool
 
+  LayoutSnapshotFields* = object
+    ## M-RLP-2 (spec §6B.7): layout-hash snapshot captured at
+    ## `__libc_start_main` wrapper entry.  Written when
+    ## FlagHasLayoutSnapshot (bit 2) is set.  The replay side (M-RLP-3)
+    ## computes the same fingerprint at the same instrumentation point
+    ## and compares against `layoutHash`; a mismatch triggers a per-entry
+    ## diff dump (decoded from `layoutFingerprint`) and a clean exit 77.
+    ##
+    ## Fingerprint format (per /proc/self/maps entry, in stream order):
+    ##   u64 start
+    ##   u64 end
+    ##   u32 prot_flags  (bit 0=R, bit 1=W, bit 2=X, bit 3=private)
+    ##   varint name_len
+    ##   bytes name[name_len]
+    ##   u8 build_id_len
+    ##   bytes build_id[build_id_len]
+    ##
+    ## Hash algorithm: XXH64 of the fingerprint bytes with seed 0.  See
+    ## `ct_interpose/src/ct_interpose/xxh64.c` for the spec-deviating
+    ## rationale (xxhash3 → xxhash64 — same determinism, ~80 lines vs
+    ## ~800).
+    layoutHash*: uint64
+    layoutFingerprint*: seq[byte]
+
 # ---------------------------------------------------------------------------
 # TraceLowLevelEvent — the main tagged union
 # ---------------------------------------------------------------------------

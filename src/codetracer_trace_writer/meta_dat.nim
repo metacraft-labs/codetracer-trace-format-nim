@@ -5,7 +5,9 @@
 ## Layout (version 2):
 ##   [4] magic "CTMD"
 ##   [2] version u16 LE
-##   [2] flags u16 LE (bit 0: has_mcr_fields, bit 1: has_replay_launch_fields)
+##   [2] flags u16 LE (bit 0: has_mcr_fields,
+##                    bit 1: has_replay_launch_fields,
+##                    bit 2: has_layout_snapshot)
 ##   varint-prefixed program string
 ##   varint args_count, then varint-prefixed arg strings
 ##   varint-prefixed workdir string
@@ -27,6 +29,10 @@
 ##     varint hook_strategies_count, then strings               (v2)
 ##   if has_replay_launch_fields:                                (M-RLP-1)
 ##     u8 aslr_disabled (0 = false, 1 = true)
+##   if has_layout_snapshot:                                     (M-RLP-2)
+##     u64 layout_hash (XXH64 over the fingerprint bytes, seed 0)
+##     varint fingerprint_len
+##     bytes fingerprint[fingerprint_len]
 ##
 ## Version history:
 ##   v1 — initial release (no hook fields).  Removed before any external
@@ -40,6 +46,12 @@
 ##        block; readers that don't know about the bit simply stop after
 ##        the MCR block, so this is a forward-compatible extension at
 ##        version 2 (no schema bump needed — the flag bit gates parsing).
+##        M-RLP-2 (2026-05-13) added FlagHasLayoutSnapshot (bit 2) and a
+##        separate block after the replay-launch block.  Choosing a
+##        separate flag bit (rather than extending the replay-launch
+##        block) preserves binary compatibility for traces recorded
+##        between M-RLP-1 and M-RLP-2, which carry the replay-launch
+##        block but no layout snapshot.
 
 import std/options
 import results
@@ -53,6 +65,7 @@ const
   MetaDatVersion*: uint16 = 2
   FlagHasMcrFields*: uint16 = 1            # bit 0
   FlagHasReplayLaunchFields*: uint16 = 2   # bit 1 — M-RLP-1 (spec §6A.5)
+  FlagHasLayoutSnapshot*: uint16 = 4       # bit 2 — M-RLP-2 (spec §6B.7)
 
 type
   MetaDatContents* = object
@@ -64,6 +77,7 @@ type
     paths*: seq[string]
     mcrFields*: Option[McrMetaFields]
     replayLaunchFields*: Option[ReplayLaunchFields]
+    layoutSnapshotFields*: Option[LayoutSnapshotFields]
 
 proc writeRawBytes(
     c: var Ctfs, f: var CtfsInternalFile,
@@ -99,7 +113,9 @@ proc writeMetaDat*(
     recorderId: string = "",
     mcrFields: Option[McrMetaFields] = none(McrMetaFields),
     replayLaunchFields: Option[ReplayLaunchFields] =
-      none(ReplayLaunchFields)
+      none(ReplayLaunchFields),
+    layoutSnapshotFields: Option[LayoutSnapshotFields] =
+      none(LayoutSnapshotFields)
 ): Result[void, string] =
   ## Write binary meta.dat to a CTFS internal file.
 
@@ -115,6 +131,8 @@ proc writeMetaDat*(
     flags = flags or FlagHasMcrFields
   if replayLaunchFields.isSome:
     flags = flags or FlagHasReplayLaunchFields
+  if layoutSnapshotFields.isSome:
+    flags = flags or FlagHasLayoutSnapshot
   ? c.writeU16LE(f, flags)
 
   # Program
@@ -160,6 +178,18 @@ proc writeMetaDat*(
     let rl = replayLaunchFields.get()
     let aslrByte: array[1, byte] = [byte(if rl.aslrDisabled: 1 else: 0)]
     ? c.writeRawBytes(f, aslrByte)
+
+  # Layout snapshot (M-RLP-2, spec §6B.7).  u64 hash, varint len, bytes.
+  if layoutSnapshotFields.isSome:
+    let ls = layoutSnapshotFields.get()
+    var hashBytes: array[8, byte]
+    let h = ls.layoutHash
+    for i in 0 ..< 8:
+      hashBytes[i] = byte((h shr (i * 8)) and 0xFF'u64)
+    ? c.writeRawBytes(f, hashBytes)
+    ? c.writeVarint(f, uint64(ls.layoutFingerprint.len))
+    if ls.layoutFingerprint.len > 0:
+      ? c.writeRawBytes(f, ls.layoutFingerprint)
 
   ok()
 
@@ -271,6 +301,26 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
       aslrDisabled: aslr,
     ))
 
+  # Layout snapshot (M-RLP-2, spec §6B.7).
+  if (flags and FlagHasLayoutSnapshot) != 0:
+    if pos + 8 > data.len:
+      return err("meta.dat: layout_snapshot hash bytes missing")
+    var h: uint64 = 0
+    for i in 0 ..< 8:
+      h = h or (uint64(data[pos + i]) shl (i * 8))
+    pos += 8
+    let fpLen = ? decodeVarint(data, pos)
+    if pos + int(fpLen) > data.len:
+      return err("meta.dat: layout_snapshot fingerprint extends past end")
+    var fp = newSeq[byte](int(fpLen))
+    for i in 0 ..< int(fpLen):
+      fp[i] = data[pos + i]
+    pos += int(fpLen)
+    contents.layoutSnapshotFields = some(LayoutSnapshotFields(
+      layoutHash: h,
+      layoutFingerprint: fp,
+    ))
+
   ok(contents)
 
 # ---------------------------------------------------------------------------
@@ -292,7 +342,9 @@ proc writeMetaDatToBuffer*(
     recorderId: string = "",
     mcrFields: Option[McrMetaFields] = none(McrMetaFields),
     replayLaunchFields: Option[ReplayLaunchFields] =
-      none(ReplayLaunchFields)
+      none(ReplayLaunchFields),
+    layoutSnapshotFields: Option[LayoutSnapshotFields] =
+      none(LayoutSnapshotFields)
 ): seq[byte] =
   ## Serialize meta.dat to an in-memory byte buffer.
   ## This is the same format as writeMetaDat but without needing a CTFS container.
@@ -311,6 +363,8 @@ proc writeMetaDatToBuffer*(
     flags = flags or FlagHasMcrFields
   if replayLaunchFields.isSome:
     flags = flags or FlagHasReplayLaunchFields
+  if layoutSnapshotFields.isSome:
+    flags = flags or FlagHasLayoutSnapshot
   result.appendU16LE(flags)
 
   # Program
@@ -355,3 +409,13 @@ proc writeMetaDatToBuffer*(
   if replayLaunchFields.isSome:
     let rl = replayLaunchFields.get()
     result.add(byte(if rl.aslrDisabled: 1 else: 0))
+
+  # Layout snapshot (M-RLP-2, spec §6B.7).  u64 hash + varint len + bytes.
+  if layoutSnapshotFields.isSome:
+    let ls = layoutSnapshotFields.get()
+    let h = ls.layoutHash
+    for i in 0 ..< 8:
+      result.add(byte((h shr (i * 8)) and 0xFF'u64))
+    encodeVarint(uint64(ls.layoutFingerprint.len), result)
+    for b in ls.layoutFingerprint:
+      result.add(b)
