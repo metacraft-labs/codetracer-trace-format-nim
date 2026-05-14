@@ -36,6 +36,8 @@
 ## (full-match) per spec § 4.
 
 import std/[re, strutils, options]
+when defined(nimPreviewSlimSystem):
+  import std/syncio
 import results
 
 export results
