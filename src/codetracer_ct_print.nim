@@ -599,7 +599,14 @@ proc buildFullDocument(reader: var NewTraceReader,
 
   # ----- metadata -----
   var meta = newJObject()
-  meta["program"] = newJString(reader.meta.program)
+  # TF-M4d: route `metadata.program` through `normalizePath` so it gets
+  # the same workdir/<tmp> stripping that `paths[]` and
+  # `metadata.workdir` already receive. Without this, `--strip-paths`
+  # output retained the absolute `/home/<user>/...` form for the
+  # `program` field alone, leaking the developer's filesystem layout
+  # into snapshots.
+  meta["program"] = newJString(
+    normalizePath(reader.meta.program, reader.meta.workdir, opts.stripPaths))
   var argsArr = newJArray()
   for a in reader.meta.args:
     argsArr.add(newJString(a))

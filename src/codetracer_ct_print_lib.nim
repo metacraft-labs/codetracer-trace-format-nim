@@ -219,7 +219,13 @@ proc buildFullDocument*(reader: var NewTraceReader,
 
   # ----- metadata -----
   var meta = newJObject()
-  meta["program"] = newJString(reader.meta.program)
+  # TF-M4d: route `metadata.program` through the same `normalizePath`
+  # walk that `paths[]` and `metadata.workdir` go through. Prior to this
+  # the field was passed through verbatim, leaving the absolute
+  # `/home/<user>/...` form in `--strip-paths` output even though every
+  # other path was workdir-relative.
+  meta["program"] = newJString(
+    normalizePath(reader.meta.program, reader.meta.workdir, opts.stripPaths))
   var argsArr = newJArray()
   for a in reader.meta.args:
     argsArr.add(newJString(a))

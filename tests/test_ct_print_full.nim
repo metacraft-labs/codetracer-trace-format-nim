@@ -406,6 +406,45 @@ proc test_strip_paths() =
   doAssert root["paths"][0].getStr.endsWith("main.py")
   echo "[ok] test_strip_paths"
 
+proc buildFixtureBytesAbsoluteProgram(): seq[byte] =
+  ## TF-M4d regression fixture: same metadata layout as
+  ## `buildFixtureBytes` but with an absolute-path program field rooted
+  ## inside the workdir. Used to assert that `--strip-paths` rewrites
+  ## `metadata.program` (it previously rewrote `paths[]` and
+  ## `metadata.workdir` but left this field absolute).
+  var wRes = initMultiStreamWriter("test.ct",
+    "/workspace/demo/scripts/run.py", chunkSize = 16)
+  doAssert wRes.isOk, "initMultiStreamWriter: " & wRes.error
+  var w = wRes.get()
+  w.metadata.workdir = "/workspace/demo"
+  discard w.registerPath("/workspace/demo/main.py").get()
+  let closeRes = w.close()
+  doAssert closeRes.isOk, "close: " & closeRes.error
+  result = w.toBytes()
+  w.closeCtfs()
+
+proc test_strip_paths_program() =
+  ## TF-M4d: `metadata.program` must follow the same workdir-relative
+  ## rewrite that `paths[]` already gets. Without this, snapshots leak
+  ## `/home/<user>/...` via this single field even after every other
+  ## path is stripped.
+  let bytes = buildFixtureBytesAbsoluteProgram()
+  var reader = openNewTraceFromBytes(bytes).get()
+  let stripped = buildFullDocument(reader, FullOpts(stripPaths: true))
+  doAssert stripped["metadata"]["workdir"].getStr == "<workdir>",
+    "workdir not stripped"
+  let prog = stripped["metadata"]["program"].getStr
+  doAssert prog == "<workdir>/scripts/run.py",
+    "expected program == '<workdir>/scripts/run.py', got: " & prog
+  # And without --strip-paths, the absolute form survives.
+  var reader2 = openNewTraceFromBytes(bytes).get()
+  let raw = buildFullDocument(reader2, FullOpts(stripPaths: false))
+  doAssert raw["metadata"]["program"].getStr ==
+    "/workspace/demo/scripts/run.py",
+    "stripPaths=false should pass program through verbatim, got: " &
+    raw["metadata"]["program"].getStr
+  echo "[ok] test_strip_paths_program"
+
 proc test_golden_snapshot() =
   ## Snapshot test — compare full output to a committed golden.
   ## Set CT_PRINT_WRITE_GOLDEN=1 to overwrite the golden.
@@ -458,6 +497,7 @@ test_io_events_present()
 test_event_counts()
 test_determinism()
 test_strip_paths()
+test_strip_paths_program()
 test_golden_snapshot()
 
 echo ""
