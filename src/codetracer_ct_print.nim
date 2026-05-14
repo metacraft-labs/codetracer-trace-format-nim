@@ -599,7 +599,13 @@ proc buildFullDocument(reader: var NewTraceReader,
 
   # ----- metadata -----
   var meta = newJObject()
-  meta["program"] = newJString(reader.meta.program)
+  # TF-M4d / TF-M5-Prep-2 (Blocker 3): route `metadata.program` through
+  # the same `normalizePath` walk that `paths[]` and `metadata.workdir`
+  # go through. Without this, `--strip-paths` output retained the
+  # absolute `/home/<user>/...` form for the `program` field alone,
+  # leaking the developer's filesystem layout into snapshots.
+  meta["program"] = newJString(
+    normalizePath(reader.meta.program, reader.meta.workdir, opts.stripPaths))
   var argsArr = newJArray()
   for a in reader.meta.args:
     argsArr.add(newJString(a))
