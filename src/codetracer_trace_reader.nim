@@ -19,6 +19,13 @@ import codetracer_ctfs/zstd_bindings
 import codetracer_trace_types
 import codetracer_trace_writer/split_binary
 import codetracer_trace_writer/meta_dat
+import codetracer_trace_writer/new_trace_reader
+import codetracer_trace_writer/step_encoding
+import codetracer_trace_writer/value_stream as v4_value_stream
+import codetracer_trace_writer/call_stream as v4_call_stream
+import codetracer_trace_writer/io_event_stream as v4_io_event_stream
+import codetracer_trace_writer/cbor as v4_cbor
+import codetracer_trace_writer/global_line_index as v4_gli
 
 export results, codetracer_trace_types
 
@@ -40,6 +47,7 @@ type
     paths*: seq[string]
     events*: seq[TraceLowLevelEvent]
     eventCount*: int
+    isV4*: bool                  ## true if this is a multi-stream v4 trace
 
 # ---------------------------------------------------------------------------
 # Internal helpers: CTFS file reading
@@ -179,6 +187,11 @@ proc openTrace*(path: string): Result[TraceReader, string] =
   mr4[0] = data[12]; mr4[1] = data[13]; mr4[2] = data[14]; mr4[3] = data[15]
   let maxEntries = fromBytesLE(uint32, mr4)
 
+  # Detect v4 (multi-stream) by absence of events.log.  v3 traces always
+  # contain events.log; v4 traces never do (they use per-kind streams).
+  let isV4 = findInternalFileEntry(data, "events.log", maxEntries).size == 0 and
+             findInternalFileEntry(data, "events.log", maxEntries).mapBlock == 0
+
   var reader = TraceReader(
     ctfsData: data,
     blockSize: blockSize,
@@ -187,6 +200,7 @@ proc openTrace*(path: string): Result[TraceReader, string] =
     paths: @[],
     events: @[],
     eventCount: 0,
+    isV4: isV4,
   )
 
   # Try meta.dat first (new binary format), fall back to meta.json + paths.json
@@ -250,8 +264,221 @@ proc openTrace*(path: string): Result[TraceReader, string] =
 
   ok(reader)
 
+proc decodeValueRecordBytes(data: openArray[byte]): ValueRecord =
+  ## Decode a CBOR-encoded ValueRecord, returning NoneValue on failure.
+  ## v4 attaches values as CBOR ValueRecord byte blobs in the value stream.
+  if data.len == 0:
+    return NoneValue
+  var dec = CborDecoder.init(data)
+  let r = dec.decodeCborValueRecord()
+  if r.isOk:
+    r.get()
+  else:
+    ValueRecord(kind: vrkRaw, rawStr: "<decode error: " & r.unsafeError & ">",
+                rawTypeId: NoneTypeId)
+
+proc decodeReturnValueBytes(data: openArray[byte]): ValueRecord =
+  ## Decode a v4 return-value byte blob.  A single 0xFF byte is the
+  ## VoidReturnMarker (→ NoneValue); otherwise the bytes are CBOR.
+  if data.len == 0:
+    return NoneValue
+  if data.len == 1 and data[0] == 0xFF:
+    return NoneValue
+  decodeValueRecordBytes(data)
+
+proc readEventsV4(reader: var TraceReader): Result[void, string] =
+  ## Read a v4 (multi-stream) trace and reconstruct a chronological
+  ## seq[TraceLowLevelEvent] that matches the v3 reader API surface.
+  ##
+  ## Event ordering produced:
+  ##   1. tlePath for each interned path (in interning order).
+  ##   2. tleFunction for each interned function (in interning order).
+  ##      v4 only stores function names — pathId/line are emitted as 0.
+  ##   3. For each step n in [0, stepCount):
+  ##        a. If n is the entryStep of one or more pending call records,
+  ##           emit tleCall (outer-first / shallower depth first, matching
+  ##           v3 chronological call-entry order).
+  ##        b. tleStep for the step itself (decoded from execution stream).
+  ##        c. tleValue for each variable value attached to this step
+  ##           (decoded from value stream, CBOR ValueRecord blobs).
+  ##        d. If n is the exitStep of any pending call records,
+  ##           emit tleReturn (innermost-first / LIFO — deeper exits first).
+  ##   4. tleEvent for each IO event (in stream order).
+  let trRes = openNewTraceFromBytes(reader.ctfsData, reader.blockSize,
+                                    reader.maxRootEntries)
+  if trRes.isErr:
+    return err("failed to open v4 trace: " & trRes.error)
+  var nr = trRes.get()
+
+  # 1. tlePath for each interned path.
+  for i in 0 ..< int(nr.pathCount()):
+    let p = nr.path(uint64(i))
+    if p.isOk:
+      reader.events.add(TraceLowLevelEvent(kind: tlePath, path: p.get()))
+
+  # 2. tleFunction for each interned function name.
+  for i in 0 ..< int(nr.functionCount()):
+    let fname = nr.function(uint64(i))
+    if fname.isOk:
+      reader.events.add(TraceLowLevelEvent(
+        kind: tleFunction,
+        functionRecord: FunctionRecord(
+          pathId: PathId(0),
+          line: Line(0),
+          name: fname.get())))
+
+  # Pre-load all call records so we can find entry/exit step boundaries.
+  var calls: seq[v4_call_stream.CallRecord]
+  let callCountRes = nr.callCount()
+  if callCountRes.isOk:
+    let total = callCountRes.get()
+    for i in 0 ..< int(total):
+      let cr = nr.call(uint64(i))
+      if cr.isOk:
+        calls.add(cr.get())
+
+  # Build a map from entryStep → list of call-record indices (sorted by depth
+  # so outer/shallower calls emit first, matching call-stack order).
+  let stepCountRes = nr.stepCount()
+  if stepCountRes.isErr:
+    return err("failed to read step count: " & stepCountRes.error)
+  let totalSteps = stepCountRes.get()
+
+  # Build a GLI matching the writer (DefaultLinesPerFile per file).
+  # IMPORTANT: this MUST stay in lock-step with
+  # `codetracer_trace_writer/multi_stream_writer.DefaultLinesPerFile`.
+  # If a future writer revision changes the assumed density (or starts
+  # writing per-file true line counts into the trace), this reader will
+  # silently misinterpret the (fileId, line) of every step. When that
+  # happens the writer should expose the counts via trace metadata and
+  # this code should read them back instead of assuming a constant.
+  const DefaultLinesPerFile: uint64 = 100_000
+  var lineCounts = newSeq[uint64](reader.paths.len)
+  for i in 0 ..< reader.paths.len:
+    lineCounts[i] = DefaultLinesPerFile
+  let gli = buildGlobalLineIndex(lineCounts)
+
+  # 3. Walk steps, weaving Call/Return events at entry/exit boundaries.
+  for n in 0'u64 ..< totalSteps:
+    # 3a. Calls entering at this step (outer→inner = shallower depth first).
+    var entering: seq[int]
+    for ci in 0 ..< calls.len:
+      if calls[ci].entryStep == n:
+        entering.add(ci)
+    # Sort by depth ascending so outer call emits first.
+    for i in 0 ..< entering.len:
+      for j in i + 1 ..< entering.len:
+        if calls[entering[j]].depth < calls[entering[i]].depth:
+          let tmp = entering[i]
+          entering[i] = entering[j]
+          entering[j] = tmp
+    for ci in entering:
+      let c = calls[ci]
+      var args = newSeq[FullValueRecord](c.args.len)
+      for ai in 0 ..< c.args.len:
+        args[ai] = FullValueRecord(
+          variableId: VariableId(c.args[ai].varnameId),
+          value: decodeValueRecordBytes(c.args[ai].value))
+      reader.events.add(TraceLowLevelEvent(
+        kind: tleCall,
+        callRecord: codetracer_trace_types.CallRecord(
+          functionId: FunctionId(c.functionId),
+          args: args)))
+
+    # 3b. tleStep — resolve GLI back to (pathId, line) where possible.
+    let stepRes = nr.step(n)
+    if stepRes.isErr:
+      return err("failed to read step " & $n & ": " & stepRes.error)
+    let stepEv = stepRes.get()
+    case stepEv.kind
+    of sekAbsoluteStep, sekDeltaStep:
+      let absGli = nr.stepAbsoluteGlobalLineIndex(n)
+      if absGli.isOk and reader.paths.len > 0:
+        let (fileId, line) = gli.resolve(absGli.get())
+        reader.events.add(TraceLowLevelEvent(
+          kind: tleStep,
+          step: StepRecord(pathId: PathId(uint64(fileId)),
+                           line: Line(int64(line)))))
+      else:
+        reader.events.add(TraceLowLevelEvent(
+          kind: tleStep,
+          step: StepRecord(pathId: PathId(0), line: Line(0))))
+    of sekRaise, sekCatch:
+      # No direct v3 mapping for raise/catch — skip (or could synthesize
+      # a tleEvent).  v3 didn't expose these via tleStep either.
+      discard
+    of sekThreadStart:
+      reader.events.add(TraceLowLevelEvent(
+        kind: tleThreadStart,
+        threadStartId: ThreadId(stepEv.startThreadId)))
+    of sekThreadExit:
+      reader.events.add(TraceLowLevelEvent(
+        kind: tleThreadExit,
+        threadExitId: ThreadId(stepEv.exitThreadId)))
+    of sekThreadSwitch:
+      reader.events.add(TraceLowLevelEvent(
+        kind: tleThreadSwitch,
+        threadSwitchId: ThreadId(stepEv.threadId)))
+
+    # 3c. tleValue for each attached variable value.
+    let valsRes = nr.values(n)
+    if valsRes.isOk:
+      for vv in valsRes.get():
+        reader.events.add(TraceLowLevelEvent(
+          kind: tleValue,
+          fullValue: FullValueRecord(
+            variableId: VariableId(vv.varnameId),
+            value: decodeValueRecordBytes(vv.data))))
+
+    # 3d. Returns exiting at this step (LIFO — innermost / deepest first).
+    var exiting: seq[int]
+    for ci in 0 ..< calls.len:
+      if calls[ci].exitStep == n:
+        exiting.add(ci)
+    for i in 0 ..< exiting.len:
+      for j in i + 1 ..< exiting.len:
+        if calls[exiting[j]].depth > calls[exiting[i]].depth:
+          let tmp = exiting[i]
+          exiting[i] = exiting[j]
+          exiting[j] = tmp
+    for ci in exiting:
+      let c = calls[ci]
+      reader.events.add(TraceLowLevelEvent(
+        kind: tleReturn,
+        returnRecord: ReturnRecord(
+          returnValue: decodeReturnValueBytes(c.returnValue))))
+
+  # 4. IO events.
+  let ioCountRes = nr.ioEventCount()
+  if ioCountRes.isOk:
+    let total = ioCountRes.get()
+    for i in 0 ..< int(total):
+      let evRes = nr.ioEvent(uint64(i))
+      if evRes.isOk:
+        let io = evRes.get()
+        let kind =
+          case io.kind
+          of ioStdout, ioStderr, ioFileOp: elkWrite
+          of ioError: elkError
+        var content = newString(io.data.len)
+        for j in 0 ..< io.data.len:
+          content[j] = char(io.data[j])
+        reader.events.add(TraceLowLevelEvent(
+          kind: tleEvent,
+          recordEvent: RecordEvent(
+            kind: kind,
+            metadata: "",
+            content: content)))
+
+  reader.eventCount = reader.events.len
+  ok()
+
 proc readEvents*(reader: var TraceReader): Result[void, string] =
-  ## Decompress and decode all events from events.log.
+  ## Decompress and decode all events. Dispatches to v3 (events.log) or
+  ## v4 (multi-stream) based on the file layout detected at openTrace time.
+  if reader.isV4:
+    return readEventsV4(reader)
+
   let eventsRes = readInternalFile(reader.ctfsData, "events.log",
                                     reader.blockSize, reader.maxRootEntries)
   if eventsRes.isErr:
