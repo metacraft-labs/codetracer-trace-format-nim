@@ -7,7 +7,8 @@
 ##   [2] version u16 LE
 ##   [2] flags u16 LE (bit 0: has_mcr_fields,
 ##                    bit 1: has_replay_launch_fields,
-##                    bit 2: has_layout_snapshot)
+##                    bit 2: has_layout_snapshot,
+##                    bit 3: has_trace_filter_provenance)
 ##   varint-prefixed program string
 ##   varint args_count, then varint-prefixed arg strings
 ##   varint-prefixed workdir string
@@ -33,6 +34,11 @@
 ##     u64 layout_hash (XXH64 over the fingerprint bytes, seed 0)
 ##     varint fingerprint_len
 ##     bytes fingerprint[fingerprint_len]
+##   if has_trace_filter_provenance:                             (TF-M7)
+##     varint trace_filter_count
+##     for i in 0 ..< trace_filter_count:
+##       varint path_len, then UTF-8 path bytes
+##       32 raw bytes: SHA-256 of the filter source (no length prefix)
 ##
 ## Version history:
 ##   v1 — initial release (no hook fields).  Removed before any external
@@ -52,6 +58,17 @@
 ##        block) preserves binary compatibility for traces recorded
 ##        between M-RLP-1 and M-RLP-2, which carry the replay-launch
 ##        block but no layout snapshot.
+##        TF-M7 (2026-05-14) added FlagHasTraceFilterProvenance (bit 3)
+##        and a separate block after the layout-snapshot block.  Spec:
+##        `codetracer-trace-format-spec/internal-files.md` §
+##        "Flag bit 3 — Trace filter provenance" and
+##        `codetracer-trace-format-spec/Trace-Filters.md` § 7.  Bit 3
+##        was chosen (rather than the spec-suggested bit 1) because
+##        bits 1 and 2 had already shipped as FlagHasReplayLaunchFields
+##        / FlagHasLayoutSnapshot in M-RLP-1/M-RLP-2; reusing them
+##        would break the in-flight trace fixtures from those
+##        milestones.  The spec was updated in the same TF-M7 commit
+##        series to match.
 
 import std/options
 import results
@@ -63,9 +80,10 @@ import ./varint
 const
   MetaDatMagic*: array[4, byte] = [0x43'u8, 0x54, 0x4D, 0x44]  # "CTMD"
   MetaDatVersion*: uint16 = 2
-  FlagHasMcrFields*: uint16 = 1            # bit 0
-  FlagHasReplayLaunchFields*: uint16 = 2   # bit 1 — M-RLP-1 (spec §6A.5)
-  FlagHasLayoutSnapshot*: uint16 = 4       # bit 2 — M-RLP-2 (spec §6B.7)
+  FlagHasMcrFields*: uint16 = 1                  # bit 0
+  FlagHasReplayLaunchFields*: uint16 = 2         # bit 1 — M-RLP-1 (spec §6A.5)
+  FlagHasLayoutSnapshot*: uint16 = 4             # bit 2 — M-RLP-2 (spec §6B.7)
+  FlagHasTraceFilterProvenance*: uint16 = 8      # bit 3 — TF-M7 (spec §7)
 
 type
   MetaDatContents* = object
@@ -78,6 +96,17 @@ type
     mcrFields*: Option[McrMetaFields]
     replayLaunchFields*: Option[ReplayLaunchFields]
     layoutSnapshotFields*: Option[LayoutSnapshotFields]
+    filterProvenance*: seq[FilterProvenance]
+      ## TF-M7: trace-filter chain entries.  Empty when the writer did
+      ## not record provenance (the flag bit is clear) AND when the
+      ## writer recorded a deliberately-empty chain (the flag bit is
+      ## set with `trace_filter_count = 0`).  Use `hasFilterProvenance`
+      ## to distinguish the two cases.
+    hasFilterProvenance*: bool
+      ## True iff FlagHasTraceFilterProvenance was set on the meta.dat
+      ## header.  Distinguishes "no provenance recorded" (false) from
+      ## "provenance recorded but empty" (true with empty
+      ## `filterProvenance`).
 
 proc writeRawBytes(
     c: var Ctfs, f: var CtfsInternalFile,
@@ -115,9 +144,17 @@ proc writeMetaDat*(
     replayLaunchFields: Option[ReplayLaunchFields] =
       none(ReplayLaunchFields),
     layoutSnapshotFields: Option[LayoutSnapshotFields] =
-      none(LayoutSnapshotFields)
+      none(LayoutSnapshotFields),
+    filterProvenance: openArray[FilterProvenance] = [],
+    emitFilterProvenance: bool = false,
 ): Result[void, string] =
   ## Write binary meta.dat to a CTFS internal file.
+  ##
+  ## `filterProvenance` records the active trace-filter chain (TF-M7,
+  ## spec § 7).  The flag bit is set whenever `emitFilterProvenance` is
+  ## true OR `filterProvenance.len > 0`; an explicit
+  ## `emitFilterProvenance = true` with an empty sequence is the spec's
+  ## "recorder implements filters but the chain is empty" signal.
 
   # Magic
   ? c.writeRawBytes(f, MetaDatMagic)
@@ -133,6 +170,9 @@ proc writeMetaDat*(
     flags = flags or FlagHasReplayLaunchFields
   if layoutSnapshotFields.isSome:
     flags = flags or FlagHasLayoutSnapshot
+  let emitProvenance = emitFilterProvenance or filterProvenance.len > 0
+  if emitProvenance:
+    flags = flags or FlagHasTraceFilterProvenance
   ? c.writeU16LE(f, flags)
 
   # Program
@@ -190,6 +230,17 @@ proc writeMetaDat*(
     ? c.writeVarint(f, uint64(ls.layoutFingerprint.len))
     if ls.layoutFingerprint.len > 0:
       ? c.writeRawBytes(f, ls.layoutFingerprint)
+
+  # Trace filter provenance (TF-M7, spec §7).  varint count, then for
+  # each entry: (varint-length path string, 32 raw sha256 bytes).
+  if emitProvenance:
+    ? c.writeVarint(f, uint64(filterProvenance.len))
+    for entry in filterProvenance:
+      ? c.writeVarintString(f, entry.path)
+      var shaBytes = newSeq[byte](32)
+      for i in 0 ..< 32:
+        shaBytes[i] = entry.sha256[i]
+      ? c.writeRawBytes(f, shaBytes)
 
   ok()
 
@@ -321,6 +372,20 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
       layoutFingerprint: fp,
     ))
 
+  # Trace filter provenance (TF-M7, spec §7).
+  if (flags and FlagHasTraceFilterProvenance) != 0:
+    contents.hasFilterProvenance = true
+    let countVal = ? decodeVarint(data, pos)
+    for i in 0'u64 ..< countVal:
+      let path = ? readString(data, pos)
+      if pos + 32 > data.len:
+        return err("meta.dat: trace_filter sha256 bytes extend past end")
+      var sha: array[32, byte]
+      for k in 0 ..< 32:
+        sha[k] = data[pos + k]
+      pos += 32
+      contents.filterProvenance.add(FilterProvenance(path: path, sha256: sha))
+
   ok(contents)
 
 # ---------------------------------------------------------------------------
@@ -344,7 +409,9 @@ proc writeMetaDatToBuffer*(
     replayLaunchFields: Option[ReplayLaunchFields] =
       none(ReplayLaunchFields),
     layoutSnapshotFields: Option[LayoutSnapshotFields] =
-      none(LayoutSnapshotFields)
+      none(LayoutSnapshotFields),
+    filterProvenance: openArray[FilterProvenance] = [],
+    emitFilterProvenance: bool = false,
 ): seq[byte] =
   ## Serialize meta.dat to an in-memory byte buffer.
   ## This is the same format as writeMetaDat but without needing a CTFS container.
@@ -365,6 +432,9 @@ proc writeMetaDatToBuffer*(
     flags = flags or FlagHasReplayLaunchFields
   if layoutSnapshotFields.isSome:
     flags = flags or FlagHasLayoutSnapshot
+  let emitProvenance = emitFilterProvenance or filterProvenance.len > 0
+  if emitProvenance:
+    flags = flags or FlagHasTraceFilterProvenance
   result.appendU16LE(flags)
 
   # Program
@@ -419,3 +489,11 @@ proc writeMetaDatToBuffer*(
     encodeVarint(uint64(ls.layoutFingerprint.len), result)
     for b in ls.layoutFingerprint:
       result.add(b)
+
+  # Trace filter provenance (TF-M7, spec §7).
+  if emitProvenance:
+    encodeVarint(uint64(filterProvenance.len), result)
+    for entry in filterProvenance:
+      result.appendVarintStr(entry.path)
+      for i in 0 ..< 32:
+        result.add(entry.sha256[i])

@@ -1,12 +1,21 @@
 {
   "metadata": {
     "program": "ct_print_demo",
-    "args": ["--demo", "fixture"],
+    "args": [
+      "--demo",
+      "fixture"
+    ],
     "workdir": "<workdir>",
     "recorder": ""
   },
-  "paths": ["<workdir>/main.py", "<workdir>/util.py"],
-  "functions": ["main", "compute"],
+  "paths": [
+    "<workdir>/main.py",
+    "<workdir>/util.py"
+  ],
+  "functions": [
+    "main",
+    "compute"
+  ],
   "varnames": [
     "x",
     "name",
@@ -72,7 +81,9 @@
       "depth": 0,
       "parent_call_key": -1,
       "args": [],
-      "children": [0]
+      "children": [
+        0
+      ]
     },
     {
       "kind": "step",

@@ -973,6 +973,72 @@ proc trace_writer_close(handle: TraceWriterHandle): cint {.exportc, cdecl, dynli
 # meta.dat — write via TraceWriter handle
 # ---------------------------------------------------------------------------
 
+proc trace_writer_add_filter_provenance(
+    handle: TraceWriterHandle,
+    path: ptr uint8, path_len: csize_t,
+    sha256_bytes: ptr uint8, sha256_len: csize_t,
+): cint {.exportc, cdecl, dynlib.} =
+  ## TF-M7 (spec § 7 / Trace-Filters.md § 7): append one
+  ## `(path, sha256)` entry to the trace-filter provenance chain that
+  ## the writer will embed in meta.dat at close() time.  Recorders
+  ## should call this in composition order (builtin default →
+  ## auto-discovered project filter → env-var filters → CLI
+  ## `--trace-filter:` args).
+  ##
+  ## `path` is the filter file path or a sentinel like
+  ## `<inline:builtin-default>` for inline filters.  `sha256_bytes`
+  ## MUST be the 32 raw bytes of the SHA-256 digest of the filter
+  ## source (file contents or, for inline filters, the literal TOML
+  ## string).  Returns 0 on success.
+  ##
+  ## Only meaningful in multi-stream (CTFS) mode.
+  if handle.isNil:
+    setError("NULL handle")
+    return 1.cint
+  if not handle.useMultiStream:
+    setError("filter provenance only supported in CTFS multi-stream mode")
+    return 1.cint
+  if not handle.msWriterReady:
+    setError("writer not ready (call begin_events first)")
+    return 1.cint
+  if sha256_len != 32.csize_t:
+    setError("sha256_bytes must be exactly 32 bytes")
+    return 1.cint
+  var pStr = ""
+  if not path.isNil and path_len > 0.csize_t:
+    pStr = newString(int(path_len))
+    copyMem(addr pStr[0], path, int(path_len))
+  var entry: FilterProvenance
+  entry.path = pStr
+  if not sha256_bytes.isNil:
+    copyMem(addr entry.sha256[0], sha256_bytes, 32)
+  handle.msWriter.filterProvenance.add(entry)
+  # The presence of at least one entry is enough to set the flag bit;
+  # the explicit "empty-but-recorded" path is the dedicated
+  # `trace_writer_record_empty_filter_provenance` proc below.
+  0.cint
+
+proc trace_writer_record_empty_filter_provenance(
+    handle: TraceWriterHandle
+): cint {.exportc, cdecl, dynlib.} =
+  ## TF-M7: mark the writer to emit a *present-but-empty* trace-filter
+  ## provenance block.  Useful only for recorders that integrate
+  ## filters but ended up with a deliberately empty chain (i.e. all
+  ## filter sources were skipped — vanishingly rare in practice).
+  ## When at least one entry is appended via
+  ## `trace_writer_add_filter_provenance`, this flag is ignored.
+  if handle.isNil:
+    setError("NULL handle")
+    return 1.cint
+  if not handle.useMultiStream:
+    setError("filter provenance only supported in CTFS multi-stream mode")
+    return 1.cint
+  if not handle.msWriterReady:
+    setError("writer not ready (call begin_events first)")
+    return 1.cint
+  handle.msWriter.recordEmptyFilterProvenance = true
+  0.cint
+
 proc ct_write_meta_dat(
     handle: TraceWriterHandle,
     recorder_id: ptr uint8,
@@ -1155,6 +1221,47 @@ proc ct_meta_dat_recorder_id(h: MetaDatReaderHandle, out_len: ptr csize_t): ptr 
   if h.recorderId.len == 0:
     return nil
   return cast[ptr uint8](unsafeAddr h.recorderId[0])
+
+proc ct_meta_dat_has_filter_provenance(h: MetaDatReaderHandle): cint {.exportc, cdecl, dynlib.} =
+  ## TF-M7: returns 1 if FlagHasTraceFilterProvenance was set on the
+  ## meta.dat header (the writer recorded provenance, even if the
+  ## chain is empty), 0 otherwise.
+  if h.isNil:
+    return 0.cint
+  if h.hasFilterProvenance: 1.cint else: 0.cint
+
+proc ct_meta_dat_filter_provenance_count(h: MetaDatReaderHandle): csize_t {.exportc, cdecl, dynlib.} =
+  ## TF-M7: number of trace-filter provenance entries recorded.
+  if h.isNil:
+    return 0.csize_t
+  return csize_t(h.filterProvenance.len)
+
+proc ct_meta_dat_filter_provenance_path(
+    h: MetaDatReaderHandle, idx: csize_t, out_len: ptr csize_t
+): ptr uint8 {.exportc, cdecl, dynlib.} =
+  ## TF-M7: get the path string of the i-th provenance entry.
+  ## Returns a pointer valid until ct_meta_dat_free.
+  if h.isNil or out_len.isNil or int(idx) >= h.filterProvenance.len:
+    if not out_len.isNil:
+      out_len[] = 0.csize_t
+    return nil
+  let s = h.filterProvenance[int(idx)].path
+  out_len[] = csize_t(s.len)
+  if s.len == 0:
+    return nil
+  return cast[ptr uint8](unsafeAddr s[0])
+
+proc ct_meta_dat_filter_provenance_sha256(
+    h: MetaDatReaderHandle, idx: csize_t, out_buf: ptr uint8
+): cint {.exportc, cdecl, dynlib.} =
+  ## TF-M7: copy the raw 32-byte sha256 digest of the i-th provenance
+  ## entry into `out_buf` (which the caller MUST size as at least 32
+  ## bytes).  Returns 0 on success.
+  if h.isNil or out_buf.isNil or int(idx) >= h.filterProvenance.len:
+    return 1.cint
+  for i in 0 ..< 32:
+    cast[ptr UncheckedArray[uint8]](out_buf)[i] = h.filterProvenance[int(idx)].sha256[i]
+  0.cint
 
 proc ct_meta_dat_free(h: MetaDatReaderHandle) {.exportc, cdecl, dynlib.} =
   ## Free a MetaDatContents handle.

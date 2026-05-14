@@ -228,6 +228,28 @@ proc buildFullDocument*(reader: var NewTraceReader,
     if opts.stripPaths and reader.meta.workdir.len > 0: "<workdir>"
     else: reader.meta.workdir)
   meta["recorder"] = newJString(reader.meta.recorderId)
+
+  # ----- trace_filter provenance (TF-M7, spec §7) -----
+  # Materialized as `metadata.trace_filter.filters[].{path,sha256}` per
+  # Trace-Filters.md § 7.  Emitted only when the meta.dat header had
+  # FlagHasTraceFilterProvenance set, so post-trace audit can
+  # distinguish "no provenance recorded" (key absent) from "provenance
+  # recorded but the chain happens to be empty" (key present, empty
+  # `filters` array).
+  if reader.meta.hasFilterProvenance:
+    var filtersArr = newJArray()
+    for entry in reader.meta.filterProvenance:
+      var entryObj = newJObject()
+      entryObj["path"] = newJString(entry.path)
+      var shaBytes = newSeq[byte](32)
+      for k in 0 ..< 32:
+        shaBytes[k] = entry.sha256[k]
+      entryObj["sha256"] = newJString(bytesToHexLower(shaBytes))
+      filtersArr.add(entryObj)
+    var traceFilterObj = newJObject()
+    traceFilterObj["filters"] = filtersArr
+    meta["trace_filter"] = traceFilterObj
+
   root["metadata"] = meta
 
   # ----- paths -----

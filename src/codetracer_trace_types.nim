@@ -340,6 +340,25 @@ type
     ## whether to use hard-pin (=true) or soft-pin (=false; §6B.5) mode.
     aslrDisabled*: bool
 
+  FilterProvenance* = object
+    ## TF-M7 (spec §7 / Trace-Filters.md §7): one entry in the trace
+    ## filter chain recorded in meta.dat under
+    ## `FlagHasTraceFilterProvenance`.
+    ##
+    ## Entries are kept in composition order (builtin default →
+    ## auto-discovered project filter → env-var filters →
+    ## `--trace-filter:` CLI args).  The `path` MAY be a sentinel of the
+    ## form `<inline:...>` for filters that are not loaded from disk;
+    ## `<inline:builtin-default>` is the canonical sentinel for the
+    ## recorder-embedded default.
+    ##
+    ## `sha256` is the raw 32-byte SHA-256 digest of the source bytes
+    ## (file contents on disk, or the literal TOML string for inline
+    ## filters), computed once at load time.  Readers SHOULD render it
+    ## as a lowercase hex string for diagnostic surfaces.
+    path*: string
+    sha256*: array[32, byte]
+
   LayoutSnapshotFields* = object
     ## M-RLP-2 (spec §6B.7): layout-hash snapshot captured at
     ## `__libc_start_main` wrapper entry.  Written when
