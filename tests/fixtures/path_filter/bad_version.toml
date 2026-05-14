@@ -1,0 +1,6 @@
+[meta]
+name = "future"
+version = 99
+
+[scope]
+default_exec = "skip"

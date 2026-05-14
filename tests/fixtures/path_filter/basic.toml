@@ -1,0 +1,22 @@
+[meta]
+name = "basic"
+version = 1
+description = "Skip stdlib paths; trace user code explicitly"
+
+[scope]
+default_exec = "trace"
+
+[[scope.rules]]
+selector = "file:glob:**/lib/std/**"
+exec = "skip"
+reason = "Suppress stdlib noise"
+
+[[scope.rules]]
+selector = "file:literal:/repo/main.nim"
+exec = "trace"
+reason = "Always trace the entry point"
+
+[[scope.rules]]
+selector = "pkg:regex:vendor\\..*"
+exec = "skip"
+reason = "Vendor third-party packages emit noise"

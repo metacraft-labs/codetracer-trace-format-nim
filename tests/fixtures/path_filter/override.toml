@@ -1,0 +1,9 @@
+[meta]
+name = "override"
+version = 1
+description = "Layer on top of basic.toml: re-trace one stdlib file"
+
+[[scope.rules]]
+selector = "file:literal:/repo/lib/std/important.nim"
+exec = "trace"
+reason = "We care about this stdlib file"

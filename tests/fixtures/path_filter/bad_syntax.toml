@@ -1,0 +1,6 @@
+[meta]
+name = "broken"
+version = 1
+
+[scope
+default_exec = "trace"

@@ -1,0 +1,24 @@
+[meta]
+name = "with_tier2"
+version = 1
+description = "Mixed Tier-1 and Tier-2 rules; Tier-2 should be warn-skipped"
+
+[scope]
+default_exec = "trace"
+default_value_action = "allow"
+
+[[scope.rules]]
+selector = "file:glob:**/secrets/**"
+exec = "trace"
+value_default = "redact"
+reason = "Trace structure but redact values"
+
+[[scope.rules.value_patterns]]
+selector = "local:regex:(?i)(password|token)"
+action = "redact"
+reason = "Redact common secret names"
+
+[[scope.rules]]
+selector = "local:literal:my_var"
+exec = "skip"
+reason = "Tier-2 selector in [[scope.rules]] — should warn-skip"
