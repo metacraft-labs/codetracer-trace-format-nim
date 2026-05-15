@@ -479,6 +479,72 @@ proc test_golden_snapshot() =
       "  To accept new output: CT_PRINT_WRITE_GOLDEN=1 nim c -r ...\n")
   echo "[ok] test_golden_snapshot"
 
+proc test_trace_filter_provenance_materialized() =
+  ## TF-M7: the trace-filter chain provenance recorded via
+  ## `MultiStreamTraceWriter.setFilterProvenance` round-trips through
+  ## `meta.dat` and is materialized into the JSON document at
+  ## `metadata.trace_filter.filters[].{path,sha256}` per
+  ## Trace-Filters.md § 7.  The sha256 is rendered as lowercase hex.
+  var wRes = initMultiStreamWriter("test.ct", "tf_demo")
+  doAssert wRes.isOk
+  var w = wRes.get()
+  w.metadata.workdir = "/w"
+  var entries = newSeq[FilterProvenance](2)
+  entries[0].path = "<inline:builtin-default>"
+  for i in 0 ..< 32:
+    entries[0].sha256[i] = byte(i)
+  entries[1].path = "/etc/codetracer/override.toml"
+  for i in 0 ..< 32:
+    entries[1].sha256[i] = byte(255 - i)
+  w.setFilterProvenance(entries)
+  doAssert w.close().isOk
+  let bytes = w.toBytes()
+  w.closeCtfs()
+
+  var reader = openNewTraceFromBytes(bytes).get()
+  let root = buildFullDocument(reader, FullOpts(stripPaths: false))
+  doAssert root["metadata"].hasKey("trace_filter"),
+    "metadata.trace_filter must be present when provenance was recorded"
+  let tf = root["metadata"]["trace_filter"]
+  doAssert tf.hasKey("filters"), "trace_filter.filters missing"
+  let filters = tf["filters"]
+  doAssert filters.len == 2,
+    "expected 2 filter entries, got " & $filters.len
+  doAssert filters[0]["path"].getStr == "<inline:builtin-default>"
+  doAssert filters[1]["path"].getStr == "/etc/codetracer/override.toml"
+
+  # Sha256: lowercase hex, 64 chars, byte 0 of entry[0] is 0x00.
+  let sha0 = filters[0]["sha256"].getStr
+  doAssert sha0.len == 64, "sha256 hex length should be 64, got " & $sha0.len
+  doAssert sha0[0..1] == "00"
+  doAssert sha0[2..3] == "01"
+  doAssert sha0 == sha0.toLowerAscii, "sha256 must be lowercase hex"
+
+  let sha1 = filters[1]["sha256"].getStr
+  doAssert sha1[0..1] == "ff"
+  doAssert sha1[2..3] == "fe"
+
+  echo "[ok] test_trace_filter_provenance_materialized"
+
+proc test_trace_filter_provenance_absent_when_not_set() =
+  ## TF-M7: when the writer does NOT call setFilterProvenance, the
+  ## materialized JSON must NOT contain `metadata.trace_filter` (key
+  ## absent, not present-with-empty-array).  This preserves the
+  ## spec §7 distinction between "did not record" and "recorded
+  ## empty".
+  var wRes = initMultiStreamWriter("test.ct", "tf_demo")
+  doAssert wRes.isOk
+  var w = wRes.get()
+  doAssert w.close().isOk
+  let bytes = w.toBytes()
+  w.closeCtfs()
+
+  var reader = openNewTraceFromBytes(bytes).get()
+  let root = buildFullDocument(reader, FullOpts(stripPaths: false))
+  doAssert not root["metadata"].hasKey("trace_filter"),
+    "metadata.trace_filter must be absent when provenance was not recorded"
+  echo "[ok] test_trace_filter_provenance_absent_when_not_set"
+
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
@@ -498,6 +564,8 @@ test_event_counts()
 test_determinism()
 test_strip_paths()
 test_strip_paths_program()
+test_trace_filter_provenance_materialized()
+test_trace_filter_provenance_absent_when_not_set()
 test_golden_snapshot()
 
 echo ""

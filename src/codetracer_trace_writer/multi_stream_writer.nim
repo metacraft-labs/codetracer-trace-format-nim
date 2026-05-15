@@ -25,7 +25,8 @@ import ./varint
 import ./linehits_builder
 import ../codetracer_trace_types
 
-export results, value_stream.VariableValue, io_event_stream.IOEventKind
+export results, value_stream.VariableValue, io_event_stream.IOEventKind,
+       codetracer_trace_types.FilterProvenance
 
 const
   DefaultLinesPerFile*: uint64 = 100_000
@@ -69,6 +70,20 @@ type
     currentDepth: uint32
     closed: bool
     filePath: string
+
+    # TF-M7: trace-filter chain provenance (spec § 7).  When non-empty
+    # OR when `recordEmptyFilterProvenance` is set, the close() path
+    # emits FlagHasTraceFilterProvenance on meta.dat and writes the
+    # per-entry (path, sha256) block.  Recorders integrating the
+    # trace-filter library set this from their composed Classifier
+    # before close().
+    filterProvenance*: seq[FilterProvenance]
+    recordEmptyFilterProvenance*: bool
+      ## When true and `filterProvenance` is empty, the writer still
+      ## emits an empty provenance block.  Use this for recorders that
+      ## implement trace filters but ended up with a zero-length chain
+      ## (spec § 7 distinguishes "no provenance recorded" from
+      ## "provenance recorded but empty").
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -140,6 +155,32 @@ proc initMultiStreamWriter*(path: string, program: string,
 proc enableLinehits*(w: var MultiStreamTraceWriter) =
   ## Enable the linehits builder. Must be called before writing steps.
   w.linehitsBuilder = some(initLinehitsBuilder())
+
+# ---------------------------------------------------------------------------
+# Filter provenance (TF-M7 — spec §7 / Trace-Filters.md §7)
+# ---------------------------------------------------------------------------
+
+proc setFilterProvenance*(w: var MultiStreamTraceWriter,
+                          entries: openArray[FilterProvenance];
+                          recordEvenIfEmpty: bool = false) =
+  ## Record the active trace-filter chain in composition order.
+  ##
+  ## When the resulting sequence is non-empty, OR when
+  ## `recordEvenIfEmpty` is true, `close()` sets
+  ## `FlagHasTraceFilterProvenance` on the meta.dat header and emits
+  ## the per-entry block.  Recorders that implement trace filters
+  ## SHOULD pass `recordEvenIfEmpty = true` so the flag distinguishes
+  ## "implements filters but chain happens to be empty" from "doesn't
+  ## record provenance at all" (spec §7).
+  ##
+  ## Calling this proc replaces any previously set provenance — there
+  ## is no append API by design: the caller composes the full
+  ## composition chain (builtin default → auto-discovered → env →
+  ## CLI) once before close().
+  w.filterProvenance = @[]
+  for e in entries:
+    w.filterProvenance.add(e)
+  w.recordEmptyFilterProvenance = recordEvenIfEmpty
 
 proc linehits*(w: var MultiStreamTraceWriter): var LinehitsBuilder =
   ## Access the linehits builder. Raises if not enabled.
@@ -516,7 +557,10 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
     return err("failed to add meta.dat: " & metaFileRes.error)
   var metaFile = metaFileRes.get()
 
-  let metaRes = w.ctfs.writeMetaDat(metaFile, w.metadata, w.paths)
+  let metaRes = w.ctfs.writeMetaDat(
+    metaFile, w.metadata, w.paths,
+    filterProvenance = w.filterProvenance,
+    emitFilterProvenance = w.recordEmptyFilterProvenance)
   if metaRes.isErr:
     return err("failed to write meta.dat: " & metaRes.error)
 

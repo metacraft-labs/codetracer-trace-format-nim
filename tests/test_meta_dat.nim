@@ -387,6 +387,129 @@ proc test_meta_dat_roundtrip_with_mcr() {.raises: [].} =
   echo "PASS: test_meta_dat_roundtrip_with_mcr"
 
 
+proc test_meta_dat_roundtrip_with_filter_provenance() {.raises: [].} =
+  ## TF-M7: round-trip the trace-filter provenance block through both
+  ## the CTFS-based writer and the buffer-based writer, then re-parse
+  ## with readMetaDat and assert the entries match byte-for-byte
+  ## (including the raw 32-byte sha256 digests and the inline-default
+  ## sentinel `<inline:builtin-default>`).
+  var entries = newSeq[FilterProvenance](3)
+  entries[0].path = "<inline:builtin-default>"
+  for i in 0 ..< 32:
+    entries[0].sha256[i] = byte(i)
+  entries[1].path = "/project/.codetracer/trace-filter.toml"
+  for i in 0 ..< 32:
+    entries[1].sha256[i] = byte(0xA0 + (i mod 16))
+  entries[2].path = "/home/user/override.toml"
+  for i in 0 ..< 32:
+    entries[2].sha256[i] = byte(255 - i)
+
+  let meta = TraceMetadata(
+    program: "prog",
+    args: @[],
+    workdir: "/w",
+  )
+  let paths = @["/p"]
+
+  # ----- CTFS-based writer -----
+  block:
+    var c = createCtfs()
+    let fileRes = c.addFile("meta.dat")
+    doAssert fileRes.isOk
+    var f = fileRes.get()
+    let wRes = c.writeMetaDat(f, meta, paths,
+      filterProvenance = entries)
+    doAssert wRes.isOk, "writeMetaDat failed: " & wRes.unsafeError
+
+    let raw = extractFileBytes(c, f)
+    # Header flags byte should have bit 3 set (FlagHasTraceFilterProvenance = 8).
+    let flags = readU16LEAt(raw, 6)
+    doAssert (flags and FlagHasTraceFilterProvenance) != 0,
+      "FlagHasTraceFilterProvenance must be set when provenance is non-empty"
+    doAssert (flags and FlagHasMcrFields) == 0,
+      "MCR flag should be off"
+
+    let parsed = readMetaDat(raw)
+    doAssert parsed.isOk, "readMetaDat failed: " & parsed.unsafeError
+    let contents = parsed.get()
+    doAssert contents.hasFilterProvenance, "hasFilterProvenance must be true"
+    doAssert contents.filterProvenance.len == 3,
+      "expected 3 provenance entries, got " & $contents.filterProvenance.len
+    doAssert contents.filterProvenance[0].path == "<inline:builtin-default>"
+    doAssert contents.filterProvenance[1].path ==
+      "/project/.codetracer/trace-filter.toml"
+    doAssert contents.filterProvenance[2].path == "/home/user/override.toml"
+    for entryIdx in 0 ..< 3:
+      for i in 0 ..< 32:
+        doAssert contents.filterProvenance[entryIdx].sha256[i] ==
+          entries[entryIdx].sha256[i],
+          "sha256 byte " & $i & " of entry " & $entryIdx & " mismatch"
+    c.closeCtfs()
+
+  # ----- Buffer-based writer -----
+  block:
+    let buf = writeMetaDatToBuffer(meta, paths,
+      filterProvenance = entries)
+    let flags = readU16LEAt(buf, 6)
+    doAssert (flags and FlagHasTraceFilterProvenance) != 0,
+      "buffer writer: FlagHasTraceFilterProvenance must be set"
+
+    let parsed = readMetaDat(buf)
+    doAssert parsed.isOk, "buffer readMetaDat failed: " & parsed.unsafeError
+    let contents = parsed.get()
+    doAssert contents.filterProvenance.len == 3
+    doAssert contents.filterProvenance[0].path == "<inline:builtin-default>"
+    doAssert contents.filterProvenance[2].path == "/home/user/override.toml"
+    # Cross-check one sha256 digest byte-by-byte.
+    for i in 0 ..< 32:
+      doAssert contents.filterProvenance[2].sha256[i] ==
+        entries[2].sha256[i],
+        "buffer: sha256 byte " & $i & " of last entry mismatch"
+
+  echo "PASS: test_meta_dat_roundtrip_with_filter_provenance"
+
+
+proc test_meta_dat_roundtrip_empty_filter_provenance() {.raises: [].} =
+  ## TF-M7: when `emitFilterProvenance` is set but the provenance list
+  ## is empty, the flag bit must still be on and the reader must
+  ## surface `hasFilterProvenance = true` with an empty list.  This
+  ## preserves the spec §7 distinction between "did not record" (flag
+  ## off) and "recorded an empty chain" (flag on, count 0).
+  let meta = TraceMetadata(program: "prog", args: @[], workdir: "/w")
+  let paths: seq[string] = @[]
+
+  let buf = writeMetaDatToBuffer(meta, paths,
+    filterProvenance = [], emitFilterProvenance = true)
+  let flags = readU16LEAt(buf, 6)
+  doAssert (flags and FlagHasTraceFilterProvenance) != 0,
+    "flag must be set even for empty provenance"
+
+  let parsed = readMetaDat(buf)
+  doAssert parsed.isOk
+  let contents = parsed.get()
+  doAssert contents.hasFilterProvenance
+  doAssert contents.filterProvenance.len == 0
+  echo "PASS: test_meta_dat_roundtrip_empty_filter_provenance"
+
+
+proc test_meta_dat_no_filter_provenance_omits_flag() {.raises: [].} =
+  ## TF-M7: when no provenance is passed and emitFilterProvenance is
+  ## false (the default), the flag bit MUST stay off and the reader
+  ## MUST report `hasFilterProvenance = false`.
+  let meta = TraceMetadata(program: "prog", args: @[], workdir: "/w")
+  let paths: seq[string] = @[]
+  let buf = writeMetaDatToBuffer(meta, paths)
+  let flags = readU16LEAt(buf, 6)
+  doAssert (flags and FlagHasTraceFilterProvenance) == 0,
+    "flag must be off when caller did not record provenance"
+
+  let parsed = readMetaDat(buf)
+  doAssert parsed.isOk
+  doAssert not parsed.get().hasFilterProvenance
+  doAssert parsed.get().filterProvenance.len == 0
+  echo "PASS: test_meta_dat_no_filter_provenance_omits_flag"
+
+
 proc test_meta_dat_read_bad_magic() {.raises: [].} =
   ## readMetaDat should reject data with wrong magic.
   let badData: array[8, byte] = [0x00'u8, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00]
@@ -555,6 +678,9 @@ test_meta_dat_with_mcr_fields()
 test_meta_dat_empty_fields()
 test_meta_dat_roundtrip()
 test_meta_dat_roundtrip_with_mcr()
+test_meta_dat_roundtrip_with_filter_provenance()
+test_meta_dat_roundtrip_empty_filter_provenance()
+test_meta_dat_no_filter_provenance_omits_flag()
 test_meta_dat_read_bad_magic()
 test_meta_dat_read_too_short()
 test_meta_dat_backward_compat()

@@ -219,11 +219,11 @@ proc buildFullDocument*(reader: var NewTraceReader,
 
   # ----- metadata -----
   var meta = newJObject()
-  # TF-M4d: route `metadata.program` through the same `normalizePath`
-  # walk that `paths[]` and `metadata.workdir` go through. Prior to this
-  # the field was passed through verbatim, leaving the absolute
-  # `/home/<user>/...` form in `--strip-paths` output even though every
-  # other path was workdir-relative.
+  # TF-M4d / TF-M5-Prep-2 (Blocker 3): route `metadata.program` through
+  # the same `normalizePath` walk that `paths[]` and `metadata.workdir`
+  # go through. Without this, `--strip-paths` output retained the
+  # absolute `/home/<user>/...` form for the `program` field alone,
+  # leaking the developer's filesystem layout into snapshots.
   meta["program"] = newJString(
     normalizePath(reader.meta.program, reader.meta.workdir, opts.stripPaths))
   var argsArr = newJArray()
@@ -234,6 +234,28 @@ proc buildFullDocument*(reader: var NewTraceReader,
     if opts.stripPaths and reader.meta.workdir.len > 0: "<workdir>"
     else: reader.meta.workdir)
   meta["recorder"] = newJString(reader.meta.recorderId)
+
+  # ----- trace_filter provenance (TF-M7, spec §7) -----
+  # Materialized as `metadata.trace_filter.filters[].{path,sha256}` per
+  # Trace-Filters.md § 7.  Emitted only when the meta.dat header had
+  # FlagHasTraceFilterProvenance set, so post-trace audit can
+  # distinguish "no provenance recorded" (key absent) from "provenance
+  # recorded but the chain happens to be empty" (key present, empty
+  # `filters` array).
+  if reader.meta.hasFilterProvenance:
+    var filtersArr = newJArray()
+    for entry in reader.meta.filterProvenance:
+      var entryObj = newJObject()
+      entryObj["path"] = newJString(entry.path)
+      var shaBytes = newSeq[byte](32)
+      for k in 0 ..< 32:
+        shaBytes[k] = entry.sha256[k]
+      entryObj["sha256"] = newJString(bytesToHexLower(shaBytes))
+      filtersArr.add(entryObj)
+    var traceFilterObj = newJObject()
+    traceFilterObj["filters"] = filtersArr
+    meta["trace_filter"] = traceFilterObj
+
   root["metadata"] = meta
 
   # ----- paths -----
