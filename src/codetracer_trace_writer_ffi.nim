@@ -1419,6 +1419,25 @@ proc ct_value_begin_sequence(h: ValueEncoderHandle, type_id: uint64, element_cou
     return 1.cint
   0.cint
 
+proc ct_value_begin_sequence_with_slice(
+    h: ValueEncoderHandle,
+    type_id: uint64,
+    element_count: cint,
+    is_slice: cint
+): cint {.exportc, cdecl, dynlib.} =
+  ## Like ct_value_begin_sequence but threads through the `is_slice` flag
+  ## that distinguishes slice/view sequences (Span<T>, Bytes, &[T]) from
+  ## owned sequences (Vec<T>, Array<T>). The legacy entry point above
+  ## remains for callers that always want the default (is_slice = false).
+  if h.isNil:
+    setError("NULL handle")
+    return 1.cint
+  let r = h[].beginSequence(type_id, int(element_count), is_slice != 0)
+  if r.isErr:
+    setError(r.error)
+    return 1.cint
+  0.cint
+
 proc ct_value_begin_tuple(h: ValueEncoderHandle, type_id: uint64, element_count: cint): cint {.exportc, cdecl, dynlib.} =
   if h.isNil:
     setError("NULL handle")
