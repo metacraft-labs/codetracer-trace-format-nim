@@ -73,7 +73,7 @@
     },
     {
       "kind": "call_entry",
-      "call_key": 1,
+      "call_key": 0,
       "function_id": 0,
       "function": "main",
       "entry_step": 1,
@@ -82,7 +82,7 @@
       "parent_call_key": -1,
       "args": [],
       "children": [
-        0
+        1
       ]
     },
     {
@@ -92,6 +92,9 @@
       "line": 2,
       "path": "<workdir>/main.py",
       "step_kind": "sekDeltaStep",
+      "function_id": 0,
+      "function": "main",
+      "depth": 0,
       "vars": [
         {
           "varname_id": 1,
@@ -113,6 +116,9 @@
       "line": 3,
       "path": "<workdir>/main.py",
       "step_kind": "sekDeltaStep",
+      "function_id": 0,
+      "function": "main",
+      "depth": 0,
       "vars": [
         {
           "varname_id": 2,
@@ -146,6 +152,9 @@
       "line": 4,
       "path": "<workdir>/main.py",
       "step_kind": "sekDeltaStep",
+      "function_id": 0,
+      "function": "main",
+      "depth": 0,
       "vars": [
         {
           "varname_id": 4,
@@ -194,6 +203,9 @@
       "line": 5,
       "path": "<workdir>/main.py",
       "step_kind": "sekDeltaStep",
+      "function_id": 0,
+      "function": "main",
+      "depth": 0,
       "vars": [
         {
           "varname_id": 6,
@@ -226,6 +238,9 @@
       "line": 6,
       "path": "<workdir>/main.py",
       "step_kind": "sekDeltaStep",
+      "function_id": 0,
+      "function": "main",
+      "depth": 0,
       "vars": []
     },
     {
@@ -239,13 +254,13 @@
     },
     {
       "kind": "call_entry",
-      "call_key": 0,
+      "call_key": 1,
       "function_id": 1,
       "function": "compute",
       "entry_step": 6,
       "exit_step": 8,
       "depth": 1,
-      "parent_call_key": -1,
+      "parent_call_key": 0,
       "args": [
         {
           "varname_id": 9,
@@ -352,7 +367,7 @@
     },
     {
       "kind": "call_exit",
-      "call_key": 0,
+      "call_key": 1,
       "function_id": 1,
       "function": "compute",
       "exit_step": 8,
@@ -370,14 +385,11 @@
       "line": 7,
       "path": "<workdir>/main.py",
       "step_kind": "sekAbsoluteStep",
-      "function_id": 0,
-      "function": "main",
-      "depth": 0,
       "vars": []
     },
     {
       "kind": "call_exit",
-      "call_key": 1,
+      "call_key": 0,
       "function_id": 0,
       "function": "main",
       "exit_step": 9,

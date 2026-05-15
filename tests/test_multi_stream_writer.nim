@@ -236,39 +236,44 @@ proc test_calls_and_returns() {.raises: [].} =
   doAssert cc.isOk and cc.get() == 3, "callCount: " &
     (if cc.isOk: $cc.get() else: cc.error)
 
-  # Call 0 is bar (written first on return)
+  # CTFS-M-CallKeyOrder: call_keys are assigned at entry time, so the
+  # outermost call (main) gets call_key 0, foo gets 1, bar gets 2.
+
+  # Call 0 is main (entered first)
   let call0 = reader.call(0)
   doAssert call0.isOk, "call 0 failed: " & call0.error
   let c0r = call0.get()
-  doAssert c0r.functionId == 2, "call0 functionId: " & $c0r.functionId
-  doAssert c0r.depth == 2, "call0 depth: " & $c0r.depth
-  doAssert c0r.args.len == 2, "call0 args count"
-  doAssert c0r.args[0] == "10".toBytes, "call0 arg0"
-  doAssert c0r.args[1] == "20".toBytes, "call0 arg1"
-  doAssert c0r.returnValue == "30".toBytes, "call0 returnValue"
+  doAssert c0r.functionId == 0, "call0 functionId: " & $c0r.functionId
+  doAssert c0r.depth == 0, "call0 depth: " & $c0r.depth
+  doAssert c0r.parentCallKey == -1, "call0 parentCallKey"
+  doAssert c0r.returnValue == @[call_stream.VoidReturnMarker],
+    "call0 returnValue should be void"
+  doAssert c0r.children.len == 1, "call0 should have 1 child"
+  doAssert c0r.children[0] == 1, "call0 child should be call 1 (foo)"
 
-  # Call 1 is foo (returned after bar)
+  # Call 1 is foo (entered after main)
   let call1 = reader.call(1)
   doAssert call1.isOk, "call 1 failed: " & call1.error
   let c1r = call1.get()
   doAssert c1r.functionId == 1, "call1 functionId: " & $c1r.functionId
   doAssert c1r.depth == 1, "call1 depth: " & $c1r.depth
+  doAssert c1r.parentCallKey == 0, "call1 parentCallKey"
   doAssert c1r.args.len == 1, "call1 args count"
   doAssert c1r.returnValue == "99".toBytes, "call1 returnValue"
   doAssert c1r.children.len == 1, "call1 should have 1 child"
-  doAssert c1r.children[0] == 0, "call1 child should be call 0 (bar)"
+  doAssert c1r.children[0] == 2, "call1 child should be call 2 (bar)"
 
-  # Call 2 is main (returned last)
+  # Call 2 is bar (entered innermost)
   let call2 = reader.call(2)
   doAssert call2.isOk, "call 2 failed: " & call2.error
   let c2r = call2.get()
-  doAssert c2r.functionId == 0, "call2 functionId: " & $c2r.functionId
-  doAssert c2r.depth == 0, "call2 depth: " & $c2r.depth
-  doAssert c2r.parentCallKey == -1, "call2 parentCallKey"
-  doAssert c2r.returnValue == @[call_stream.VoidReturnMarker],
-    "call2 returnValue should be void"
-  doAssert c2r.children.len == 1, "call2 should have 1 child"
-  doAssert c2r.children[0] == 1, "call2 child should be call 1 (foo)"
+  doAssert c2r.functionId == 2, "call2 functionId: " & $c2r.functionId
+  doAssert c2r.depth == 2, "call2 depth: " & $c2r.depth
+  doAssert c2r.parentCallKey == 1, "call2 parentCallKey"
+  doAssert c2r.args.len == 2, "call2 args count"
+  doAssert c2r.args[0] == "10".toBytes, "call2 arg0"
+  doAssert c2r.args[1] == "20".toBytes, "call2 arg1"
+  doAssert c2r.returnValue == "30".toBytes, "call2 returnValue"
 
   echo "PASS: test_calls_and_returns"
 

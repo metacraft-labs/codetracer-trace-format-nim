@@ -40,6 +40,12 @@ type
     entryStep: uint64
     depth: uint32
     parentCallKey: int64
+    callKey: uint64
+      ## call_key allocated at entry time. CTFS-M-CallKeyOrder: keys are
+      ## assigned monotonically at `registerCall` so that parent
+      ## call_key < child call_key and entry order matches key order.
+      ## The matching CallRecord is buffered in `completedCalls` at this
+      ## index and flushed to the call stream in key order (see close()).
     args: seq[CallArg]
     children: seq[uint64]
 
@@ -63,10 +69,24 @@ type
     # State tracking
     stepCount*: uint64
     callCount: uint64
+      ## Total number of CallRecords already written to the call stream.
+      ## With CTFS-M-CallKeyOrder this advances as buffered records flush
+      ## in entry order (not as registerReturn fires).
+    nextCallKey: uint64
+      ## Monotonic call_key generator. Incremented at each `registerCall`
+      ## so call_keys reflect entry order across nested calls.
     lastGlobalLineIndex: uint64
     lastPathId: uint64
     lastLine: uint64
     callStack: seq[PendingCall]
+    completedCalls: seq[(uint64, call_stream.CallRecord)]
+      ## CTFS-M-CallKeyOrder: finished CallRecords waiting to be written
+      ## to the call stream. Filled in registerReturn (in exit order) and
+      ## drained in call_key (entry) order. The stream is the CTFS
+      ## VariableRecordTable "calls"; record position == call_key, so we
+      ## must write in key order. When `callStack` returns to empty, we
+      ## know every key issued so far has a completed record and flush
+      ## all of them at once; close() also drains any leftovers.
     currentDepth: uint32
     closed: bool
     filePath: string
@@ -272,10 +292,45 @@ proc registerStep*(w: var MultiStreamTraceWriter, pathId: uint64,
 # Call / Return
 # ---------------------------------------------------------------------------
 
+proc flushCompletedCalls(w: var MultiStreamTraceWriter): Result[void, string] =
+  ## CTFS-M-CallKeyOrder: drain `completedCalls` in call_key order to the
+  ## call stream. Called when `callStack` empties (every key issued so far
+  ## has a finished record) and from close() for any leftovers.
+  ##
+  ## Records were buffered in registerReturn in exit order; their call_keys
+  ## were assigned at entry time so a child key > parent key. Sorting by
+  ## call_key and appending in that order makes the on-disk record index
+  ## equal to the entry-order call_key.
+  if w.completedCalls.len == 0:
+    return ok()
+  # Insertion-sort by callKey: typical fan-out is small (1..few siblings
+  # per parent), so this is effectively linear and avoids pulling in a
+  # generic sort over a tuple type.
+  for i in 1 ..< w.completedCalls.len:
+    var j = i
+    while j > 0 and w.completedCalls[j - 1][0] > w.completedCalls[j][0]:
+      let tmp = w.completedCalls[j - 1]
+      w.completedCalls[j - 1] = w.completedCalls[j]
+      w.completedCalls[j] = tmp
+      dec j
+  for entry in w.completedCalls:
+    let res = w.ctfs.writeCall(w.callWriter, entry[1])
+    if res.isErr:
+      return err("failed to write call record: " & res.error)
+    w.callCount += 1
+  w.completedCalls.setLen(0)
+  ok()
+
 proc registerCall*(w: var MultiStreamTraceWriter, functionId: uint64,
     args: openArray[CallArg]): Result[void, string] =
-  ## Register a function call entry. Pushes onto the internal call stack.
-  ## The call record is written when registerReturn is called.
+  ## Register a function call entry. Pushes onto the internal call stack
+  ## and allocates the call_key immediately so entry order matches key
+  ## order (CTFS-M-CallKeyOrder).
+  ##
+  ## The matching CallRecord is materialized in `registerReturn` and
+  ## buffered in `completedCalls`; it reaches the call stream once the
+  ## enclosing root call returns (or at close() for partial traces),
+  ## with all entries written in call_key order.
   ##
   ## ``args`` carries one (varname_id, CBOR value) entry per parameter so the
   ## frontend can render the call's argument names alongside their values.
@@ -284,9 +339,18 @@ proc registerCall*(w: var MultiStreamTraceWriter, functionId: uint64,
 
   let parentKey =
     if w.callStack.len > 0:
-      int64(w.callCount) - 1  # approximate: use the parent's eventual callKey
+      int64(w.callStack[^1].callKey)
     else:
       -1'i64
+
+  let callKey = w.nextCallKey
+  w.nextCallKey += 1
+
+  # If there's a parent on the stack, register this as a child now —
+  # the parent's CallRecord won't be assembled until its own return
+  # fires, by which time all child keys are already in its `children`.
+  if w.callStack.len > 0:
+    w.callStack[^1].children.add(callKey)
 
   var argsSeq = newSeq[CallArg](args.len)
   for i in 0 ..< args.len:
@@ -297,6 +361,7 @@ proc registerCall*(w: var MultiStreamTraceWriter, functionId: uint64,
     entryStep: w.stepCount,
     depth: w.currentDepth,
     parentCallKey: parentKey,
+    callKey: callKey,
     args: argsSeq,
     children: @[],
   ))
@@ -305,7 +370,10 @@ proc registerCall*(w: var MultiStreamTraceWriter, functionId: uint64,
 
 proc registerReturn*(w: var MultiStreamTraceWriter,
     returnValue: seq[byte] = @[]): Result[void, string] =
-  ## Register a function return. Pops the call stack and writes the call record.
+  ## Register a function return. Pops the call stack and buffers the
+  ## CallRecord under its entry-allocated call_key. The buffer flushes
+  ## (in call_key order) once `callStack` becomes empty, ensuring the
+  ## record position in the call stream equals its entry-order call_key.
   if w.closed:
     return err("writer is closed")
   if w.callStack.len == 0:
@@ -316,12 +384,6 @@ proc registerReturn*(w: var MultiStreamTraceWriter,
   w.currentDepth -= 1
 
   let retVal = if returnValue.len == 0: @[VoidReturnMarker] else: returnValue
-
-  let callKey = w.callCount
-
-  # If there's a parent on the stack, register this as a child
-  if w.callStack.len > 0:
-    w.callStack[^1].children.add(callKey)
 
   let rec = call_stream.CallRecord(
     functionId: pending.functionId,
@@ -335,11 +397,15 @@ proc registerReturn*(w: var MultiStreamTraceWriter,
     children: pending.children,
   )
 
-  let res = w.ctfs.writeCall(w.callWriter, rec)
-  if res.isErr:
-    return err("failed to write call record: " & res.error)
+  w.completedCalls.add((pending.callKey, rec))
 
-  w.callCount += 1
+  # When the root call returns, every key issued so far has a buffered
+  # record. Flush them now in key order so memory stays bounded for
+  # long traces composed of many top-level calls.
+  if w.callStack.len == 0:
+    let flushRes = w.flushCompletedCalls()
+    if flushRes.isErr:
+      return err(flushRes.error)
   ok()
 
 # ---------------------------------------------------------------------------
@@ -517,16 +583,17 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   # writing meta. We mirror registerReturn's semantics: exitStep is the
   # last produced step, returnValue is VoidReturnMarker, and child links
   # are propagated up the stack so callKey ordering stays valid.
+  #
+  # CTFS-M-CallKeyOrder: call_keys are already allocated (at entry time)
+  # and child links were registered against the parent when each child
+  # was entered, so here we just synthesize the missing CallRecords for
+  # the still-open frames and buffer them. The final flushCompletedCalls
+  # below writes everything in call_key (entry) order.
   while w.callStack.len > 0:
     let pending = w.callStack[^1]
     w.callStack.setLen(w.callStack.len - 1)
     if w.currentDepth > 0:
       w.currentDepth -= 1
-
-    let callKey = w.callCount
-
-    if w.callStack.len > 0:
-      w.callStack[^1].children.add(callKey)
 
     let rec = call_stream.CallRecord(
       functionId: pending.functionId,
@@ -540,11 +607,15 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
       children: pending.children,
     )
 
-    let res = w.ctfs.writeCall(w.callWriter, rec)
-    if res.isErr:
-      return err("failed to flush unclosed call record: " & res.error)
+    w.completedCalls.add((pending.callKey, rec))
 
-    w.callCount += 1
+  # Flush any buffered call records in call_key order. This covers both
+  # the records synthesized above for unclosed frames and any leftover
+  # buffered records (e.g. if the outermost call never returned, the
+  # incremental flush at the empty-stack point never fired).
+  let drainRes = w.flushCompletedCalls()
+  if drainRes.isErr:
+    return err("failed to flush unclosed call records: " & drainRes.error)
 
   # Flush exec stream
   let flushRes = w.ctfs.flush(w.execWriter)
