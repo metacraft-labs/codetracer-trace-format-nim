@@ -196,6 +196,18 @@ proc valueRecordToJson*(v: ValueRecord): JsonNode =
   of vrkValueRef:
     result["kind"] = newJString("ValueRef")
     result["ref_id"] = newJInt(int64(v.refId))
+  of vrkSet:
+    result["kind"] = newJString("Set")
+    var members = newJArray()
+    for e in v.setMembers:
+      members.add(valueRecordToJson(e))
+    result["members"] = members
+    result["type_id"] = newJInt(int64(uint64(v.setTypeId)))
+  of vrkEnum:
+    result["kind"] = newJString("Enum")
+    result["name"] = newJString(v.enumName)
+    result["ordinal"] = newJInt(v.enumOrdinal)
+    result["type_id"] = newJInt(int64(uint64(v.enumTypeId)))
 
 proc decodeValueBytesToJson*(data: seq[byte]): JsonNode =
   ## Decode CBOR-encoded value bytes into a structured JSON node.

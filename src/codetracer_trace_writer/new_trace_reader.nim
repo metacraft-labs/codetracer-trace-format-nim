@@ -303,83 +303,77 @@ proc callCount*(r: var NewTraceReader): Result[uint64, string] =
   ok(r.callReader.count())
 
 proc callForStep*(r: var NewTraceReader, stepId: uint64): Result[CallRecord, string] =
-  ## Find the innermost enclosing call record for the given step using
-  ## proportional (interpolation) search on call records sorted by entryStep.
-  ## Call records store [entryStep, exitStep] ranges. The search exploits
-  ## the approximate uniform distribution of step IDs across calls,
-  ## giving O(log log C) convergence -- typically 2-3 iterations.
+  ## Find the innermost enclosing call record for the given step.
+  ##
+  ## Call records are sorted by `entryStep` ascending (= entry order, which
+  ## also matches call_key allocation order after CTFS-M-CallKeyOrder).
+  ## Because calls NEST, child entries follow their parent's entry but a
+  ## parent's `exitStep` is far larger than any of its children's: child
+  ## ranges `[entryStep, exitStep]` are strictly contained in the parent's.
+  ##
+  ## Strategy (correct for arbitrary nesting):
+  ##   1. Binary-search for the largest index `k` with
+  ##      `calls[k].entryStep <= stepId`. All calls at index > k were
+  ##      entered after `stepId` and cannot contain it.
+  ##   2. Walk back from `k` and return the FIRST call whose
+  ##      `exitStep >= stepId`. That call is, by construction, the
+  ##      most-recently-entered frame still open at `stepId`, hence the
+  ##      deepest enclosing call. Earlier indices in the walk are either
+  ##      siblings that already returned (their parent eventually has
+  ##      `exitStep >= stepId`) or the matching parent itself.
+  ##
+  ## CTFS-M-FunctionAttrTemplate: the previous implementation interleaved
+  ## an interpolation search with an early-exit on `stepId > hi.exitStep`
+  ## and used the lo/hi-contains shortcut to record matches. Both pieces
+  ## broke for steps that sit in a caller's body AFTER a nested call
+  ## returned: the interpolation could jump past the parent (whose
+  ## `exitStep` extends far beyond a sibling child's `exitStep`), and the
+  ## hi-side early-exit truncated the search even when `lo` itself still
+  ## covered `stepId`. The net effect was that every post-return step of
+  ## any caller -- and every step in code emitted via template inlining
+  ## that physically sits after the inlined call returns -- was reported
+  ## as "not found in any call", emitting a step with no `function`,
+  ## `function_id`, or `depth` attribution.
   ?r.ensureCallReader()
   let totalCalls = r.callReader.count()
   if totalCalls == 0:
     return err("no call records")
 
+  # Step 1: binary search for largest index k with entryStep <= stepId.
+  # If no such index exists (stepId precedes the first call), bail out.
   var lo: uint64 = 0
   var hi: uint64 = totalCalls - 1
-
-  # Best match: deepest (most nested) call containing stepId
-  var bestCall: CallRecord
-  var bestFound = false
-
-  for iteration in 0 ..< 20:  # safety bound
-    if lo > hi:
-      break
-
-    # Read boundary calls
-    let loCall = ?r.callReader.readCall(lo)
-    let hiCall = ?r.callReader.readCall(hi)
-
-    if stepId < loCall.entryStep:
-      break
-    if stepId > hiCall.exitStep:
-      break
-
-    # Check if lo contains our step
-    if stepId >= loCall.entryStep and stepId <= loCall.exitStep:
-      if not bestFound or loCall.depth > bestCall.depth:
-        bestCall = loCall
-        bestFound = true
-      # Narrow from the left to find deeper calls
-      lo = lo + 1
-      if lo > hi: break
-      continue
-
-    # Check if hi contains our step
-    if lo != hi and stepId >= hiCall.entryStep and stepId <= hiCall.exitStep:
-      if not bestFound or hiCall.depth > bestCall.depth:
-        bestCall = hiCall
-        bestFound = true
-      hi = hi - 1
-      if lo > hi: break
-      continue
-
-    if lo == hi:
-      break
-
-    # Interpolate position based on entryStep distribution
-    let rangeSteps = hiCall.entryStep - loCall.entryStep
-    if rangeSteps == 0:
-      break
-    let offset = stepId - loCall.entryStep
-    let estimate = lo + (hi - lo) * offset div rangeSteps
-    let mid = max(lo + 1, min(estimate, hi - 1))
-
+  var k: int64 = -1
+  while lo <= hi:
+    let mid = lo + (hi - lo) div 2
     let midCall = ?r.callReader.readCall(mid)
-    if stepId >= midCall.entryStep and stepId <= midCall.exitStep:
-      if not bestFound or midCall.depth > bestCall.depth:
-        bestCall = midCall
-        bestFound = true
-      # Continue searching for deeper calls
+    if midCall.entryStep <= stepId:
+      k = int64(mid)
+      if mid == high(uint64):  # defensive, can't happen with reasonable trace
+        break
       lo = mid + 1
-      continue
-    elif stepId < midCall.entryStep:
-      hi = mid - 1
     else:
-      lo = mid + 1
+      if mid == 0:
+        break
+      hi = mid - 1
+  if k < 0:
+    return err("step " & $stepId & " not found in any call")
 
-  if bestFound:
-    ok(bestCall)
-  else:
-    err("step " & $stepId & " not found in any call")
+  # Step 2: walk backwards looking for the first enclosing call. The
+  # walk traverses sibling subtrees that already returned; their parent
+  # (or grandparent, etc.) is the answer. Worst case is O(N) but the
+  # expected cost on well-formed traces is O(call-depth-at-stepId)
+  # because each backward hop skips at most one returned subtree before
+  # landing on the enclosing frame.
+  var i = uint64(k)
+  while true:
+    let c = ?r.callReader.readCall(i)
+    if c.exitStep >= stepId:
+      return ok(c)
+    if i == 0:
+      break
+    i -= 1
+  err("step " & $stepId & " not found in any call")
 
 iterator callRange*(r: var NewTraceReader, start, count: uint64): CallRecord =
   ## Yields call records in [start, start+count).
