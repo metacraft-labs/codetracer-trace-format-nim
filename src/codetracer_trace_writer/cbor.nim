@@ -101,9 +101,15 @@ const
   # CBOR text(6) "fields" = 0x66 + "fields"
   CborKeyFields = [0x66'u8, 0x66, 0x69, 0x65, 0x6C, 0x64, 0x73]
   # CBOR text(4) "name" = 0x64 + "name"
-  CborKeyName = [0x64'u8, 0x6E, 0x61, 0x6D, 0x65]
+  CborKeyName* = [0x64'u8, 0x6E, 0x61, 0x6D, 0x65]
   # CBOR text(20) "dereference_type_id" = 0x73 + ... (length 19)
   CborKeyDereferenceTypeId = [0x73'u8, 0x64, 0x65, 0x72, 0x65, 0x66, 0x65, 0x72, 0x65, 0x6E, 0x63, 0x65, 0x5F, 0x74, 0x79, 0x70, 0x65, 0x5F, 0x69, 0x64]
+  # CBOR text(7) "members" = 0x67 + "members" — vrkSet
+  CborKeyMembers* = [0x67'u8, 0x6D, 0x65, 0x6D, 0x62, 0x65, 0x72, 0x73]
+  # CBOR text(7) "ordinal" = 0x67 + "ordinal" — vrkEnum
+  CborKeyOrdinal* = [0x67'u8, 0x6F, 0x72, 0x64, 0x69, 0x6E, 0x61, 0x6C]
+  # CBOR text(11) "field_names" = 0x6B + "field_names" — vrkStruct schema
+  CborKeyFieldNames* = [0x6B'u8, 0x66, 0x69, 0x65, 0x6C, 0x64, 0x5F, 0x6E, 0x61, 0x6D, 0x65, 0x73]
 
 proc writePrecomputed*(enc: var CborEncoder, data: openArray[byte]) {.inline.} =
   let pos = enc.buf.len
@@ -508,13 +514,22 @@ proc encodeCborValueRecordImpl(enc: var CborEncoder, v: ValueRecord) =
     enc.writeUint(uint64(v.tupleTypeId))
 
   of vrkStruct:
-    enc.writeMapHeader(3)
+    # CTFS-M-TypeSchema: when `fieldNames` is populated, append a
+    # `field_names` array after `field_values`. Empty `fieldNames`
+    # preserves the prior 3-key wire layout for byte-stability.
+    let hasNames = v.fieldNames.len > 0
+    enc.writeMapHeader(if hasNames: 4 else: 3)
     enc.writePrecomputed(CborKeyKind)
     enc.writeTextString("Struct")
     enc.writePrecomputed(CborKeyFieldValues)
     enc.writeArrayHeader(uint64(v.fieldValues.len))
     for e in v.fieldValues:
       enc.encodeCborValueRecord(e)
+    if hasNames:
+      enc.writePrecomputed(CborKeyFieldNames)
+      enc.writeArrayHeader(uint64(v.fieldNames.len))
+      for n in v.fieldNames:
+        enc.writeTextString(n)
     enc.writePrecomputed(CborKeyTypeId)
     enc.writeUint(uint64(v.structTypeId))
 
@@ -612,6 +627,34 @@ proc encodeCborValueRecordImpl(enc: var CborEncoder, v: ValueRecord) =
     enc.writePrecomputed(CborKeyTypeId)
     enc.writeUint(uint64(v.charTypeId))
 
+  of vrkSet:
+    # CTFS-M-TypeSchema: dedicated set wire shape — `{kind:"Set",
+    # members:[...], type_id:N}`. Distinct from vrkSequence so the
+    # materializer can render Set without TypeRecord lookup.
+    enc.writeMapHeader(3)
+    enc.writePrecomputed(CborKeyKind)
+    enc.writeTextString("Set")
+    enc.writePrecomputed(CborKeyMembers)
+    enc.writeArrayHeader(uint64(v.setMembers.len))
+    for e in v.setMembers:
+      enc.encodeCborValueRecord(e)
+    enc.writePrecomputed(CborKeyTypeId)
+    enc.writeUint(uint64(v.setTypeId))
+
+  of vrkEnum:
+    # CTFS-M-TypeSchema: dedicated enum wire shape — `{kind:"Enum",
+    # name:"cBlue", ordinal:2, type_id:N}`. Replaces the vrkRaw fallback
+    # used before the dedicated variant existed.
+    enc.writeMapHeader(4)
+    enc.writePrecomputed(CborKeyKind)
+    enc.writeTextString("Enum")
+    enc.writePrecomputed(CborKeyName)
+    enc.writeTextString(v.enumName)
+    enc.writePrecomputed(CborKeyOrdinal)
+    enc.writeInt(v.enumOrdinal)
+    enc.writePrecomputed(CborKeyTypeId)
+    enc.writeUint(uint64(v.enumTypeId))
+
   of vrkValueRef:
     enc.writeTag(CborTagValueRef)
     enc.writeUint(uint64(v.refId))
@@ -691,9 +734,22 @@ proc decodeCborValueRecordImpl(dec: var CborDecoder): Result[ValueRecord, string
     var elems = newSeq[ValueRecord](int(count))
     for i in 0 ..< int(count):
       elems[i] = ?dec.decodeCborValueRecord()
-    discard ?dec.readTextString()  # "type_id"
+    # Next key is either "field_names" (CTFS-M-TypeSchema, optional) or
+    # "type_id". Peek the key string to disambiguate.
+    let nextKey = ?dec.readTextString()
+    var fieldNames: seq[string]
+    var typeIdKey = nextKey
+    if nextKey == "field_names":
+      let fnCount = ?dec.readArrayHeader()
+      fieldNames = newSeq[string](int(fnCount))
+      for i in 0 ..< int(fnCount):
+        fieldNames[i] = ?dec.readTextString()
+      typeIdKey = ?dec.readTextString()
+    if typeIdKey != "type_id":
+      return err("cbor: expected 'type_id' in Struct, got '" & typeIdKey & "'")
     let tid = ?dec.readUint()
-    ok(ValueRecord(kind: vrkStruct, fieldValues: elems, structTypeId: TypeId(tid)))
+    ok(ValueRecord(kind: vrkStruct, fieldValues: elems,
+                   fieldNames: fieldNames, structTypeId: TypeId(tid)))
 
   of "Variant":
     discard ?dec.readTextString()  # "discriminator"
@@ -755,6 +811,26 @@ proc decodeCborValueRecordImpl(dec: var CborDecoder): Result[ValueRecord, string
     discard ?dec.readTextString()  # "type_id"
     let tid = ?dec.readUint()
     ok(ValueRecord(kind: vrkChar, charVal: c, charTypeId: TypeId(tid)))
+
+  of "Set":
+    discard ?dec.readTextString()  # "members"
+    let count = ?dec.readArrayHeader()
+    var elems = newSeq[ValueRecord](int(count))
+    for i in 0 ..< int(count):
+      elems[i] = ?dec.decodeCborValueRecord()
+    discard ?dec.readTextString()  # "type_id"
+    let tid = ?dec.readUint()
+    ok(ValueRecord(kind: vrkSet, setMembers: elems, setTypeId: TypeId(tid)))
+
+  of "Enum":
+    discard ?dec.readTextString()  # "name"
+    let name = ?dec.readTextString()
+    discard ?dec.readTextString()  # "ordinal"
+    let ord = ?dec.readInt()
+    discard ?dec.readTextString()  # "type_id"
+    let tid = ?dec.readUint()
+    ok(ValueRecord(kind: vrkEnum, enumName: name, enumOrdinal: ord,
+                   enumTypeId: TypeId(tid)))
 
   else:
     err("cbor: unknown ValueRecord kind: '" & kindStr & "'")

@@ -63,6 +63,9 @@ const
   CborKeyFields2 = [0x66'u8, 0x66, 0x69, 0x65, 0x6C, 0x64, 0x73]
   CborKeyName2 = [0x64'u8, 0x6E, 0x61, 0x6D, 0x65]
   CborKeyDereferenceTypeId2 = [0x73'u8, 0x64, 0x65, 0x72, 0x65, 0x66, 0x65, 0x72, 0x65, 0x6E, 0x63, 0x65, 0x5F, 0x74, 0x79, 0x70, 0x65, 0x5F, 0x69, 0x64]
+  CborKeyMembers2 = [0x67'u8, 0x6D, 0x65, 0x6D, 0x62, 0x65, 0x72, 0x73]
+  CborKeyOrdinal2 = [0x67'u8, 0x6F, 0x72, 0x64, 0x69, 0x6E, 0x61, 0x6C]
+  CborKeyFieldNames2 = [0x6B'u8, 0x66, 0x69, 0x65, 0x6C, 0x64, 0x5F, 0x6E, 0x61, 0x6D, 0x65, 0x73]
 
 {.push checks: off, boundChecks: off.}
 
@@ -133,13 +136,19 @@ proc encodeCborValueRecordInto*(buf: var SafeBuffer, v: ValueRecord) =
     buf.writeCborUint(uint64(v.tupleTypeId))
 
   of vrkStruct:
-    buf.writeCborMapHeader(3)
+    let hasNames = v.fieldNames.len > 0
+    buf.writeCborMapHeader(if hasNames: 4 else: 3)
     buf.writeOpenArray(CborKeyKind2)
     buf.writeCborTextString("Struct")
     buf.writeOpenArray(CborKeyFieldValues2)
     buf.writeCborArrayHeader(uint64(v.fieldValues.len))
     for e in v.fieldValues:
       encodeCborValueRecordInto(buf, e)
+    if hasNames:
+      buf.writeOpenArray(CborKeyFieldNames2)
+      buf.writeCborArrayHeader(uint64(v.fieldNames.len))
+      for n in v.fieldNames:
+        buf.writeCborTextString(n)
     buf.writeOpenArray(CborKeyTypeId2)
     buf.writeCborUint(uint64(v.structTypeId))
 
@@ -232,6 +241,31 @@ proc encodeCborValueRecordInto*(buf: var SafeBuffer, v: ValueRecord) =
     buf.writeCborTextString($v.charVal)
     buf.writeOpenArray(CborKeyTypeId2)
     buf.writeCborUint(uint64(v.charTypeId))
+
+  of vrkSet:
+    buf.writeCborMapHeader(3)
+    buf.writeOpenArray(CborKeyKind2)
+    buf.writeCborTextString("Set")
+    buf.writeOpenArray(CborKeyMembers2)
+    buf.writeCborArrayHeader(uint64(v.setMembers.len))
+    for e in v.setMembers:
+      encodeCborValueRecordInto(buf, e)
+    buf.writeOpenArray(CborKeyTypeId2)
+    buf.writeCborUint(uint64(v.setTypeId))
+
+  of vrkEnum:
+    buf.writeCborMapHeader(4)
+    buf.writeOpenArray(CborKeyKind2)
+    buf.writeCborTextString("Enum")
+    buf.writeOpenArray(CborKeyName2)
+    buf.writeCborTextString(v.enumName)
+    buf.writeOpenArray(CborKeyOrdinal2)
+    buf.writeCborInt(v.enumOrdinal)
+    buf.writeOpenArray(CborKeyTypeId2)
+    buf.writeCborUint(uint64(v.enumTypeId))
+
+  of vrkValueRef:
+    discard  # safe encoder doesn't currently support vrkValueRef
 
 proc encodeCborTypeSpecificInfoInto(buf: var SafeBuffer, si: TypeSpecificInfo) {.inline.} =
   case si.kind

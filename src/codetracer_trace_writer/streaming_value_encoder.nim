@@ -163,6 +163,20 @@ proc writeChar*(sve: var StreamingValueEncoder, c: char, typeId: uint64): Result
   sve.enc.writeUint(typeId)
   ok()
 
+proc writeEnum*(sve: var StreamingValueEncoder, name: string, ordinal: int64,
+                typeId: uint64): Result[void, string] =
+  ## CTFS-M-TypeSchema: emit an Enum leaf — `{kind:"Enum", name:..., ordinal:..., type_id:...}`.
+  sve.enc.writeMapHeader(4)
+  sve.enc.writePrecomputed(CborKeyKind)
+  sve.enc.writeTextString("Enum")
+  sve.enc.writePrecomputed(CborKeyName)
+  sve.enc.writeTextString(name)
+  sve.enc.writePrecomputed(CborKeyOrdinal)
+  sve.enc.writeInt(ordinal)
+  sve.enc.writePrecomputed(CborKeyTypeId)
+  sve.enc.writeUint(typeId)
+  ok()
+
 proc writeBigInt*(sve: var StreamingValueEncoder, bytes: openArray[byte], negative: bool,
                   typeId: uint64): Result[void, string] =
   ## map(4) { "kind":"BigInt", "b": byteString, "negative": bool, "type_id": typeId }

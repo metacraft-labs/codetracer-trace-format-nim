@@ -136,6 +136,8 @@ type
     vrkBigInt
     vrkChar
     vrkValueRef  ## Reference to a previously-encoded compound value
+    vrkSet       ## CTFS-M-TypeSchema: dedicated set rendering
+    vrkEnum      ## CTFS-M-TypeSchema: dedicated enum rendering (name + ordinal)
 
   ValueRecord* = object
     case kind*: ValueRecordKind
@@ -160,6 +162,11 @@ type
       tupleTypeId*: TypeId
     of vrkStruct:
       fieldValues*: seq[ValueRecord]
+      fieldNames*: seq[string]
+        ## CTFS-M-TypeSchema: parallel-indexed names for `fieldValues`.
+        ## Either empty (legacy/anonymous struct) or the same length as
+        ## `fieldValues`. Materializers pair (name, value) when present
+        ## and fall back to positional rendering when absent.
       structTypeId*: TypeId
     of vrkVariant:
       discriminator*: string
@@ -189,6 +196,20 @@ type
       charTypeId*: TypeId
     of vrkValueRef:
       refId*: uint32
+    of vrkSet:
+      ## CTFS-M-TypeSchema: a Nim `set[T]` rendered as its concrete
+      ## members. Distinct from `vrkSequence` so the materializer can
+      ## render `{kind: Set, members: [...]}` directly without needing
+      ## the TypeRecord to disambiguate.
+      setMembers*: seq[ValueRecord]
+      setTypeId*: TypeId
+    of vrkEnum:
+      ## CTFS-M-TypeSchema: a Nim enum value carrying both the
+      ## symbolic name and the integer ordinal. Replaces the prior
+      ## `vrkRaw` workaround which only carried the symbol name.
+      enumName*: string
+      enumOrdinal*: int64
+      enumTypeId*: TypeId
 
 const NoneValue*: ValueRecord = ValueRecord(kind: vrkNone, noneTypeId: NoneTypeId)
 
@@ -488,7 +509,7 @@ proc `==`*(a, b: ValueRecord): bool =
   of vrkString: a.text == b.text and a.strTypeId == b.strTypeId
   of vrkSequence: eqSeqValueRecord(a.seqElements, b.seqElements) and a.isSlice == b.isSlice and a.seqTypeId == b.seqTypeId
   of vrkTuple: eqSeqValueRecord(a.tupleElements, b.tupleElements) and a.tupleTypeId == b.tupleTypeId
-  of vrkStruct: eqSeqValueRecord(a.fieldValues, b.fieldValues) and a.structTypeId == b.structTypeId
+  of vrkStruct: eqSeqValueRecord(a.fieldValues, b.fieldValues) and a.fieldNames == b.fieldNames and a.structTypeId == b.structTypeId
   of vrkVariant: a.discriminator == b.discriminator and eqSeqValueRecord(a.contents, b.contents) and a.variantTypeId == b.variantTypeId
   of vrkReference: eqSeqValueRecord(a.dereferenced, b.dereferenced) and a.address == b.address and a.mutable == b.mutable and a.refTypeId == b.refTypeId
   of vrkRaw: a.rawStr == b.rawStr and a.rawTypeId == b.rawTypeId
@@ -498,6 +519,8 @@ proc `==`*(a, b: ValueRecord): bool =
   of vrkBigInt: a.bigIntBytes == b.bigIntBytes and a.negative == b.negative and a.bigIntTypeId == b.bigIntTypeId
   of vrkChar: a.charVal == b.charVal and a.charTypeId == b.charTypeId
   of vrkValueRef: a.refId == b.refId
+  of vrkSet: eqSeqValueRecord(a.setMembers, b.setMembers) and a.setTypeId == b.setTypeId
+  of vrkEnum: a.enumName == b.enumName and a.enumOrdinal == b.enumOrdinal and a.enumTypeId == b.enumTypeId
 
 proc `==`*(a, b: FieldTypeRecord): bool =
   a.name == b.name and a.typeId == b.typeId

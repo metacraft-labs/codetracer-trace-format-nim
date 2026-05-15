@@ -541,6 +541,37 @@ proc test_complex_value_records()  =
       value: ValueRecord(kind: vrkChar, charVal: 'Z', charTypeId: TypeId(11)))),
     "Value(Char)")
 
+  # CTFS-M-TypeSchema: Set value (members + type_id)
+  assertRoundtrip(TraceLowLevelEvent(kind: tleValue,
+    fullValue: FullValueRecord(variableId: VariableId(11),
+      value: ValueRecord(kind: vrkSet,
+        setMembers: @[
+          ValueRecord(kind: vrkInt, intVal: 1, intTypeId: TypeId(7)),
+          ValueRecord(kind: vrkInt, intVal: 3, intTypeId: TypeId(7)),
+          ValueRecord(kind: vrkInt, intVal: 5, intTypeId: TypeId(7)),
+        ],
+        setTypeId: TypeId(1)))),
+    "Value(Set)")
+
+  # CTFS-M-TypeSchema: Enum value (name + ordinal + type_id)
+  assertRoundtrip(TraceLowLevelEvent(kind: tleValue,
+    fullValue: FullValueRecord(variableId: VariableId(12),
+      value: ValueRecord(kind: vrkEnum,
+        enumName: "cBlue", enumOrdinal: 2, enumTypeId: TypeId(17)))),
+    "Value(Enum)")
+
+  # CTFS-M-TypeSchema: Struct value with `fieldNames` populated.
+  assertRoundtrip(TraceLowLevelEvent(kind: tleValue,
+    fullValue: FullValueRecord(variableId: VariableId(13),
+      value: ValueRecord(kind: vrkStruct,
+        fieldValues: @[
+          ValueRecord(kind: vrkInt, intVal: 1, intTypeId: TypeId(7)),
+          ValueRecord(kind: vrkInt, intVal: 2, intTypeId: TypeId(7)),
+        ],
+        fieldNames: @["x", "y"],
+        structTypeId: TypeId(6)))),
+    "Value(Struct with field_names)")
+
   echo "PASS: test_complex_value_records"
 
 # ---------------------------------------------------------------------------

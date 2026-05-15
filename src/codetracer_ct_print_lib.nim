@@ -107,10 +107,23 @@ proc valueRecordToJson*(v: ValueRecord): JsonNode =
     result["type_id"] = newJInt(int64(uint64(v.tupleTypeId)))
   of vrkStruct:
     result["kind"] = newJString("Struct")
+    # CTFS-M-TypeSchema: when the struct carries `fieldNames`, surface
+    # `fields` as `[[name, value], ...]` pairs in addition to keeping
+    # the positional `field_values` array. Consumers that already key
+    # off `field_values` keep working; new consumers can prefer
+    # `fields` for named rendering.
     var fields = newJArray()
     for e in v.fieldValues:
       fields.add(valueRecordToJson(e))
     result["field_values"] = fields
+    if v.fieldNames.len > 0 and v.fieldNames.len == v.fieldValues.len:
+      var pairs = newJArray()
+      for i in 0 ..< v.fieldValues.len:
+        var pair = newJArray()
+        pair.add(newJString(v.fieldNames[i]))
+        pair.add(valueRecordToJson(v.fieldValues[i]))
+        pairs.add(pair)
+      result["fields"] = pairs
     result["type_id"] = newJInt(int64(uint64(v.structTypeId)))
   of vrkVariant:
     result["kind"] = newJString("Variant")
@@ -156,6 +169,18 @@ proc valueRecordToJson*(v: ValueRecord): JsonNode =
   of vrkValueRef:
     result["kind"] = newJString("ValueRef")
     result["ref_id"] = newJInt(int64(v.refId))
+  of vrkSet:
+    result["kind"] = newJString("Set")
+    var members = newJArray()
+    for e in v.setMembers:
+      members.add(valueRecordToJson(e))
+    result["members"] = members
+    result["type_id"] = newJInt(int64(uint64(v.setTypeId)))
+  of vrkEnum:
+    result["kind"] = newJString("Enum")
+    result["name"] = newJString(v.enumName)
+    result["ordinal"] = newJInt(v.enumOrdinal)
+    result["type_id"] = newJInt(int64(uint64(v.enumTypeId)))
 
 proc decodeValueBytesToJson*(data: seq[byte]): JsonNode =
   ## Decode CBOR-encoded value bytes into structured JSON. On decode
