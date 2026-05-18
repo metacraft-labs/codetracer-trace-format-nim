@@ -2,13 +2,15 @@
 
 ## Binary meta.dat writer for CTFS trace metadata.
 ##
-## Layout (version 2):
+## Layout (version 3):
 ##   [4] magic "CTMD"
 ##   [2] version u16 LE
 ##   [2] flags u16 LE (bit 0: has_mcr_fields,
 ##                    bit 1: has_replay_launch_fields,
 ##                    bit 2: has_layout_snapshot,
 ##                    bit 3: has_trace_filter_provenance)
+##   varint-prefixed recording_id string  (M-REC-1; required, UUIDv7,
+##                                         lowercase hyphenated 36-char form)
 ##   varint-prefixed program string
 ##   varint args_count, then varint-prefixed arg strings
 ##   varint-prefixed workdir string
@@ -47,6 +49,11 @@
 ##        until the schema gained them in v2.
 ##   v2 — appended hookProfile + hookStrategies inside the MCR-fields
 ##        block so meta.dat reaches parity with the legacy meta.json.
+##   v3 — M-REC-1 (2026-05-18): prepended a required `recording_id`
+##        UUIDv7 string before the existing `program` field.  Pre-1.0:
+##        no backcompat shim — v2 fixtures must be regenerated.  Spec:
+##        ~codetracer-specs/Refactoring-Plans/Recording-Identifier-Migration.md~
+##        §3 and the M-REC-1 milestone in the companion `.status.org`.
 ##        M-RLP-1 (2026-05-12) added FlagHasReplayLaunchFields (bit 1)
 ##        and a one-byte aslr_disabled block appended after the MCR
 ##        block; readers that don't know about the bit simply stop after
@@ -76,10 +83,11 @@ import ../codetracer_trace_types
 import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
 import ./varint
+import ./uuid_v7
 
 const
   MetaDatMagic*: array[4, byte] = [0x43'u8, 0x54, 0x4D, 0x44]  # "CTMD"
-  MetaDatVersion*: uint16 = 2
+  MetaDatVersion*: uint16 = 3
   FlagHasMcrFields*: uint16 = 1                  # bit 0
   FlagHasReplayLaunchFields*: uint16 = 2         # bit 1 — M-RLP-1 (spec §6A.5)
   FlagHasLayoutSnapshot*: uint16 = 4             # bit 2 — M-RLP-2 (spec §6B.7)
@@ -88,6 +96,8 @@ const
 type
   MetaDatContents* = object
     version*: uint16
+    recordingId*: string
+      ## M-REC-1: UUIDv7 identifying this recording.  Required in v3+.
     program*: string
     workdir*: string
     args*: seq[string]
@@ -156,6 +166,12 @@ proc writeMetaDat*(
   ## `emitFilterProvenance = true` with an empty sequence is the spec's
   ## "recorder implements filters but the chain is empty" signal.
 
+  # Recording id must be present and syntactically valid.  Pre-1.0
+  # the spec forbids backcompat: a missing or malformed id is a write
+  # error here so that no caller can accidentally produce a v3 trace
+  # without the M-REC-1 spine.
+  ? validateRecordingIdStr(meta.recordingId)
+
   # Magic
   ? c.writeRawBytes(f, MetaDatMagic)
 
@@ -174,6 +190,9 @@ proc writeMetaDat*(
   if emitProvenance:
     flags = flags or FlagHasTraceFilterProvenance
   ? c.writeU16LE(f, flags)
+
+  # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.
+  ? c.writeVarintString(f, meta.recordingId)
 
   # Program
   ? c.writeVarintString(f, meta.program)
@@ -281,6 +300,11 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
   var pos = 8
 
   var contents = MetaDatContents(version: version)
+
+  # Recording id (UUIDv7, canonical 36-char form).  M-REC-1, required
+  # in v3+: a malformed or missing id rejects the trace at parse time.
+  contents.recordingId = ? readString(data, pos)
+  ? validateRecordingIdStr(contents.recordingId)
 
   # Program
   contents.program = ? readString(data, pos)
@@ -415,6 +439,14 @@ proc writeMetaDatToBuffer*(
 ): seq[byte] =
   ## Serialize meta.dat to an in-memory byte buffer.
   ## This is the same format as writeMetaDat but without needing a CTFS container.
+  ##
+  ## A malformed `meta.recordingId` aborts via `doAssert`.  Callers
+  ## must pass a syntactically valid UUIDv7 (M-REC-1, spec §3); this
+  ## proc has no `Result` return type so we cannot surface a recoverable
+  ## error.  Use `writeMetaDat` (CTFS-based) when you need that.
+  doAssert validateRecordingIdStr(meta.recordingId).isOk,
+    "writeMetaDatToBuffer: meta.recordingId is not a canonical UUIDv7"
+
   result = newSeq[byte]()
 
   # Magic
@@ -436,6 +468,9 @@ proc writeMetaDatToBuffer*(
   if emitProvenance:
     flags = flags or FlagHasTraceFilterProvenance
   result.appendU16LE(flags)
+
+  # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.
+  result.appendVarintStr(meta.recordingId)
 
   # Program
   result.appendVarintStr(meta.program)

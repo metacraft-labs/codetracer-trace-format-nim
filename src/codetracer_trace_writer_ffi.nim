@@ -1087,11 +1087,16 @@ proc ct_write_meta_dat_to_buffer(
     args: ptr ptr uint8, arg_lens: ptr csize_t, args_count: csize_t,
     paths: ptr ptr uint8, path_lens: ptr csize_t, paths_count: csize_t,
     recorder_id: ptr uint8, recorder_id_len: csize_t,
+    recording_id: ptr uint8, recording_id_len: csize_t,
     out_buf: ptr ptr uint8, out_len: ptr csize_t
 ): cint {.exportc, cdecl, dynlib.} =
   ## Write meta.dat to a newly allocated buffer from explicit fields.
   ## The caller must free the buffer with ct_free_buffer.
   ## Returns 0 on success.
+  ##
+  ## M-REC-1: `recording_id` is required.  Pass a canonical-form
+  ## UUIDv7 (lowercase hyphenated, 36 chars) or pass `NULL`/0-length
+  ## to have the FFI mint one for you via the OS CSPRNG.
   if out_buf.isNil or out_len.isNil:
     setError("NULL output pointers")
     return 1.cint
@@ -1127,7 +1132,26 @@ proc ct_write_meta_dat_to_buffer(
     recId = newString(int(recorder_id_len))
     copyMem(addr recId[0], recorder_id, int(recorder_id_len))
 
-  let meta = TraceMetadata(program: progStr, args: argSeq, workdir: wdStr)
+  # M-REC-1: resolve recording_id — caller-provided if non-empty,
+  # otherwise mint a fresh UUIDv7.
+  var recordingIdStr = ""
+  if not recording_id.isNil and recording_id_len > 0.csize_t:
+    recordingIdStr = newString(int(recording_id_len))
+    copyMem(addr recordingIdStr[0], recording_id, int(recording_id_len))
+    let valRes = validateRecordingIdStr(recordingIdStr)
+    if valRes.isErr:
+      setError("recording_id not a canonical UUIDv7: " & valRes.error)
+      return 1.cint
+  else:
+    let uuidRes = newUuidV7()
+    if uuidRes.isErr:
+      setError("failed to mint recording_id: " & uuidRes.error)
+      return 1.cint
+    recordingIdStr = $uuidRes.get()
+
+  let meta = TraceMetadata(
+    recordingId: recordingIdStr,
+    program: progStr, args: argSeq, workdir: wdStr)
   let buf = writeMetaDatToBuffer(meta, pathSeq, recorderId = recId)
 
   let outPtr = cast[ptr uint8](alloc(buf.len))
@@ -1221,6 +1245,16 @@ proc ct_meta_dat_recorder_id(h: MetaDatReaderHandle, out_len: ptr csize_t): ptr 
   if h.recorderId.len == 0:
     return nil
   return cast[ptr uint8](unsafeAddr h.recorderId[0])
+
+proc ct_meta_dat_recording_id(h: MetaDatReaderHandle, out_len: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib.} =
+  ## M-REC-1: returns the UUIDv7 recording_id from the parsed meta.dat.
+  ## Pointer is valid until ct_meta_dat_free is called on the handle.
+  if h.isNil or out_len.isNil:
+    return nil
+  out_len[] = csize_t(h.recordingId.len)
+  if h.recordingId.len == 0:
+    return nil
+  return cast[ptr uint8](unsafeAddr h.recordingId[0])
 
 proc ct_meta_dat_has_filter_provenance(h: MetaDatReaderHandle): cint {.exportc, cdecl, dynlib.} =
   ## TF-M7: returns 1 if FlagHasTraceFilterProvenance was set on the

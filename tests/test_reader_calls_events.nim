@@ -53,7 +53,7 @@ proc writeCallsAndEventsTrace(numCalls: int, numEvents: int): seq[byte] {.raises
   let metaFileRes = ctfs.addFile("meta.dat")
   doAssert metaFileRes.isOk
   var metaFile = metaFileRes.get()
-  let meta = TraceMetadata(program: "call_event_test", args: @[], workdir: "/tmp")
+  let meta = TraceMetadata(recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb", program: "call_event_test", args: @[], workdir: "/tmp")
   let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/main.py"])
   doAssert metaWr.isOk
 

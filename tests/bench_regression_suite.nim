@@ -424,7 +424,7 @@ proc writeLargeTrace(numSteps: int): seq[byte] =
   let metaFileRes = ctfs.addFile("meta.dat")
   doAssert metaFileRes.isOk
   var metaFile = metaFileRes.get()
-  let meta = TraceMetadata(program: "bench", args: @[], workdir: "/tmp")
+  let meta = TraceMetadata(recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb", program: "bench", args: @[], workdir: "/tmp")
   let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/bench.py"])
   doAssert metaWr.isOk
 

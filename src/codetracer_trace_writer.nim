@@ -24,8 +24,9 @@ import codetracer_ctfs/zstd_bindings
 import codetracer_trace_types
 import codetracer_trace_writer/split_binary
 import codetracer_trace_writer/meta_dat
+import codetracer_trace_writer/uuid_v7
 
-export results, codetracer_trace_types
+export results, codetracer_trace_types, uuid_v7
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -117,18 +118,36 @@ proc flushChunk(w: var TraceWriter): Result[void, string] =
 
 proc newTraceWriter*(path: string, program: string, args: seq[string],
     workdir: string = "",
-    chunkThreshold: int = DefaultChunkThreshold): Result[TraceWriter, string] =
+    chunkThreshold: int = DefaultChunkThreshold,
+    recordingId: string = ""): Result[TraceWriter, string] =
   ## Create a new TraceWriter that writes a .ct file at the given path.
   ## Uses streaming CTFS mode so the file can be read concurrently.
+  ##
+  ## ~recordingId~ is the canonical UUIDv7 recording identity (M-REC-1,
+  ## spec §3).  Pass `""` to have the writer mint one via
+  ## `newUuidV7()`; pass an explicit id to pin the recording's identity
+  ## (used by import flows that preserve the original recorder's id).
   let ctfsRes = createCtfsStreaming(path)
   if ctfsRes.isErr:
     return err("failed to create CTFS container: " & ctfsRes.error)
+
+  var resolvedId = recordingId
+  if resolvedId.len == 0:
+    let uuidRes = newUuidV7()
+    if uuidRes.isErr:
+      return err("failed to mint recording_id: " & uuidRes.error)
+    resolvedId = $uuidRes.get()
+  else:
+    let valRes = validateRecordingIdStr(resolvedId)
+    if valRes.isErr:
+      return err("recordingId is not a canonical UUIDv7: " & valRes.error)
 
   var w = TraceWriter(
     ctfs: ctfsRes.get(),
     encoder: SplitBinaryEncoder.init(),
     paths: @[],
     metadata: TraceMetadata(
+      recordingId: resolvedId,
       program: program,
       args: args,
       workdir: workdir,
@@ -266,7 +285,7 @@ proc close*(w: var TraceWriter): Result[void, string] =
     if writeRes.isErr:
       return err("failed to write events.fmt: " & writeRes.error)
 
-  # Write meta.json
+  # Write meta.json (legacy JSON sidecar; readers prefer meta.dat).
   block:
     let metaRes = w.ctfs.addFile("meta.json")
     if metaRes.isErr:
@@ -275,6 +294,10 @@ proc close*(w: var TraceWriter): Result[void, string] =
     var metaJson: string
     try:
       var node = newJObject()
+      # M-REC-1: recording_id is required.  Surfaces in the JSON
+      # fallback path so cross-tool consumers that only know how to
+      # parse meta.json still see the canonical id.
+      node["recording_id"] = newJString(w.metadata.recordingId)
       node["program"] = newJString(w.metadata.program)
       var argsArr = newJArray()
       for arg in w.metadata.args:

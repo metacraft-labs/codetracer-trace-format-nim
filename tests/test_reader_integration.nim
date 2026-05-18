@@ -55,6 +55,7 @@ proc writeFullTrace(): seq[byte] {.raises: [].} =
   doAssert metaFileRes.isOk
   var metaFile = metaFileRes.get()
   let meta = TraceMetadata(
+    recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb",
     program: "integration_test",
     args: @["--verbose", "--count=100"],
     workdir: "/home/test")
@@ -385,7 +386,7 @@ proc test_reader_cache_eviction() {.raises: [].} =
   let metaFileRes = ctfs.addFile("meta.dat")
   doAssert metaFileRes.isOk
   var metaFile = metaFileRes.get()
-  let meta = TraceMetadata(program: "cache_test", args: @[], workdir: "/tmp")
+  let meta = TraceMetadata(recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb", program: "cache_test", args: @[], workdir: "/tmp")
   let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/cache.py"])
   doAssert metaWr.isOk
 
@@ -481,7 +482,7 @@ proc writeTraceWithSortedCalls(): seq[byte] {.raises: [].} =
   let metaFileRes = ctfs.addFile("meta.dat")
   doAssert metaFileRes.isOk
   var metaFile = metaFileRes.get()
-  let meta = TraceMetadata(program: "search_test", args: @[], workdir: "/tmp")
+  let meta = TraceMetadata(recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb", program: "search_test", args: @[], workdir: "/tmp")
   let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/main.py"])
   doAssert metaWr.isOk
 

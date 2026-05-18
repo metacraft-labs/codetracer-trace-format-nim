@@ -9,7 +9,7 @@ max_root_entries: 31
 === File Entries ===
 [0] name: "events.log" size: 200 map_block: 1
 [1] name: "events.fmt" size: 12 map_block: 3
-[2] name: "meta.json" size: 87 map_block: 5
+[2] name: "meta.json" size: 141 map_block: 5
 [3] name: "paths.json" size: 32 map_block: 7
 
 === Internal File: events.log ===
@@ -33,7 +33,7 @@ max_root_entries: 31
 split-binary
 
 === Internal File: meta.json ===
-{"program":"test_program","args":["--flag","input.txt"],"workdir":"/home/user/project"}
+{"recording_id":"01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb","program":"test_program","args":["--flag","input.txt"],"workdir":"/home/user/project"}
 
 === Internal File: paths.json ===
 ["/src/main.nim","/src/lib.nim"]

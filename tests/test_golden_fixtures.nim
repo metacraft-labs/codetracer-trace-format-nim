@@ -103,15 +103,23 @@ proc generateSeekableZstd3Frames(): seq[byte] =
 
 proc generateTraceComplete(): seq[byte] =
   ## Full trace writer output with known events.
+  ##
+  ## M-REC-1: passes a stable canonical-form recording_id so the
+  ## golden fixture's meta.json content is reproducible across runs.
+  ## The id is fabricated (the embedded ms timestamp does not
+  ## correspond to a real recording time) and only exists here as a
+  ## byte-stable test constant.
   let path = getTempDir() / "golden_regen_trace_complete.ct"
   try:
     removeFile(path)
   except OSError:
     discard
 
+  const GoldenRecordingId = "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb"
   var writerRes = newTraceWriter(path, "test_program", @["--flag", "input.txt"],
                                   workdir = "/home/user/project",
-                                  chunkThreshold = 5)
+                                  chunkThreshold = 5,
+                                  recordingId = GoldenRecordingId)
   doAssert writerRes.isOk, "newTraceWriter failed: " & writerRes.error
   var w = writerRes.get()
 

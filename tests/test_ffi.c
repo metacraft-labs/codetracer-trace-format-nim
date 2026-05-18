@@ -141,6 +141,9 @@ int main(void) {
         size_t path_lens[] = { strlen(path_strs[0]), strlen(path_strs[1]) };
 
         const char* rec_id = "test-recorder-v1";
+        /* M-REC-1: canonical UUIDv7.  Hard-coded so the test
+         * exercises caller-supplied id rather than the mint path. */
+        const char* recording_id = "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb";
 
         uint8_t* buf = NULL;
         size_t buf_len = 0;
@@ -151,6 +154,7 @@ int main(void) {
             arg_ptrs, arg_lens, 3,
             path_ptrs, path_lens, 2,
             (const uint8_t*)rec_id, strlen(rec_id),
+            (const uint8_t*)recording_id, strlen(recording_id),
             &buf, &buf_len);
         ASSERT(rc == 0, "ct_write_meta_dat_to_buffer should succeed");
         ASSERT(buf != NULL, "output buffer should be non-NULL");

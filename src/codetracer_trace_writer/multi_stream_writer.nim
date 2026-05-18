@@ -23,10 +23,11 @@ import ./step_encoding
 import ./global_line_index
 import ./varint
 import ./linehits_builder
+import ./uuid_v7
 import ../codetracer_trace_types
 
 export results, value_stream.VariableValue, io_event_stream.IOEventKind,
-       codetracer_trace_types.FilterProvenance
+       codetracer_trace_types.FilterProvenance, uuid_v7
 
 const
   DefaultLinesPerFile*: uint64 = 100_000
@@ -128,12 +129,30 @@ proc toGlobalLineIndex(w: var MultiStreamTraceWriter,
 # ---------------------------------------------------------------------------
 
 proc initMultiStreamWriter*(path: string, program: string,
-    chunkSize: int = 4096): Result[MultiStreamTraceWriter, string] =
+    chunkSize: int = 4096,
+    recordingId: string = ""): Result[MultiStreamTraceWriter, string] =
   ## Create a new multi-stream trace writer.
   ## Produces an in-memory CTFS container (call close() to finalize).
+  ##
+  ## ~recordingId~ defaults to a freshly-minted UUIDv7 (M-REC-1).  Pass
+  ## an explicit canonical-form id to pin the recording's identity
+  ## (e.g. on the import path where the source recording's id must be
+  ## preserved).
+  var resolvedId = recordingId
+  if resolvedId.len == 0:
+    let uuidRes = newUuidV7()
+    if uuidRes.isErr:
+      return err("failed to mint recording_id: " & uuidRes.error)
+    resolvedId = $uuidRes.get()
+  else:
+    let valRes = validateRecordingIdStr(resolvedId)
+    if valRes.isErr:
+      return err("recordingId is not a canonical UUIDv7: " & valRes.error)
+
   var w: MultiStreamTraceWriter
   w.ctfs = createCtfs()
-  w.metadata = TraceMetadata(program: program, args: @[], workdir: "")
+  w.metadata = TraceMetadata(
+    recordingId: resolvedId, program: program, args: @[], workdir: "")
   w.paths = @[]
   w.gliDirty = true
   w.filePath = path

@@ -76,9 +76,12 @@ proc generateTraceComplete(): seq[byte] =
   except OSError:
     discard
 
+  # M-REC-1: keep this fixture byte-stable by pinning recording_id.
+  const GoldenRecordingId = "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb"
   var writerRes = newTraceWriter(path, "test_program", @["--flag", "input.txt"],
                                   workdir = "/home/user/project",
-                                  chunkThreshold = 5)
+                                  chunkThreshold = 5,
+                                  recordingId = GoldenRecordingId)
   doAssert writerRes.isOk, "newTraceWriter failed: " & writerRes.error
   var w = writerRes.get()
 

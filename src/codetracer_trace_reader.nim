@@ -19,6 +19,7 @@ import codetracer_ctfs/zstd_bindings
 import codetracer_trace_types
 import codetracer_trace_writer/split_binary
 import codetracer_trace_writer/meta_dat
+import codetracer_trace_writer/uuid_v7
 import codetracer_trace_writer/new_trace_reader
 import codetracer_trace_writer/step_encoding
 import codetracer_trace_writer/value_stream as v4_value_stream
@@ -35,6 +36,11 @@ export results, codetracer_trace_types
 
 type
   TraceReaderMetadata* = object
+    ## Per-trace metadata as surfaced by `openTrace`.
+    ##
+    ## `recordingId` is the canonical UUIDv7 (M-REC-1, RFC 9562); the
+    ## reader rejects traces whose metadata file lacks a valid id.
+    recordingId*: string
     program*: string
     args*: seq[string]
     workdir*: string
@@ -209,6 +215,8 @@ proc openTrace*(path: string): Result[TraceReader, string] =
     let parsed = readMetaDat(metaDatRes.get())
     if parsed.isOk:
       let contents = parsed.get()
+      # M-REC-1: surface recording_id from the parsed metadata.
+      reader.metadata.recordingId = contents.recordingId
       reader.metadata.program = contents.program
       reader.metadata.workdir = contents.workdir
       reader.metadata.args = contents.args
@@ -216,12 +224,17 @@ proc openTrace*(path: string): Result[TraceReader, string] =
     else:
       return err("meta.dat present but corrupt: " & parsed.error)
   else:
-    # Fall back to meta.json + paths.json (old format)
+    # Fall back to meta.json + paths.json (legacy JSON sidecar).
+    # M-REC-1: pre-1.0 the spec rejects metadata without recording_id,
+    # so we require the JSON to carry one too.
     let metaRes = readInternalFile(data, "meta.json", blockSize, maxEntries)
     if metaRes.isOk:
       let metaStr = bytesToString(metaRes.get())
+      var recordingIdFromJson = ""
       try:
         let node = parseJson(metaStr)
+        recordingIdFromJson =
+          node.getOrDefault("recording_id").getStr("")
         reader.metadata.program = node.getOrDefault("program").getStr("")
         reader.metadata.workdir = node.getOrDefault("workdir").getStr("")
         let argsNode = node.getOrDefault("args")
@@ -240,6 +253,11 @@ proc openTrace*(path: string): Result[TraceReader, string] =
         return err("value error parsing meta.json")
       except Exception:
         return err("unexpected error parsing meta.json")
+      let valRes = validateRecordingIdStr(recordingIdFromJson)
+      if valRes.isErr:
+        return err("meta.json: invalid or missing recording_id: " &
+                   valRes.error)
+      reader.metadata.recordingId = recordingIdFromJson
 
     let pathsRes = readInternalFile(data, "paths.json", blockSize, maxEntries)
     if pathsRes.isOk:

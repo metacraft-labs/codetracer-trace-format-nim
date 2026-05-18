@@ -183,12 +183,16 @@ int ct_write_meta_dat(trace_writer_t handle,
  * meta.dat — standalone buffer write
  * -------------------------------------------------------------------------- */
 
+/* M-REC-1: recording_id is the canonical UUIDv7 identity (RFC 9562)
+ * for this recording.  Pass canonical lowercase hyphenated 36-char
+ * form, or NULL/0 to have the writer mint one via the OS CSPRNG. */
 int ct_write_meta_dat_to_buffer(
     const uint8_t* program, size_t program_len,
     const uint8_t* workdir, size_t workdir_len,
     const uint8_t* const* args, const size_t* arg_lens, size_t args_count,
     const uint8_t* const* paths, const size_t* path_lens, size_t paths_count,
     const uint8_t* recorder_id, size_t recorder_id_len,
+    const uint8_t* recording_id, size_t recording_id_len,
     uint8_t** out_buf, size_t* out_len);
 
 void ct_free_buffer(uint8_t* buf);
@@ -200,6 +204,9 @@ void ct_free_buffer(uint8_t* buf);
 typedef void* meta_dat_reader_t;
 
 meta_dat_reader_t ct_read_meta_dat(const uint8_t* data, size_t len);
+/* M-REC-1: returns the UUIDv7 recording_id; pointer valid until
+ * ct_meta_dat_free. */
+const uint8_t* ct_meta_dat_recording_id(meta_dat_reader_t h, size_t* out_len);
 const uint8_t* ct_meta_dat_program(meta_dat_reader_t h, size_t* out_len);
 const uint8_t* ct_meta_dat_workdir(meta_dat_reader_t h, size_t* out_len);
 size_t ct_meta_dat_args_count(meta_dat_reader_t h);

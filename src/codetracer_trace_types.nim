@@ -322,6 +322,17 @@ type
     place*: Place
 
   TraceMetadata* = object
+    ## Per-trace metadata stamped into `meta.dat` (or, for the legacy
+    ## JSON fallback path, into `meta.json`).
+    ##
+    ## ~recordingId~ is the canonical identifier for this recording — a
+    ## UUIDv7 (RFC 9562) generated at record start by the recorder.
+    ## See ~codetracer-specs/Refactoring-Plans/Recording-Identifier-Migration.md~
+    ## for the migration rationale.  Pre-1.0, this field is REQUIRED;
+    ## parsers reject metadata without it.  Canonical text form:
+    ## lowercase hyphenated 36-char (e.g.
+    ## `01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb`).
+    recordingId*: string
     workdir*: string
     program*: string
     args*: seq[string]

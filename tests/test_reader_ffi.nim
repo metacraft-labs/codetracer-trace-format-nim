@@ -62,7 +62,7 @@ proc writeTestTrace(path: string) =
   let metaFileRes = ctfs.addFile("meta.dat")
   doAssert metaFileRes.isOk
   var metaFile = metaFileRes.get()
-  let meta = TraceMetadata(program: "test_ffi_prog", args: @["--test"], workdir: "/tmp/ffi")
+  let meta = TraceMetadata(recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb", program: "test_ffi_prog", args: @["--test"], workdir: "/tmp/ffi")
   let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/main.py", "/src/util.py"],
     recorderId = "ffi-test")
   doAssert metaWr.isOk

@@ -2,13 +2,19 @@
 
 ## Tests for binary meta.dat writer and reader.
 
-import std/[options, os, strutils]
+import std/[hashes, options, os, strutils]
 import results
 import codetracer_ctfs
 import codetracer_trace_types
+import codetracer_trace_writer
 import codetracer_trace_writer/meta_dat
 import codetracer_trace_writer/varint
+import codetracer_trace_writer/uuid_v7
 import codetracer_trace_reader
+
+# M-REC-1: a canonical UUIDv7 used in tests that don't care about
+# id-generation behaviour.  Keeps each test's wire layout deterministic.
+const TestRecordingId* = "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -59,6 +65,7 @@ proc test_meta_dat_write_layout() {.raises: [].} =
   var f = fileRes.get()
 
   let meta = TraceMetadata(
+    recordingId: TestRecordingId,
     program: "test_prog",
     args: @["--flag", "value"],
     workdir: "/tmp/test"
@@ -77,12 +84,17 @@ proc test_meta_dat_write_layout() {.raises: [].} =
   pos = 4
 
   # Version
-  doAssert readU16LEAt(raw, pos) == 2, "version mismatch"
+  doAssert readU16LEAt(raw, pos) == 3, "version mismatch (expected v3, M-REC-1)"
   pos += 2
 
   # Flags
   doAssert readU16LEAt(raw, pos) == 0, "flags should be 0 (no MCR)"
   pos += 2
+
+  # Recording id (M-REC-1)
+  let recId = decodeString(raw, pos)
+  doAssert recId.isOk and recId.get() == TestRecordingId,
+    "recording_id mismatch"
 
   # Program
   let prog = decodeString(raw, pos)
@@ -130,6 +142,7 @@ proc test_meta_dat_with_mcr_fields() {.raises: [].} =
   var f = fileRes.get()
 
   let meta = TraceMetadata(
+    recordingId: TestRecordingId,
     program: "mcr_test",
     args: @["arg1"],
     workdir: "/work"
@@ -153,7 +166,7 @@ proc test_meta_dat_with_mcr_fields() {.raises: [].} =
   pos = 4
 
   # Version
-  doAssert readU16LEAt(raw, pos) == 2, "version mismatch"
+  doAssert readU16LEAt(raw, pos) == 3, "version mismatch (v3 from M-REC-1)"
   pos += 2
 
   # Flags — bit 0 should be set
@@ -161,7 +174,11 @@ proc test_meta_dat_with_mcr_fields() {.raises: [].} =
   doAssert (flags and 1) == 1, "flags bit 0 should be set for MCR fields"
   pos += 2
 
-  # Skip program, args, workdir, recorder_id, paths
+  # Skip recording_id, program, args, workdir, recorder_id, paths
+  let recId = decodeString(raw, pos)
+  doAssert recId.isOk and recId.get() == TestRecordingId,
+    "recording_id mismatch"
+
   let prog = decodeString(raw, pos)
   doAssert prog.isOk and prog.get() == "mcr_test"
 
@@ -241,7 +258,10 @@ proc test_meta_dat_empty_fields() {.raises: [].} =
   doAssert fileRes.isOk, "addFile failed"
   var f = fileRes.get()
 
+  # M-REC-1: recording_id is required even when every other field is
+  # empty.  This test pins the minimum-size meta.dat layout.
   let meta = TraceMetadata(
+    recordingId: TestRecordingId,
     program: "",
     args: @[],
     workdir: ""
@@ -257,10 +277,14 @@ proc test_meta_dat_empty_fields() {.raises: [].} =
   # Magic + version + flags = 8 bytes
   doAssert raw[0] == 0x43 and raw[1] == 0x54 and raw[2] == 0x4D and raw[3] == 0x44
   pos = 4
-  doAssert readU16LEAt(raw, pos) == 2
+  doAssert readU16LEAt(raw, pos) == 3
   pos += 2
   doAssert readU16LEAt(raw, pos) == 0
   pos += 2
+
+  # Recording id (varint 36 + 36 bytes of canonical UUIDv7) — M-REC-1
+  let recId = decodeString(raw, pos)
+  doAssert recId.isOk and recId.get() == TestRecordingId
 
   # Empty program (varint 0)
   let prog = decodeString(raw, pos)
@@ -282,9 +306,11 @@ proc test_meta_dat_empty_fields() {.raises: [].} =
   let pathsCount = decodeVarint(raw, pos)
   doAssert pathsCount.isOk and pathsCount.get() == 0
 
-  # 8 fixed bytes + 5 varint zeros (each 1 byte) = 13 bytes total
+  # 8 fixed bytes + 1 varint (=36) + 36 recording_id bytes + 5 varint
+  # zeros (each 1 byte) = 50 bytes total.
   doAssert pos == raw.len, "trailing bytes: consumed " & $pos & " of " & $raw.len
-  doAssert raw.len == 13, "expected 13 bytes for empty meta.dat, got " & $raw.len
+  doAssert raw.len == 50,
+    "expected 50 bytes for minimal v3 meta.dat, got " & $raw.len
 
   c.closeCtfs()
   echo "PASS: test_meta_dat_empty_fields"
@@ -298,6 +324,7 @@ proc test_meta_dat_roundtrip() {.raises: [].} =
   var f = fileRes.get()
 
   let meta = TraceMetadata(
+    recordingId: TestRecordingId,
     program: "/usr/bin/myapp",
     args: @["--verbose", "-o", "output.txt"],
     workdir: "/home/user/project"
@@ -313,7 +340,9 @@ proc test_meta_dat_roundtrip() {.raises: [].} =
   doAssert parsed.isOk, "readMetaDat failed: " & parsed.unsafeError
 
   let contents = parsed.get()
-  doAssert contents.version == 2, "version mismatch"
+  doAssert contents.version == 3, "version mismatch (expected v3)"
+  doAssert contents.recordingId == TestRecordingId,
+    "recording_id round-trip failed: got " & contents.recordingId
   doAssert contents.program == "/usr/bin/myapp", "program mismatch: " & contents.program
   doAssert contents.workdir == "/home/user/project", "workdir mismatch"
   doAssert contents.args.len == 3, "args count mismatch"
@@ -339,6 +368,7 @@ proc test_meta_dat_roundtrip_with_mcr() {.raises: [].} =
   var f = fileRes.get()
 
   let meta = TraceMetadata(
+    recordingId: TestRecordingId,
     program: "mcr_prog",
     args: @["a"],
     workdir: "/w"
@@ -405,6 +435,7 @@ proc test_meta_dat_roundtrip_with_filter_provenance() {.raises: [].} =
     entries[2].sha256[i] = byte(255 - i)
 
   let meta = TraceMetadata(
+    recordingId: TestRecordingId,
     program: "prog",
     args: @[],
     workdir: "/w",
@@ -475,7 +506,8 @@ proc test_meta_dat_roundtrip_empty_filter_provenance() {.raises: [].} =
   ## surface `hasFilterProvenance = true` with an empty list.  This
   ## preserves the spec §7 distinction between "did not record" (flag
   ## off) and "recorded an empty chain" (flag on, count 0).
-  let meta = TraceMetadata(program: "prog", args: @[], workdir: "/w")
+  let meta = TraceMetadata(
+    recordingId: TestRecordingId, program: "prog", args: @[], workdir: "/w")
   let paths: seq[string] = @[]
 
   let buf = writeMetaDatToBuffer(meta, paths,
@@ -496,7 +528,8 @@ proc test_meta_dat_no_filter_provenance_omits_flag() {.raises: [].} =
   ## TF-M7: when no provenance is passed and emitFilterProvenance is
   ## false (the default), the flag bit MUST stay off and the reader
   ## MUST report `hasFilterProvenance = false`.
-  let meta = TraceMetadata(program: "prog", args: @[], workdir: "/w")
+  let meta = TraceMetadata(
+    recordingId: TestRecordingId, program: "prog", args: @[], workdir: "/w")
   let paths: seq[string] = @[]
   let buf = writeMetaDatToBuffer(meta, paths)
   let flags = readU16LEAt(buf, 6)
@@ -547,7 +580,8 @@ proc test_meta_dat_backward_compat() {.raises: [].} =
   doAssert metaFileRes.isOk, "addFile meta.json failed"
   var metaFile = metaFileRes.get()
 
-  let metaJson = """{"program":"/bin/old_prog","args":["--old","flag"],"workdir":"/old/dir"}"""
+  # M-REC-1: meta.json fallback path now also requires recording_id.
+  let metaJson = """{"recording_id":"01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb","program":"/bin/old_prog","args":["--old","flag"],"workdir":"/old/dir"}"""
   let wRes1 = writeJsonString(c, metaFile, metaJson)
   doAssert wRes1.isOk, "write meta.json failed"
 
@@ -600,6 +634,7 @@ proc test_meta_dat_openTrace_binary() {.raises: [].} =
   var metaDatFile = metaDatFileRes.get()
 
   let meta = TraceMetadata(
+    recordingId: TestRecordingId,
     program: "/bin/test_prog",
     args: @["--flag", "value"],
     workdir: "/tmp/test"
@@ -636,7 +671,7 @@ proc test_meta_dat_openTrace_binary() {.raises: [].} =
   let metaJsonFileRes = cJson.addFile("meta.json")
   doAssert metaJsonFileRes.isOk
   var metaJsonFile = metaJsonFileRes.get()
-  let metaJsonStr = """{"program":"/bin/test_prog","args":["--flag","value"],"workdir":"/tmp/test"}"""
+  let metaJsonStr = """{"recording_id":"01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb","program":"/bin/test_prog","args":["--flag","value"],"workdir":"/tmp/test"}"""
   let w1 = writeJsonString(cJson, metaJsonFile, metaJsonStr)
   doAssert w1.isOk
 
@@ -672,7 +707,188 @@ proc test_meta_dat_openTrace_binary() {.raises: [].} =
   echo "PASS: test_meta_dat_openTrace_binary"
 
 
+# ---------------------------------------------------------------------------
+# M-REC-1 — recording_id behaviours
+# ---------------------------------------------------------------------------
+
+proc test_meta_dat_uuidv7_generation() {.raises: [].} =
+  ## M-REC-1 acceptance: a freshly minted UUIDv7 is canonical-form, has
+  ## the version-7 nibble, and a valid variant nibble.
+  let r1 = newUuidV7()
+  doAssert r1.isOk, "newUuidV7 should succeed on a healthy host"
+  let u = r1.get()
+  let s = $u
+  doAssert s.len == 36, "canonical text form is 36 chars; got " & $s.len
+  doAssert s[8] == '-' and s[13] == '-' and s[18] == '-' and s[23] == '-'
+  doAssert s[14] == '7', "version nibble must be '7'; got '" & $s[14] & "'"
+  doAssert s[19] in {'8', '9', 'a', 'b'},
+    "variant nibble must be in {8,9,a,b}; got '" & $s[19] & "'"
+
+  # Round-trip parse: the string we just printed must parse back to
+  # the same bytes.
+  let parsed = parseUuidV7(s)
+  doAssert parsed.isOk, "parseUuidV7 failed: " & parsed.error
+  for i in 0 ..< 16:
+    doAssert parsed.get().bytes[i] == u.bytes[i],
+      "byte " & $i & " differs after parse round-trip"
+
+  echo "PASS: test_meta_dat_uuidv7_generation"
+
+
+proc test_meta_dat_uuidv7_ms_monotonic_sortable() {.raises: [].} =
+  ## M-REC-1 acceptance: two recordings minted on the same host one
+  ## second apart sort by id lex-ascending, and the embedded ms
+  ## timestamp of the later id is strictly greater.
+  let aRes = newUuidV7()
+  doAssert aRes.isOk
+  let a = aRes.get()
+  let aStr = $a
+  let aMs = a.unixMs
+
+  # Sleep ~1.05 seconds.  RFC 9562 §6.2: ms-granularity timestamps, so
+  # a one-second gap is far more than enough to guarantee a strictly
+  # larger unix_ts_ms prefix.
+  try:
+    os.sleep(1050)
+  except CatchableError:
+    discard  # On the practically-impossible failure path, just continue.
+
+  let bRes = newUuidV7()
+  doAssert bRes.isOk
+  let b = bRes.get()
+  let bStr = $b
+  let bMs = b.unixMs
+
+  doAssert aMs < bMs,
+    "later recording's embedded ms must be > earlier; aMs=" &
+    $aMs & " bMs=" & $bMs
+  doAssert aStr < bStr,
+    "canonical text form must sort ascending by creation time; " &
+    "a=" & aStr & " b=" & bStr
+
+  echo "PASS: test_meta_dat_uuidv7_ms_monotonic_sortable"
+
+
+proc test_meta_dat_recording_id_required() {.raises: [].} =
+  ## M-REC-1: writing meta.dat with an empty recording_id MUST fail
+  ## (validation happens before the magic bytes are emitted).
+  var c = createCtfs()
+  let fileRes = c.addFile("meta.dat")
+  doAssert fileRes.isOk
+  var f = fileRes.get()
+
+  let meta = TraceMetadata(
+    recordingId: "",  # invalid
+    program: "p", args: @[], workdir: "/w")
+  let wRes = c.writeMetaDat(f, meta, @[])
+  doAssert wRes.isErr,
+    "writeMetaDat must reject empty recording_id"
+
+  c.closeCtfs()
+  echo "PASS: test_meta_dat_recording_id_required"
+
+
+proc test_meta_dat_recording_id_malformed_rejected() {.raises: [].} =
+  ## M-REC-1: malformed canonical form (wrong length, wrong version
+  ## nibble, uppercase) is rejected by the writer and (for binary
+  ## fixtures) by the reader.
+  var c = createCtfs()
+  let badCases = @[
+    "not-a-uuid",                                  # too short
+    "01949FCC-7D92-7E9C-AAAA-BBBBBBBBBBBB",        # uppercase
+    "01949fcc-7d92-4e9c-aaaa-bbbbbbbbbbbb",        # version 4, not 7
+    "01949fcc-7d92-7e9c-caaa-bbbbbbbbbbbb",        # variant 'c' (= 11b, wrong)
+    "01949fcc7d927e9caaaabbbbbbbbbbbbbbbb",        # missing hyphens
+  ]
+  for bad in badCases:
+    let fileRes = c.addFile("bad_" & $hash(bad))
+    doAssert fileRes.isOk
+    var f = fileRes.get()
+    let meta = TraceMetadata(
+      recordingId: bad, program: "p", args: @[], workdir: "/w")
+    let wRes = c.writeMetaDat(f, meta, @[])
+    doAssert wRes.isErr,
+      "writeMetaDat must reject malformed recording_id: '" & bad & "'"
+
+  c.closeCtfs()
+  echo "PASS: test_meta_dat_recording_id_malformed_rejected"
+
+
+proc test_meta_dat_reader_rejects_missing_recording_id() {.raises: [].} =
+  ## M-REC-1: a hand-crafted v3 meta.dat with an empty recording_id
+  ## string (varint length 0, no body) MUST be rejected at parse time.
+  var buf = newSeq[byte](0)
+  # Magic
+  for b in [0x43'u8, 0x54, 0x4D, 0x44]:
+    buf.add(b)
+  # Version = 3
+  buf.add(3'u8); buf.add(0'u8)
+  # Flags = 0
+  buf.add(0'u8); buf.add(0'u8)
+  # Empty recording_id (varint 0 — zero-length string)
+  buf.add(0'u8)
+  # Empty program, args_count = 0, empty workdir, empty recorder_id,
+  # paths_count = 0
+  buf.add(0'u8)  # program
+  buf.add(0'u8)  # args_count
+  buf.add(0'u8)  # workdir
+  buf.add(0'u8)  # recorder_id
+  buf.add(0'u8)  # paths_count
+
+  let res = readMetaDat(buf)
+  doAssert res.isErr,
+    "readMetaDat must reject meta.dat with empty recording_id"
+
+  echo "PASS: test_meta_dat_reader_rejects_missing_recording_id"
+
+
+proc test_meta_dat_writer_mints_when_blank() {.raises: [].} =
+  ## newTraceWriter with empty recordingId mints a fresh UUIDv7.
+  ## Two writers in a row produce different ids.
+  let tmpDir = getTempDir() / "test_meta_dat_writer_mints"
+  try:
+    createDir(tmpDir)
+  except OSError, IOError:
+    discard
+
+  let path1 = tmpDir / "a.ct"
+  let path2 = tmpDir / "b.ct"
+
+  let w1Res = newTraceWriter(path1, "p", @["arg"])
+  doAssert w1Res.isOk, "newTraceWriter failed: " & w1Res.error
+  var w1 = w1Res.get()
+  let id1 = w1.metadata.recordingId
+  doAssert validateRecordingIdStr(id1).isOk,
+    "minted id1 is not a canonical UUIDv7: '" & id1 & "'"
+
+  let w2Res = newTraceWriter(path2, "p", @["arg"])
+  doAssert w2Res.isOk
+  var w2 = w2Res.get()
+  let id2 = w2.metadata.recordingId
+  doAssert validateRecordingIdStr(id2).isOk
+  doAssert id1 != id2,
+    "two freshly-minted ids should differ; both were '" & id1 & "'"
+
+  discard w1.close()
+  discard w2.close()
+
+  try:
+    removeFile(path1)
+    removeFile(path2)
+    removeDir(tmpDir)
+  except OSError, IOError:
+    discard
+
+  echo "PASS: test_meta_dat_writer_mints_when_blank"
+
+
 # Run all tests
+test_meta_dat_uuidv7_generation()
+test_meta_dat_uuidv7_ms_monotonic_sortable()
+test_meta_dat_recording_id_required()
+test_meta_dat_recording_id_malformed_rejected()
+test_meta_dat_reader_rejects_missing_recording_id()
+test_meta_dat_writer_mints_when_blank()
 test_meta_dat_write_layout()
 test_meta_dat_with_mcr_fields()
 test_meta_dat_empty_fields()

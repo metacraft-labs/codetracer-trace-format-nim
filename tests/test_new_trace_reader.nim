@@ -54,7 +54,7 @@ proc writeSmallTrace(): seq[byte] {.raises: [].} =
   let metaFileRes = ctfs.addFile("meta.dat")
   doAssert metaFileRes.isOk
   var metaFile = metaFileRes.get()
-  let meta = TraceMetadata(program: "test_prog", args: @["--run"], workdir: "/tmp")
+  let meta = TraceMetadata(recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb", program: "test_prog", args: @["--run"], workdir: "/tmp")
   let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/main.py", "/src/helper.py"],
     recorderId = "reader-test")
   doAssert metaWr.isOk
@@ -172,7 +172,7 @@ proc writeLargeTrace(numSteps: int, chunkSize: int = DefaultExecChunkSize): seq[
   let metaFileRes = ctfs.addFile("meta.dat")
   doAssert metaFileRes.isOk
   var metaFile = metaFileRes.get()
-  let meta = TraceMetadata(program: "bench", args: @[], workdir: "/tmp")
+  let meta = TraceMetadata(recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb", program: "bench", args: @[], workdir: "/tmp")
   let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/bench.py"])
   doAssert metaWr.isOk
 
@@ -276,7 +276,7 @@ proc bench_reader_startup_time() {.raises: [].} =
   let metaFileRes = ctfs.addFile("meta.dat")
   doAssert metaFileRes.isOk
   var metaFile = metaFileRes.get()
-  let meta = TraceMetadata(program: "bench_startup", args: @[], workdir: "/tmp")
+  let meta = TraceMetadata(recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb", program: "bench_startup", args: @[], workdir: "/tmp")
   let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/bench.py"])
   doAssert metaWr.isOk
 

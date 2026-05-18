@@ -66,6 +66,7 @@ proc test_new_format_write_read_roundtrip() =
   var metaFile = metaFileRes.get()
 
   let meta = TraceMetadata(
+    recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb",
     program: "cross_test",
     args: @["--flag", "value"],
     workdir: "/tmp/cross"
@@ -354,7 +355,7 @@ proc test_both_formats_produce_valid_ctfs() =
   let metaFileRes = ctfs.addFile("meta.dat")
   doAssert metaFileRes.isOk
   var metaFile = metaFileRes.get()
-  let meta = TraceMetadata(program: "compat_test", args: @[], workdir: "/tmp")
+  let meta = TraceMetadata(recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb", program: "compat_test", args: @[], workdir: "/tmp")
   let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/test.py"])
   doAssert metaWr.isOk
 
