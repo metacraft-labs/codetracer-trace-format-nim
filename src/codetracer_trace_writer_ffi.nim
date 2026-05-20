@@ -109,6 +109,10 @@ type
     ctFilePath: string  # path to the .ct output file (set in begin_events)
     programName: string  # stored from trace_writer_new, used when creating .ct
     workdir: string
+    metaArgs: seq[string]
+      ## Program argv recorded in meta.dat (CTFS spec §7).  Set via
+      ## trace_writer_set_args; stored here and propagated to the
+      ## multi-stream writer's metadata when/if it becomes ready.
     started: bool
     # Function registry: name+path+line -> id
     functions: seq[FunctionEntry]
@@ -222,6 +226,7 @@ proc trace_writer_new(
     hasPendingStep: false,
     programName: prog,
     workdir: "",
+    metaArgs: @[],
     started: false,
     functions: @[],
     functionIndex: initTable[string, csize_t](),
@@ -297,6 +302,7 @@ proc trace_writer_begin_events(
 
     handle.msWriter = res.get()
     handle.msWriter.metadata.workdir = handle.workdir
+    handle.msWriter.metadata.args = handle.metaArgs
     handle.msWriterReady = true
     handle.ctFilePath = ctPath
     return 0.cint
@@ -424,6 +430,33 @@ proc trace_writer_set_workdir(
       handle.msWriter.metadata.workdir = handle.workdir
   elif handle.writerReady:
     handle.writer.metadata.workdir = handle.workdir
+
+proc trace_writer_set_args(
+    handle: TraceWriterHandle,
+    args: ptr ptr uint8,
+    arg_lens: ptr csize_t,
+    args_count: csize_t,
+) {.exportc, cdecl, dynlib.} =
+  ## Record the recorded program's argv in the trace metadata (CTFS
+  ## spec §7 `meta.dat` `args`).  Each entry is a (pointer, length)
+  ## pair so non-UTF8 / embedded-NUL argv survives the FFI boundary.
+  ## Can be called before or after begin_events — the value is stored
+  ## and propagated to the multi-stream writer's metadata when/if it
+  ## becomes ready.  Passing a NULL handle is a no-op.
+  if handle.isNil:
+    return
+  var argSeq = newSeq[string](int(args_count))
+  if not args.isNil and not arg_lens.isNil:
+    for i in 0 ..< int(args_count):
+      let aPtr = cast[ptr UncheckedArray[ptr uint8]](args)[i]
+      let aLen = cast[ptr UncheckedArray[csize_t]](arg_lens)[i]
+      if not aPtr.isNil and aLen > 0.csize_t:
+        argSeq[i] = newString(int(aLen))
+        copyMem(addr argSeq[i][0], aPtr, int(aLen))
+  handle.metaArgs = argSeq
+  # Propagate to the multi-stream writer's metadata if already created.
+  if handle.useMultiStream and handle.msWriterReady:
+    handle.msWriter.metadata.args = handle.metaArgs
 
 proc trace_writer_register_step(
     handle: TraceWriterHandle,

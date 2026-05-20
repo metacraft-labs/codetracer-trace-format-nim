@@ -296,6 +296,72 @@ proc printSummaryV4(reader: var NewTraceReader) =
   echo lines.join("\n")
 
 # ---------------------------------------------------------------------------
+# V4 meta-json — metadata + counts only, no event decode
+# ---------------------------------------------------------------------------
+
+proc printMetaJsonV4(reader: var NewTraceReader) =
+  ## Emit a compact JSON document with the CTFS `meta.dat` metadata plus
+  ## interning-table / event counts.  Unlike `--full` / `--json` this
+  ## does NOT decode the per-event streams, so it stays O(meta.dat) fast
+  ## even on multi-GB traces.  Shape (deterministic ordering):
+  ##   { metadata: { program, args[], workdir, recorder,
+  ##                 trace_filter?: { filters: [{path, sha256}] } },
+  ##     counts:  { steps, calls, values, io_events,
+  ##                paths, functions, types, varnames } }
+  ##
+  ## This is the canonical fast path for callers that only need the
+  ## recorder-stamped metadata (program identity, args, the composed
+  ## trace-filter provenance chain) without paying the event-decode
+  ## cost — e.g. recorder integration tests asserting on a recorded
+  ## trace's metadata.  `metadata.trace_filter` is materialized exactly
+  ## as `--full` does (TF-M7, Trace-Filters.md § 7): present-but-empty
+  ## when the recorder recorded an empty chain, absent when the recorder
+  ## did not record provenance at all.
+  var root = newJObject()
+
+  var meta = newJObject()
+  meta["program"] = newJString(reader.meta.program)
+  var argsArr = newJArray()
+  for a in reader.meta.args:
+    argsArr.add(newJString(a))
+  meta["args"] = argsArr
+  meta["workdir"] = newJString(reader.meta.workdir)
+  meta["recorder"] = newJString(reader.meta.recorderId)
+
+  if reader.meta.hasFilterProvenance:
+    var filtersArr = newJArray()
+    for entry in reader.meta.filterProvenance:
+      var entryObj = newJObject()
+      entryObj["path"] = newJString(entry.path)
+      var hex = newStringOfCap(64)
+      for k in 0 ..< 32:
+        hex.add(toHex(int(entry.sha256[k]), 2).toLowerAscii())
+      entryObj["sha256"] = newJString(hex)
+      filtersArr.add(entryObj)
+    var traceFilterObj = newJObject()
+    traceFilterObj["filters"] = filtersArr
+    meta["trace_filter"] = traceFilterObj
+
+  root["metadata"] = meta
+
+  var counts = newJObject()
+  let sc = reader.stepCount()
+  let cc = reader.callCount()
+  let vc = reader.valueCount()
+  let ic = reader.ioEventCount()
+  if sc.isOk: counts["steps"] = newJInt(int64(sc.get()))
+  if cc.isOk: counts["calls"] = newJInt(int64(cc.get()))
+  if vc.isOk: counts["values"] = newJInt(int64(vc.get()))
+  if ic.isOk: counts["io_events"] = newJInt(int64(ic.get()))
+  counts["paths"] = newJInt(int64(reader.pathCount()))
+  counts["functions"] = newJInt(int64(reader.functionCount()))
+  counts["types"] = newJInt(int64(reader.typeCount()))
+  counts["varnames"] = newJInt(int64(reader.varnameCount()))
+  root["counts"] = counts
+
+  echo pretty(root)
+
+# ---------------------------------------------------------------------------
 # V4 JSON (full dump - legacy, value bytes are passed through as text)
 # ---------------------------------------------------------------------------
 
@@ -1093,6 +1159,11 @@ ct-print: Convert .ct trace files to human-readable formats.
 Usage:
   ct-print <file.ct>                     Print trace as text (default)
   ct-print --summary <file.ct>           Print metadata + counts only
+  ct-print --meta-json <file.ct>         JSON dump of meta.dat metadata
+                                          (program, args, workdir, recorder,
+                                          trace_filter chain) + counts only.
+                                          Does NOT decode event streams, so
+                                          it stays fast on multi-GB traces.
   ct-print --json <file.ct>              JSON dump (legacy: variable values
                                           are NOT decoded; use --full instead)
   ct-print --json-events <file.ct>       JSON events array (legacy)
@@ -1209,6 +1280,7 @@ proc main() =
       of "json": format = "json"
       of "json-events": format = "json-events"
       of "summary": format = "summary"
+      of "meta-json": format = "meta-json"
       of "full": format = "full"
       of "events": format = "events"
       of "follow": follow = true
@@ -1260,7 +1332,8 @@ proc main() =
       # used to accept arbitrary bytes here and produce a degenerate empty
       # document — refuse instead. (Legacy callers that want the old text
       # path can still use --no-native + a real v2/v3 file.)
-      if format == "full" or format == "events" or format == "summary":
+      if format == "full" or format == "events" or format == "summary" or
+         format == "meta-json":
         quit(
           "ct-print: not a recognised .ct file: " & detail &
           " (path=" & filePath & ")")
@@ -1276,6 +1349,7 @@ proc main() =
       var reader = newReaderRes.get()
       case format
       of "summary": printSummaryV4(reader)
+      of "meta-json": printMetaJsonV4(reader)
       of "json": printJsonV4(reader)
       of "json-events": printJsonEventsV4(reader)
       of "full": printFullV4(reader, opts)
