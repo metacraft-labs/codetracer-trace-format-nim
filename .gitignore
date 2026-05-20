@@ -53,3 +53,13 @@ tests/test_file_access
 tests/test_network_reader
 tests/test_query_protocol
 tests/test_replication
+# Added 2026-05-20 — compiled test/bench/generator executables that were
+# missing from the per-file list (three of them had been committed as
+# stray binaries; evicted from the index the same day).
+tests/test_ct_print_full
+tests/generate_golden_fixtures
+tests/generate_ct_print_fixture
+tests/test_path_filter
+tests/test_split_trace
+tests/test_trace_storage_config
+ct-space

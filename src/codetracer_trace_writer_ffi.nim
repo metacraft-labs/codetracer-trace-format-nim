@@ -2203,9 +2203,17 @@ proc ct_reader_event_fields(
 # NimMain — required for static/shared lib initialization
 # ---------------------------------------------------------------------------
 
-proc NimMain() {.importc.}
+# This library is designed to be embedded alongside other Nim-compiled
+# artifacts (notably the MCR emulator) in a single binary. Every build
+# path compiles it with `--nimMainPrefix:codetracerTraceWriter` so the
+# generated runtime entry points don't collide with another embedded Nim
+# lib's `NimMain` (LNK2005 "NimMain already defined" on Windows / duplicate
+# symbol on Unix). The prefix MUST stay in sync with the `buildStaticLib`
+# / `buildSharedLib` / `testFfi` nimble tasks and with the
+# `codetracer_trace_writer_nim` Rust crate's build.rs.
+proc codetracerTraceWriterNimMain() {.importc.}
 
 proc codetracer_trace_writer_init() {.exportc, cdecl, dynlib.} =
   ## Call this once before using any other function if linking as a static lib.
   ## For shared libs (.so/.dylib), this is called automatically via a constructor.
-  NimMain()
+  codetracerTraceWriterNimMain()
