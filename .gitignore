@@ -63,3 +63,6 @@ tests/test_path_filter
 tests/test_split_trace
 tests/test_trace_storage_config
 ct-space
+# Windows builds the ct-print / ct-space utilities with a .exe suffix.
+ct-print.exe
+ct-space.exe
