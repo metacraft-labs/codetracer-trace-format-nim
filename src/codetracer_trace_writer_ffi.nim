@@ -607,6 +607,8 @@ proc trace_writer_register_call(
   if handle.isNil:
     return
   if handle.useMultiStream:
+    if handle.msWriter.stepCount > 0:
+      discard flushPendingStep(handle)
     discard handle.msWriter.registerCall(uint64(function_id),
         handle.pendingCallArgs)
     handle.pendingCallArgs.setLen(0)
@@ -620,6 +622,7 @@ proc trace_writer_register_return(handle: TraceWriterHandle) {.exportc, cdecl, d
   if handle.isNil:
     return
   if handle.useMultiStream:
+    discard flushPendingStep(handle)
     discard handle.msWriter.registerReturn()
     return
   discard handle.writer.writeReturn()
@@ -640,6 +643,7 @@ proc trace_writer_register_return_int(
     var sve = StreamingValueEncoder.init()
     discard sve.writeInt(value, uint64(typeId))
     let retBytes = sve.getBytes()
+    discard flushPendingStep(handle)
     discard handle.msWriter.registerReturn(retBytes)
     return
 
@@ -669,6 +673,7 @@ proc trace_writer_register_return_raw(
     var sve = StreamingValueEncoder.init()
     discard sve.writeRaw(toNimStr(value_repr), uint64(typeId))
     let retBytes = sve.getBytes()
+    discard flushPendingStep(handle)
     discard handle.msWriter.registerReturn(retBytes)
     return
 
@@ -814,6 +819,7 @@ proc trace_writer_register_return_cbor(
     var data = newSeq[byte](int(cbor_len))
     if not cbor_data.isNil and cbor_len > 0.csize_t:
       copyMem(addr data[0], cbor_data, int(cbor_len))
+    discard flushPendingStep(handle)
     discard handle.msWriter.registerReturn(data)
     return
 

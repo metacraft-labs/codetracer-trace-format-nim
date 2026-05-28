@@ -98,5 +98,5 @@ task testFfi, "Build and run C FFI test":
   # emulator) without a duplicate-`NimMain` link error. It MUST match the
   # `proc codetracerTraceWriterNimMain` importc in codetracer_trace_writer_ffi.nim.
   exec "nim c --app:staticlib --mm:arc --noMain -d:release --nimMainPrefix:codetracerTraceWriter --passC:\"-fPIC\" -p:src -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim"
-  exec "gcc -o tests/test_ffi tests/test_ffi.c -L. -lcodetracer_trace_writer -lzstd -lm -I include"
+  exec "gcc -o tests/test_ffi tests/test_ffi.c ./libcodetracer_trace_writer.a -lzstd -lm -I include"
   exec "./tests/test_ffi"
