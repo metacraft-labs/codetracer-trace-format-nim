@@ -15,7 +15,10 @@
 ##   - `event_log.dat` + `.idx`— chunk-indexed OS-event log with structured
 ##                               (geid, tick, tid, kind, fd, returnValue,
 ##                               metadata, content) entries.
-##   - `paths.json`            — empty array placeholder (M1 writer)
+##   - `paths.json`            — JSON string array of recorded source
+##                               paths (populated by ct_recorder/
+##                               trace_writer.nim from `--source` plus
+##                               DWARF-discovered companions).
 ##   - `cpidx.idx` + `cpdata.bin` (optional) — checkpoint records
 ##
 ## Without this decoder, `ct-print --full` on a native bundle silently produced
@@ -674,10 +677,33 @@ proc buildNativeFullDocument*(data: openArray[byte], opts: NativeOpts):
   meta["hook_strategies"] = hsArr
   root["metadata"] = meta
 
-  # paths/functions/varnames/types — native bundles do not interning-table
-  # these (paths.json is always `[]` in M1). Surface as empty arrays so the
-  # output schema matches the v4 `--full` output.
-  root["paths"] = newJArray()
+  # paths: ct_recorder/trace_writer.nim writes the registered --source
+  # paths (and DWARF-discovered companions) into the CTFS-internal
+  # paths.json as a JSON string array.  Surface them in the output so
+  # ct-print --summary / --full reflects what the recorder actually
+  # captured, matching the v4 `--full` schema.
+  #
+  # functions/varnames/types are not interning-tabled by the native
+  # bundle's M1 writer (it streams them inline in the per-thread event
+  # payloads instead of building separate interning tables); surface
+  # as empty arrays for schema parity.
+  var pathsArr = newJArray()
+  var pathsCount = 0
+  let pathsR = readInternalFile(data, "paths.json", info.blockSize, info.maxRoot)
+  if pathsR.isOk:
+    let pathsBytes = pathsR.get()
+    if pathsBytes.len > 0:
+      let pathsTxt = bytesToUtf8(pathsBytes)
+      try:
+        let parsed = parseJson(pathsTxt)
+        if parsed.kind == JArray:
+          for item in parsed.elems:
+            if item.kind == JString:
+              pathsArr.add(item)
+              inc pathsCount
+      except CatchableError:
+        discard  # malformed paths.json — leave count at 0 / array empty
+  root["paths"] = pathsArr
   root["functions"] = newJArray()
   root["varnames"] = newJArray()
   root["types"] = newJArray()
@@ -712,7 +738,7 @@ proc buildNativeFullDocument*(data: openArray[byte], opts: NativeOpts):
 
   # ----- counts -----
   var counts = newJObject()
-  counts["paths"] = newJInt(0)
+  counts["paths"] = newJInt(int64(pathsCount))
   counts["functions"] = newJInt(0)
   counts["varnames"] = newJInt(0)
   counts["types"] = newJInt(0)

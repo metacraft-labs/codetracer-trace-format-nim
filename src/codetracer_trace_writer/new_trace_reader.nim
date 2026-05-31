@@ -7,7 +7,7 @@
 ## and IO-event streams are initialized lazily on first access.
 
 import results
-import std/os
+import std/[os, json]
 import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
 import ./meta_dat
@@ -32,6 +32,15 @@ type
     funcReader: InterningTableReader
     typeReader: InterningTableReader
     varnameReader: InterningTableReader
+
+    # paths.json fallback for traces that don't carry a binary paths
+    # interning table yet (the M13 ct_recorder writer populates
+    # paths.json but the binary paths.dat / paths.off table is still
+    # an open TODO per the meta-json-retirement work tracked in
+    # codetracer-specs/Planned-Work/Legacy-CTFS-Format-Cleanup.md).
+    # When pathReader is empty we fall back to this list so callers
+    # get the source paths they actually recorded.
+    pathsJson: seq[string]
 
     # Stream readers (lazy, loaded on first access)
     execReader: ExecStreamReader
@@ -79,6 +88,26 @@ proc openNewTraceFromBytes*(data: seq[byte],
   let vnRes = initInterningTableReader(data, "varnames", blockSize, maxEntries)
   if vnRes.isOk: reader.varnameReader = vnRes.get()
 
+  # paths.json fallback: when no binary paths interning table is
+  # present, try the JSON form ct_recorder writes (M13).  The
+  # binary table is preferred when both exist — see pathCount / path.
+  if reader.pathReader.count() == 0:
+    let pathsJsonRes = readInternalFile(data, "paths.json", blockSize, maxEntries)
+    if pathsJsonRes.isOk:
+      let pathsBytes = pathsJsonRes.get()
+      if pathsBytes.len > 0:
+        var pathsTxt = newString(pathsBytes.len)
+        for i, b in pathsBytes:
+          pathsTxt[i] = char(b)
+        try:
+          let parsed = parseJson(pathsTxt)
+          if parsed.kind == JArray:
+            for item in parsed.elems:
+              if item.kind == JString:
+                reader.pathsJson.add(item.getStr(""))
+        except CatchableError:
+          discard  # malformed paths.json — leave the fallback empty
+
   ok(reader)
 
 proc openNewTrace*(path: string): Result[NewTraceReader, string] =
@@ -106,7 +135,12 @@ proc openNewTrace*(path: string): Result[NewTraceReader, string] =
 # ---------------------------------------------------------------------------
 
 proc path*(r: NewTraceReader, id: uint64): Result[string, string] =
-  r.pathReader.readById(id)
+  if r.pathReader.count() > 0:
+    r.pathReader.readById(id)
+  elif r.pathsJson.len > 0 and id < uint64(r.pathsJson.len):
+    ok(r.pathsJson[int(id)])
+  else:
+    r.pathReader.readById(id)  # error path — preserve the original error
 
 proc function*(r: NewTraceReader, id: uint64): Result[string, string] =
   r.funcReader.readById(id)
@@ -117,7 +151,10 @@ proc typeName*(r: NewTraceReader, id: uint64): Result[string, string] =
 proc varname*(r: NewTraceReader, id: uint64): Result[string, string] =
   r.varnameReader.readById(id)
 
-proc pathCount*(r: NewTraceReader): uint64 = r.pathReader.count()
+proc pathCount*(r: NewTraceReader): uint64 =
+  let binary = r.pathReader.count()
+  if binary > 0: binary
+  else: uint64(r.pathsJson.len)
 proc functionCount*(r: NewTraceReader): uint64 = r.funcReader.count()
 proc typeCount*(r: NewTraceReader): uint64 = r.typeReader.count()
 proc varnameCount*(r: NewTraceReader): uint64 = r.varnameReader.count()
