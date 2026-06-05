@@ -934,22 +934,63 @@ proc decodeCborTypeRecord*(dec: var CborDecoder): Result[TypeRecord, string] =
 # RValue is #[serde(tag = "kind")] enum
 
 proc encodeCborRValue(enc: var CborEncoder, rv: RValue) {.inline.} =
+  ## M14: ~RValue~ uses serde adjacently-tagged form
+  ## ~#[serde(tag = "kind", content = "data")]~ so newtype tuple
+  ## variants (~Simple~, ~Compound~) and struct variants work
+  ## uniformly across JSON and CBOR. Unit variant ~Literal~ omits the
+  ## ~"data"~ key (serde's behaviour for unit variants).
   case rv.kind
   of rvkSimple:
     enc.writeMapHeader(2)
     enc.writePrecomputed(CborKeyKind)
     enc.writeTextString("Simple")
-    enc.writePrecomputed(CborKey0)
+    enc.writeTextString("data")
     enc.writeUint(uint64(rv.simpleId))
 
   of rvkCompound:
     enc.writeMapHeader(2)
     enc.writePrecomputed(CborKeyKind)
     enc.writeTextString("Compound")
-    enc.writePrecomputed(CborKey0)
+    enc.writeTextString("data")
     enc.writeArrayHeader(uint64(rv.compoundIds.len))
     for id in rv.compoundIds:
       enc.writeUint(uint64(id))
+
+  of rvkLiteral:
+    enc.writeMapHeader(1)
+    enc.writePrecomputed(CborKeyKind)
+    enc.writeTextString("Literal")
+
+  of rvkFieldAccess:
+    enc.writeMapHeader(2)
+    enc.writePrecomputed(CborKeyKind)
+    enc.writeTextString("FieldAccess")
+    enc.writeTextString("data")
+    enc.writeMapHeader(2)
+    enc.writeTextString("receiver")
+    enc.writeUint(uint64(rv.faReceiver))
+    enc.writeTextString("field")
+    enc.writeTextString(rv.faField)
+
+  of rvkIndexAccess:
+    enc.writeMapHeader(2)
+    enc.writePrecomputed(CborKeyKind)
+    enc.writeTextString("IndexAccess")
+    enc.writeTextString("data")
+    enc.writeMapHeader(2)
+    enc.writeTextString("receiver")
+    enc.writeUint(uint64(rv.iaReceiver))
+    enc.writeTextString("index")
+    enc.writeInt(int64(rv.iaIndex))
+
+  of rvkFunctionReturn:
+    enc.writeMapHeader(2)
+    enc.writePrecomputed(CborKeyKind)
+    enc.writeTextString("FunctionReturn")
+    enc.writeTextString("data")
+    enc.writeMapHeader(1)
+    enc.writeTextString("call_key")
+    enc.writeInt(int64(rv.frCallKey))
 
 proc encodeCborAssignmentRecord*(enc: var CborEncoder, a: AssignmentRecord) {.inline.} =
   enc.writeMapHeader(3)
@@ -972,18 +1013,44 @@ proc decodeCborRValue(dec: var CborDecoder): Result[RValue, string] =
 
   case kindStr
   of "Simple":
-    discard ?dec.readTextString()  # "0"
+    discard ?dec.readTextString()  # "data"
     let id = ?dec.readUint()
     ok(RValue(kind: rvkSimple, simpleId: VariableId(id)))
   of "Compound":
-    discard ?dec.readTextString()  # "0"
+    discard ?dec.readTextString()  # "data"
     let count = ?dec.readArrayHeader()
     var ids = newSeq[VariableId](int(count))
     for i in 0 ..< int(count):
       ids[i] = VariableId(?dec.readUint())
     ok(RValue(kind: rvkCompound, compoundIds: ids))
+  of "Literal":
+    ok(RValue(kind: rvkLiteral))
+  of "FieldAccess":
+    discard ?dec.readTextString()  # "data"
+    discard ?dec.readMapHeader()
+    discard ?dec.readTextString()  # "receiver"
+    let rcv = ?dec.readUint()
+    discard ?dec.readTextString()  # "field"
+    let field = ?dec.readTextString()
+    ok(RValue(kind: rvkFieldAccess, faReceiver: VariableId(rcv), faField: field))
+  of "IndexAccess":
+    discard ?dec.readTextString()  # "data"
+    discard ?dec.readMapHeader()
+    discard ?dec.readTextString()  # "receiver"
+    let rcv = ?dec.readUint()
+    discard ?dec.readTextString()  # "index"
+    let idx = ?dec.readInt()
+    ok(RValue(kind: rvkIndexAccess, iaReceiver: VariableId(rcv), iaIndex: idx))
+  of "FunctionReturn":
+    discard ?dec.readTextString()  # "data"
+    discard ?dec.readMapHeader()
+    discard ?dec.readTextString()  # "call_key"
+    let ck = ?dec.readInt()
+    ok(RValue(kind: rvkFunctionReturn, frCallKey: CallKey(ck)))
   else:
-    err("cbor: unknown RValue kind: '" & kindStr & "'")
+    # M14 back-compat: unknown RValue variants surface as an empty
+    # Compound so old readers do not blow up on newer recorders.
+    ok(RValue(kind: rvkCompound, compoundIds: @[]))
 
 proc decodeCborAssignmentRecord*(dec: var CborDecoder): Result[AssignmentRecord, string] =
   discard ?dec.readMapHeader()

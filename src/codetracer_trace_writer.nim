@@ -194,6 +194,49 @@ proc writeStep*(w: var TraceWriter, pathId: uint64, line: int64): Result[void, s
   w.writeEvent(TraceLowLevelEvent(kind: tleStep,
     step: StepRecord(pathId: PathId(pathId), line: Line(line))))
 
+proc writeStepWithColumn*(w: var TraceWriter, pathId: uint64, line: int64,
+                          column: int64): Result[void, string] =
+  ## M14: write a Step event carrying an explicit column. Recorders that
+  ## have column information (Python 3.11+ ~co_positions~, sourcemapped
+  ## JavaScript, native debug info) call this instead of ~writeStep~.
+  w.writeEvent(TraceLowLevelEvent(kind: tleStep,
+    step: StepRecord(pathId: PathId(pathId), line: Line(line),
+                     hasColumn: true, column: Line(column))))
+
+proc writeBindVariable*(w: var TraceWriter, variableId: uint64,
+                        place: int64): Result[void, string] =
+  ## M14: emit a BindVariable event.
+  w.writeEvent(TraceLowLevelEvent(kind: tleBindVariable,
+    bindVar: BindVariableRecord(variableId: VariableId(variableId),
+                                place: Place(place))))
+
+proc writeAssignmentSimple*(w: var TraceWriter, target: uint64, passBy: PassBy,
+                            source: uint64): Result[void, string] =
+  ## M14: emit ~target = source~ (RValue::Simple).
+  w.writeEvent(TraceLowLevelEvent(kind: tleAssignment,
+    assignment: AssignmentRecord(
+      to: VariableId(target),
+      passBy: passBy,
+      frm: RValue(kind: rvkSimple, simpleId: VariableId(source)))))
+
+proc writeAssignmentLiteral*(w: var TraceWriter, target: uint64,
+                             passBy: PassBy): Result[void, string] =
+  ## M14: emit ~target = <literal>~.
+  w.writeEvent(TraceLowLevelEvent(kind: tleAssignment,
+    assignment: AssignmentRecord(
+      to: VariableId(target),
+      passBy: passBy,
+      frm: RValue(kind: rvkLiteral))))
+
+proc writeAssignmentFunctionReturn*(w: var TraceWriter, target: uint64,
+                                    passBy: PassBy, callKey: int64): Result[void, string] =
+  ## M14: emit ~target = <return value of call referenced by callKey>~.
+  w.writeEvent(TraceLowLevelEvent(kind: tleAssignment,
+    assignment: AssignmentRecord(
+      to: VariableId(target),
+      passBy: passBy,
+      frm: RValue(kind: rvkFunctionReturn, frCallKey: CallKey(callKey)))))
+
 proc writePath*(w: var TraceWriter, path: string): Result[void, string] =
   w.writeEvent(TraceLowLevelEvent(kind: tlePath, path: path))
 

@@ -254,6 +254,12 @@ type
   StepRecord* = object
     pathId*: PathId
     line*: Line
+    ## M14: optional column. ~hasColumn = false~ means the recorder did
+    ## not capture per-instruction column information; the Rust side
+    ## models this as ~column: Option<Line>~ with ~None~ as the
+    ## back-compat default for pre-M14 traces.
+    hasColumn*: bool
+    column*: Line
 
   FullValueRecord* = object
     variableId*: VariableId
@@ -287,6 +293,11 @@ type
   RValueKind* = enum
     rvkSimple
     rvkCompound
+    ## M14 additions. Mirror the Rust ~RValue~ variants 1:1.
+    rvkLiteral
+    rvkFieldAccess
+    rvkIndexAccess
+    rvkFunctionReturn
 
   RValue* = object
     case kind*: RValueKind
@@ -294,6 +305,16 @@ type
       simpleId*: VariableId
     of rvkCompound:
       compoundIds*: seq[VariableId]
+    of rvkLiteral:
+      discard
+    of rvkFieldAccess:
+      faReceiver*: VariableId
+      faField*: string
+    of rvkIndexAccess:
+      iaReceiver*: VariableId
+      iaIndex*: int64
+    of rvkFunctionReturn:
+      frCallKey*: CallKey
 
   AssignmentRecord* = object
     to*: VariableId
@@ -553,7 +574,8 @@ proc `==`*(a, b: TypeRecord): bool =
   a.kind == b.kind and a.langType == b.langType and a.specificInfo == b.specificInfo
 
 proc `==`*(a, b: StepRecord): bool =
-  a.pathId == b.pathId and a.line == b.line
+  a.pathId == b.pathId and a.line == b.line and a.hasColumn == b.hasColumn and
+    (not a.hasColumn or a.column == b.column)
 
 proc `==`*(a, b: FullValueRecord): bool =
   a.variableId == b.variableId and a.value == b.value
@@ -590,6 +612,10 @@ proc `==`*(a, b: RValue): bool =
   case a.kind
   of rvkSimple: a.simpleId == b.simpleId
   of rvkCompound: eqSeqVariableId(a.compoundIds, b.compoundIds)
+  of rvkLiteral: true
+  of rvkFieldAccess: a.faReceiver == b.faReceiver and a.faField == b.faField
+  of rvkIndexAccess: a.iaReceiver == b.iaReceiver and a.iaIndex == b.iaIndex
+  of rvkFunctionReturn: a.frCallKey == b.frCallKey
 
 proc `==`*(a, b: AssignmentRecord): bool =
   a.to == b.to and a.passBy == b.passBy and a.frm == b.frm

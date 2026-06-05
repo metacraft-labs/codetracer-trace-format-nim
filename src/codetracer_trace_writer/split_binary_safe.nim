@@ -302,21 +302,54 @@ proc encodeCborTypeRecordInto*(buf: var SafeBuffer, t: TypeRecord) =
   encodeCborTypeSpecificInfoInto(buf, t.specificInfo)
 
 proc encodeCborRValueInto(buf: var SafeBuffer, rv: RValue) {.inline.} =
+  ## M14: serde adjacently-tagged form (see ~split_binary.nim~).
   case rv.kind
   of rvkSimple:
     buf.writeCborMapHeader(2)
     buf.writeOpenArray(CborKeyKind2)
     buf.writeCborTextString("Simple")
-    buf.writeOpenArray(CborKey02)
+    buf.writeCborTextString("data")
     buf.writeCborUint(uint64(rv.simpleId))
   of rvkCompound:
     buf.writeCborMapHeader(2)
     buf.writeOpenArray(CborKeyKind2)
     buf.writeCborTextString("Compound")
-    buf.writeOpenArray(CborKey02)
+    buf.writeCborTextString("data")
     buf.writeCborArrayHeader(uint64(rv.compoundIds.len))
     for id in rv.compoundIds:
       buf.writeCborUint(uint64(id))
+  of rvkLiteral:
+    buf.writeCborMapHeader(1)
+    buf.writeOpenArray(CborKeyKind2)
+    buf.writeCborTextString("Literal")
+  of rvkFieldAccess:
+    buf.writeCborMapHeader(2)
+    buf.writeOpenArray(CborKeyKind2)
+    buf.writeCborTextString("FieldAccess")
+    buf.writeCborTextString("data")
+    buf.writeCborMapHeader(2)
+    buf.writeCborTextString("receiver")
+    buf.writeCborUint(uint64(rv.faReceiver))
+    buf.writeCborTextString("field")
+    buf.writeCborTextString(rv.faField)
+  of rvkIndexAccess:
+    buf.writeCborMapHeader(2)
+    buf.writeOpenArray(CborKeyKind2)
+    buf.writeCborTextString("IndexAccess")
+    buf.writeCborTextString("data")
+    buf.writeCborMapHeader(2)
+    buf.writeCborTextString("receiver")
+    buf.writeCborUint(uint64(rv.iaReceiver))
+    buf.writeCborTextString("index")
+    buf.writeCborInt(int64(rv.iaIndex))
+  of rvkFunctionReturn:
+    buf.writeCborMapHeader(2)
+    buf.writeOpenArray(CborKeyKind2)
+    buf.writeCborTextString("FunctionReturn")
+    buf.writeCborTextString("data")
+    buf.writeCborMapHeader(1)
+    buf.writeCborTextString("call_key")
+    buf.writeCborInt(int64(rv.frCallKey))
 
 proc encodeCborAssignmentRecordInto*(buf: var SafeBuffer, a: AssignmentRecord) =
   buf.writeCborMapHeader(3)

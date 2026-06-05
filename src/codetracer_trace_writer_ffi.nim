@@ -120,6 +120,12 @@ type
     # Type registry: kind+langType -> id
     types: seq[TypeEntry]
     typeIndex: Table[string, csize_t]  # "kind\0langType" -> index
+    # M14 variable registry: name -> id. Required so the new
+    # ct_bind_variable / ct_assignment entry points can intern names
+    # without re-walking the existing single-stream / multi-stream
+    # accounting code.
+    variables: seq[string]
+    variableIndex: Table[string, csize_t]
 
   TraceWriterHandle = ptr TraceWriterState
 
@@ -876,6 +882,182 @@ proc trace_writer_register_special_event(
       content: toNimStr(content),
     ),
   ))
+
+# ---------------------------------------------------------------------------
+# M14 — Assignment / BindVariable / column-aware Step
+# ---------------------------------------------------------------------------
+#
+# These entry points expose the M14 value-origin recorder vocabulary
+# (~Assignment~, ~BindVariable~, column-aware ~Step~) over the same
+# single-stream + multi-stream code paths the older entry points use.
+# Recorders call them only when they have something meaningful to emit;
+# the events are otherwise silently absent from the trace, preserving
+# back-compat with pre-M14 readers (which skip unknown variants).
+
+type
+  FfiRValueKind* {.pure.} = enum
+    Simple = 0
+    Compound = 1
+    Literal = 2
+    FieldAccess = 3
+    IndexAccess = 4
+    FunctionReturn = 5
+
+  FfiPassBy* {.pure.} = enum
+    Value = 0
+    Reference = 1
+
+proc toPassBy(p: FfiPassBy): PassBy =
+  case p
+  of FfiPassBy.Value: pbValue
+  of FfiPassBy.Reference: pbReference
+
+proc buildRvalue(
+    rvalueKind: FfiRValueKind,
+    simpleVariableId: csize_t,
+    compoundIds: ptr csize_t,
+    compoundLen: csize_t,
+    fieldName: cstring,
+    index: int64,
+    callKey: int64,
+): RValue =
+  case rvalueKind
+  of FfiRValueKind.Simple:
+    RValue(kind: rvkSimple, simpleId: VariableId(uint64(simpleVariableId)))
+  of FfiRValueKind.Compound:
+    if compoundIds.isNil or compoundLen == 0.csize_t:
+      RValue(kind: rvkCompound, compoundIds: @[])
+    else:
+      var ids = newSeq[VariableId](int(compoundLen))
+      let arr = cast[ptr UncheckedArray[csize_t]](compoundIds)
+      for i in 0 ..< int(compoundLen):
+        ids[i] = VariableId(uint64(arr[i]))
+      RValue(kind: rvkCompound, compoundIds: ids)
+  of FfiRValueKind.Literal:
+    RValue(kind: rvkLiteral)
+  of FfiRValueKind.FieldAccess:
+    RValue(kind: rvkFieldAccess,
+           faReceiver: VariableId(uint64(simpleVariableId)),
+           faField: toNimStr(fieldName))
+  of FfiRValueKind.IndexAccess:
+    RValue(kind: rvkIndexAccess,
+           iaReceiver: VariableId(uint64(simpleVariableId)),
+           iaIndex: index)
+  of FfiRValueKind.FunctionReturn:
+    RValue(kind: rvkFunctionReturn, frCallKey: CallKey(callKey))
+
+proc internVariable(handle: TraceWriterHandle, name: string): uint64 =
+  ## Intern a variable name and emit the ~VariableName~ event the first
+  ## time it appears.  M14 entry points share this helper.
+  let existing = handle.variableIndex.getOrDefault(name, high(csize_t))
+  if existing != high(csize_t):
+    return uint64(existing)
+  let id = csize_t(handle.variables.len)
+  handle.variables.add(name)
+  handle.variableIndex[name] = id
+  if handle.useMultiStream and handle.msWriterReady:
+    discard handle.msWriter.registerVarname(name)
+  elif handle.writerReady:
+    discard handle.writer.writeEvent(TraceLowLevelEvent(
+      kind: tleVariableName, varName: name))
+  uint64(id)
+
+proc ct_bind_variable(
+    handle: TraceWriterHandle,
+    variable_name: cstring,
+    place: int64,
+) {.exportc, cdecl, dynlib.} =
+  ## Emit a BindVariable event associating ~variable_name~ with ~place~.
+  ##
+  ## Currently routed through the single-stream writer only.  The
+  ## multi-stream writer does not yet expose a generic ~writeEvent~
+  ## surface for history events; when it does (tracked in CTFS-M5 /
+  ## history-stream landing) this entry point will route through it too.
+  if handle.isNil:
+    return
+  let name = toNimStr(variable_name)
+  let variableId = internVariable(handle, name)
+  if handle.useMultiStream:
+    setError("ct_bind_variable: multi-stream writer does not yet support history events")
+    return
+  if not handle.writerReady:
+    return
+  discard handle.writer.writeBindVariable(variableId, place)
+
+proc ct_assignment(
+    handle: TraceWriterHandle,
+    target_name: cstring,
+    pass_by: FfiPassBy,
+    rvalue_kind: FfiRValueKind,
+    simple_variable_id: csize_t,
+    compound_ids: ptr csize_t,
+    compound_len: csize_t,
+    field_name: cstring,
+    index: int64,
+    call_key: int64,
+) {.exportc, cdecl, dynlib.} =
+  ## M14: emit an Assignment event.  The arguments are interpreted per
+  ## ~rvalue_kind~; see the Rust FFI's ~ct_assignment~ for the same
+  ## discriminator table.  Currently routed through the single-stream
+  ## writer only (see the note on ~ct_bind_variable~).
+  if handle.isNil:
+    return
+  let name = toNimStr(target_name)
+  let variableId = internVariable(handle, name)
+  let rvalue = buildRvalue(rvalue_kind, simple_variable_id, compound_ids,
+                           compound_len, field_name, index, call_key)
+  if handle.useMultiStream:
+    setError("ct_assignment: multi-stream writer does not yet support history events")
+    return
+  if not handle.writerReady:
+    return
+  discard handle.writer.writeEvent(TraceLowLevelEvent(
+    kind: tleAssignment,
+    assignment: AssignmentRecord(
+      to: VariableId(variableId),
+      passBy: toPassBy(pass_by),
+      frm: rvalue)))
+
+proc ct_assignment_with_column(
+    handle: TraceWriterHandle,
+    path: cstring,
+    line: int64,
+    column: int64,
+    has_column: cint,
+) {.exportc, cdecl, dynlib.} =
+  ## M14: emit a Step event at (path, line, column).  When ~has_column~
+  ## is zero the event is the legacy column-less Step so pre-M14 readers
+  ## still parse it.
+  if handle.isNil:
+    return
+  let p = toNimStr(path)
+  if handle.useMultiStream:
+    if not handle.msWriterReady:
+      return
+    discard flushPendingStep(handle)
+    let pathIdRes = handle.msWriter.registerPath(p)
+    if pathIdRes.isErr:
+      return
+    let pathId = pathIdRes.get()
+    if has_column != 0:
+      # M14: multi-stream Step events do not yet carry column info
+      # (delta-step encoding only records a global line index).  Until
+      # the exec stream grows a column slot, the column is dropped here
+      # and the FFI behaves as register_step from the recorder's point
+      # of view.
+      setError("ct_assignment_with_column: multi-stream Step does not yet carry column; falling back to no-column")
+    handle.pendingStepPathId = pathId
+    handle.pendingStepLine = uint64(line)
+    handle.hasPendingStep = true
+    return
+  if not handle.writerReady:
+    return
+  discard handle.writer.writePath(p)
+  let pathId = uint64(handle.writer.paths.len - 1)
+  if has_column != 0:
+    discard handle.writer.writeStepWithColumn(pathId, line, column)
+  else:
+    discard handle.writer.writeStep(pathId, line)
 
 # ---------------------------------------------------------------------------
 # Thread lifecycle events

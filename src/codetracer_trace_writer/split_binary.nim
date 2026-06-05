@@ -403,21 +403,54 @@ proc encodeCborTypeRecordInto*(buf: var SafeBuffer, t: TypeRecord) =
   encodeCborTypeSpecificInfoInto(buf, t.specificInfo)
 
 proc encodeCborRValueInto(buf: var SafeBuffer, rv: RValue) {.inline.} =
+  ## M14: serde adjacently-tagged form ~{tag = "kind", content = "data"}~.
   case rv.kind
   of rvkSimple:
     buf.writeCborMapHeader(2)
     buf.writeOpenArray(CborKeyKind2)
     buf.writeCborTextString("Simple")
-    buf.writeOpenArray(CborKey02)
+    buf.writeCborTextString("data")
     buf.writeCborUint(uint64(rv.simpleId))
   of rvkCompound:
     buf.writeCborMapHeader(2)
     buf.writeOpenArray(CborKeyKind2)
     buf.writeCborTextString("Compound")
-    buf.writeOpenArray(CborKey02)
+    buf.writeCborTextString("data")
     buf.writeCborArrayHeader(uint64(rv.compoundIds.len))
     for id in rv.compoundIds:
       buf.writeCborUint(uint64(id))
+  of rvkLiteral:
+    buf.writeCborMapHeader(1)
+    buf.writeOpenArray(CborKeyKind2)
+    buf.writeCborTextString("Literal")
+  of rvkFieldAccess:
+    buf.writeCborMapHeader(2)
+    buf.writeOpenArray(CborKeyKind2)
+    buf.writeCborTextString("FieldAccess")
+    buf.writeCborTextString("data")
+    buf.writeCborMapHeader(2)
+    buf.writeCborTextString("receiver")
+    buf.writeCborUint(uint64(rv.faReceiver))
+    buf.writeCborTextString("field")
+    buf.writeCborTextString(rv.faField)
+  of rvkIndexAccess:
+    buf.writeCborMapHeader(2)
+    buf.writeOpenArray(CborKeyKind2)
+    buf.writeCborTextString("IndexAccess")
+    buf.writeCborTextString("data")
+    buf.writeCborMapHeader(2)
+    buf.writeCborTextString("receiver")
+    buf.writeCborUint(uint64(rv.iaReceiver))
+    buf.writeCborTextString("index")
+    buf.writeCborInt(int64(rv.iaIndex))
+  of rvkFunctionReturn:
+    buf.writeCborMapHeader(2)
+    buf.writeOpenArray(CborKeyKind2)
+    buf.writeCborTextString("FunctionReturn")
+    buf.writeCborTextString("data")
+    buf.writeCborMapHeader(1)
+    buf.writeCborTextString("call_key")
+    buf.writeCborInt(int64(rv.frCallKey))
 
 proc encodeCborAssignmentRecordInto*(buf: var SafeBuffer, a: AssignmentRecord) =
   buf.writeCborMapHeader(3)
@@ -532,12 +565,24 @@ proc encodeEvent*(enc: var SplitBinaryEncoder, event: TraceLowLevelEvent) =
   ensureSpace(enc.buf, 512)
   case event.kind
   of tleStep:
-    # 17 bytes: tag(1) + pathId(8) + line(8) — direct store (no memcpy call)
-    let p = enc.buf.pos
-    enc.buf.data[p] = 0
-    cast[ptr uint64](addr enc.buf.data[p + 1])[] = uint64(event.step.pathId)
-    cast[ptr int64](addr enc.buf.data[p + 9])[] = int64(event.step.line)
-    enc.buf.pos = p + 17
+    # M14: when the recorder did not provide a column the legacy
+    # 17-byte tag(0) form is used so pre-M14 readers continue to
+    # decode the event. Recorders that have column info emit the new
+    # 25-byte tag(24) form ("StepWithColumn").
+    if event.step.hasColumn:
+      let p = enc.buf.pos
+      enc.buf.data[p] = 24
+      cast[ptr uint64](addr enc.buf.data[p + 1])[] = uint64(event.step.pathId)
+      cast[ptr int64](addr enc.buf.data[p + 9])[] = int64(event.step.line)
+      cast[ptr int64](addr enc.buf.data[p + 17])[] = int64(event.step.column)
+      enc.buf.pos = p + 25
+    else:
+      # 17 bytes: tag(1) + pathId(8) + line(8) — direct store (no memcpy call)
+      let p = enc.buf.pos
+      enc.buf.data[p] = 0
+      cast[ptr uint64](addr enc.buf.data[p + 1])[] = uint64(event.step.pathId)
+      cast[ptr int64](addr enc.buf.data[p + 9])[] = int64(event.step.line)
+      enc.buf.pos = p + 17
 
   of tlePath:
     # Header (1 + 4 = 5 bytes) on stack, then string direct
@@ -730,11 +775,11 @@ proc decodeEvent*(data: openArray[byte], pos: var int): Result[TraceLowLevelEven
   ## Decode a single TraceLowLevelEvent from data starting at pos.
   let tag = ?readU8(data, pos)
   case tag
-  of 0: # Step
+  of 0: # Step (legacy, no column — M14 back-compat path)
     let pathId = ?readU64(data, pos)
     let line = ?readI64(data, pos)
     ok(TraceLowLevelEvent(kind: tleStep,
-      step: StepRecord(pathId: PathId(pathId), line: Line(line))))
+      step: StepRecord(pathId: PathId(pathId), line: Line(line), hasColumn: false)))
 
   of 1: # Path
     let s = ?readStr(data, pos)
@@ -869,6 +914,14 @@ proc decodeEvent*(data: openArray[byte], pos: var int): Result[TraceLowLevelEven
 
   of 23: # DropLastStep
     ok(TraceLowLevelEvent(kind: tleDropLastStep))
+
+  of 24: # M14: Step with column
+    let pathId = ?readU64(data, pos)
+    let line = ?readI64(data, pos)
+    let col = ?readI64(data, pos)
+    ok(TraceLowLevelEvent(kind: tleStep,
+      step: StepRecord(pathId: PathId(pathId), line: Line(line),
+                       hasColumn: true, column: Line(col))))
 
   else:
     err("unknown event tag: " & $tag)
