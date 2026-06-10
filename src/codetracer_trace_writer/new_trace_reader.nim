@@ -251,22 +251,27 @@ proc varnameCount*(r: NewTraceReader): uint64 = r.varnameReader.count()
 # ---------------------------------------------------------------------------
 
 proc lineLength*(r: NewTraceReader, fileId: uint64,
-    line: uint32): Option[uint32] =
-  ## Return the addressable column count of ``line`` (0-indexed) in
-  ## the file with id ``fileId``.  Returns ``none`` when the trace is
-  ## not column-aware, when ``fileId`` is out of range, when the line
-  ## is past the file's known line table, or when the recorder did not
-  ## surface a per-line table (``line_count = 0`` in paths.dat).  The
-  ## back-compat default is "no per-line data" → ``none``, matching
-  ## the spec contract for pre-extension traces.
+    lineIndex0: uint32): Option[uint32] =
+  ## Return the addressable column count of ``lineIndex0`` (0-indexed,
+  ## so line 1 of the file is ``lineIndex0 = 0``) in the file with id
+  ## ``fileId``.  Returns ``none`` when the trace is not column-aware,
+  ## when ``fileId`` is out of range, when the line index is past the
+  ## file's known line table, or when the recorder did not surface a
+  ## per-line table (``line_count = 0`` in paths.dat).  The back-compat
+  ## default is "no per-line data" → ``none``, matching the spec
+  ## contract for pre-extension traces.
+  ##
+  ## Note: callers that have a 1-indexed line number (per the spec
+  ## convention used by AbsoluteStep / DeltaStep cursor tracking) must
+  ## subtract 1 before calling.
   if not r.meta.hasColumnAwareSteps:
     return none(uint32)
   if fileId >= uint64(r.lineLengths.len):
     return none(uint32)
   let lls = r.lineLengths[fileId]
-  if int(line) >= lls.len:
+  if int(lineIndex0) >= lls.len:
     return none(uint32)
-  some(lls[int(line)])
+  some(lls[int(lineIndex0)])
 
 proc ensurePositionTables(r: var NewTraceReader) =
   ## Build per-file cumulative tables used by ``decodeGlobalPositionIndex``.

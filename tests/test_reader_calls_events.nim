@@ -166,7 +166,7 @@ proc test_reader_call_access() {.raises: [].} =
       "call " & intToStr(i) & " exitStep mismatch"
 
     doAssert c.args.len == 1, "call " & intToStr(i) & " args count"
-    doAssert c.args[0] == intToStr(i).toBytes, "call " & intToStr(i) & " arg data"
+    doAssert c.args[0].value == intToStr(i).toBytes, "call " & intToStr(i) & " arg data"
     doAssert c.returnValue == intToStr(i * 10).toBytes,
       "call " & intToStr(i) & " returnValue"
 

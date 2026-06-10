@@ -178,7 +178,7 @@ proc test_calls_and_returns() {.raises: [].} =
   # Step 2: foo entry
   let s2 = w.registerStep(0, 10, @[])
   doAssert s2.isOk
-  let c1 = w.registerCall(1, @["42".toBytes])  # foo(42)
+  let c1 = w.registerCall(1, @[CallArg(varnameId: 0, value: "42".toBytes)])  # foo(42)
   doAssert c1.isOk
 
   # Step 3: inside foo
@@ -188,7 +188,10 @@ proc test_calls_and_returns() {.raises: [].} =
   # Step 4: bar entry
   let s4 = w.registerStep(0, 20, @[])
   doAssert s4.isOk
-  let c2 = w.registerCall(2, @["10".toBytes, "20".toBytes])  # bar(10,20)
+  let c2 = w.registerCall(2, @[
+    CallArg(varnameId: 0, value: "10".toBytes),
+    CallArg(varnameId: 1, value: "20".toBytes),
+  ])  # bar(10,20)
   doAssert c2.isOk
 
   # Step 5: inside bar
@@ -271,8 +274,8 @@ proc test_calls_and_returns() {.raises: [].} =
   doAssert c2r.depth == 2, "call2 depth: " & $c2r.depth
   doAssert c2r.parentCallKey == 1, "call2 parentCallKey"
   doAssert c2r.args.len == 2, "call2 args count"
-  doAssert c2r.args[0] == "10".toBytes, "call2 arg0"
-  doAssert c2r.args[1] == "20".toBytes, "call2 arg1"
+  doAssert c2r.args[0].value == "10".toBytes, "call2 arg0"
+  doAssert c2r.args[1].value == "20".toBytes, "call2 arg1"
   doAssert c2r.returnValue == "30".toBytes, "call2 returnValue"
 
   echo "PASS: test_calls_and_returns"
