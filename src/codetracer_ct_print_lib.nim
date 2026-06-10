@@ -260,6 +260,15 @@ proc buildFullDocument*(reader: var NewTraceReader,
     else: reader.meta.workdir)
   meta["recorder"] = newJString(reader.meta.recorderId)
 
+  # ----- meta.dat flag bits surfaced under `metadata.flags` -----
+  # Stable JSON anchor for golden tests: every flag bit gets its
+  # own boolean field, defaulting false on traces written before
+  # the flag was introduced.  Currently only the column-aware flag
+  # is exposed here; further flags follow the same pattern.
+  var flagsObj = newJObject()
+  flagsObj["has_column_aware_steps"] = newJBool(reader.meta.hasColumnAwareSteps)
+  meta["flags"] = flagsObj
+
   # ----- trace_filter provenance (TF-M7, spec §7) -----
   # Materialized as `metadata.trace_filter.filters[].{path,sha256}` per
   # Trace-Filters.md § 7.  Emitted only when the meta.dat header had
@@ -319,7 +328,11 @@ proc buildFullDocument*(reader: var NewTraceReader,
   counts["functions"] = newJInt(int64(reader.functionCount()))
   counts["varnames"] = newJInt(int64(reader.varnameCount()))
   counts["types"] = newJInt(int64(reader.typeCount()))
-  let scR = reader.stepCount()
+  # User-facing "step count" is the number of logical line-bearing
+  # events (AbsoluteStep + DeltaStep) — stable across the addition of
+  # new event types and unaffected by the writer's column-aware mode
+  # (which interleaves DeltaColumn nudges into the events stream).
+  let scR = reader.logicalStepCount()
   counts["steps"] = newJInt(if scR.isOk: int64(scR.get()) else: -1)
   let ccR = reader.callCount()
   counts["calls"] = newJInt(if ccR.isOk: int64(ccR.get()) else: -1)

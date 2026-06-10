@@ -354,7 +354,10 @@ proc printMetaJsonV4(reader: var NewTraceReader) =
   root["metadata"] = meta
 
   var counts = newJObject()
-  let sc = reader.stepCount()
+  # Use logicalStepCount so user-facing "steps" excludes DeltaColumn
+  # nudges (column-aware traces interleave them with line moves but
+  # they are not logical source-line steps).
+  let sc = reader.logicalStepCount()
   let cc = reader.callCount()
   let vc = reader.valueCount()
   let ic = reader.ioEventCount()
@@ -717,6 +720,15 @@ proc buildFullDocument(reader: var NewTraceReader,
     else: reader.meta.workdir)
   meta["recorder"] = newJString(reader.meta.recorderId)
 
+  # ----- meta.dat flag bits surfaced under `metadata.flags` -----
+  # Stable JSON anchor for golden tests: every flag bit gets its
+  # own boolean field, defaulting false on traces written before
+  # the flag was introduced.  Currently only the column-aware flag
+  # is exposed here; further flags follow the same pattern.
+  var flagsObj = newJObject()
+  flagsObj["has_column_aware_steps"] = newJBool(reader.meta.hasColumnAwareSteps)
+  meta["flags"] = flagsObj
+
   # ----- trace_filter provenance (TF-M7, spec §7) -----
   # Materialized as `metadata.trace_filter.filters[].{path,sha256}` per
   # Trace-Filters.md § 7.  Emitted only when the meta.dat header had
@@ -774,7 +786,10 @@ proc buildFullDocument(reader: var NewTraceReader,
   counts["functions"] = newJInt(int64(reader.functionCount()))
   counts["varnames"] = newJInt(int64(reader.varnameCount()))
   counts["types"] = newJInt(int64(reader.typeCount()))
-  let scR = reader.stepCount()
+  # Use logicalStepCount so user-facing "steps" excludes DeltaColumn
+  # nudges — column-aware traces interleave them with line moves but
+  # they are not logical source-line steps.
+  let scR = reader.logicalStepCount()
   counts["steps"] = newJInt(if scR.isOk: int64(scR.get()) else: -1)
   let ccR = reader.callCount()
   counts["calls"] = newJInt(if ccR.isOk: int64(ccR.get()) else: -1)
@@ -854,6 +869,14 @@ proc buildFullDocument(reader: var NewTraceReader,
         if pStr.isOk:
           stepObj["path"] = newJString(
             normalizePath(pStr.get(), reader.meta.workdir, opts.stripPaths))
+        # Column-aware traces: surface the step's column by decoding the
+        # absolute global_position_index per the spec.  Pre-extension
+        # traces leave the field absent so the JSON output stays
+        # bit-for-bit compatible with pre-column-aware consumers.
+        if reader.meta.hasColumnAwareSteps:
+          let posRes = reader.decodeGlobalPositionIndex(absGli.get())
+          if posRes.isOk:
+            stepObj["column"] = newJInt(int64(posRes.get().column))
       else:
         discard pathIdResolved  # silence "unused" warning under strict modes
       let stepEv = reader.step(stepIdx)

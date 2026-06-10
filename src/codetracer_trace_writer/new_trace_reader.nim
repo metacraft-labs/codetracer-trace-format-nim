@@ -411,6 +411,44 @@ proc stepCount*(r: var NewTraceReader): Result[uint64, string] =
   ?r.ensureExecReader()
   ok(r.execReader.totalEvents)
 
+proc logicalStepCount*(r: var NewTraceReader): Result[uint64, string] =
+  ## Return the user-facing "step count" — every exec event except
+  ## column-only nudges (``sekDeltaColumn``).  Matches the pre-P6
+  ## semantics of ``stepCount`` (totalEvents) on line-only traces
+  ## byte-for-byte, and continues to match it for column-aware
+  ## traces because DeltaColumn events are subtracted out.  Used by
+  ## ct-print for ``counts.steps`` so golden anchors stay stable
+  ## across the writer's column-aware-mode opt-in.
+  ##
+  ## Why this isn't named "stepCount": ``stepCount`` still returns
+  ## the raw exec event count because the FFI and chunked-storage
+  ## internals correlate calls / IO events back to events-stream
+  ## position via that index — including DeltaColumn nudges.
+  ##
+  ## Fast path: when the trace is not column-aware, the count is
+  ## exactly ``stepCount`` and we skip the event walk entirely.
+  ## Column-aware traces walk the event stream via ``readChunkEvents``
+  ## (O(N) total decode cost — chunks are decompressed once each,
+  ## events read in bulk).  Looping ``readEvent`` is O(N²) because
+  ## each call re-scans from the chunk start.
+  ?r.ensureExecReader()
+  if not r.meta.hasColumnAwareSteps:
+    return ok(r.execReader.totalEvents)
+  var n: uint64 = 0
+  var chunkBuf: seq[StepEvent]
+  let total = int(r.execReader.totalEvents)
+  let chunkSize = int(r.execReader.chunkSize)
+  let chunkCount = (total + chunkSize - 1) div chunkSize
+  for chunkIdx in 0 ..< chunkCount:
+    discard ?r.execReader.readChunkEvents(chunkIdx, chunkBuf)
+    for ev in chunkBuf:
+      case ev.kind
+      of sekDeltaColumn:
+        discard
+      else:
+        n += 1
+  ok(n)
+
 proc stepAbsoluteGlobalLineIndices*(r: var NewTraceReader,
     startN: uint64, count: uint64,
     output: var openArray[uint64]): Result[uint64, string] =
