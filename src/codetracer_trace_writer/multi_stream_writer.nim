@@ -257,9 +257,30 @@ proc linehits*(w: var MultiStreamTraceWriter): var LinehitsBuilder =
 # ---------------------------------------------------------------------------
 
 proc registerPath*(w: var MultiStreamTraceWriter,
-    path: string): Result[uint64, string] =
+    path: string,
+    lineLengths: openArray[uint32] = []): Result[uint64, string] =
   ## Register a source path and return its interned ID.
-  let idRes = w.ctfs.ensurePathId(w.interning, path)
+  ##
+  ## P6.5 / Layout A — ``lineLengths`` is the per-line addressable
+  ## column count, used only when the writer has opted into
+  ## column-aware mode (``enableColumnAwareSteps``).  When the trace is
+  ## column-aware, the on-disk paths.dat record is extended to carry
+  ## ``path_len + path_bytes + line_count + zigzag-delta line_lengths``
+  ## (spec §"paths.dat per-line offset table — Layout A").  When the
+  ## trace is line-only, ``lineLengths`` is ignored and the legacy
+  ## bare-path-bytes record format is preserved byte-for-byte.
+  ##
+  ## Recorders that don't yet surface per-line column counts can leave
+  ## ``lineLengths`` at its default empty value.  Column-aware traces
+  ## still write the ``path_len`` and ``line_count = 0`` framing so
+  ## the reader can decode the record uniformly — empty
+  ## ``lineLengths`` just signals "no per-line data available yet"
+  ## and column resolution falls back to surfacing ``None``.
+  let idRes =
+    if w.columnAwareSteps:
+      w.ctfs.ensurePathIdColumnAware(w.interning, path, lineLengths)
+    else:
+      w.ctfs.ensurePathId(w.interning, path)
   if idRes.isErr:
     return err(idRes.error)
   let id = idRes.get()

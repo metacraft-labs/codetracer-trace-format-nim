@@ -376,6 +376,49 @@ proc readEventsV4(reader: var TraceReader): Result[void, string] =
     lineCounts[i] = DefaultLinesPerFile
   let gli = buildGlobalLineIndex(lineCounts)
 
+  # P6.5 / Piece B — column-tracking cursor.
+  #
+  # When the trace is column-aware (``meta.hasColumnAwareSteps``) we
+  # surface a running ``column`` slot on every emitted ``StepRecord``.
+  # The cursor is a tiny state machine fed by each step event:
+  #
+  #   * ``sekAbsoluteStep(G)`` — decode G via the per-file line-length
+  #     tables (when populated) to land on (line, column).  Without
+  #     per-line data the column slot is unknown; default to 1 — the
+  #     spec's "column = 1 means the start of the line" convention
+  #     covers the common "recorder didn't fill in lineLengths yet"
+  #     case.
+  #   * ``sekDeltaStep(D)`` — D is a delta over ``global_position_index``.
+  #     In the current writer (which still encodes line-only GLIs even
+  #     in column-aware mode) D ≠ 0 always crosses a line, so per spec
+  #     "DeltaStep that crosses a line boundary resets column to 1".
+  #     A future column-aware writer that emits within-line position
+  #     deltas SHOULD use ``sekDeltaColumn`` for those, keeping this
+  #     branch's reset semantics correct.
+  #   * ``sekDeltaColumn(D)`` — column += D, line unchanged.  Spec
+  #     §"Column Encoding — DeltaColumn (chosen)".
+  #
+  # Subtle cases the reviewer can spot-check:
+  #
+  #   * ``DeltaColumn`` after ``DeltaStep`` with ``lineDelta = 0`` (rare;
+  #     current writer can't emit it because every ``registerStep`` call
+  #     bumps GLI by at least 1).  In that case the cursor would skip
+  #     the reset and keep the previous column, then apply the column
+  #     delta — matches spec.
+  #   * ``AbsoluteStep`` with ``column = 0`` per spec is illegal (columns
+  #     are 1-based) — we never emit it because
+  #     ``decodeGlobalPositionIndex`` produces 1-based columns by
+  #     construction.  If a future writer encodes a position past
+  #     ``sum(line_lengths)`` for a file, ``decodeGlobalPositionIndex``
+  #     errors and we fall back to ``column = 1``.
+  #   * The cursor only fires when ``meta.hasColumnAwareSteps`` is true.
+  #     For legacy traces every ``StepRecord.hasColumn`` stays ``false``
+  #     and the emitted events are byte-for-byte identical to the
+  #     pre-P6.5 output.
+  let columnAware = nr.meta.hasColumnAwareSteps
+  var cursorColumn: uint32 = 1
+  var cursorHasColumn = false
+
   # 3. Walk steps, weaving Call/Return events at entry/exit boundaries.
   for n in 0'u64 ..< totalSteps:
     # 3a. Calls entering at this step (outer→inner = shallower depth first).
@@ -410,23 +453,57 @@ proc readEventsV4(reader: var TraceReader): Result[void, string] =
     let stepEv = stepRes.get()
     case stepEv.kind
     of sekAbsoluteStep, sekDeltaStep, sekDeltaColumn:
+      # P6.5: update the column cursor.  See the long comment above
+      # the step-walk loop for the state machine's spec basis.
+      if columnAware:
+        case stepEv.kind
+        of sekAbsoluteStep:
+          let absGli = nr.stepAbsoluteGlobalLineIndex(n)
+          if absGli.isOk:
+            let posRes = nr.decodeGlobalPositionIndex(absGli.get())
+            if posRes.isOk:
+              cursorColumn = posRes.get().column
+            else:
+              # No per-line data — column slot defaults to column 1.
+              cursorColumn = 1
+          else:
+            cursorColumn = 1
+          cursorHasColumn = true
+        of sekDeltaStep:
+          # Line transition resets column to 1 (spec §"Column Encoding
+          # — DeltaColumn (chosen)").
+          if stepEv.lineDelta != 0:
+            cursorColumn = 1
+          cursorHasColumn = true
+        of sekDeltaColumn:
+          let nextCol = int64(cursorColumn) + stepEv.columnDelta
+          if nextCol < 1:
+            cursorColumn = 1
+          else:
+            cursorColumn = uint32(nextCol)
+          cursorHasColumn = true
+        else:
+          discard
+
       # sekDeltaColumn: column-aware traces only (tag 0x07).  At the v3
       # legacy projection layer we surface column motion as a tleStep at
-      # the running (path, line) — column information is dropped here
-      # because StepRecord doesn't carry a column field.  Readers that
-      # need the column-aware data should consume the underlying
-      # NewTraceReader API directly.
+      # the running (path, line); the column slot is populated above
+      # when the trace is column-aware.
       let absGli = nr.stepAbsoluteGlobalLineIndex(n)
       if absGli.isOk and reader.paths.len > 0:
         let (fileId, line) = gli.resolve(absGli.get())
-        reader.events.add(TraceLowLevelEvent(
-          kind: tleStep,
-          step: StepRecord(pathId: PathId(uint64(fileId)),
-                           line: Line(int64(line)))))
+        var rec = StepRecord(pathId: PathId(uint64(fileId)),
+                             line: Line(int64(line)))
+        if cursorHasColumn:
+          rec.hasColumn = true
+          rec.column = Line(int64(cursorColumn))
+        reader.events.add(TraceLowLevelEvent(kind: tleStep, step: rec))
       else:
-        reader.events.add(TraceLowLevelEvent(
-          kind: tleStep,
-          step: StepRecord(pathId: PathId(0), line: Line(0))))
+        var rec = StepRecord(pathId: PathId(0), line: Line(0))
+        if cursorHasColumn:
+          rec.hasColumn = true
+          rec.column = Line(int64(cursorColumn))
+        reader.events.add(TraceLowLevelEvent(kind: tleStep, step: rec))
     of sekRaise, sekCatch:
       # No direct v3 mapping for raise/catch — skip (or could synthesize
       # a tleEvent).  v3 didn't expose these via tleStep either.

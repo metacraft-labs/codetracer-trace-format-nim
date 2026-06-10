@@ -78,6 +78,7 @@
 ##        series to match.
 
 import std/options
+import std/strutils
 import results
 import ../codetracer_trace_types
 import ../codetracer_ctfs/types
@@ -100,6 +101,24 @@ const
     ## §"Reader Behaviour and Back-Compat" and
     ## ``codetracer-trace-format-spec/internal-files.md``
     ## §"Metadata (meta.dat)".
+
+  KnownFlags*: uint16 = (
+    FlagHasMcrFields or
+    FlagHasReplayLaunchFields or
+    FlagHasLayoutSnapshot or
+    FlagHasTraceFilterProvenance or
+    FlagHasColumnAwareSteps)
+    ## P6.5 (column-extension back-compat): every flag bit this reader
+    ## understands.  ``readMetaDat`` rejects any meta.dat whose flag
+    ## word has bits outside this mask set, per
+    ## ``codetracer-trace-format-spec/internal-files.md``
+    ## §"Metadata (meta.dat)" ("bits 4-15 reserved; readers reject when
+    ## set" — generalised here to "all unknown bits reject").  This is
+    ## the contract the column extension (and every future flag-bit
+    ## extension) relies on: when a future writer sets a bit this
+    ## reader has not learned about, the reader refuses to open the
+    ## trace cleanly rather than silently misdecoding downstream
+    ## streams (e.g. the column-aware step stream).
 
 type
   MetaDatContents* = object
@@ -314,6 +333,23 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
     return err("meta.dat: unsupported version " & $version & ", expected " & $MetaDatVersion)
 
   let flags = readU16LE(data, 6)
+
+  # P6.5: strict back-compat rejection.  Any flag bit outside this
+  # reader's ``KnownFlags`` set causes the open to fail cleanly rather
+  # than silently misdecoding downstream streams.  This is the
+  # mechanism that lets the column extension's wire-format break (tag
+  # 0x07 in the step stream when bit 4 is set) be safely additive: an
+  # older reader compiled without bit 4 in its ``KnownFlags`` mask
+  # rejects column-aware traces at meta-parse time, before any step
+  # stream is touched.  See spec
+  # `codetracer-trace-format-spec/internal-files.md`
+  # §"Metadata (meta.dat)" and `trace-events.md`
+  # §"Reader Behaviour and Back-Compat".
+  let unknownBits = flags and (not KnownFlags)
+  if unknownBits != 0:
+    return err("meta.dat: unknown flag bits set: 0x" &
+      toHex(unknownBits.BiggestInt, 4))
+
   var pos = 8
 
   var contents = MetaDatContents(version: version)

@@ -7,7 +7,7 @@
 ## and IO-event streams are initialized lazily on first access.
 
 import results
-import std/[os, json]
+import std/[os, json, options]
 import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
 import ./meta_dat
@@ -17,6 +17,7 @@ import ./value_stream
 import ./call_stream
 import ./io_event_stream
 import ./step_encoding
+import ./varint
 
 type
   NewTraceReader* = object
@@ -41,6 +42,28 @@ type
     # When pathReader is empty we fall back to this list so callers
     # get the source paths they actually recorded.
     pathsJson: seq[string]
+
+    # P6.5 / Layout A — per-file line-length tables, parsed from the
+    # column-aware paths.dat records when `meta.hasColumnAwareSteps`
+    # is set.  ``lineLengths[fileId][line]`` is the addressable column
+    # count of line (0-indexed) in file ``fileId``.  When the trace is
+    # not column-aware, this stays empty and column queries return
+    # ``none``.
+    lineLengths: seq[seq[uint32]]
+    # Per-file cumulative line-base table (prefix sum of lineLengths).
+    # Built lazily on first column resolution.  ``lineBase[fileId][l]``
+    # is the in-file offset where line ``l`` starts in the file's
+    # contiguous position range.
+    lineBase: seq[seq[uint64]]
+    # Per-file base in the global position space (prefix sum of each
+    # file's ``sum(lineLengths)`` in column-aware mode, or
+    # ``line_count`` in line-only mode).  ``fileBase[fileId]`` is the
+    # ``global_position_index`` of the first position in that file.
+    fileBase: seq[uint64]
+    # Per-file size (sum of lineLengths in column-aware mode) used by
+    # ``decodeGlobalPositionIndex``'s binary search.
+    fileSize: seq[uint64]
+    posTablesBuilt: bool
 
     # Stream readers (lazy, loaded on first access)
     execReader: ExecStreamReader
@@ -108,6 +131,49 @@ proc openNewTraceFromBytes*(data: seq[byte],
         except CatchableError:
           discard  # malformed paths.json — leave the fallback empty
 
+  # P6.5 / Layout A — when the trace is column-aware, parse each
+  # paths.dat record as
+  # ``path_len + path_bytes + line_count + line_lengths`` and cache
+  # the per-file line-length table.  Pre-extension traces (column flag
+  # clear) skip this step and ``lineLengths`` stays empty.
+  if reader.meta.hasColumnAwareSteps and reader.pathReader.count() > 0:
+    let pathTotal = reader.pathReader.count()
+    reader.lineLengths = newSeq[seq[uint32]](int(pathTotal))
+    for i in 0'u64 ..< pathTotal:
+      let rawRes = reader.pathReader.readRawById(i)
+      if rawRes.isErr:
+        return err("paths.dat[" & $i & "]: " & rawRes.error)
+      let raw = rawRes.get()
+      var pos = 0
+      let pathLenRes = decodeVarint(raw, pos)
+      if pathLenRes.isErr:
+        return err("paths.dat[" & $i & "]: column-aware path_len varint: " &
+          pathLenRes.error)
+      let pathLen = int(pathLenRes.get())
+      if pos + pathLen > raw.len:
+        return err("paths.dat[" & $i & "]: path_bytes truncated")
+      pos += pathLen
+      let lineCountRes = decodeVarint(raw, pos)
+      if lineCountRes.isErr:
+        return err("paths.dat[" & $i & "]: column-aware line_count varint: " &
+          lineCountRes.error)
+      let lineCount = int(lineCountRes.get())
+      var lls = newSeq[uint32](lineCount)
+      var prev: int64 = 0
+      for l in 0 ..< lineCount:
+        let dRes = decodeSignedVarint(raw, pos)
+        if dRes.isErr:
+          return err("paths.dat[" & $i & "]: line_length[" & $l & "]: " &
+            dRes.error)
+        let d = dRes.get()
+        let current = if l == 0: d else: prev + d
+        if current < 0:
+          return err("paths.dat[" & $i & "]: line_length[" & $l &
+            "] negative: " & $current)
+        lls[l] = uint32(current)
+        prev = current
+      reader.lineLengths[i] = lls
+
   ok(reader)
 
 proc openNewTrace*(path: string): Result[NewTraceReader, string] =
@@ -136,7 +202,27 @@ proc openNewTrace*(path: string): Result[NewTraceReader, string] =
 
 proc path*(r: NewTraceReader, id: uint64): Result[string, string] =
   if r.pathReader.count() > 0:
-    r.pathReader.readById(id)
+    if r.meta.hasColumnAwareSteps:
+      # P6.5 / Layout A: paths.dat record is
+      # ``path_len + path_bytes + line_count + line_lengths``.  Decode
+      # only the path prefix to surface the legacy string-shaped API.
+      let rawRes = r.pathReader.readRawById(id)
+      if rawRes.isErr:
+        return err(rawRes.error)
+      let raw = rawRes.get()
+      var pos = 0
+      let pathLenRes = decodeVarint(raw, pos)
+      if pathLenRes.isErr:
+        return err("paths.dat[" & $id & "]: " & pathLenRes.error)
+      let pathLen = int(pathLenRes.get())
+      if pos + pathLen > raw.len:
+        return err("paths.dat[" & $id & "]: path_bytes truncated")
+      var s = newString(pathLen)
+      for k in 0 ..< pathLen:
+        s[k] = char(raw[pos + k])
+      ok(s)
+    else:
+      r.pathReader.readById(id)
   elif r.pathsJson.len > 0 and id < uint64(r.pathsJson.len):
     ok(r.pathsJson[int(id)])
   else:
@@ -158,6 +244,110 @@ proc pathCount*(r: NewTraceReader): uint64 =
 proc functionCount*(r: NewTraceReader): uint64 = r.funcReader.count()
 proc typeCount*(r: NewTraceReader): uint64 = r.typeReader.count()
 proc varnameCount*(r: NewTraceReader): uint64 = r.varnameReader.count()
+
+# ---------------------------------------------------------------------------
+# P6.5 — column-aware position decoding (spec §"Source Location
+#                                            Addressing")
+# ---------------------------------------------------------------------------
+
+proc lineLength*(r: NewTraceReader, fileId: uint64,
+    line: uint32): Option[uint32] =
+  ## Return the addressable column count of ``line`` (0-indexed) in
+  ## the file with id ``fileId``.  Returns ``none`` when the trace is
+  ## not column-aware, when ``fileId`` is out of range, when the line
+  ## is past the file's known line table, or when the recorder did not
+  ## surface a per-line table (``line_count = 0`` in paths.dat).  The
+  ## back-compat default is "no per-line data" → ``none``, matching
+  ## the spec contract for pre-extension traces.
+  if not r.meta.hasColumnAwareSteps:
+    return none(uint32)
+  if fileId >= uint64(r.lineLengths.len):
+    return none(uint32)
+  let lls = r.lineLengths[fileId]
+  if int(line) >= lls.len:
+    return none(uint32)
+  some(lls[int(line)])
+
+proc ensurePositionTables(r: var NewTraceReader) =
+  ## Build per-file cumulative tables used by ``decodeGlobalPositionIndex``.
+  ## Idempotent: callable from every per-step resolution.
+  if r.posTablesBuilt:
+    return
+  let fileCount = r.lineLengths.len
+  r.lineBase = newSeq[seq[uint64]](fileCount)
+  r.fileBase = newSeq[uint64](fileCount)
+  r.fileSize = newSeq[uint64](fileCount)
+  var runningGlobal: uint64 = 0
+  for fid in 0 ..< fileCount:
+    let lls = r.lineLengths[fid]
+    var lb = newSeq[uint64](lls.len)
+    var sum: uint64 = 0
+    for i in 0 ..< lls.len:
+      lb[i] = sum
+      sum += uint64(lls[i])
+    r.lineBase[fid] = lb
+    r.fileBase[fid] = runningGlobal
+    r.fileSize[fid] = sum
+    runningGlobal += sum
+  r.posTablesBuilt = true
+
+proc decodeGlobalPositionIndex*(r: var NewTraceReader,
+    p: uint64): Result[tuple[file: uint64, line: uint32, column: uint32],
+    string] =
+  ## P6.5 — resolve a ``global_position_index`` to ``(file, line,
+  ## column)`` using the per-file / per-line cumulative tables built
+  ## from the column-aware paths.dat records.  Implements the spec
+  ## algorithm at ``codetracer-trace-format-spec/trace-events.md``
+  ## §"Decoding ``global_position_index``": ``O(log F)`` file-table
+  ## binary search + ``O(log L)`` line-table binary search.
+  ##
+  ## Only valid on column-aware traces.  ``line`` and ``column`` are
+  ## 1-based to match the spec.
+  if not r.meta.hasColumnAwareSteps:
+    return err("decodeGlobalPositionIndex requires a column-aware trace")
+  r.ensurePositionTables()
+  if r.fileBase.len == 0:
+    return err("trace has no paths registered")
+
+  # Binary search for the file: largest fid with fileBase[fid] <= p.
+  var lo = 0
+  var hi = r.fileBase.len - 1
+  var fid = -1
+  while lo <= hi:
+    let mid = (lo + hi) div 2
+    if r.fileBase[mid] <= p:
+      fid = mid
+      lo = mid + 1
+    else:
+      hi = mid - 1
+  if fid < 0:
+    return err("global_position_index " & $p &
+      " precedes the first file's base")
+  if p >= r.fileBase[fid] + r.fileSize[fid]:
+    return err("global_position_index " & $p &
+      " out of range for file " & $fid)
+
+  let q = p - r.fileBase[fid]
+  let lb = r.lineBase[fid]
+  if lb.len == 0:
+    return err("file " & $fid & " has no line-length table")
+
+  # Binary search for the line: largest l with lb[l] <= q.
+  lo = 0
+  hi = lb.len - 1
+  var l = -1
+  while lo <= hi:
+    let mid = (lo + hi) div 2
+    if lb[mid] <= q:
+      l = mid
+      lo = mid + 1
+    else:
+      hi = mid - 1
+  if l < 0:
+    return err("in-file offset " & $q & " precedes the first line")
+
+  let column = uint32(q - lb[l] + 1)
+  ok((file: uint64(fid), line: uint32(l + 1), column: column))
 
 # ---------------------------------------------------------------------------
 # Step access (lazy init exec reader)
@@ -197,6 +387,15 @@ proc stepAbsoluteGlobalLineIndex*(r: var NewTraceReader,
       currentGli = ev.globalLineIndex
     of sekDeltaStep:
       currentGli = uint64(int64(currentGli) + ev.lineDelta)
+    of sekDeltaColumn:
+      # P6.5: in column-aware traces ``global_position_index`` is
+      # one-dimensional, so a column-only delta is also a position
+      # delta.  Apply it to the running GLI so callers that decode the
+      # absolute position see the post-column-delta cursor.  In
+      # line-only traces this branch never fires because writers
+      # cannot emit tag 0x07 without the column flag and the meta-dat
+      # strict-rejection check guards against mismatches.
+      currentGli = uint64(int64(currentGli) + ev.columnDelta)
     else:
       # Non-step events (raise, catch, thread_switch) don't change GLI
       discard
@@ -267,6 +466,11 @@ proc stepAbsoluteGlobalLineIndices*(r: var NewTraceReader,
         currentGli = ev.globalLineIndex
       of sekDeltaStep:
         currentGli = uint64(int64(currentGli) + ev.lineDelta)
+      of sekDeltaColumn:
+        # P6.5: see ``stepAbsoluteGlobalLineIndex`` for rationale —
+        # column deltas advance ``global_position_index`` in the
+        # one-dimensional column-aware position space.
+        currentGli = uint64(int64(currentGli) + ev.columnDelta)
       else:
         discard
       if absIdx >= n and absIdx < stopN:

@@ -882,6 +882,56 @@ proc test_meta_dat_writer_mints_when_blank() {.raises: [].} =
   echo "PASS: test_meta_dat_writer_mints_when_blank"
 
 
+proc test_meta_dat_strict_unknown_flag_rejection() {.raises: [].} =
+  ## P6.5: ``readMetaDat`` MUST reject any meta.dat whose flag word
+  ## carries a bit outside ``KnownFlags``.  This is the contract that
+  ## makes future flag-bit extensions safely additive: an older reader
+  ## that doesn't know a new bit refuses to open the trace cleanly,
+  ## rather than silently misdecoding downstream streams.
+  ##
+  ## Tests three cases:
+  ##   * flags = 0 (pre-extension trace) round-trips cleanly,
+  ##   * flags = FlagHasColumnAwareSteps (bit 4, known) round-trips
+  ##     cleanly with ``hasColumnAwareSteps = true``,
+  ##   * flags = bit 4 + bit 5 fails because bit 5 is unknown.
+  proc craft(flags: uint16): seq[byte] {.raises: [].} =
+    var buf = newSeq[byte](0)
+    for b in [0x43'u8, 0x54, 0x4D, 0x44]:
+      buf.add(b)
+    buf.add(3'u8); buf.add(0'u8)               # version 3
+    buf.add(byte(flags and 0xFF))
+    buf.add(byte((flags shr 8) and 0xFF))
+    # recording_id (canonical UUIDv7)
+    encodeVarint(uint64(TestRecordingId.len), buf)
+    for c in TestRecordingId:
+      buf.add(byte(c))
+    # program, args_count, workdir, recorder_id, paths_count — all empty/zero.
+    buf.add(0'u8); buf.add(0'u8); buf.add(0'u8); buf.add(0'u8); buf.add(0'u8)
+    buf
+
+  block:
+    let res = readMetaDat(craft(0))
+    doAssert res.isOk, "flags=0 must round-trip: " &
+      (if res.isErr: res.error else: "ok")
+    doAssert not res.get().hasColumnAwareSteps
+
+  block:
+    let res = readMetaDat(craft(FlagHasColumnAwareSteps))
+    doAssert res.isOk,
+      "bit 4 alone must round-trip: " &
+      (if res.isErr: res.error else: "ok")
+    doAssert res.get().hasColumnAwareSteps
+
+  block:
+    let res = readMetaDat(craft(FlagHasColumnAwareSteps or 0x20'u16))
+    doAssert res.isErr,
+      "bit 4 + bit 5 must reject because bit 5 is unknown"
+    doAssert "unknown" in res.error,
+      "rejection error must mention 'unknown'; got: " & res.error
+
+  echo "PASS: test_meta_dat_strict_unknown_flag_rejection"
+
+
 # Run all tests
 test_meta_dat_uuidv7_generation()
 test_meta_dat_uuidv7_ms_monotonic_sortable()
@@ -901,3 +951,4 @@ test_meta_dat_read_bad_magic()
 test_meta_dat_read_too_short()
 test_meta_dat_backward_compat()
 test_meta_dat_openTrace_binary()
+test_meta_dat_strict_unknown_flag_rejection()
