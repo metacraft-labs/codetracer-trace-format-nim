@@ -382,11 +382,19 @@ proc stepAbsoluteGlobalLineIndex*(r: var NewTraceReader,
   ?r.ensureExecReader()
 
   let chunkSize = uint64(r.execReader.chunkSize)
-  let chunkStart = (n div chunkSize) * chunkSize
+  let chunkIdx = int(n div chunkSize)
+  let eventInChunk = int(n mod chunkSize)
   var currentGli: uint64 = 0
 
-  for i in chunkStart .. n:
-    let ev = ?r.execReader.readEvent(i)
+  # Decode the containing chunk in one pass via readChunkEvents (O(N)
+  # per chunk) rather than looping ``readEvent(i)`` (O(N²) per chunk
+  # because each readEvent re-scans from chunk start).  When ct-print
+  # calls this proc once per step in a for-loop the difference is
+  # cubic vs quadratic — a 1000-event trace went from ~45s to <1s.
+  var chunkBuf: seq[StepEvent]
+  discard ?r.execReader.readChunkEvents(chunkIdx, chunkBuf)
+  for i in 0 .. eventInChunk:
+    let ev = chunkBuf[i]
     case ev.kind
     of sekAbsoluteStep:
       currentGli = ev.globalLineIndex
