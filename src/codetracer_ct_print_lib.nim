@@ -395,6 +395,16 @@ proc buildFullDocument*(reader: var NewTraceReader,
         if pStr.isOk:
           stepObj["path"] = newJString(
             normalizePath(pStr.get(), reader.meta.workdir, opts.stripPaths))
+        # P1.4: surface the per-step column for column-aware traces so
+        # JSON-events / --full consumers can read the resolved
+        # ``(file, line, column)`` directly without having to walk the
+        # exec stream themselves.  The decoder errors on legacy traces;
+        # we leave the field absent in that case to keep the JSON
+        # bit-for-bit compatible with pre-column-aware tooling.
+        if reader.meta.hasColumnAwareSteps:
+          let posRes = reader.decodeGlobalPositionIndex(absGli.get())
+          if posRes.isOk:
+            stepObj["column"] = newJInt(int64(posRes.get().column))
       let stepEv = reader.step(stepIdx)
       if stepEv.isOk:
         let se = stepEv.get()

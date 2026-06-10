@@ -327,6 +327,15 @@ proc printMetaJsonV4(reader: var NewTraceReader) =
   meta["args"] = argsArr
   meta["workdir"] = newJString(reader.meta.workdir)
   meta["recorder"] = newJString(reader.meta.recorderId)
+  # P1.4: surface the meta.dat flag bits so consumers (e.g. the
+  # ``test_column_aware_steps.py`` smoke test) can assert on
+  # ``has_column_aware_steps`` without re-reading the raw header.
+  # We expose the bool directly rather than as a flags array so the
+  # field name is stable across future flag additions (each known flag
+  # becomes its own boolean keyed by its meta.dat constant name).
+  var flagsObj = newJObject()
+  flagsObj["has_column_aware_steps"] = newJBool(reader.meta.hasColumnAwareSteps)
+  meta["flags"] = flagsObj
 
   if reader.meta.hasFilterProvenance:
     var filtersArr = newJArray()
@@ -504,6 +513,21 @@ proc stepEventToJson(reader: var NewTraceReader, gli: GlobalLineIndex,
     let pathStr = reader.path(uint64(pathId))
     if pathStr.isOk:
       stepObj["path"] = newJString(pathStr.get())
+    # P1.4: surface the per-step column for column-aware traces so
+    # JSON-events consumers (e.g. the
+    # ``tests/python/test_column_aware_steps.py`` acceptance harness)
+    # can assert that each step in a single-line multi-statement program
+    # lands at a distinct column.  We resolve the absolute global
+    # position index → ``(file, line, column)`` via the spec-canonical
+    # ``decodeGlobalPositionIndex`` algorithm (spec §"Decoding
+    # ``global_position_index``").  The decoder is no-op on legacy traces
+    # — it errors when the column-aware flag is clear, in which case we
+    # leave the column field absent so the JSON output stays bit-for-bit
+    # compatible with pre-column-aware consumers.
+    if reader.meta.hasColumnAwareSteps:
+      let posRes = reader.decodeGlobalPositionIndex(absGli.get())
+      if posRes.isOk:
+        stepObj["column"] = newJInt(int64(posRes.get().column))
 
   let ev = reader.step(stepIdx)
   if ev.isOk:

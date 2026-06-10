@@ -1207,6 +1207,72 @@ proc trace_writer_register_delta_column(
   if res.isErr:
     setError(res.error)
 
+proc trace_writer_register_path_with_line_lengths(
+    handle: TraceWriterHandle,
+    path: cstring,
+    line_count: cint,
+    line_lengths: ptr UncheckedArray[uint32],
+): cint {.exportc, cdecl, dynlib.} =
+  ## P1.3: register a source path together with its per-line column
+  ## counts (``paths.dat`` Layout A — see ~codetracer-trace-format-spec/
+  ## trace-events.md~ §"paths.dat per-line offset table — Layout A").
+  ##
+  ## ``line_count`` is the number of entries in ``line_lengths`` (each
+  ## entry is a 32-bit unsigned line length, in 1-based column
+  ## addressing).  ``line_lengths`` may be NULL when ``line_count`` is
+  ## 0, in which case the FFI behaves as plain
+  ## ``trace_writer_register_step``-style path interning with no per-line
+  ## data — column resolution falls back to surfacing ``None`` at read
+  ## time (spec §"Decoding ``global_position_index``" default).
+  ##
+  ## When the writer has NOT opted into column-aware mode
+  ## (``trace_writer_enable_column_aware_steps`` was not called) the
+  ## ``line_lengths`` argument is ignored and the legacy bare-path-bytes
+  ## paths.dat record format is preserved byte-for-byte — this matches
+  ## the back-compat contract documented in P6.5.
+  ##
+  ## Only the multi-stream backend is supported; calling this on the
+  ## legacy single-stream backend interns the path string via
+  ## ``writePath`` so its index in ``paths`` stays consistent with the
+  ## (legacy) implicit registration done by ``trace_writer_register_step``.
+  ##
+  ## Returns 0 on success, non-zero on failure (with ``last_error`` set).
+  if handle.isNil:
+    setError("trace_writer_register_path_with_line_lengths: NULL handle")
+    return 1.cint
+  let p = toNimStr(path)
+
+  if handle.useMultiStream:
+    if not handle.msWriterReady:
+      setError("trace_writer_register_path_with_line_lengths: writer not " &
+        "ready (call trace_writer_begin_events first)")
+      return 1.cint
+    # Materialise the C buffer into a Nim ``seq[uint32]`` so we can
+    # forward it through ``registerPath``'s ``openArray[uint32]``
+    # parameter.  A NULL pointer with line_count > 0 is treated as
+    # "no per-line data" — defensive parity with the empty-array case.
+    var lengths: seq[uint32] = @[]
+    if line_count > 0 and not line_lengths.isNil:
+      lengths = newSeq[uint32](int(line_count))
+      for i in 0 ..< int(line_count):
+        lengths[i] = line_lengths[i]
+    let pathIdRes = handle.msWriter.registerPath(p, lengths)
+    if pathIdRes.isErr:
+      setError(pathIdRes.error)
+      return 1.cint
+    return 0.cint
+
+  # Legacy single-stream backend: intern the path string so its index
+  # stays consistent with implicit registration done by
+  # trace_writer_register_step; line_lengths are ignored because the
+  # legacy paths.json carries no per-line metadata.
+  if not handle.writerReady:
+    setError("trace_writer_register_path_with_line_lengths: writer not " &
+      "ready (call trace_writer_begin_events first)")
+    return 1.cint
+  discard handle.writer.writePath(p)
+  0.cint
+
 # ---------------------------------------------------------------------------
 # Close
 # ---------------------------------------------------------------------------
@@ -2079,6 +2145,30 @@ proc ct_reader_path_count(h: pointer): uint64 {.exportc, cdecl, dynlib.} =
   if h.isNil: return 0
   let rh = cast[TraceReaderHandle](h)
   rh[].pathCount()
+
+proc ct_reader_line_length(
+    h: pointer,
+    file_id: uint64,
+    line_index0: uint32,
+    out_value: ptr uint32,
+): cint {.exportc, cdecl, dynlib.} =
+  ## P1.3 round-trip helper: return the addressable column count of
+  ## ``line_index0`` (0-indexed) in the file with id ``file_id``.
+  ##
+  ## Returns 0 when a value is available and writes it to ``out_value``;
+  ## returns 1 when the trace is not column-aware, when ``file_id`` is
+  ## out of range, when ``line_index0`` is past the file's known line
+  ## table, or when the recorder did not surface a per-line table.  The
+  ## back-compat default is "no per-line data" → return-code 1, matching
+  ## the ``NewTraceReader.lineLength`` ``Option[uint32]`` contract.
+  if h.isNil or out_value.isNil:
+    return 1.cint
+  let rh = cast[TraceReaderHandle](h)
+  let opt = rh[].lineLength(file_id, line_index0)
+  if opt.isNone:
+    return 1.cint
+  out_value[] = opt.get()
+  0.cint
 
 proc ct_reader_function_count(h: pointer): uint64 {.exportc, cdecl, dynlib.} =
   if h.isNil: return 0

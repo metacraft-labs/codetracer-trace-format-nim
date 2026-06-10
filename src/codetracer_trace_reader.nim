@@ -751,6 +751,14 @@ proc eventToJson(event: TraceLowLevelEvent): JsonNode =
     result["type"] = newJString("Step")
     result["path_id"] = newJInt(int64(uint64(event.step.pathId)))
     result["line"] = newJInt(int64(event.step.line))
+    # P1.4: surface the column on column-aware traces so JSON-events
+    # consumers can observe the per-step column without re-decoding the
+    # global position index themselves.  Legacy (non-column-aware)
+    # traces have ``hasColumn = false`` and the field is omitted to
+    # keep the JSON output bit-for-bit compatible with pre-extension
+    # readers.
+    if event.step.hasColumn:
+      result["column"] = newJInt(int64(event.step.column))
   of tlePath:
     result["type"] = newJString("Path")
     result["name"] = newJString(event.path)
