@@ -92,6 +92,14 @@ const
   FlagHasReplayLaunchFields*: uint16 = 2         # bit 1 — M-RLP-1 (spec §6A.5)
   FlagHasLayoutSnapshot*: uint16 = 4             # bit 2 — M-RLP-2 (spec §6B.7)
   FlagHasTraceFilterProvenance*: uint16 = 8      # bit 3 — TF-M7 (spec §7)
+  FlagHasColumnAwareSteps*: uint16 = 0x10        # bit 4 — P6.3 / P6.4
+    ## When set, the exec stream is permitted to contain tag 0x07
+    ## (sekDeltaColumn) and ``global_position_index`` addresses
+    ## ``(line, column)`` tuples instead of lines.  See
+    ## ``codetracer-trace-format-spec/trace-events.md``
+    ## §"Reader Behaviour and Back-Compat" and
+    ## ``codetracer-trace-format-spec/internal-files.md``
+    ## §"Metadata (meta.dat)".
 
 type
   MetaDatContents* = object
@@ -117,6 +125,12 @@ type
       ## header.  Distinguishes "no provenance recorded" (false) from
       ## "provenance recorded but empty" (true with empty
       ## `filterProvenance`).
+    hasColumnAwareSteps*: bool
+      ## True iff FlagHasColumnAwareSteps was set on the meta.dat header.
+      ## Readers must surface column data from sekDeltaColumn / column-aware
+      ## global_position_index only when this is set.  Pre-extension
+      ## traces always have it clear and readers must surface columns as
+      ## ``None``.
 
 proc writeRawBytes(
     c: var Ctfs, f: var CtfsInternalFile,
@@ -157,6 +171,7 @@ proc writeMetaDat*(
       none(LayoutSnapshotFields),
     filterProvenance: openArray[FilterProvenance] = [],
     emitFilterProvenance: bool = false,
+    columnAwareSteps: bool = false,
 ): Result[void, string] =
   ## Write binary meta.dat to a CTFS internal file.
   ##
@@ -189,6 +204,8 @@ proc writeMetaDat*(
   let emitProvenance = emitFilterProvenance or filterProvenance.len > 0
   if emitProvenance:
     flags = flags or FlagHasTraceFilterProvenance
+  if columnAwareSteps:
+    flags = flags or FlagHasColumnAwareSteps
   ? c.writeU16LE(f, flags)
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.
@@ -300,6 +317,7 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
   var pos = 8
 
   var contents = MetaDatContents(version: version)
+  contents.hasColumnAwareSteps = (flags and FlagHasColumnAwareSteps) != 0
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1, required
   # in v3+: a malformed or missing id rejects the trace at parse time.
@@ -436,6 +454,7 @@ proc writeMetaDatToBuffer*(
       none(LayoutSnapshotFields),
     filterProvenance: openArray[FilterProvenance] = [],
     emitFilterProvenance: bool = false,
+    columnAwareSteps: bool = false,
 ): seq[byte] =
   ## Serialize meta.dat to an in-memory byte buffer.
   ## This is the same format as writeMetaDat but without needing a CTFS container.
@@ -467,6 +486,8 @@ proc writeMetaDatToBuffer*(
   let emitProvenance = emitFilterProvenance or filterProvenance.len > 0
   if emitProvenance:
     flags = flags or FlagHasTraceFilterProvenance
+  if columnAwareSteps:
+    flags = flags or FlagHasColumnAwareSteps
   result.appendU16LE(flags)
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.

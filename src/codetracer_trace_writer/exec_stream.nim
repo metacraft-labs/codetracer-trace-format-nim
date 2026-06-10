@@ -155,6 +155,14 @@ proc writeEvent*(ctfs: var Ctfs, w: var ExecStreamWriter,
       # Convert delta to absolute using tracked position
       let newIndex = uint64(int64(w.lastGlobalLineIndex) + ev.lineDelta)
       ev = StepEvent(kind: sekAbsoluteStep, globalLineIndex: newIndex)
+    of sekDeltaColumn:
+      # In column-aware traces `global_position_index` is a single 1-D
+      # address over (line, column) tuples, so a column delta is also a
+      # position delta.  At chunk boundaries we promote it to an
+      # AbsoluteStep just like sekDeltaStep so the chunk is independently
+      # decodable.
+      let newIndex = uint64(int64(w.lastGlobalLineIndex) + ev.columnDelta)
+      ev = StepEvent(kind: sekAbsoluteStep, globalLineIndex: newIndex)
     of sekAbsoluteStep:
       discard  # already absolute, good
     else:
@@ -166,6 +174,8 @@ proc writeEvent*(ctfs: var Ctfs, w: var ExecStreamWriter,
     w.lastGlobalLineIndex = ev.globalLineIndex
   of sekDeltaStep:
     w.lastGlobalLineIndex = uint64(int64(w.lastGlobalLineIndex) + ev.lineDelta)
+  of sekDeltaColumn:
+    w.lastGlobalLineIndex = uint64(int64(w.lastGlobalLineIndex) + ev.columnDelta)
   else:
     discard
 

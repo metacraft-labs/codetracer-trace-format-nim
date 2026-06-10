@@ -409,7 +409,13 @@ proc readEventsV4(reader: var TraceReader): Result[void, string] =
       return err("failed to read step " & $n & ": " & stepRes.error)
     let stepEv = stepRes.get()
     case stepEv.kind
-    of sekAbsoluteStep, sekDeltaStep:
+    of sekAbsoluteStep, sekDeltaStep, sekDeltaColumn:
+      # sekDeltaColumn: column-aware traces only (tag 0x07).  At the v3
+      # legacy projection layer we surface column motion as a tleStep at
+      # the running (path, line) — column information is dropped here
+      # because StepRecord doesn't carry a column field.  Readers that
+      # need the column-aware data should consume the underlying
+      # NewTraceReader API directly.
       let absGli = nr.stepAbsoluteGlobalLineIndex(n)
       if absGli.isOk and reader.paths.len > 0:
         let (fileId, line) = gli.resolve(absGli.get())

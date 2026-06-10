@@ -106,6 +106,17 @@ type
       ## (spec § 7 distinguishes "no provenance recorded" from
       ## "provenance recorded but empty").
 
+    # P6.3 / P6.4 — column-aware step mode.  When set:
+    #  * `writeColumnStep` is permitted (emits tag 0x07, sekDeltaColumn);
+    #  * `meta.dat` flags include `FlagHasColumnAwareSteps` (bit 4) so
+    #    column-unaware readers reject the trace cleanly instead of
+    #    silently misdecoding the step stream.
+    columnAwareSteps*: bool
+      ## True iff this writer is producing a column-aware trace.  Gates
+      ## tag 0x07 emission and the bit-4 flag on meta.dat.  Defaults to
+      ## false so existing callers keep producing line-only traces
+      ## byte-for-byte identical to the pre-P6.4 output.
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -194,6 +205,22 @@ proc initMultiStreamWriter*(path: string, program: string,
 proc enableLinehits*(w: var MultiStreamTraceWriter) =
   ## Enable the linehits builder. Must be called before writing steps.
   w.linehitsBuilder = some(initLinehitsBuilder())
+
+# ---------------------------------------------------------------------------
+# Column-aware step mode (P6.3 / P6.4)
+# ---------------------------------------------------------------------------
+
+proc enableColumnAwareSteps*(w: var MultiStreamTraceWriter) =
+  ## Opt this writer into column-aware step encoding.  After calling
+  ## this, ``writeColumnStep`` is permitted, and ``close()`` will set
+  ## ``FlagHasColumnAwareSteps`` (bit 4) on ``meta.dat`` so
+  ## column-unaware readers reject the trace cleanly via the reserved
+  ## bits-4-15 check (see spec §"Reader Behaviour and Back-Compat").
+  ##
+  ## Must be called before any step events are written — the flag is
+  ## trace-global; the writer MUST NOT mix column-aware and line-only
+  ## step records within a single trace.
+  w.columnAwareSteps = true
 
 # ---------------------------------------------------------------------------
 # Filter provenance (TF-M7 — spec §7 / Trace-Filters.md §7)
@@ -304,6 +331,52 @@ proc registerStep*(w: var MultiStreamTraceWriter, pathId: uint64,
   w.lastGlobalLineIndex = gli
   w.lastPathId = pathId
   w.lastLine = line
+  w.stepCount += 1
+  ok()
+
+proc registerColumnStep*(w: var MultiStreamTraceWriter,
+    columnDelta: int64,
+    values: openArray[VariableValue]): Result[void, string] =
+  ## Emit a column-only step (sekDeltaColumn, tag 0x07) that advances
+  ## the cursor's column within the current line.  ``columnDelta`` is a
+  ## signed zigzag varint on the wire; magnitudes ≤ ±63 cost two bytes
+  ## (1 tag + 1 varint) — see spec §"Column Encoding — `DeltaColumn`
+  ## (chosen)".
+  ##
+  ## Only callable on a writer that has opted into column-aware mode via
+  ## ``enableColumnAwareSteps``.  The first step in a trace must still
+  ## be a line-aware ``registerStep`` so the running
+  ## ``global_position_index`` is well-defined before column deltas are
+  ## applied.
+  if w.closed:
+    return err("writer is closed")
+  if not w.columnAwareSteps:
+    return err("registerColumnStep called on a writer that has not " &
+      "opted into column-aware mode (call enableColumnAwareSteps first)")
+  if w.stepCount == 0:
+    return err("registerColumnStep cannot be the first step — emit an " &
+      "AbsoluteStep (registerStep) first so the cursor position is defined")
+
+  # In column-aware mode `global_position_index` is one-dimensional, so
+  # a column delta is also a position delta.  The exec-stream writer
+  # picks up the running index from `lastGlobalLineIndex` already.
+  let ev = StepEvent(kind: sekDeltaColumn, columnDelta: columnDelta)
+  let evRes = w.ctfs.writeEvent(w.execWriter, ev)
+  if evRes.isErr:
+    return err("failed to write delta-column event: " & evRes.error)
+
+  let valRes = w.ctfs.writeStepValues(w.valueWriter, values)
+  if valRes.isErr:
+    return err("failed to write step values: " & valRes.error)
+
+  # Update running line/position index by the column delta.  Path /
+  # line slots are unchanged (column-only motion stays within the
+  # current line by construction).
+  w.lastGlobalLineIndex = uint64(int64(w.lastGlobalLineIndex) + columnDelta)
+
+  if w.linehitsBuilder.isSome:
+    w.linehitsBuilder.get().recordHit(w.lastGlobalLineIndex, w.stepCount)
+
   w.stepCount += 1
   ok()
 
@@ -650,7 +723,8 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   let metaRes = w.ctfs.writeMetaDat(
     metaFile, w.metadata, w.paths,
     filterProvenance = w.filterProvenance,
-    emitFilterProvenance = w.recordEmptyFilterProvenance)
+    emitFilterProvenance = w.recordEmptyFilterProvenance,
+    columnAwareSteps = w.columnAwareSteps)
   if metaRes.isErr:
     return err("failed to write meta.dat: " & metaRes.error)
 

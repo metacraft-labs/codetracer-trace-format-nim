@@ -1146,6 +1146,68 @@ proc trace_writer_register_thread_switch(
   ))
 
 # ---------------------------------------------------------------------------
+# Column-aware step mode (P6.3 / P6.4)
+# ---------------------------------------------------------------------------
+#
+# Opt-in entry point for recorders that want to emit ``sekDeltaColumn``
+# (tag 0x07) events.  Mirrors the Nim ``enableColumnAwareSteps`` API on
+# ``MultiStreamTraceWriter`` and the dedicated ``writeDeltaColumn`` call.
+#
+# Calling ``trace_writer_enable_column_aware_steps`` flips a one-way
+# switch on the writer:
+#   * subsequent ``trace_writer_register_step`` / ``ct_assignment_with_column``
+#     calls run unchanged,
+#   * ``trace_writer_register_delta_column`` is permitted and emits
+#     ``sekDeltaColumn``,
+#   * on close, ``meta.dat`` carries ``FlagHasColumnAwareSteps`` (bit 4)
+#     so column-unaware readers reject the trace cleanly via the
+#     reserved-bits check.
+#
+# Only the multi-stream backend supports column-aware mode; calling
+# ``trace_writer_register_delta_column`` on the legacy single-stream
+# backend is a no-op (the legacy format has no column-only event).
+
+proc trace_writer_enable_column_aware_steps(
+    handle: TraceWriterHandle,
+) {.exportc, cdecl, dynlib.} =
+  ## Opt this writer into column-aware step encoding.  Must be called
+  ## before any step event is registered — the flag is trace-global per
+  ## the spec.
+  if handle.isNil:
+    return
+  if handle.useMultiStream:
+    if not handle.msWriterReady:
+      return
+    handle.msWriter.enableColumnAwareSteps()
+
+proc trace_writer_register_delta_column(
+    handle: TraceWriterHandle,
+    column_delta: int64,
+) {.exportc, cdecl, dynlib.} =
+  ## Emit a ``sekDeltaColumn`` (tag 0x07) event advancing the cursor's
+  ## column within the current line by ``column_delta`` (signed).
+  ##
+  ## Only valid on a multi-stream writer that has already called
+  ## ``trace_writer_enable_column_aware_steps`` and on which an absolute
+  ## step has been registered (so the running ``global_position_index``
+  ## is defined).  Otherwise sets a thread-local error string and
+  ## returns silently.
+  if handle.isNil:
+    return
+  if not handle.useMultiStream:
+    setError("trace_writer_register_delta_column: only the multi-stream " &
+      "backend supports column-aware events")
+    return
+  if not handle.msWriterReady:
+    return
+  # Flush any buffered step before we emit the column event so the
+  # exec / value streams stay in lock-step.
+  discard flushPendingStep(handle)
+  let res = handle.msWriter.registerColumnStep(column_delta, @[])
+  if res.isErr:
+    setError(res.error)
+
+# ---------------------------------------------------------------------------
 # Close
 # ---------------------------------------------------------------------------
 
@@ -1824,6 +1886,8 @@ proc stepEventToJson(ev: StepEvent): string =
     "{\"kind\":\"thread_start\",\"thread_id\":" & $ev.startThreadId & "}"
   of sekThreadExit:
     "{\"kind\":\"thread_exit\",\"thread_id\":" & $ev.exitThreadId & "}"
+  of sekDeltaColumn:
+    "{\"kind\":\"delta_column\",\"column_delta\":" & $ev.columnDelta & "}"
 
 proc variableValueToJson(v: VariableValue): string =
   "{\"varname_id\":" & $v.varnameId &
