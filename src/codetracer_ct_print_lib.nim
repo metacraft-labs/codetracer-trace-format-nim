@@ -47,6 +47,26 @@ proc buildGliFromMeta*(meta: MetaDatContents): GlobalLineIndex =
 proc resolveGli*(gli: GlobalLineIndex, globalIdx: uint64): (int, uint64) =
   gli.resolve(globalIdx)
 
+proc precomputeStepGlis*(reader: var NewTraceReader): seq[uint64] =
+  ## Walk the exec stream once and return a seq mapping step_index →
+  ## absolute global_position_index.  Used by ct-print's --json /
+  ## --full / --events emission so the per-step loop becomes a flat
+  ## seq lookup instead of an O(N²) ``stepAbsoluteGlobalLineIndex(i)``
+  ## call per step (which itself walks O(N) events per call ⇒ O(N³)
+  ## for ct-print's outer loop).  Empty seq when the reader has no
+  ## exec stream or the bulk fetch fails — callers fall back to the
+  ## per-step accessor in that case.
+  let scR = reader.stepCount()
+  if scR.isErr:
+    return @[]
+  let n = scR.get()
+  if n == 0:
+    return @[]
+  result = newSeq[uint64](n)
+  let fetched = reader.stepAbsoluteGlobalLineIndices(0'u64, n, result)
+  if fetched.isErr or fetched.get() != n:
+    return @[]
+
 # ---------------------------------------------------------------------------
 # Byte/string helpers
 # ---------------------------------------------------------------------------
@@ -362,9 +382,12 @@ proc buildFullDocument*(reader: var NewTraceReader,
         callsByExit.add((c.get().exitStep, c.get(), i))
 
   var eventsArr = newJArray()
-  let scRes = reader.stepCount()
-  if scRes.isOk:
-    for stepIdx in 0'u64 ..< scRes.get():
+  # Pre-fetch all step GLIs in one O(N) pass — calling
+  # stepAbsoluteGlobalLineIndex per step inside the loop is O(N²).
+  let allGlis = precomputeStepGlis(reader)
+  if allGlis.len > 0:
+    for stepIdx in 0'u64 ..< uint64(allGlis.len):
+      let stepGli = allGlis[int(stepIdx)]
       # 1) call entries at this step
       for (es, rec, ck) in callsByEntry:
         if es == stepIdx:
@@ -399,9 +422,8 @@ proc buildFullDocument*(reader: var NewTraceReader,
       var stepObj = newJObject()
       stepObj["kind"] = newJString("step")
       stepObj["step_index"] = newJInt(int64(stepIdx))
-      let absGli = reader.stepAbsoluteGlobalLineIndex(stepIdx)
-      if absGli.isOk:
-        let (pathId, line) = resolveGli(gli, absGli.get())
+      block emitStep:
+        let (pathId, line) = resolveGli(gli, stepGli)
         stepObj["path_id"] = newJInt(int64(pathId))
         stepObj["line"] = newJInt(int64(line))
         let pStr = reader.path(uint64(pathId))
@@ -415,7 +437,7 @@ proc buildFullDocument*(reader: var NewTraceReader,
         # we leave the field absent in that case to keep the JSON
         # bit-for-bit compatible with pre-column-aware tooling.
         if reader.meta.hasColumnAwareSteps:
-          let posRes = reader.decodeGlobalPositionIndex(absGli.get())
+          let posRes = reader.decodeGlobalPositionIndex(stepGli)
           if posRes.isOk:
             stepObj["column"] = newJInt(int64(posRes.get().column))
       let stepEv = reader.step(stepIdx)

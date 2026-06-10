@@ -52,6 +52,25 @@ proc resolveGli(gli: GlobalLineIndex, globalIdx: uint64): (int, uint64) =
   ## Convert global line index to (pathId, line).
   gli.resolve(globalIdx)
 
+proc precomputeStepGlis(reader: var NewTraceReader): seq[uint64] =
+  ## Walk the exec stream once and return a seq mapping step_index →
+  ## absolute global_position_index.  ct-print's per-step JSON loops
+  ## use this so they stay O(N) — calling
+  ## ``stepAbsoluteGlobalLineIndex(i)`` per step is O(N²) (and the
+  ## outer loop made the whole emission O(N³) before this helper).
+  ## Empty seq on any failure; callers should fall back to omitting
+  ## path / line / column data for the step in that case.
+  let scR = reader.stepCount()
+  if scR.isErr:
+    return @[]
+  let n = scR.get()
+  if n == 0:
+    return @[]
+  result = newSeq[uint64](n)
+  let fetched = reader.stepAbsoluteGlobalLineIndices(0'u64, n, result)
+  if fetched.isErr or fetched.get() != n:
+    return @[]
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -408,21 +427,21 @@ proc printJsonV4(reader: var NewTraceReader) =
     else: funcsArr.add(newJString("(error)"))
   root["functions"] = funcsArr
 
-  # Steps
+  # Steps — pre-fetch all GLIs in one O(N) bulk pass so the per-step
+  # loop is a flat seq lookup; using stepAbsoluteGlobalLineIndex(i)
+  # in the loop is O(N^2) per call (and O(N^3) end-to-end).
   var stepsArr = newJArray()
-  let sc = reader.stepCount()
-  if sc.isOk:
-    for i in 0'u64 ..< sc.get():
+  let allGlis = precomputeStepGlis(reader)
+  if allGlis.len > 0:
+    for i in 0'u64 ..< uint64(allGlis.len):
       var stepObj = newJObject()
       stepObj["index"] = newJInt(int64(i))
-      let absGli = reader.stepAbsoluteGlobalLineIndex(i)
-      if absGli.isOk:
-        let (pathId, line) = resolveGli(gli, absGli.get())
-        stepObj["path_id"] = newJInt(int64(pathId))
-        stepObj["line"] = newJInt(int64(line))
-        let pathStr = reader.path(uint64(pathId))
-        if pathStr.isOk:
-          stepObj["path"] = newJString(pathStr.get())
+      let (pathId, line) = resolveGli(gli, allGlis[int(i)])
+      stepObj["path_id"] = newJInt(int64(pathId))
+      stepObj["line"] = newJInt(int64(line))
+      let pathStr = reader.path(uint64(pathId))
+      if pathStr.isOk:
+        stepObj["path"] = newJString(pathStr.get())
       let ev = reader.step(i)
       if ev.isOk:
         stepObj["kind"] = newJString($ev.get().kind)
@@ -453,8 +472,9 @@ proc printJsonV4(reader: var NewTraceReader) =
 
   # Values (per step)
   var valuesArr = newJArray()
-  if sc.isOk:
-    for i in 0'u64 ..< sc.get():
+  let scForValues = reader.stepCount()
+  if scForValues.isOk:
+    for i in 0'u64 ..< scForValues.get():
       let vals = reader.values(i)
       if vals.isOk:
         for v in vals.get():
@@ -497,10 +517,12 @@ proc printJsonV4(reader: var NewTraceReader) =
 # ---------------------------------------------------------------------------
 
 proc stepEventToJson(reader: var NewTraceReader, gli: GlobalLineIndex,
-    stepIdx: uint64,
+    stepIdx: uint64, stepGli: uint64,
     ioEvents: seq[IOEvent], ioIndices: seq[uint64]): seq[JsonNode] =
   ## Produce JSON nodes for a single step: the step itself, its values,
-  ## and any IO events at this step.
+  ## and any IO events at this step.  ``stepGli`` is the precomputed
+  ## absolute global_position_index for this step (from
+  ## ``precomputeStepGlis``) so the caller's per-step loop stays O(N).
   var nodes: seq[JsonNode]
 
   # Step event
@@ -508,9 +530,8 @@ proc stepEventToJson(reader: var NewTraceReader, gli: GlobalLineIndex,
   stepObj["type"] = newJString("step")
   stepObj["step_index"] = newJInt(int64(stepIdx))
 
-  let absGli = reader.stepAbsoluteGlobalLineIndex(stepIdx)
-  if absGli.isOk:
-    let (pathId, line) = resolveGli(gli, absGli.get())
+  block resolveStep:
+    let (pathId, line) = resolveGli(gli, stepGli)
     stepObj["path_id"] = newJInt(int64(pathId))
     stepObj["line"] = newJInt(int64(line))
     let pathStr = reader.path(uint64(pathId))
@@ -528,7 +549,7 @@ proc stepEventToJson(reader: var NewTraceReader, gli: GlobalLineIndex,
     # leave the column field absent so the JSON output stays bit-for-bit
     # compatible with pre-column-aware consumers.
     if reader.meta.hasColumnAwareSteps:
-      let posRes = reader.decodeGlobalPositionIndex(absGli.get())
+      let posRes = reader.decodeGlobalPositionIndex(stepGli)
       if posRes.isOk:
         stepObj["column"] = newJInt(int64(posRes.get().column))
 
@@ -649,9 +670,12 @@ proc printJsonEventsV4(reader: var NewTraceReader) =
       obj["name"] = newJString(t.get())
     eventsArr.add(obj)
 
-  let sc = reader.stepCount()
-  if sc.isOk:
-    for stepIdx in 0'u64 ..< sc.get():
+  # Pre-fetch all step GLIs in one O(N) pass so the per-step loop
+  # below stays linear instead of calling stepAbsoluteGlobalLineIndex
+  # per step (which is O(N) each ⇒ O(N²) total).
+  let allGlis = precomputeStepGlis(reader)
+  if allGlis.len > 0:
+    for stepIdx in 0'u64 ..< uint64(allGlis.len):
       # Collect IO events for this step
       var stepIo: seq[IOEvent]
       var stepIoIndices: seq[uint64]
@@ -675,7 +699,8 @@ proc printJsonEventsV4(reader: var NewTraceReader) =
           callObj["depth"] = newJInt(int64(rec.depth))
           eventsArr.add(callObj)
 
-      let nodes = stepEventToJson(reader, gli, stepIdx, stepIo, stepIoIndices)
+      let nodes = stepEventToJson(reader, gli, stepIdx, allGlis[int(stepIdx)],
+        stepIo, stepIoIndices)
       for n in nodes:
         eventsArr.add(n)
 
@@ -821,9 +846,12 @@ proc buildFullDocument(reader: var NewTraceReader,
 
   var eventsArr = newJArray()
 
-  let scRes = reader.stepCount()
-  if scRes.isOk:
-    for stepIdx in 0'u64 ..< scRes.get():
+  # Pre-fetch all step GLIs in one O(N) pass — calling
+  # stepAbsoluteGlobalLineIndex per step inside the loop is O(N²).
+  let allGlis = precomputeStepGlis(reader)
+  if allGlis.len > 0:
+    for stepIdx in 0'u64 ..< uint64(allGlis.len):
+      let stepGli = allGlis[int(stepIdx)]
       # 1. Emit call entry events at this step (deterministic depth-asc order).
       for (es, rec, ck) in callsByEntry:
         if es == stepIdx:
@@ -858,11 +886,8 @@ proc buildFullDocument(reader: var NewTraceReader,
       var stepObj = newJObject()
       stepObj["kind"] = newJString("step")
       stepObj["step_index"] = newJInt(int64(stepIdx))
-      let absGli = reader.stepAbsoluteGlobalLineIndex(stepIdx)
-      var pathIdResolved = -1
-      if absGli.isOk:
-        let (pathId, line) = resolveGli(gli, absGli.get())
-        pathIdResolved = pathId
+      block emitStep:
+        let (pathId, line) = resolveGli(gli, stepGli)
         stepObj["path_id"] = newJInt(int64(pathId))
         stepObj["line"] = newJInt(int64(line))
         let pStr = reader.path(uint64(pathId))
@@ -874,11 +899,9 @@ proc buildFullDocument(reader: var NewTraceReader,
         # traces leave the field absent so the JSON output stays
         # bit-for-bit compatible with pre-column-aware consumers.
         if reader.meta.hasColumnAwareSteps:
-          let posRes = reader.decodeGlobalPositionIndex(absGli.get())
+          let posRes = reader.decodeGlobalPositionIndex(stepGli)
           if posRes.isOk:
             stepObj["column"] = newJInt(int64(posRes.get().column))
-      else:
-        discard pathIdResolved  # silence "unused" warning under strict modes
       let stepEv = reader.step(stepIdx)
       if stepEv.isOk:
         let se = stepEv.get()
@@ -1013,22 +1036,19 @@ proc printTextV4(reader: var NewTraceReader) =
       if ev.isOk:
         ioByStep.add((ev.get().stepId, ev.get()))
 
-  let sc = reader.stepCount()
-  if sc.isErr:
+  # Pre-fetch all step GLIs in one O(N) pass — calling
+  # stepAbsoluteGlobalLineIndex per step inside the loop is O(N²).
+  let allGlis = precomputeStepGlis(reader)
+  if allGlis.len == 0:
     echo "(no steps)"
     return
-
-  let totalSteps = sc.get()
-  if totalSteps == 0:
-    echo "(no steps)"
-    return
+  let totalSteps = uint64(allGlis.len)
 
   for stepIdx in 0'u64 ..< totalSteps:
     var pathStr = "?"
     var lineNum: uint64 = 0
-    let absGli = reader.stepAbsoluteGlobalLineIndex(stepIdx)
-    if absGli.isOk:
-      let (pathId, line) = resolveGli(gli, absGli.get())
+    block resolveStep:
+      let (pathId, line) = resolveGli(gli, allGlis[int(stepIdx)])
       lineNum = line
       let p = reader.path(uint64(pathId))
       if p.isOk:
@@ -1107,13 +1127,21 @@ proc followV4(filePath: string, pollMs: int) =
 
     let sc = reader.stepCount()
     if sc.isOk and sc.get() > lastStepCount:
+      # Bulk-fetch GLIs for just the new steps so this tail tick stays
+      # linear in the delta size (per-step accessor would be O(K²) for
+      # K new events).
+      let newCount = sc.get() - lastStepCount
+      var newGlis = newSeq[uint64](newCount)
+      let fetched = reader.stepAbsoluteGlobalLineIndices(
+        lastStepCount, newCount, newGlis)
+      let usableGlis = fetched.isOk and fetched.get() == newCount
       for stepIdx in lastStepCount ..< sc.get():
         var stepObj = newJObject()
         stepObj["type"] = newJString("step")
         stepObj["step_index"] = newJInt(int64(stepIdx))
-        let absGli = reader.stepAbsoluteGlobalLineIndex(stepIdx)
-        if absGli.isOk:
-          let (pathId, line) = resolveGli(gli, absGli.get())
+        if usableGlis:
+          let (pathId, line) = resolveGli(
+            gli, newGlis[int(stepIdx - lastStepCount)])
           stepObj["path_id"] = newJInt(int64(pathId))
           stepObj["line"] = newJInt(int64(line))
           let pathStr = reader.path(uint64(pathId))
