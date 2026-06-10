@@ -59,6 +59,13 @@ type
     interning: TraceInterningTables
     metadata*: TraceMetadata
     paths*: seq[string]
+    pathLineLengths: seq[seq[uint32]]
+      ## P6 follow-up — per-path line-length tables, used in column-aware
+      ## mode to compute byte-offset-based ``global_position_index`` values
+      ## that match the reader's ``decodeGlobalPositionIndex`` expectation
+      ## per spec §"Source Location Addressing".  Parallel to ``paths``;
+      ## empty seq for files whose line_lengths the caller didn't
+      ## supply.  Ignored when ``columnAwareSteps`` is false.
 
     # Global line index (rebuilt when paths change)
     gli: GlobalLineIndex
@@ -123,16 +130,55 @@ type
 
 proc rebuildGli(w: var MultiStreamTraceWriter) =
   ## Rebuild the global line index from the current set of paths.
+  ##
+  ## In column-aware mode each file's slot is sized to the file's total
+  ## byte capacity (sum of per-line lengths) so the resulting
+  ## ``global_position_index`` matches the spec's byte-offset-based
+  ## addressing.  Files whose ``lineLengths`` weren't supplied fall back
+  ## to the legacy ``DefaultLinesPerFile`` allocation.
+  ##
+  ## In line-only mode every file gets the legacy ``DefaultLinesPerFile``
+  ## allocation, preserving byte-for-byte output of pre-P6 traces.
   var counts = newSeq[uint64](w.paths.len)
   for i in 0 ..< w.paths.len:
-    counts[i] = DefaultLinesPerFile
+    if w.columnAwareSteps and i < w.pathLineLengths.len and
+       w.pathLineLengths[i].len > 0:
+      var total: uint64 = 0
+      for L in w.pathLineLengths[i]:
+        total += uint64(L)
+      counts[i] = max(total, 1'u64)
+    else:
+      counts[i] = DefaultLinesPerFile
   w.gli = buildGlobalLineIndex(counts)
   w.gliDirty = false
 
 proc toGlobalLineIndex(w: var MultiStreamTraceWriter,
     pathId: uint64, line: uint64): uint64 =
+  ## In column-aware mode, returns the byte-offset-based
+  ## ``global_position_index`` of column 1 on ``line`` (the spec's
+  ## reset-on-line-change semantic: after a ``register_step`` the cursor
+  ## column is 1, and subsequent ``DeltaColumn`` events advance it
+  ## within the line).
+  ##
+  ## In line-only mode, returns the legacy ``file_base + line`` value
+  ## so traces produced without column data are byte-for-byte identical
+  ## to pre-P6 output.
   if w.gliDirty:
     w.rebuildGli()
+  if w.columnAwareSteps and pathId < uint64(w.pathLineLengths.len) and
+     w.pathLineLengths[int(pathId)].len > 0:
+    # Cumulative byte offset of column 1 on ``line``: sum of the lengths
+    # of preceding lines.  ``line`` is 1-based per the cursor convention;
+    # line 1 sits at offset 0 within the file.  When ``line`` exceeds the
+    # known line count we clamp to the file's total capacity (the reader's
+    # ``decodeGlobalPositionIndex`` handles past-end addresses the same
+    # way).
+    let lls = w.pathLineLengths[int(pathId)]
+    var lineOffset: uint64 = 0
+    let upTo = min(int(line) - 1, lls.len)
+    for i in 0 ..< upTo:
+      lineOffset += uint64(lls[i])
+    return w.gli.prefixSum[int(pathId)] + lineOffset
   w.gli.globalIndex(int(pathId), line)
 
 # ---------------------------------------------------------------------------
@@ -287,6 +333,18 @@ proc registerPath*(w: var MultiStreamTraceWriter,
   # Track paths list for meta.dat (only add if new)
   if id == uint64(w.paths.len):
     w.paths.add(path)
+    # Mirror the per-file line-lengths so ``toGlobalLineIndex`` can
+    # compute byte-offset positions in column-aware mode.  When line
+    # lengths weren't supplied, store an empty seq so ``rebuildGli``
+    # falls back to the legacy ``DefaultLinesPerFile`` allocation for
+    # that path.
+    if w.columnAwareSteps:
+      var lls = newSeq[uint32](lineLengths.len)
+      for i in 0 ..< lineLengths.len:
+        lls[i] = lineLengths[i]
+      w.pathLineLengths.add(lls)
+    else:
+      w.pathLineLengths.add(@[])
     w.gliDirty = true
   ok(id)
 

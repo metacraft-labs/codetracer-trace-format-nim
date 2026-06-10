@@ -509,6 +509,65 @@ proc test_strict_meta_flag_rejection() {.raises: [].} =
   echo "PASS: test_strict_meta_flag_rejection"
 
 
+proc test_writer_gli_matches_reader_decode() {.raises: [].} =
+  ## Issue A fix verification — when the writer is in column-aware mode
+  ## and a path's line_lengths are populated, the GLI it emits for an
+  ## AbsoluteStep must match the byte-offset encoding the reader's
+  ## ``decodeGlobalPositionIndex`` expects.
+  ##
+  ## Pre-fix, the writer's ``toGlobalLineIndex`` used the legacy
+  ## ``pathId * DefaultLinesPerFile + line`` line-based encoding while
+  ## the reader expected ``file_base + cumulative_byte_offset``; the
+  ## misalignment was invisible to end-user behavior because the
+  ## reader's cursor compensated via DeltaColumn accumulation, but
+  ## raw AbsoluteStep decode was wrong.  This test guards against the
+  ## regression.
+  let writerRes = initMultiStreamWriter("test_writer_gli.ct", "writer_gli")
+  doAssert writerRes.isOk
+  var w = writerRes.get()
+  w.enableColumnAwareSteps()
+
+  # Two files with distinct line-length distributions.
+  let llA: seq[uint32] = @[10'u32, 10, 10, 10]   # file_size = 40
+  let llB: seq[uint32] = @[20'u32, 20, 20, 20]   # file_size = 80
+  doAssert w.registerPath("/A.py", llA).isOk
+  doAssert w.registerPath("/B.py", llB).isOk
+
+  # Step on file A line 2 (column 1 implicit per spec line-change rule).
+  # Expected GLI: file_base=0 + cumsum(llA[0..0]) + 0 = 10.
+  doAssert w.registerStep(0, 2, @[]).isOk
+  # Step on file B line 3.
+  # Expected GLI: file_base=40 + cumsum(llB[0..1]) + 0 = 40 + 40 = 80.
+  doAssert w.registerStep(1, 3, @[]).isOk
+
+  doAssert w.close().isOk
+  let bytes = w.toBytes()
+  w.closeCtfs()
+
+  var readerRes = openNewTraceFromBytes(bytes)
+  doAssert readerRes.isOk
+  var reader = readerRes.get()
+
+  # Reader sees two AbsoluteSteps (chunk-boundary auto-promotion + the
+  # second step is on a different file so it can't be a delta).  Decode
+  # each via the canonical position-index decoder.
+  let abs0 = reader.stepAbsoluteGlobalLineIndex(0)
+  doAssert abs0.isOk, "step 0 GLI: " & abs0.unsafeError
+  let dec0 = reader.decodeGlobalPositionIndex(abs0.get())
+  doAssert dec0.isOk, "decode step 0: " & dec0.unsafeError
+  doAssert dec0.get() == (file: 0'u64, line: 2'u32, column: 1'u32),
+    "step 0 expected (file=0, line=2, col=1), got " & $dec0.get()
+
+  let abs1 = reader.stepAbsoluteGlobalLineIndex(1)
+  doAssert abs1.isOk, "step 1 GLI: " & abs1.unsafeError
+  let dec1 = reader.decodeGlobalPositionIndex(abs1.get())
+  doAssert dec1.isOk, "decode step 1: " & dec1.unsafeError
+  doAssert dec1.get() == (file: 1'u64, line: 3'u32, column: 1'u32),
+    "step 1 expected (file=1, line=3, col=1), got " & $dec1.get()
+
+  echo "PASS: test_writer_gli_matches_reader_decode"
+
+
 test_column_aware_round_trip()
 test_column_step_requires_opt_in()
 test_column_step_first_is_rejected()
@@ -519,4 +578,5 @@ test_decode_global_position_index()
 test_step_record_column_field()
 test_step_record_column_none_for_legacy()
 test_strict_meta_flag_rejection()
+test_writer_gli_matches_reader_decode()
 echo "ALL PASS: test_column_aware_steps"
