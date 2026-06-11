@@ -13,6 +13,7 @@ import std/options
 import results
 import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
+import ../codetracer_ctfs/variable_record_table
 import ./meta_dat
 import ./interning_table
 import ./exec_stream
@@ -36,6 +37,35 @@ const
     ## don't have at this level.
 
 type
+  SourceViewRecord* = object
+    ## In-memory shape of one ``source_views.dat`` record, mirroring the
+    ## on-disk encoding documented at
+    ## ``codetracer-trace-format-spec/internal-files.md`` §
+    ## "Alternate Source Views (Deminification Support)".  The record
+    ## carries one formatted view of one source path together with a
+    ## sourcemap V3 that translates positions in ``content`` back to
+    ## positions in the original (typically minified) source at
+    ## ``pathId``.
+    pathId*: uint64
+      ## Index into ``paths.dat`` — the original source this view
+      ## applies to.  Writers MUST validate the id against the
+      ## currently-registered paths before appending so a malformed
+      ## index can never reach the on-disk record.
+    viewKind*: uint8
+      ## 0 = raw (rarely emitted), 1 = prettier_format, 2 = black_format,
+      ## 3-127 reserved, 128+ vendor-specific.
+    viewName*: string
+      ## Human-readable name shown in the UI (e.g.
+      ## ``"lodash.fmt.js"``).
+    content*: seq[byte]
+      ## The formatted source as UTF-8 bytes.
+    sourcemapV3*: seq[byte]
+      ## Sourcemap V3 JSON (UTF-8), translating
+      ## ``(generated_line, generated_column)`` in ``content`` →
+      ## ``(original_line, original_column)`` in the source at
+      ## ``pathId``.  Length-zero is the spec-allowed "no sourcemap"
+      ## marker.
+
   PendingCall = object
     functionId: uint64
     entryStep: uint64
@@ -123,6 +153,18 @@ type
       ## tag 0x07 emission and the bit-4 flag on meta.dat.  Defaults to
       ## false so existing callers keep producing line-only traces
       ## byte-for-byte identical to the pre-P6.4 output.
+
+    # Deminification / alternate source views (spec §
+    # "Alternate Source Views (Deminification Support)").  Buffered
+    # in memory and serialized into ``source_views.dat`` /
+    # ``source_views.off`` on close() only when at least one view has
+    # been registered — pre-extension writers (no registerSourceView
+    # call) leave the CTFS container untouched so their output stays
+    # byte-for-byte identical to pre-deminification traces.
+    sourceViews*: seq[SourceViewRecord]
+      ## In-order list of formatted-source views.  Index in this seq
+      ## becomes the on-disk record index.  Empty until a recorder
+      ## opts in via ``registerSourceView``.
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -347,6 +389,48 @@ proc registerPath*(w: var MultiStreamTraceWriter,
       w.pathLineLengths.add(@[])
     w.gliDirty = true
   ok(id)
+
+# ---------------------------------------------------------------------------
+# Alternate source views (Deminification Support).  Spec §
+# "Alternate Source Views (Deminification Support)" in
+# ``codetracer-trace-format-spec/internal-files.md``.
+# ---------------------------------------------------------------------------
+
+proc registerSourceView*(w: var MultiStreamTraceWriter,
+    pathId: uint64,
+    viewKind: uint8,
+    viewName: string,
+    content: seq[byte],
+    sourcemapV3: seq[byte]): Result[uint64, string] =
+  ## Buffer a formatted-view record for emission into
+  ## ``source_views.dat`` at ``close()`` time.  Returns the new view's
+  ## 0-based index in the (per-trace) source-views table.
+  ##
+  ## ``pathId`` MUST refer to a path already registered via
+  ## ``registerPath``.  Validating up front lets us reject a malformed
+  ## index at the call site rather than at serialization time when the
+  ## trace is being finalized.
+  ##
+  ## Emitting any record flips ``FlagHasAlternateSourceViews`` (bit 5)
+  ## on meta.dat at close time — pre-extension readers reject the
+  ## trace cleanly via the strict-rejection contract (spec §
+  ## "Reader Behaviour and Back-Compat").  Writers that never call
+  ## this proc keep producing pre-extension-compatible traces
+  ## byte-for-byte (no source_views files, no flag bit).
+  if w.closed:
+    return err("writer is closed")
+  if pathId >= uint64(w.paths.len):
+    return err("registerSourceView: path_id " & $pathId &
+      " is out of range (only " & $w.paths.len & " path(s) registered)")
+  let idx = uint64(w.sourceViews.len)
+  w.sourceViews.add(SourceViewRecord(
+    pathId: pathId,
+    viewKind: viewKind,
+    viewName: viewName,
+    content: content,
+    sourcemapV3: sourcemapV3,
+  ))
+  ok(idx)
 
 # ---------------------------------------------------------------------------
 # Function / Type / Varname registration (interning)
@@ -793,6 +877,46 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   if flushRes.isErr:
     return err("failed to flush exec stream: " & flushRes.error)
 
+  # Emit source_views.dat / source_views.off when the writer has any
+  # alternate-view records buffered.  Skipped entirely when none have
+  # been registered so pre-extension traces remain byte-for-byte
+  # identical to the pre-deminification output (back-compat contract
+  # for the bit-5 meta.dat flag).
+  #
+  # NOTE on file naming: the spec section uses ``source_views.dat`` /
+  # ``source_views.off``, but the CTFS base40 filename encoding caps
+  # internal-file names at 12 characters (see
+  # ``codetracer_ctfs/base40.nim``).  ``source_views.dat`` is 16 chars
+  # and silently truncates to ``source_views`` — colliding with the
+  # ``.off`` entry — so we use the 12-char abbreviation
+  # ``srcviews.dat`` / ``srcviews.off`` on disk.  Readers must look
+  # for these abbreviated names; the spec text is the conceptual
+  # reference and the abbreviation is the wire-format reality.
+  const SourceViewsBaseName = "srcviews"
+  let hasSourceViews = w.sourceViews.len > 0
+  if hasSourceViews:
+    let svTableRes = initVariableRecordTableWriter(
+      w.ctfs, SourceViewsBaseName)
+    if svTableRes.isErr:
+      return err("failed to init source_views table: " & svTableRes.error)
+    var svTable = svTableRes.get()
+    for sv in w.sourceViews:
+      var rec: seq[byte] = @[]
+      encodeVarint(sv.pathId, rec)
+      rec.add(sv.viewKind)
+      encodeVarint(uint64(sv.viewName.len), rec)
+      for i in 0 ..< sv.viewName.len:
+        rec.add(byte(sv.viewName[i]))
+      encodeVarint(uint64(sv.content.len), rec)
+      for b in sv.content:
+        rec.add(b)
+      encodeVarint(uint64(sv.sourcemapV3.len), rec)
+      for b in sv.sourcemapV3:
+        rec.add(b)
+      let appendRes = w.ctfs.append(svTable, rec)
+      if appendRes.isErr:
+        return err("failed to write source_views record: " & appendRes.error)
+
   # Write meta.dat
   let metaFileRes = w.ctfs.addFile("meta.dat")
   if metaFileRes.isErr:
@@ -803,7 +927,8 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
     metaFile, w.metadata, w.paths,
     filterProvenance = w.filterProvenance,
     emitFilterProvenance = w.recordEmptyFilterProvenance,
-    columnAwareSteps = w.columnAwareSteps)
+    columnAwareSteps = w.columnAwareSteps,
+    alternateSourceViews = hasSourceViews)
   if metaRes.isErr:
     return err("failed to write meta.dat: " & metaRes.error)
 

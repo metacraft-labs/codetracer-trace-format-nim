@@ -354,6 +354,8 @@ proc printMetaJsonV4(reader: var NewTraceReader) =
   # becomes its own boolean keyed by its meta.dat constant name).
   var flagsObj = newJObject()
   flagsObj["has_column_aware_steps"] = newJBool(reader.meta.hasColumnAwareSteps)
+  flagsObj["has_alternate_source_views"] = newJBool(
+    reader.meta.hasAlternateSourceViews)
   meta["flags"] = flagsObj
 
   if reader.meta.hasFilterProvenance:
@@ -748,10 +750,11 @@ proc buildFullDocument(reader: var NewTraceReader,
   # ----- meta.dat flag bits surfaced under `metadata.flags` -----
   # Stable JSON anchor for golden tests: every flag bit gets its
   # own boolean field, defaulting false on traces written before
-  # the flag was introduced.  Currently only the column-aware flag
-  # is exposed here; further flags follow the same pattern.
+  # the flag was introduced.
   var flagsObj = newJObject()
   flagsObj["has_column_aware_steps"] = newJBool(reader.meta.hasColumnAwareSteps)
+  flagsObj["has_alternate_source_views"] = newJBool(
+    reader.meta.hasAlternateSourceViews)
   meta["flags"] = flagsObj
 
   # ----- trace_filter provenance (TF-M7, spec §7) -----
@@ -805,12 +808,31 @@ proc buildFullDocument(reader: var NewTraceReader,
     typesArr.add(newJString(if tn.isOk: tn.get() else: "(error)"))
   root["types"] = typesArr
 
+  # ----- source_views (Alternate Source Views, Deminification Support) -----
+  # Inline content/sourcemap bytes would blow up the JSON, so we surface
+  # only their lengths — golden tests anchor on the per-view metadata
+  # and the recorded byte counts.
+  var sourceViewsArr = newJArray()
+  for i in 0'u64 ..< reader.sourceViewCount():
+    let svRes = reader.sourceView(i)
+    if svRes.isOk:
+      let sv = svRes.get()
+      var svObj = newJObject()
+      svObj["path_id"] = newJInt(int64(sv.pathId))
+      svObj["view_kind"] = newJInt(int64(sv.viewKind))
+      svObj["view_name"] = newJString(sv.viewName)
+      svObj["content_len"] = newJInt(int64(sv.content.len))
+      svObj["map_len"] = newJInt(int64(sv.sourcemapV3.len))
+      sourceViewsArr.add(svObj)
+  root["source_views"] = sourceViewsArr
+
   # ----- counts (for golden anchoring) -----
   var counts = newJObject()
   counts["paths"] = newJInt(int64(reader.pathCount()))
   counts["functions"] = newJInt(int64(reader.functionCount()))
   counts["varnames"] = newJInt(int64(reader.varnameCount()))
   counts["types"] = newJInt(int64(reader.typeCount()))
+  counts["source_views"] = newJInt(int64(reader.sourceViewCount()))
   # Use logicalStepCount so user-facing "steps" excludes DeltaColumn
   # nudges — column-aware traces interleave them with line moves but
   # they are not logical source-line steps.

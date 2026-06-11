@@ -10,6 +10,7 @@ import results
 import std/[os, json, options]
 import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
+import ../codetracer_ctfs/variable_record_table
 import ./meta_dat
 import ./interning_table
 import ./exec_stream
@@ -20,6 +21,16 @@ import ./step_encoding
 import ./varint
 
 type
+  SourceView* = object
+    ## Decoded shape of one ``source_views.dat`` record.  See
+    ## ``codetracer-trace-format-spec/internal-files.md`` §
+    ## "Alternate Source Views (Deminification Support)".
+    pathId*: uint64
+    viewKind*: uint8
+    viewName*: string
+    content*: seq[byte]
+    sourcemapV3*: seq[byte]
+
   NewTraceReader* = object
     data: seq[byte]            ## raw .ct file bytes (mmap later)
     blockSize: uint32
@@ -76,6 +87,19 @@ type
     valueLoaded: bool
     callLoaded: bool
     ioEventLoaded: bool
+
+    # Alternate source views (spec §"Alternate Source Views
+    # (Deminification Support)").  Parsed eagerly at open time when
+    # ``meta.hasAlternateSourceViews`` is set so the random-access
+    # accessors below (``sourceView``, ``sourceViewsForPath``) are
+    # zero-cost on the hot path.  Empty on pre-extension traces — the
+    # back-compat default is "no views".
+    sourceViews: seq[SourceView]
+    # Reverse index: ``sourceViewsByPath[pathId]`` is the list of
+    # ``sourceViews`` indices whose ``pathId`` matches.  Built alongside
+    # ``sourceViews`` so ``sourceViewsForPath`` is O(1) regardless of
+    # how many views the trace carries.
+    sourceViewsByPath: seq[seq[uint64]]
 
 # ---------------------------------------------------------------------------
 # Opening
@@ -174,6 +198,83 @@ proc openNewTraceFromBytes*(data: seq[byte],
         prev = current
       reader.lineLengths[i] = lls
 
+  # Alternate source views (spec §"Alternate Source Views
+  # (Deminification Support)").  When the writer set bit 5 we eagerly
+  # decode every record so the per-view accessors below run in O(1).
+  # When the bit is clear we don't touch the container — pre-extension
+  # traces have no such files.
+  if reader.meta.hasAlternateSourceViews:
+    # See the writer's note on the abbreviated 12-char base name:
+    # ``source_views.dat`` (spec name, 16 chars) collides with
+    # ``source_views.off`` in the base40 filename encoding, so the
+    # on-disk files are ``srcviews.dat`` / ``srcviews.off``.
+    let svRes = initVariableRecordTableReader(
+      data, "srcviews", blockSize, maxEntries)
+    if svRes.isErr:
+      return err("source_views.dat: " & svRes.error)
+    let svReader = svRes.get()
+    let total = svReader.count()
+    reader.sourceViews = newSeq[SourceView](int(total))
+    let pathCount = reader.pathReader.count()
+    reader.sourceViewsByPath = newSeq[seq[uint64]](int(pathCount))
+    for i in 0'u64 ..< total:
+      let rawRes = svReader.read(i)
+      if rawRes.isErr:
+        return err("source_views.dat[" & $i & "]: " & rawRes.error)
+      let raw = rawRes.get()
+      var pos = 0
+      let pathIdRes = decodeVarint(raw, pos)
+      if pathIdRes.isErr:
+        return err("source_views.dat[" & $i & "]: path_id varint: " &
+          pathIdRes.error)
+      let pathId = pathIdRes.get()
+      if pos >= raw.len:
+        return err("source_views.dat[" & $i & "]: view_kind byte missing")
+      let viewKind = raw[pos]
+      pos += 1
+      let viewNameLenRes = decodeVarint(raw, pos)
+      if viewNameLenRes.isErr:
+        return err("source_views.dat[" & $i & "]: view_name_len: " &
+          viewNameLenRes.error)
+      let viewNameLen = int(viewNameLenRes.get())
+      if pos + viewNameLen > raw.len:
+        return err("source_views.dat[" & $i & "]: view_name truncated")
+      var viewName = newString(viewNameLen)
+      for k in 0 ..< viewNameLen:
+        viewName[k] = char(raw[pos + k])
+      pos += viewNameLen
+      let contentLenRes = decodeVarint(raw, pos)
+      if contentLenRes.isErr:
+        return err("source_views.dat[" & $i & "]: content_len: " &
+          contentLenRes.error)
+      let contentLen = int(contentLenRes.get())
+      if pos + contentLen > raw.len:
+        return err("source_views.dat[" & $i & "]: content truncated")
+      var content = newSeq[byte](contentLen)
+      for k in 0 ..< contentLen:
+        content[k] = raw[pos + k]
+      pos += contentLen
+      let mapLenRes = decodeVarint(raw, pos)
+      if mapLenRes.isErr:
+        return err("source_views.dat[" & $i & "]: map_len: " &
+          mapLenRes.error)
+      let mapLen = int(mapLenRes.get())
+      if pos + mapLen > raw.len:
+        return err("source_views.dat[" & $i & "]: map truncated")
+      var smap = newSeq[byte](mapLen)
+      for k in 0 ..< mapLen:
+        smap[k] = raw[pos + k]
+      pos += mapLen
+      reader.sourceViews[int(i)] = SourceView(
+        pathId: pathId,
+        viewKind: viewKind,
+        viewName: viewName,
+        content: content,
+        sourcemapV3: smap,
+      )
+      if pathId < pathCount:
+        reader.sourceViewsByPath[int(pathId)].add(i)
+
   ok(reader)
 
 proc openNewTrace*(path: string): Result[NewTraceReader, string] =
@@ -241,6 +342,36 @@ proc pathCount*(r: NewTraceReader): uint64 =
   let binary = r.pathReader.count()
   if binary > 0: binary
   else: uint64(r.pathsJson.len)
+
+# ---------------------------------------------------------------------------
+# Alternate source views (Deminification Support).  See spec §
+# "Alternate Source Views (Deminification Support)" in
+# ``codetracer-trace-format-spec/internal-files.md``.
+# ---------------------------------------------------------------------------
+
+proc sourceViewCount*(r: NewTraceReader): uint64 =
+  ## Number of formatted-view records carried by this trace.  Always
+  ## zero on pre-extension traces (``meta.hasAlternateSourceViews ==
+  ## false``).
+  uint64(r.sourceViews.len)
+
+proc sourceView*(r: NewTraceReader, idx: uint64): Result[SourceView, string] =
+  ## Random-access read of view ``idx``.  Returns ``err`` when ``idx``
+  ## is out of range — the reader's per-record decode happens at open
+  ## time so this accessor is O(1).
+  if idx >= uint64(r.sourceViews.len):
+    return err("sourceView: index " & $idx & " out of range (" &
+      $r.sourceViews.len & " view(s))")
+  ok(r.sourceViews[int(idx)])
+
+proc sourceViewsForPath*(r: NewTraceReader, pathId: uint64): seq[uint64] =
+  ## Indices into the source-views table that target ``pathId``.
+  ## Returns an empty seq when the trace carries no views for that
+  ## path (or when ``pathId`` is out of range — back-compat-safe
+  ## default to mirror the spec's "no views" pre-extension behaviour).
+  if pathId >= uint64(r.sourceViewsByPath.len):
+    return @[]
+  r.sourceViewsByPath[int(pathId)]
 proc functionCount*(r: NewTraceReader): uint64 = r.funcReader.count()
 proc typeCount*(r: NewTraceReader): uint64 = r.typeReader.count()
 proc varnameCount*(r: NewTraceReader): uint64 = r.varnameReader.count()

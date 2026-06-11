@@ -101,13 +101,22 @@ const
     ## §"Reader Behaviour and Back-Compat" and
     ## ``codetracer-trace-format-spec/internal-files.md``
     ## §"Metadata (meta.dat)".
+  FlagHasAlternateSourceViews*: uint16 = 0x20    # bit 5 — Deminification Support
+    ## When set, the trace carries one or more ``source_views.dat``
+    ## records: alternate (formatted) views of source paths registered
+    ## in ``paths.dat``, used to deminify minified JS/Python sources at
+    ## record time.  Each record carries
+    ## ``(path_id, view_kind, view_name, content, sourcemapV3)``.
+    ## See ``codetracer-trace-format-spec/internal-files.md`` §
+    ## "Alternate Source Views (Deminification Support)".
 
   KnownFlags*: uint16 = (
     FlagHasMcrFields or
     FlagHasReplayLaunchFields or
     FlagHasLayoutSnapshot or
     FlagHasTraceFilterProvenance or
-    FlagHasColumnAwareSteps)
+    FlagHasColumnAwareSteps or
+    FlagHasAlternateSourceViews)
     ## P6.5 (column-extension back-compat): every flag bit this reader
     ## understands.  ``readMetaDat`` rejects any meta.dat whose flag
     ## word has bits outside this mask set, per
@@ -150,6 +159,13 @@ type
       ## global_position_index only when this is set.  Pre-extension
       ## traces always have it clear and readers must surface columns as
       ## ``None``.
+    hasAlternateSourceViews*: bool
+      ## True iff FlagHasAlternateSourceViews was set on the meta.dat
+      ## header.  When set, the trace carries ``source_views.dat`` /
+      ## ``source_views.off`` records (formatted views of minified
+      ## sources for the replay-server's deminification path).  Pre-
+      ## extension traces always have it clear; readers should not look
+      ## for the source_views files when this is false.
 
 proc writeRawBytes(
     c: var Ctfs, f: var CtfsInternalFile,
@@ -191,6 +207,7 @@ proc writeMetaDat*(
     filterProvenance: openArray[FilterProvenance] = [],
     emitFilterProvenance: bool = false,
     columnAwareSteps: bool = false,
+    alternateSourceViews: bool = false,
 ): Result[void, string] =
   ## Write binary meta.dat to a CTFS internal file.
   ##
@@ -225,6 +242,8 @@ proc writeMetaDat*(
     flags = flags or FlagHasTraceFilterProvenance
   if columnAwareSteps:
     flags = flags or FlagHasColumnAwareSteps
+  if alternateSourceViews:
+    flags = flags or FlagHasAlternateSourceViews
   ? c.writeU16LE(f, flags)
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.
@@ -354,6 +373,8 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
 
   var contents = MetaDatContents(version: version)
   contents.hasColumnAwareSteps = (flags and FlagHasColumnAwareSteps) != 0
+  contents.hasAlternateSourceViews =
+    (flags and FlagHasAlternateSourceViews) != 0
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1, required
   # in v3+: a malformed or missing id rejects the trace at parse time.
@@ -491,6 +512,7 @@ proc writeMetaDatToBuffer*(
     filterProvenance: openArray[FilterProvenance] = [],
     emitFilterProvenance: bool = false,
     columnAwareSteps: bool = false,
+    alternateSourceViews: bool = false,
 ): seq[byte] =
   ## Serialize meta.dat to an in-memory byte buffer.
   ## This is the same format as writeMetaDat but without needing a CTFS container.
@@ -524,6 +546,8 @@ proc writeMetaDatToBuffer*(
     flags = flags or FlagHasTraceFilterProvenance
   if columnAwareSteps:
     flags = flags or FlagHasColumnAwareSteps
+  if alternateSourceViews:
+    flags = flags or FlagHasAlternateSourceViews
   result.appendU16LE(flags)
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.

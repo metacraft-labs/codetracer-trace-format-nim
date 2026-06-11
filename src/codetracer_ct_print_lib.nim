@@ -287,6 +287,8 @@ proc buildFullDocument*(reader: var NewTraceReader,
   # is exposed here; further flags follow the same pattern.
   var flagsObj = newJObject()
   flagsObj["has_column_aware_steps"] = newJBool(reader.meta.hasColumnAwareSteps)
+  flagsObj["has_alternate_source_views"] = newJBool(
+    reader.meta.hasAlternateSourceViews)
   meta["flags"] = flagsObj
 
   # ----- trace_filter provenance (TF-M7, spec §7) -----
@@ -342,12 +344,32 @@ proc buildFullDocument*(reader: var NewTraceReader,
     typesArr.add(newJString(if tn.isOk: tn.get() else: "(error)"))
   root["types"] = typesArr
 
+  # ----- source_views (Alternate Source Views, Deminification Support) -----
+  # Inline content/sourcemap bytes would blow up the JSON; surface only
+  # the per-view metadata + byte counts so golden tests anchor on the
+  # structural fields without storing the formatted source in the
+  # diff.
+  var sourceViewsArr = newJArray()
+  for i in 0'u64 ..< reader.sourceViewCount():
+    let svRes = reader.sourceView(i)
+    if svRes.isOk:
+      let sv = svRes.get()
+      var svObj = newJObject()
+      svObj["path_id"] = newJInt(int64(sv.pathId))
+      svObj["view_kind"] = newJInt(int64(sv.viewKind))
+      svObj["view_name"] = newJString(sv.viewName)
+      svObj["content_len"] = newJInt(int64(sv.content.len))
+      svObj["map_len"] = newJInt(int64(sv.sourcemapV3.len))
+      sourceViewsArr.add(svObj)
+  root["source_views"] = sourceViewsArr
+
   # ----- counts (deterministic anchors for golden tests) -----
   var counts = newJObject()
   counts["paths"] = newJInt(int64(reader.pathCount()))
   counts["functions"] = newJInt(int64(reader.functionCount()))
   counts["varnames"] = newJInt(int64(reader.varnameCount()))
   counts["types"] = newJInt(int64(reader.typeCount()))
+  counts["source_views"] = newJInt(int64(reader.sourceViewCount()))
   # User-facing "step count" is the number of logical line-bearing
   # events (AbsoluteStep + DeltaStep) — stable across the addition of
   # new event types and unaffected by the writer's column-aware mode

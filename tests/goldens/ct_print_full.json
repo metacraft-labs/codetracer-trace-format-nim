@@ -6,7 +6,11 @@
       "fixture"
     ],
     "workdir": "<workdir>",
-    "recorder": ""
+    "recorder": "",
+    "flags": {
+      "has_column_aware_steps": false,
+      "has_alternate_source_views": false
+    }
   },
   "paths": [
     "<workdir>/main.py",
@@ -39,11 +43,13 @@
     "Point",
     "Shape"
   ],
+  "source_views": [],
   "counts": {
     "paths": 2,
     "functions": 2,
     "varnames": 10,
     "types": 9,
+    "source_views": 0,
     "steps": 10,
     "calls": 2,
     "values": 10,
@@ -385,6 +391,9 @@
       "line": 7,
       "path": "<workdir>/main.py",
       "step_kind": "sekAbsoluteStep",
+      "function_id": 0,
+      "function": "main",
+      "depth": 0,
       "vars": []
     },
     {

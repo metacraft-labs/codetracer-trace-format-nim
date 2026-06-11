@@ -1273,6 +1273,72 @@ proc trace_writer_register_path_with_line_lengths(
   discard handle.writer.writePath(p)
   0.cint
 
+proc trace_writer_register_source_view(
+    handle: TraceWriterHandle,
+    path_id: uint64,
+    view_kind: uint8,
+    view_name: cstring,
+    view_name_len: csize_t,
+    content: ptr UncheckedArray[byte],
+    content_len: csize_t,
+    sourcemap: ptr UncheckedArray[byte],
+    sourcemap_len: csize_t,
+): int64 {.exportc, cdecl, dynlib.} =
+  ## Buffer an alternate source view (spec §"Alternate Source Views
+  ## (Deminification Support)").  See
+  ## ``codetracer-trace-format-spec/internal-files.md``.
+  ##
+  ## ``path_id`` MUST refer to a path already registered via
+  ## ``trace_writer_register_path_with_line_lengths`` (or implicitly by
+  ## ``trace_writer_register_step``).  ``view_kind`` is 0 = raw,
+  ## 1 = prettier_format, 2 = black_format, 3-127 reserved,
+  ## 128+ vendor-specific.  ``view_name`` is the human-readable name
+  ## (NOT necessarily NUL-terminated — pass the length separately).
+  ## ``content`` is the formatted source bytes; ``sourcemap`` is the
+  ## Sourcemap V3 JSON bytes (may be NULL/empty for "no sourcemap").
+  ##
+  ## Only the multi-stream backend is supported.  Returns the new
+  ## view's 0-based index on success, ``-1`` on error (with
+  ## ``last_error`` set).  Returning a signed type lets recorders
+  ## distinguish "index 0" from "error".
+  if handle.isNil:
+    setError("trace_writer_register_source_view: NULL handle")
+    return -1'i64
+  if not handle.useMultiStream:
+    setError("trace_writer_register_source_view: only the multi-stream " &
+      "backend supports alternate source views")
+    return -1'i64
+  if not handle.msWriterReady:
+    setError("trace_writer_register_source_view: writer not ready " &
+      "(call trace_writer_begin_events first)")
+    return -1'i64
+
+  # Materialise the view name and binary payloads into Nim values so
+  # the writer can take ownership of the bytes.  NULL payloads with
+  # length 0 are treated as empty seqs (the spec-allowed default).
+  var name = ""
+  if not view_name.isNil and view_name_len > 0:
+    name = newString(int(view_name_len))
+    for i in 0 ..< int(view_name_len):
+      name[i] = view_name[i]
+  var contentBytes: seq[byte] = @[]
+  if not content.isNil and content_len > 0:
+    contentBytes = newSeq[byte](int(content_len))
+    for i in 0 ..< int(content_len):
+      contentBytes[i] = content[i]
+  var mapBytes: seq[byte] = @[]
+  if not sourcemap.isNil and sourcemap_len > 0:
+    mapBytes = newSeq[byte](int(sourcemap_len))
+    for i in 0 ..< int(sourcemap_len):
+      mapBytes[i] = sourcemap[i]
+
+  let res = handle.msWriter.registerSourceView(
+    path_id, view_kind, name, contentBytes, mapBytes)
+  if res.isErr:
+    setError(res.error)
+    return -1'i64
+  int64(res.get())
+
 # ---------------------------------------------------------------------------
 # Close
 # ---------------------------------------------------------------------------

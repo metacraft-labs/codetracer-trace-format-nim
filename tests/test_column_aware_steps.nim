@@ -460,16 +460,17 @@ proc handcraftMetaDatWithFlags(flags: uint16): seq[byte] {.raises: [].} =
   buf
 
 proc test_strict_meta_flag_rejection() {.raises: [].} =
-  ## A meta.dat byte sequence with bit 5 set (an unknown flag) MUST be
+  ## A meta.dat byte sequence with bit 6 set (an unknown flag) MUST be
   ## rejected by ``readMetaDat`` — this is the wire-format safety net
   ## that makes the column extension's bit-4 break clean for older
   ## readers (and gives every future bit allocation the same guarantee).
-  # Bit 5 (= 0x20) is currently unallocated.  Use it alone to make sure
-  # the rejection fires on the unknown bit by itself.
-  let badBuf = handcraftMetaDatWithFlags(0x20'u16)
+  # Bit 6 (= 0x40) is currently unallocated.  (Bit 5 was previously
+  # used here but is now FlagHasAlternateSourceViews.)  Use bit 6 alone
+  # to make sure the rejection fires on the unknown bit by itself.
+  let badBuf = handcraftMetaDatWithFlags(0x40'u16)
   let badRes = readMetaDat(badBuf)
   doAssert badRes.isErr,
-    "readMetaDat must reject meta.dat with unknown flag bit 5 set"
+    "readMetaDat must reject meta.dat with unknown flag bit 6 set"
 
   # Sanity check the error message mentions the unknown bits.
   doAssert "unknown flag" in badRes.error or
@@ -486,12 +487,12 @@ proc test_strict_meta_flag_rejection() {.raises: [].} =
   doAssert goodRes.get().hasColumnAwareSteps,
     "hasColumnAwareSteps must be surfaced when bit 4 is set"
 
-  # Mix: bit 4 (known) + bit 5 (unknown) → reject.
+  # Mix: bit 4 (known) + bit 6 (unknown) → reject.
   let mixedBuf = handcraftMetaDatWithFlags(
-    FlagHasColumnAwareSteps or 0x20'u16)
+    FlagHasColumnAwareSteps or 0x40'u16)
   let mixedRes = readMetaDat(mixedBuf)
   doAssert mixedRes.isErr,
-    "meta.dat with bit 4 + bit 5 must reject because bit 5 is unknown"
+    "meta.dat with bit 4 + bit 6 must reject because bit 6 is unknown"
 
   # All currently-known bits together still parse cleanly.
   let allKnown =

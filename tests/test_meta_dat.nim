@@ -893,7 +893,10 @@ proc test_meta_dat_strict_unknown_flag_rejection() {.raises: [].} =
   ##   * flags = 0 (pre-extension trace) round-trips cleanly,
   ##   * flags = FlagHasColumnAwareSteps (bit 4, known) round-trips
   ##     cleanly with ``hasColumnAwareSteps = true``,
-  ##   * flags = bit 4 + bit 5 fails because bit 5 is unknown.
+  ##   * flags = bit 4 + bit 6 fails because bit 6 is unknown.
+  ##     (Bit 5 was reserved for FlagHasAlternateSourceViews — once
+  ##     that landed this test was retargeted to the next unknown
+  ##     bit so the strict-rejection contract stays exercised.)
   proc craft(flags: uint16): seq[byte] {.raises: [].} =
     var buf = newSeq[byte](0)
     for b in [0x43'u8, 0x54, 0x4D, 0x44]:
@@ -923,9 +926,9 @@ proc test_meta_dat_strict_unknown_flag_rejection() {.raises: [].} =
     doAssert res.get().hasColumnAwareSteps
 
   block:
-    let res = readMetaDat(craft(FlagHasColumnAwareSteps or 0x20'u16))
+    let res = readMetaDat(craft(FlagHasColumnAwareSteps or 0x40'u16))
     doAssert res.isErr,
-      "bit 4 + bit 5 must reject because bit 5 is unknown"
+      "bit 4 + bit 6 must reject because bit 6 is unknown"
     doAssert "unknown" in res.error,
       "rejection error must mention 'unknown'; got: " & res.error
 
