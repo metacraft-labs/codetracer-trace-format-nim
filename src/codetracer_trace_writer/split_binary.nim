@@ -14,7 +14,6 @@
 ## cross-language trace compatibility.
 
 import results
-import stew/endians2
 import ./cbor
 import ./safe_buffer
 import ../codetracer_trace_types

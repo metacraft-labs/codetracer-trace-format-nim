@@ -48,7 +48,7 @@
 ## concern; if a future caller needs strict monotonicity, layer it on
 ## top.
 
-import std/[sysrand, strutils, times]
+import std/[sysrand, times]
 import results
 
 const

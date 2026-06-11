@@ -57,7 +57,7 @@
 ##   module returns `Result[..., string]` and the CLI treats `isErr` as a
 ##   user-visible error rather than a silent fallback.
 
-import std/[json, base64, strutils, algorithm, options]
+import std/[json, base64, strutils, algorithm]
 import results
 import stew/endians2
 import codetracer_ctfs/base40

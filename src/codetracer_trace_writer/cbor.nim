@@ -17,7 +17,6 @@
 ##   Major type 7: false=0xf4, true=0xf5, null=0xf6, float64=0xfb + 8 bytes BE
 
 import results
-import stew/endians2
 import ../codetracer_trace_types
 
 export results, codetracer_trace_types
