@@ -33,10 +33,10 @@ proc makeData(rng: var Rng, length: int): seq[byte] =
 
 proc makeCallRecord(rng: var Rng, idx: int): CallRecord =
   let numArgs = int(rng.next() mod 4) + 1  # 1 to 4 args
-  var args = newSeq[seq[byte]](numArgs)
+  var args = newSeq[CallArg](numArgs)
   for a in 0 ..< numArgs:
     let argLen = int(rng.next() mod 20) + 1
-    args[a] = makeData(rng, argLen)
+    args[a] = CallArg(varnameId: uint64(a), value: makeData(rng, argLen))
 
   let retLen = int(rng.next() mod 16) + 1
   let retVal = makeData(rng, retLen)
@@ -139,7 +139,7 @@ proc test_call_stream_void_return() {.raises: [].} =
     entryStep: 100,
     exitStep: 200,
     depth: 0,
-    args: @[@[byte 1, 2, 3]],
+    args: @[CallArg(varnameId: 0, value: @[byte 1, 2, 3])],
     returnValue: @[VoidReturnMarker],
     exception: @[],
     children: @[],
@@ -180,7 +180,10 @@ proc test_call_stream_exception_exit() {.raises: [].} =
     entryStep: 500,
     exitStep: 600,
     depth: 1,
-    args: @[@[byte 10], @[byte 20, 30]],
+    args: @[
+      CallArg(varnameId: 0, value: @[byte 10]),
+      CallArg(varnameId: 1, value: @[byte 20, 30]),
+    ],
     returnValue: @[],  # no return value on exception
     exception: excData,
     children: @[],
@@ -201,8 +204,8 @@ proc test_call_stream_exception_exit() {.raises: [].} =
   doAssert call.exception == excData,
     "exception data mismatch"
   doAssert call.args.len == 2
-  doAssert call.args[0] == @[byte 10]
-  doAssert call.args[1] == @[byte 20, 30]
+  doAssert call.args[0].value == @[byte 10]
+  doAssert call.args[1].value == @[byte 20, 30]
 
   echo "PASS: test_call_stream_exception_exit"
 
@@ -223,7 +226,7 @@ proc test_call_stream_nested_calls() {.raises: [].} =
     entryStep: 0,
     exitStep: 1000,
     depth: 0,
-    args: @[@[byte 0xFF]],
+    args: @[CallArg(varnameId: 0, value: @[byte 0xFF])],
     returnValue: @[byte 42],
     exception: @[],
     children: @[uint64 1, 2, 3, 4, 5],
@@ -239,7 +242,7 @@ proc test_call_stream_nested_calls() {.raises: [].} =
       entryStep: uint64(i * 100),
       exitStep: uint64(i * 100 + 50),
       depth: 1,
-      args: @[@[byte(i)]],
+      args: @[CallArg(varnameId: 0, value: @[byte(i)])],
       returnValue: @[byte(i * 10)],
       exception: @[],
       children: @[],
