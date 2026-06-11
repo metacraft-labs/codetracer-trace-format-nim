@@ -52,6 +52,20 @@ proc resolveGli(gli: GlobalLineIndex, globalIdx: uint64): (int, uint64) =
   ## Convert global line index to (pathId, line).
   gli.resolve(globalIdx)
 
+proc resolveStepLocation(reader: var NewTraceReader,
+    gli: GlobalLineIndex, stepGli: uint64): (int, uint64) =
+  ## Resolve a step's absolute ``global_position_index`` to ``(pathId,
+  ## line)``.  Column-aware traces encode GLI as a byte-offset (cumulative
+  ## sum of preceding line_lengths), so the legacy line-count-based
+  ## ``gli.resolve`` returns garbage on them.  Route through the spec-
+  ## canonical ``decodeGlobalPositionIndex`` when the column-aware flag is
+  ## set; fall back to the line-count resolver for legacy traces.
+  if reader.meta.hasColumnAwareSteps:
+    let posRes = reader.decodeGlobalPositionIndex(stepGli)
+    if posRes.isOk:
+      return (int(posRes.get().file), uint64(posRes.get().line))
+  gli.resolve(stepGli)
+
 proc precomputeStepGlis(reader: var NewTraceReader): seq[uint64] =
   ## Walk the exec stream once and return a seq mapping step_index →
   ## absolute global_position_index.  ct-print's per-step JSON loops
@@ -438,7 +452,7 @@ proc printJsonV4(reader: var NewTraceReader) =
     for i in 0'u64 ..< uint64(allGlis.len):
       var stepObj = newJObject()
       stepObj["index"] = newJInt(int64(i))
-      let (pathId, line) = resolveGli(gli, allGlis[int(i)])
+      let (pathId, line) = resolveStepLocation(reader, gli, allGlis[int(i)])
       stepObj["path_id"] = newJInt(int64(pathId))
       stepObj["line"] = newJInt(int64(line))
       let pathStr = reader.path(uint64(pathId))
@@ -533,7 +547,7 @@ proc stepEventToJson(reader: var NewTraceReader, gli: GlobalLineIndex,
   stepObj["step_index"] = newJInt(int64(stepIdx))
 
   block resolveStep:
-    let (pathId, line) = resolveGli(gli, stepGli)
+    let (pathId, line) = resolveStepLocation(reader, gli, stepGli)
     stepObj["path_id"] = newJInt(int64(pathId))
     stepObj["line"] = newJInt(int64(line))
     let pathStr = reader.path(uint64(pathId))
@@ -909,7 +923,7 @@ proc buildFullDocument(reader: var NewTraceReader,
       stepObj["kind"] = newJString("step")
       stepObj["step_index"] = newJInt(int64(stepIdx))
       block emitStep:
-        let (pathId, line) = resolveGli(gli, stepGli)
+        let (pathId, line) = resolveStepLocation(reader, gli, stepGli)
         stepObj["path_id"] = newJInt(int64(pathId))
         stepObj["line"] = newJInt(int64(line))
         let pStr = reader.path(uint64(pathId))
@@ -1070,7 +1084,7 @@ proc printTextV4(reader: var NewTraceReader) =
     var pathStr = "?"
     var lineNum: uint64 = 0
     block resolveStep:
-      let (pathId, line) = resolveGli(gli, allGlis[int(stepIdx)])
+      let (pathId, line) = resolveStepLocation(reader, gli, allGlis[int(stepIdx)])
       lineNum = line
       let p = reader.path(uint64(pathId))
       if p.isOk:

@@ -455,6 +455,19 @@ proc readEventsV4(reader: var TraceReader): Result[void, string] =
     of sekAbsoluteStep, sekDeltaStep, sekDeltaColumn:
       # P6.5: update the column cursor.  See the long comment above
       # the step-walk loop for the state machine's spec basis.
+      #
+      # In column-aware mode the on-wire ``global_position_index`` is a
+      # byte-offset (sum of preceding line_lengths) — NOT a line count.
+      # The line-only ``gli.resolve`` does line-count-based prefix-sum
+      # search and therefore produces nonsense values on column-aware
+      # traces.  Use ``decodeGlobalPositionIndex`` to recover both line
+      # and column in one O(log F) + O(log L) pass; the per-file
+      # line-length tables it consults are populated from paths.dat at
+      # construction time.
+      var resolvedLine: int64 = 0
+      var resolvedPathId: uint64 = 0
+      var haveResolvedLine = false
+
       if columnAware:
         case stepEv.kind
         of sekAbsoluteStep:
@@ -463,6 +476,9 @@ proc readEventsV4(reader: var TraceReader): Result[void, string] =
             let posRes = nr.decodeGlobalPositionIndex(absGli.get())
             if posRes.isOk:
               cursorColumn = posRes.get().column
+              resolvedPathId = posRes.get().file
+              resolvedLine = int64(posRes.get().line)
+              haveResolvedLine = true
             else:
               # No per-line data — column slot defaults to column 1.
               cursorColumn = 1
@@ -475,6 +491,13 @@ proc readEventsV4(reader: var TraceReader): Result[void, string] =
           if stepEv.lineDelta != 0:
             cursorColumn = 1
           cursorHasColumn = true
+          let absGli = nr.stepAbsoluteGlobalLineIndex(n)
+          if absGli.isOk:
+            let posRes = nr.decodeGlobalPositionIndex(absGli.get())
+            if posRes.isOk:
+              resolvedPathId = posRes.get().file
+              resolvedLine = int64(posRes.get().line)
+              haveResolvedLine = true
         of sekDeltaColumn:
           let nextCol = int64(cursorColumn) + stepEv.columnDelta
           if nextCol < 1:
@@ -482,6 +505,13 @@ proc readEventsV4(reader: var TraceReader): Result[void, string] =
           else:
             cursorColumn = uint32(nextCol)
           cursorHasColumn = true
+          let absGli = nr.stepAbsoluteGlobalLineIndex(n)
+          if absGli.isOk:
+            let posRes = nr.decodeGlobalPositionIndex(absGli.get())
+            if posRes.isOk:
+              resolvedPathId = posRes.get().file
+              resolvedLine = int64(posRes.get().line)
+              haveResolvedLine = true
         else:
           discard
 
@@ -489,21 +519,29 @@ proc readEventsV4(reader: var TraceReader): Result[void, string] =
       # legacy projection layer we surface column motion as a tleStep at
       # the running (path, line); the column slot is populated above
       # when the trace is column-aware.
-      let absGli = nr.stepAbsoluteGlobalLineIndex(n)
-      if absGli.isOk and reader.paths.len > 0:
-        let (fileId, line) = gli.resolve(absGli.get())
-        var rec = StepRecord(pathId: PathId(uint64(fileId)),
-                             line: Line(int64(line)))
+      if haveResolvedLine and reader.paths.len > 0:
+        var rec = StepRecord(pathId: PathId(resolvedPathId),
+                             line: Line(resolvedLine))
         if cursorHasColumn:
           rec.hasColumn = true
           rec.column = Line(int64(cursorColumn))
         reader.events.add(TraceLowLevelEvent(kind: tleStep, step: rec))
       else:
-        var rec = StepRecord(pathId: PathId(0), line: Line(0))
-        if cursorHasColumn:
-          rec.hasColumn = true
-          rec.column = Line(int64(cursorColumn))
-        reader.events.add(TraceLowLevelEvent(kind: tleStep, step: rec))
+        let absGli = nr.stepAbsoluteGlobalLineIndex(n)
+        if absGli.isOk and reader.paths.len > 0:
+          let (fileId, line) = gli.resolve(absGli.get())
+          var rec = StepRecord(pathId: PathId(uint64(fileId)),
+                               line: Line(int64(line)))
+          if cursorHasColumn:
+            rec.hasColumn = true
+            rec.column = Line(int64(cursorColumn))
+          reader.events.add(TraceLowLevelEvent(kind: tleStep, step: rec))
+        else:
+          var rec = StepRecord(pathId: PathId(0), line: Line(0))
+          if cursorHasColumn:
+            rec.hasColumn = true
+            rec.column = Line(int64(cursorColumn))
+          reader.events.add(TraceLowLevelEvent(kind: tleStep, step: rec))
     of sekRaise, sekCatch:
       # No direct v3 mapping for raise/catch — skip (or could synthesize
       # a tleEvent).  v3 didn't expose these via tleStep either.
