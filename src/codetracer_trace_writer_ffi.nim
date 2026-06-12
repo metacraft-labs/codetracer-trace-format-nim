@@ -2450,6 +2450,110 @@ proc ct_reader_step_locations(
   written
 
 # ---------------------------------------------------------------------------
+# ct_reader_step_locations_with_columns — column-aware bulk accessor
+# ---------------------------------------------------------------------------
+#
+# M1 of the Column-Aware Replay Navigation campaign:
+# `(file, line, column)` from the column-aware step encoding.
+#
+# Mirrors ``ct_reader_step_locations`` but also fills a column buffer.
+# On legacy line-only traces (``meta.hasColumnAwareSteps == false``)
+# every column slot is set to 0 — callers MUST treat 0 as "no column
+# recorded" (the M1 spec keeps column 1-indexed when present).
+#
+# Callers SHOULD invoke ``ct_reader_has_column_aware_steps`` first to
+# decide whether the column buffer carries information; this proc
+# defensively zero-fills the column buffer on legacy traces so the
+# caller can still ingest the data without branching per step.
+
+proc ct_reader_step_locations_with_columns(
+    h: pointer, startN: uint64, count: uint64,
+    outPathIds: ptr uint64, outLines: ptr uint64, outColumns: ptr uint64
+): uint64 {.exportc, cdecl, dynlib.} =
+  ## Resolve steps ``[startN, startN + count)`` to ``(path_id, line,
+  ## column)`` triples.  On legacy line-only traces the column slot is
+  ## set to 0 (caller treats as "no column").
+  ##
+  ## ``outColumns`` must hold at least ``count`` entries; passing NULL
+  ## is an error.  Returns the number of entries actually written, or
+  ## ``UINT64_MAX`` on error.
+  if h.isNil or outPathIds.isNil or outLines.isNil or outColumns.isNil:
+    setError("NULL parameter")
+    return high(uint64)
+  if count == 0'u64:
+    return 0
+  let rh = cast[TraceReaderHandle](h)
+
+  var glis = newSeq[uint64](int(count))
+  let writtenRes = rh[].stepAbsoluteGlobalLineIndices(startN, count, glis)
+  if writtenRes.isErr:
+    setError(writtenRes.error)
+    return high(uint64)
+  let written = writtenRes.get()
+  if written == 0'u64:
+    return 0
+
+  let pidArr = cast[ptr UncheckedArray[uint64]](outPathIds)
+  let lineArr = cast[ptr UncheckedArray[uint64]](outLines)
+  let colArr = cast[ptr UncheckedArray[uint64]](outColumns)
+  let columnAware = rh[].meta.hasColumnAwareSteps
+
+  if not columnAware:
+    # Legacy line-only trace: GLI resolves directly via prefix-sum.
+    let gli = getOrBuildGli(rh)
+    for i in 0 ..< int(written):
+      let (pathId, line) = gli.resolve(glis[i])
+      pidArr[i] = uint64(pathId)
+      lineArr[i] = line
+      colArr[i] = 0
+    return written
+
+  # Column-aware path: decodeGlobalPositionIndex resolves the GLI's
+  # byte-offset encoding to (file, line, column) using the per-file
+  # line-length tables populated from paths.dat at construction time.
+  # See codetracer_trace_reader.nim's P6.5 column-tracking projection
+  # for the spec basis — we replicate the cursor here so the bulk
+  # ingest does not have to walk every step event individually.
+  #
+  # Subtlety: ``decodeGlobalPositionIndex`` returns column = 1 for
+  # absolute positions that land on a line boundary, which is the
+  # spec's "column 1 means the start of the line" convention.  When
+  # the per-file line-length table is absent (the writer chose not to
+  # populate ``lineLengths``), the decoder errors — we fall back to
+  # column = 1 in that case, matching the legacy reader.
+  # Build the line-only GLI once outside the loop in case any step
+  # needs the legacy fallback (per-line data absent).  Cheap since
+  # ``getOrBuildGli`` caches via a thread-local in the runtime.
+  let gliFallback = getOrBuildGli(rh)
+  for i in 0 ..< int(written):
+    let posRes = rh[].decodeGlobalPositionIndex(glis[i])
+    if posRes.isOk:
+      let pos = posRes.get()
+      pidArr[i] = pos.file
+      lineArr[i] = uint64(pos.line)
+      colArr[i] = uint64(pos.column)
+    else:
+      # Fall back to line-only resolution.  Column = 1 mirrors the
+      # column-tracking cursor's default when per-line data is absent.
+      let (pathId, line) = gliFallback.resolve(glis[i])
+      pidArr[i] = uint64(pathId)
+      lineArr[i] = line
+      colArr[i] = 1
+  written
+
+# ---------------------------------------------------------------------------
+# ct_reader_has_column_aware_steps — metadata accessor
+# ---------------------------------------------------------------------------
+
+proc ct_reader_has_column_aware_steps(h: pointer): cint {.exportc, cdecl, dynlib.} =
+  ## Return 1 when the trace is column-aware (``meta.hasColumnAwareSteps
+  ## == true``) and 0 otherwise.  Returns -1 on a NULL handle.
+  if h.isNil:
+    return -1.cint
+  let rh = cast[TraceReaderHandle](h)
+  if rh[].meta.hasColumnAwareSteps: 1.cint else: 0.cint
+
+# ---------------------------------------------------------------------------
 # ct_reader_step_value_count / ct_reader_step_value — structured value access
 # ---------------------------------------------------------------------------
 
