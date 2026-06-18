@@ -93,9 +93,25 @@ type
     # The multi-stream API writes step + all values together.
     # So we buffer the step info and accumulate values, then flush
     # on the next step or on close.
+    #
+    # Two flavours of pending step coexist so the recorder can interleave
+    # ``trace_writer_register_step`` (line) and
+    # ``trace_writer_register_delta_column`` (column) without losing
+    # variables.  M-leo regression: a ``register_step`` →
+    # ``register_delta_column`` → ``register_variable_*`` → ``register_return``
+    # sequence used to lose the trailing variable because the column step
+    # was emitted eagerly with empty values and ``hasPendingStep`` cleared
+    # to false, so the subsequent ``flushPendingStep`` was a no-op.  Now
+    # the column step is buffered too — ``flushPendingStep`` emits
+    # whichever flavour is pending (line OR column) together with the
+    # accumulated values, and any leftover values without a pending step
+    # are flushed via a synthetic zero-column step so they still reach
+    # the value stream.  See ``tests/test_pending_value_after_delta_column.nim``.
     hasPendingStep: bool
     pendingStepPathId: uint64
     pendingStepLine: uint64
+    hasPendingColumnStep: bool
+    pendingColumnDelta: int64
     pendingValues: seq[VariableValue]
 
     # Pending call arguments for multi-stream mode:
@@ -230,6 +246,7 @@ proc trace_writer_new(
     msWriterReady: false,
     useMultiStream: format == ffiBinary,
     hasPendingStep: false,
+    hasPendingColumnStep: false,
     programName: prog,
     workdir: "",
     metaArgs: @[],
@@ -372,18 +389,57 @@ proc trace_writer_finish_paths(handle: TraceWriterHandle): cint {.exportc, cdecl
 
 proc flushPendingStep(handle: TraceWriterHandle): cint =
   ## Flush the buffered pending step and its accumulated variable values
-  ## to the multi-stream writer. Returns 0 on success, 1 on error.
-  if not handle.hasPendingStep:
+  ## to the multi-stream writer.  Handles three cases:
+  ##
+  ## 1. A pending line step (``hasPendingStep``):
+  ##    emit ``registerStep`` with the accumulated values.
+  ## 2. A pending column step (``hasPendingColumnStep``):
+  ##    emit ``registerColumnStep`` with the accumulated values.
+  ## 3. No pending step but a non-empty ``pendingValues`` queue
+  ##    (M-leo regression: variables were registered after the last
+  ##    ``registerColumnStep`` was flushed, so the values would otherwise
+  ##    be silently dropped on close / return).  Emit a synthetic
+  ##    zero-delta column step so the values still reach the value
+  ##    stream parallel to the exec stream.
+  ##
+  ## Returns 0 on success, 1 on error.
+  if handle.hasPendingStep:
+    let res = handle.msWriter.registerStep(
+      handle.pendingStepPathId,
+      handle.pendingStepLine,
+      handle.pendingValues)
+    if res.isErr:
+      setError(res.error)
+      return 1.cint
+    handle.pendingValues.setLen(0)
+    handle.hasPendingStep = false
     return 0.cint
-  let res = handle.msWriter.registerStep(
-    handle.pendingStepPathId,
-    handle.pendingStepLine,
-    handle.pendingValues)
-  if res.isErr:
-    setError(res.error)
-    return 1.cint
-  handle.pendingValues.setLen(0)
-  handle.hasPendingStep = false
+
+  if handle.hasPendingColumnStep:
+    let res = handle.msWriter.registerColumnStep(
+      handle.pendingColumnDelta,
+      handle.pendingValues)
+    if res.isErr:
+      setError(res.error)
+      return 1.cint
+    handle.pendingValues.setLen(0)
+    handle.hasPendingColumnStep = false
+    return 0.cint
+
+  if handle.pendingValues.len > 0:
+    # M-leo fix: variables registered after a column step was already
+    # emitted (legacy code path) would strand the values in
+    # pendingValues with no step to attach to.  Emit a synthetic
+    # zero-delta column step so the values still surface in the value
+    # stream.  Only valid in column-aware mode and after at least one
+    # step has been emitted; otherwise drop the orphan values rather
+    # than corrupt the stream.
+    if handle.msWriter.columnAwareSteps and handle.msWriter.stepCount > 0:
+      let res = handle.msWriter.registerColumnStep(0'i64, handle.pendingValues)
+      if res.isErr:
+        setError(res.error)
+        return 1.cint
+    handle.pendingValues.setLen(0)
   0.cint
 
 # ---------------------------------------------------------------------------
@@ -1237,12 +1293,19 @@ proc trace_writer_register_delta_column(
     return
   if not handle.msWriterReady:
     return
-  # Flush any buffered step before we emit the column event so the
-  # exec / value streams stay in lock-step.
-  discard flushPendingStep(handle)
-  let res = handle.msWriter.registerColumnStep(column_delta, @[])
-  if res.isErr:
-    setError(res.error)
+  # Flush any buffered step (with its accumulated values) before we
+  # buffer the new column step.  Then buffer the column step itself —
+  # we do NOT emit it eagerly because the recorder may follow it with
+  # ``trace_writer_register_variable_*`` calls (the M-leo
+  # ``register_step → register_delta_column → register_variable_* →
+  # register_return`` sequence used to strand those trailing values).
+  # The column step + accumulated values is emitted at the next
+  # ``flushPendingStep`` (driven by the next register_step / call /
+  # return / close).
+  if flushPendingStep(handle) != 0.cint:
+    return
+  handle.pendingColumnDelta = column_delta
+  handle.hasPendingColumnStep = true
 
 proc trace_writer_register_path_with_line_lengths(
     handle: TraceWriterHandle,
