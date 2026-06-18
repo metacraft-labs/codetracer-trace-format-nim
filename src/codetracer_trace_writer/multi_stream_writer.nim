@@ -611,9 +611,25 @@ proc registerCall*(w: var MultiStreamTraceWriter, functionId: uint64,
   for i in 0 ..< args.len:
     argsSeq[i] = args[i]
 
+  # CTFS-M entry_step convention: the call_entry event MUST be emitted at
+  # a step index that lies within the trace's [0, stepCount) range so the
+  # downstream reader (ct-print) can place it during its single-pass walk.
+  # The FFI flushes any pending step BEFORE calling registerCall (so the
+  # step that produced the call's argument context is already written),
+  # which means `w.stepCount` here is the count AFTER that flush — i.e.
+  # the index of the NEXT step.  Capturing that value works for non-leaf
+  # callees (the first body step of the callee fills the slot), but for
+  # leaf calls (snforge contract_call / storage_read / etc. that have no
+  # further body steps before register_return) it points past the last
+  # emitted step and the call_entry is silently dropped by ct-print.
+  # Mirror registerReturn's symmetric convention: use the just-flushed
+  # step's index (`stepCount - 1`), which is always within range for any
+  # caller that emitted at least one step before the call.  For the very
+  # first registerCall in a trace (before any step has been flushed), fall
+  # back to 0 so the call_entry still places at the trace's initial step.
   w.callStack.add(PendingCall(
     functionId: functionId,
-    entryStep: w.stepCount,
+    entryStep: if w.stepCount > 0: w.stepCount - 1 else: 0,
     depth: w.currentDepth,
     parentCallKey: parentKey,
     callKey: callKey,
