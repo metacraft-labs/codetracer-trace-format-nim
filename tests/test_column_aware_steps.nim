@@ -460,17 +460,21 @@ proc handcraftMetaDatWithFlags(flags: uint16): seq[byte] {.raises: [].} =
   buf
 
 proc test_strict_meta_flag_rejection() {.raises: [].} =
-  ## A meta.dat byte sequence with bit 6 set (an unknown flag) MUST be
-  ## rejected by ``readMetaDat`` — this is the wire-format safety net
-  ## that makes the column extension's bit-4 break clean for older
-  ## readers (and gives every future bit allocation the same guarantee).
-  # Bit 6 (= 0x40) is currently unallocated.  (Bit 5 was previously
-  # used here but is now FlagHasAlternateSourceViews.)  Use bit 6 alone
-  # to make sure the rejection fires on the unknown bit by itself.
-  let badBuf = handcraftMetaDatWithFlags(0x40'u16)
+  ## A meta.dat byte sequence with a still-reserved flag bit set MUST
+  ## be rejected by ``readMetaDat`` — this is the wire-format safety
+  ## net that makes the column extension's bit-4 break clean for
+  ## older readers (and gives every future bit allocation the same
+  ## guarantee).
+  # Bit 8 (= 0x100) is the lowest still-reserved bit after the
+  # M-capability-flags milestone allocated bits 6 and 7.  Earlier
+  # iterations of this test used bit 6 (then 5) — keep the test in
+  # sync with the latest reserved range to keep the unknown-bit
+  # rejection contract enforced.
+  const FirstReservedBit: uint16 = 0x100
+  let badBuf = handcraftMetaDatWithFlags(FirstReservedBit)
   let badRes = readMetaDat(badBuf)
   doAssert badRes.isErr,
-    "readMetaDat must reject meta.dat with unknown flag bit 6 set"
+    "readMetaDat must reject meta.dat with unknown flag bit 8 set"
 
   # Sanity check the error message mentions the unknown bits.
   doAssert "unknown flag" in badRes.error or
@@ -487,18 +491,34 @@ proc test_strict_meta_flag_rejection() {.raises: [].} =
   doAssert goodRes.get().hasColumnAwareSteps,
     "hasColumnAwareSteps must be surfaced when bit 4 is set"
 
-  # Mix: bit 4 (known) + bit 6 (unknown) → reject.
+  # Bits 6 / 7 are the capability bits — both must parse cleanly and
+  # surface through ``supportsColumnBreakpoints`` /
+  # ``supportsColumnMotions``.
+  let capBuf = handcraftMetaDatWithFlags(
+    FlagHasColumnAwareSteps or FlagSupportsColumnBreakpoints or
+    FlagSupportsColumnMotions)
+  let capRes = readMetaDat(capBuf)
+  doAssert capRes.isOk,
+    "capability bits + column-aware should parse cleanly; got: " &
+    (if capRes.isErr: capRes.error else: "ok")
+  doAssert capRes.get().supportsColumnBreakpoints,
+    "supportsColumnBreakpoints must surface when bit 6 is set"
+  doAssert capRes.get().supportsColumnMotions,
+    "supportsColumnMotions must surface when bit 7 is set"
+
+  # Mix: bit 4 (known) + bit 8 (unknown) → reject.
   let mixedBuf = handcraftMetaDatWithFlags(
-    FlagHasColumnAwareSteps or 0x40'u16)
+    FlagHasColumnAwareSteps or FirstReservedBit)
   let mixedRes = readMetaDat(mixedBuf)
   doAssert mixedRes.isErr,
-    "meta.dat with bit 4 + bit 6 must reject because bit 6 is unknown"
+    "meta.dat with bit 4 + bit 8 must reject because bit 8 is unknown"
 
   # All currently-known bits together still parse cleanly.
   let allKnown =
     FlagHasColumnAwareSteps or FlagHasMcrFields or
     FlagHasReplayLaunchFields or FlagHasLayoutSnapshot or
-    FlagHasTraceFilterProvenance
+    FlagHasTraceFilterProvenance or FlagSupportsColumnBreakpoints or
+    FlagSupportsColumnMotions
   # We can't easily construct a fully valid meta.dat with every block
   # in place from scratch — that needs the full encoder.  The "every
   # known bit ORed together" case is covered by
@@ -569,6 +589,131 @@ proc test_writer_gli_matches_reader_decode() {.raises: [].} =
   echo "PASS: test_writer_gli_matches_reader_decode"
 
 
+# ---------------------------------------------------------------------------
+# M-capability-flags — column breakpoints / column motions bits
+# ---------------------------------------------------------------------------
+
+proc test_capability_flags_round_trip() {.raises: [].} =
+  ## Calling ``enableColumnBreakpointsSupport`` /
+  ## ``enableColumnMotionsSupport`` on the writer MUST set
+  ## ``FlagSupportsColumnBreakpoints`` / ``FlagSupportsColumnMotions``
+  ## on the meta.dat header and the reader MUST surface them via
+  ## ``meta.supportsColumnBreakpoints`` / ``meta.supportsColumnMotions``.
+  ## Capability bits imply ``columnAwareSteps``, so the wire-format bit
+  ## must also be set even if the recorder doesn't separately call
+  ## ``enableColumnAwareSteps``.
+  let writerRes = initMultiStreamWriter("test_caps.ct", "caps")
+  doAssert writerRes.isOk, "init failed: " & writerRes.error
+  var w = writerRes.get()
+
+  w.enableColumnBreakpointsSupport()
+  w.enableColumnMotionsSupport()
+
+  doAssert w.registerPath("/src/main.rs").isOk
+  doAssert w.registerStep(0, 1, @[]).isOk
+  doAssert w.close().isOk
+  let bytes = w.toBytes()
+  w.closeCtfs()
+
+  var readerRes = openNewTraceFromBytes(bytes)
+  doAssert readerRes.isOk, "reader open: " & readerRes.error
+  let reader = readerRes.get()
+
+  doAssert reader.meta.hasColumnAwareSteps,
+    "capability flags imply column-aware steps"
+  doAssert reader.meta.supportsColumnBreakpoints,
+    "FlagSupportsColumnBreakpoints (bit 6) should round-trip"
+  doAssert reader.meta.supportsColumnMotions,
+    "FlagSupportsColumnMotions (bit 7) should round-trip"
+
+  echo "PASS: test_capability_flags_round_trip"
+
+
+proc test_capability_flags_independent() {.raises: [].} =
+  ## A recorder MAY set one capability bit without the other.  This is
+  ## the asymmetric case: only breakpoint support is opted in, motions
+  ## stays off.
+  let writerRes = initMultiStreamWriter("test_caps_bp.ct", "caps_bp")
+  doAssert writerRes.isOk
+  var w = writerRes.get()
+
+  w.enableColumnBreakpointsSupport()
+  doAssert w.registerPath("/src/main.rs").isOk
+  doAssert w.registerStep(0, 1, @[]).isOk
+  doAssert w.close().isOk
+  let bytes = w.toBytes()
+  w.closeCtfs()
+
+  var readerRes = openNewTraceFromBytes(bytes)
+  doAssert readerRes.isOk
+  let reader = readerRes.get()
+
+  doAssert reader.meta.hasColumnAwareSteps
+  doAssert reader.meta.supportsColumnBreakpoints,
+    "only breakpoint support was opted in"
+  doAssert not reader.meta.supportsColumnMotions,
+    "motions stays off when only breakpoint support was enabled"
+
+  echo "PASS: test_capability_flags_independent"
+
+
+proc test_capability_flags_default_off() {.raises: [].} =
+  ## A column-aware recorder that DOES NOT explicitly opt in to either
+  ## capability MUST emit a trace with both capability bits clear
+  ## (recorder claims wire-format columns but the GUI must disable
+  ## per-column affordances).
+  let writerRes = initMultiStreamWriter("test_caps_off.ct", "caps_off")
+  doAssert writerRes.isOk
+  var w = writerRes.get()
+  w.enableColumnAwareSteps()
+  doAssert w.registerPath("/src/main.rs").isOk
+  doAssert w.registerStep(0, 1, @[]).isOk
+  doAssert w.close().isOk
+  let bytes = w.toBytes()
+  w.closeCtfs()
+
+  var readerRes = openNewTraceFromBytes(bytes)
+  doAssert readerRes.isOk
+  let reader = readerRes.get()
+
+  doAssert reader.meta.hasColumnAwareSteps
+  doAssert not reader.meta.supportsColumnBreakpoints,
+    "default capability for breakpoints is false"
+  doAssert not reader.meta.supportsColumnMotions,
+    "default capability for motions is false"
+
+  echo "PASS: test_capability_flags_default_off"
+
+
+proc test_capability_bits_reject_without_column_aware_buffer() {.raises: [].} =
+  ## The buffer-based ``writeMetaDatToBuffer`` enforces the
+  ## "capability bits require columnAwareSteps" contract via
+  ## ``doAssert``.  Surface that here by writing capability-only
+  ## metadata WITHOUT columnAwareSteps and confirming it traps.
+  ##
+  ## We intercept the assertion via ``defer``-and-recover semantics by
+  ## wrapping the call in a try/except branch.  Since the proc raises
+  ## ``AssertionDefect``, we mark it ``{.raises: [].}`` outer and use a
+  ## try/except inside.
+  let meta = TraceMetadata(
+    program: "p", workdir: "w", args: @[],
+    recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb")
+  var trapped = false
+  try:
+    discard writeMetaDatToBuffer(
+      meta, paths = [],
+      columnAwareSteps = false,
+      supportsColumnBreakpoints = true)
+  except AssertionDefect:
+    trapped = true
+  except CatchableError:
+    discard
+  doAssert trapped,
+    "writeMetaDatToBuffer must trap when capability bit is set " &
+    "without columnAwareSteps"
+  echo "PASS: test_capability_bits_reject_without_column_aware_buffer"
+
+
 test_column_aware_round_trip()
 test_column_step_requires_opt_in()
 test_column_step_first_is_rejected()
@@ -580,4 +725,8 @@ test_step_record_column_field()
 test_step_record_column_none_for_legacy()
 test_strict_meta_flag_rejection()
 test_writer_gli_matches_reader_decode()
+test_capability_flags_round_trip()
+test_capability_flags_independent()
+test_capability_flags_default_off()
+test_capability_bits_reject_without_column_aware_buffer()
 echo "ALL PASS: test_column_aware_steps"

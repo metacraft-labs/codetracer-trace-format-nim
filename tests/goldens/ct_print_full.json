@@ -9,7 +9,9 @@
     "recorder": "",
     "flags": {
       "has_column_aware_steps": false,
-      "has_alternate_source_views": false
+      "has_alternate_source_views": false,
+      "supports_column_breakpoints": false,
+      "supports_column_motions": false
     }
   },
   "paths": [

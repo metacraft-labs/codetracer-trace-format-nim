@@ -109,6 +109,25 @@ const
     ## ``(path_id, view_kind, view_name, content, sourcemapV3)``.
     ## See ``codetracer-trace-format-spec/internal-files.md`` §
     ## "Alternate Source Views (Deminification Support)".
+  FlagSupportsColumnBreakpoints*: uint16 = 0x40  # bit 6 — Capability Flag
+    ## Capability bit: when set, the recorder's columns are sharp enough
+    ## for the GUI to place per-column breakpoints (M6 Alt+click).  The
+    ## bit MUST only be set in combination with
+    ## ``FlagHasColumnAwareSteps`` — capability flags presuppose column
+    ## data on the wire.  Recorders that emit columns purely as display
+    ## hints (no runtime distinguishability between same-line statements)
+    ## MUST leave this bit clear; the GUI then disables the per-column
+    ## breakpoint affordance and falls back to line-only breakpoints.
+    ## See ``codetracer-trace-format-spec/internal-files.md``
+    ## §"Column-Aware Capability Flags".
+  FlagSupportsColumnMotions*: uint16 = 0x80      # bit 7 — Capability Flag
+    ## Capability bit: when set, the recorder's step predicate fires
+    ## per statement-start (not per line) so the GUI can offer
+    ## column-aware step-over / step-in / step-out.  Like
+    ## ``FlagSupportsColumnBreakpoints``, this bit MUST only be set
+    ## together with ``FlagHasColumnAwareSteps``.  When clear the GUI
+    ## hides the per-column motion buttons; legacy line-only motions
+    ## remain available.
 
   KnownFlags*: uint16 = (
     FlagHasMcrFields or
@@ -116,7 +135,9 @@ const
     FlagHasLayoutSnapshot or
     FlagHasTraceFilterProvenance or
     FlagHasColumnAwareSteps or
-    FlagHasAlternateSourceViews)
+    FlagHasAlternateSourceViews or
+    FlagSupportsColumnBreakpoints or
+    FlagSupportsColumnMotions)
     ## P6.5 (column-extension back-compat): every flag bit this reader
     ## understands.  ``readMetaDat`` rejects any meta.dat whose flag
     ## word has bits outside this mask set, per
@@ -166,6 +187,18 @@ type
       ## sources for the replay-server's deminification path).  Pre-
       ## extension traces always have it clear; readers should not look
       ## for the source_views files when this is false.
+    supportsColumnBreakpoints*: bool
+      ## True iff FlagSupportsColumnBreakpoints was set on the meta.dat
+      ## header.  GUI consumers gate per-column breakpoint affordances
+      ## (M6 Alt+click) on this; legacy / non-statement-precise
+      ## recorders surface the bit as false and the GUI falls back to
+      ## line-only breakpoints.
+    supportsColumnMotions*: bool
+      ## True iff FlagSupportsColumnMotions was set on the meta.dat
+      ## header.  GUI consumers gate per-column step-over / step-in /
+      ## step-out affordances on this; clear means the recorder's step
+      ## predicate is line-granular and only line-only motions are
+      ## meaningful.
 
 proc writeRawBytes(
     c: var Ctfs, f: var CtfsInternalFile,
@@ -208,6 +241,8 @@ proc writeMetaDat*(
     emitFilterProvenance: bool = false,
     columnAwareSteps: bool = false,
     alternateSourceViews: bool = false,
+    supportsColumnBreakpoints: bool = false,
+    supportsColumnMotions: bool = false,
 ): Result[void, string] =
   ## Write binary meta.dat to a CTFS internal file.
   ##
@@ -244,6 +279,20 @@ proc writeMetaDat*(
     flags = flags or FlagHasColumnAwareSteps
   if alternateSourceViews:
     flags = flags or FlagHasAlternateSourceViews
+  # Capability bits only make sense on top of the wire-format bit;
+  # silently dropping them when columnAwareSteps is false would be a
+  # misleading round-trip.  Surface the contract explicitly so an
+  # accidental misuse fails the write rather than producing a header
+  # that the reader's invariant check will later reject.
+  if (supportsColumnBreakpoints or supportsColumnMotions) and
+      not columnAwareSteps:
+    return err(
+      "meta.dat: capability flags (column breakpoints / motions) " &
+      "require columnAwareSteps to be enabled")
+  if supportsColumnBreakpoints:
+    flags = flags or FlagSupportsColumnBreakpoints
+  if supportsColumnMotions:
+    flags = flags or FlagSupportsColumnMotions
   ? c.writeU16LE(f, flags)
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.
@@ -375,6 +424,10 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
   contents.hasColumnAwareSteps = (flags and FlagHasColumnAwareSteps) != 0
   contents.hasAlternateSourceViews =
     (flags and FlagHasAlternateSourceViews) != 0
+  contents.supportsColumnBreakpoints =
+    (flags and FlagSupportsColumnBreakpoints) != 0
+  contents.supportsColumnMotions =
+    (flags and FlagSupportsColumnMotions) != 0
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1, required
   # in v3+: a malformed or missing id rejects the trace at parse time.
@@ -513,6 +566,8 @@ proc writeMetaDatToBuffer*(
     emitFilterProvenance: bool = false,
     columnAwareSteps: bool = false,
     alternateSourceViews: bool = false,
+    supportsColumnBreakpoints: bool = false,
+    supportsColumnMotions: bool = false,
 ): seq[byte] =
   ## Serialize meta.dat to an in-memory byte buffer.
   ## This is the same format as writeMetaDat but without needing a CTFS container.
@@ -548,6 +603,18 @@ proc writeMetaDatToBuffer*(
     flags = flags or FlagHasColumnAwareSteps
   if alternateSourceViews:
     flags = flags or FlagHasAlternateSourceViews
+  # ``writeMetaDatToBuffer`` is the buffer-side mirror of
+  # ``writeMetaDat`` and has no Result return type — surface the
+  # capability/columnAwareSteps invariant via ``doAssert`` (already the
+  # convention used for the recordingId validation above) so the test
+  # suite catches the misuse loud and clear.
+  doAssert (not supportsColumnBreakpoints and not supportsColumnMotions) or
+      columnAwareSteps,
+    "writeMetaDatToBuffer: capability flags require columnAwareSteps"
+  if supportsColumnBreakpoints:
+    flags = flags or FlagSupportsColumnBreakpoints
+  if supportsColumnMotions:
+    flags = flags or FlagSupportsColumnMotions
   result.appendU16LE(flags)
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.

@@ -289,6 +289,10 @@ proc buildFullDocument*(reader: var NewTraceReader,
   flagsObj["has_column_aware_steps"] = newJBool(reader.meta.hasColumnAwareSteps)
   flagsObj["has_alternate_source_views"] = newJBool(
     reader.meta.hasAlternateSourceViews)
+  flagsObj["supports_column_breakpoints"] = newJBool(
+    reader.meta.supportsColumnBreakpoints)
+  flagsObj["supports_column_motions"] = newJBool(
+    reader.meta.supportsColumnMotions)
   meta["flags"] = flagsObj
 
   # ----- trace_filter provenance (TF-M7, spec §7) -----
