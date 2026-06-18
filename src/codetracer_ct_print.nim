@@ -20,7 +20,7 @@ when defined(nimPreviewSlimSystem):
 ##   - structs/sequences/tuples/variants/refs: full nested decode
 ##   - all variants of ValueRecord are surfaced; nothing is hex-blob'd.
 
-import std/[os, parseopt, json, strutils, base64]
+import std/[os, parseopt, json, strutils, base64, algorithm]
 import results
 import codetracer_trace_reader
 import codetracer_trace_writer/new_trace_reader
@@ -1028,6 +1028,64 @@ proc buildFullDocument(reader: var NewTraceReader,
           if rec.exception.len > 0:
             exitObj["exception"] = decodeValueBytesToJson(rec.exception)
           eventsArr.add(exitObj)
+
+    # Post-loop drain: synthesize missing call_entry events for records
+    # whose entryStep landed past the last step (entryStep >= allGlis.len).
+    # This happens when the writer's close() drain finalizes still-open
+    # frames whose entry was registered at w.stepCount but no further
+    # registerStep ever produced a real step at that index. The matching
+    # call_exit was already emitted in the loop above because the writer
+    # clamps exitStep to stepCount - 1, so without this drain the events
+    # array is unbalanced (an exit with no entry).
+    #
+    # We anchor the synthesized entry on the last step (entry_step is
+    # preserved as the original — possibly out-of-range — value so the
+    # CallRecord round-trips faithfully). Records are scanned in
+    # entryStep-ascending, then call_key (storage) order so deeper
+    # frames synthesized in close() appear after their parents.
+    let lastStep = uint64(allGlis.len) - 1
+    var pending: seq[(uint64, v4calls.CallRecord, uint64)]
+    for entry in callsByEntry:
+      if entry[0] >= uint64(allGlis.len):
+        pending.add(entry)
+    # Stable-sort by entryStep so parent-before-child holds (call_key
+    # order is already the entry order for ties).
+    pending.sort(proc(a, b: (uint64, v4calls.CallRecord, uint64)): int =
+      if a[0] < b[0]: -1
+      elif a[0] > b[0]: 1
+      elif a[2] < b[2]: -1
+      elif a[2] > b[2]: 1
+      else: 0)
+    for (es, rec, ck) in pending:
+      var callObj = newJObject()
+      callObj["kind"] = newJString("call_entry")
+      callObj["call_key"] = newJInt(int64(ck))
+      callObj["function_id"] = newJInt(int64(rec.functionId))
+      let fn = reader.function(rec.functionId)
+      if fn.isOk:
+        callObj["function"] = newJString(fn.get())
+      callObj["entry_step"] = newJInt(int64(rec.entryStep))
+      callObj["exit_step"] = newJInt(int64(rec.exitStep))
+      callObj["depth"] = newJInt(int64(rec.depth))
+      callObj["parent_call_key"] = newJInt(rec.parentCallKey)
+      # Flag synthesized entries so downstream consumers can spot the
+      # writer-close drain case (entry at last-step, exit already past).
+      callObj["synthesized_at_step"] = newJInt(int64(lastStep))
+      var argsJson = newJArray()
+      for arg in rec.args:
+        var argObj = newJObject()
+        argObj["varname_id"] = newJInt(int64(arg.varnameId))
+        let argVn = reader.varname(arg.varnameId)
+        if argVn.isOk:
+          argObj["varname"] = newJString(argVn.get())
+        argObj["value"] = decodeValueBytesToJson(arg.value)
+        argsJson.add(argObj)
+      callObj["args"] = argsJson
+      var childrenJson = newJArray()
+      for c in rec.children:
+        childrenJson.add(newJInt(int64(c)))
+      callObj["children"] = childrenJson
+      eventsArr.add(callObj)
 
   root["events"] = eventsArr
   return root

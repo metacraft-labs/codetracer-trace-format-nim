@@ -17,7 +17,7 @@
 ## `FullOpts.stripPaths` flag substitutes `<workdir>` and `<tmp>` placeholders
 ## for cross-machine snapshots.
 
-import std/[json, strutils, base64]
+import std/[json, strutils, base64, algorithm]
 import results
 import codetracer_trace_writer/new_trace_reader
 import codetracer_trace_writer/meta_dat
@@ -545,6 +545,55 @@ proc buildFullDocument*(reader: var NewTraceReader,
           if rec.exception.len > 0:
             exitObj["exception"] = decodeValueBytesToJson(rec.exception)
           eventsArr.add(exitObj)
+
+    # Post-loop drain: synthesize missing call_entry events for records
+    # whose entryStep landed past the last step (entryStep >= allGlis.len).
+    # Happens when writer's close() drain finalizes still-open frames whose
+    # entry was registered at w.stepCount with no further registerStep
+    # producing a real step at that index. The matching call_exit was
+    # already emitted in the loop above (writer clamps exitStep to
+    # stepCount - 1), so without this drain the events array is unbalanced
+    # (an exit with no entry). Anchored at the last step; entry_step keeps
+    # the original — possibly out-of-range — value for fidelity.
+    let lastStep = uint64(allGlis.len) - 1
+    var pending: seq[(uint64, v4calls.CallRecord, uint64)]
+    for entry in callsByEntry:
+      if entry[0] >= uint64(allGlis.len):
+        pending.add(entry)
+    pending.sort(proc(a, b: (uint64, v4calls.CallRecord, uint64)): int =
+      if a[0] < b[0]: -1
+      elif a[0] > b[0]: 1
+      elif a[2] < b[2]: -1
+      elif a[2] > b[2]: 1
+      else: 0)
+    for (es, rec, ck) in pending:
+      var callObj = newJObject()
+      callObj["kind"] = newJString("call_entry")
+      callObj["call_key"] = newJInt(int64(ck))
+      callObj["function_id"] = newJInt(int64(rec.functionId))
+      let fn = reader.function(rec.functionId)
+      if fn.isOk:
+        callObj["function"] = newJString(fn.get())
+      callObj["entry_step"] = newJInt(int64(rec.entryStep))
+      callObj["exit_step"] = newJInt(int64(rec.exitStep))
+      callObj["depth"] = newJInt(int64(rec.depth))
+      callObj["parent_call_key"] = newJInt(rec.parentCallKey)
+      callObj["synthesized_at_step"] = newJInt(int64(lastStep))
+      var argsJson = newJArray()
+      for arg in rec.args:
+        var argObj = newJObject()
+        argObj["varname_id"] = newJInt(int64(arg.varnameId))
+        let argVn = reader.varname(arg.varnameId)
+        if argVn.isOk:
+          argObj["varname"] = newJString(argVn.get())
+        argObj["value"] = decodeValueBytesToJson(arg.value)
+        argsJson.add(argObj)
+      callObj["args"] = argsJson
+      var childrenJson = newJArray()
+      for c in rec.children:
+        childrenJson.add(newJInt(int64(c)))
+      callObj["children"] = childrenJson
+      eventsArr.add(callObj)
 
   root["events"] = eventsArr
   return root

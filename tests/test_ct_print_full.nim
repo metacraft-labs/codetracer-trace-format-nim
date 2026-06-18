@@ -545,6 +545,66 @@ proc test_trace_filter_provenance_absent_when_not_set() =
     "metadata.trace_filter must be absent when provenance was not recorded"
   echo "[ok] test_trace_filter_provenance_absent_when_not_set"
 
+proc test_unclosed_call_entry_emitted_after_loop() =
+  ## Regression: a call_entry whose entryStep == stepCount (writer's
+  ## close() drain finalized a still-open frame after the last
+  ## registerStep) MUST still appear in --full output. The previous
+  ## bug silently dropped these entries while the matching call_exit
+  ## fired (writer clamps exitStep to stepCount - 1), producing an
+  ## unbalanced events list.
+  var wRes = initMultiStreamWriter("test.ct", "unclosed_demo", chunkSize = 8)
+  doAssert wRes.isOk, wRes.error
+  var w = wRes.get()
+  let p0 = w.registerPath("/u/main.py").get()
+  let fnOuter = w.registerFunction("outer").get()
+  let fnInner = w.registerFunction("inner").get()
+  # Step 0 + outer call entry.
+  doAssert w.registerStep(p0, 1'u64, @[]).isOk
+  doAssert w.registerCall(fnOuter, @[]).isOk
+  # Step 1 belongs to outer.
+  doAssert w.registerStep(p0, 2'u64, @[]).isOk
+  # Inner call entered, but NO further registerStep happens — the
+  # writer's close() drain will record:
+  #   inner: entryStep=2 (== stepCount), exitStep=1 (clamped)
+  #   outer: entryStep=1, exitStep=1 (clamped)
+  doAssert w.registerCall(fnInner, @[]).isOk
+  doAssert w.close().isOk
+  let bytes = w.toBytes()
+  w.closeCtfs()
+
+  var reader = openNewTraceFromBytes(bytes).get()
+  let root = buildFullDocument(reader, FullOpts(stripPaths: false))
+  let events = root["events"]
+
+  var entries = 0
+  var exits = 0
+  for ev in events.elems:
+    case ev["kind"].getStr
+    of "call_entry": entries += 1
+    of "call_exit": exits += 1
+    else: discard
+  doAssert entries == 2,
+    "expected 2 call_entry events, got " & $entries
+  doAssert exits == 2,
+    "expected 2 call_exit events (entries/exits must balance), got " & $exits
+
+  # The drained inner entry should carry the synthesized_at_step flag
+  # and reference the last step index.
+  var sawSynthesized = false
+  let stepCount = root["counts"]["steps"].getInt
+  for ev in events.elems:
+    if ev["kind"].getStr == "call_entry" and ev.hasKey("synthesized_at_step"):
+      sawSynthesized = true
+      doAssert ev["function"].getStr == "inner",
+        "synthesized entry should be the inner frame, got " &
+        ev["function"].getStr
+      doAssert ev["entry_step"].getInt >= stepCount,
+        "synthesized entry_step (" & $ev["entry_step"].getInt &
+        ") should be >= stepCount (" & $stepCount & ")"
+  doAssert sawSynthesized,
+    "expected at least one synthesized call_entry from the close() drain"
+  echo "[ok] test_unclosed_call_entry_emitted_after_loop"
+
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
@@ -566,6 +626,7 @@ test_strip_paths()
 test_strip_paths_program()
 test_trace_filter_provenance_materialized()
 test_trace_filter_provenance_absent_when_not_set()
+test_unclosed_call_entry_emitted_after_loop()
 test_golden_snapshot()
 
 echo ""
