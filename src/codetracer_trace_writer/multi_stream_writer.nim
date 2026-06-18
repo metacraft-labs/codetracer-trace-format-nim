@@ -154,6 +154,21 @@ type
       ## false so existing callers keep producing line-only traces
       ## byte-for-byte identical to the pre-P6.4 output.
 
+    # M-capability-flags — column-aware capability bits.  Recorders
+    # that not only emit column data but also support the GUI's
+    # per-column affordances (breakpoints, motions) flip these so the
+    # GUI can show/hide UI accordingly.  Both bits MUST imply
+    # ``columnAwareSteps``; ``close()`` enforces this when serialising
+    # the meta.dat header.  See spec § "Column-Aware Capability
+    # Flags".
+    supportsColumnBreakpoints*: bool
+      ## True iff this writer's recorder guarantees columns sharp
+      ## enough for per-column breakpoint placement.
+    supportsColumnMotions*: bool
+      ## True iff this writer's recorder guarantees the step predicate
+      ## fires per-statement so the GUI can offer per-column motions
+      ## (step-over / step-in / step-out at sub-statement granularity).
+
     # Deminification / alternate source views (spec §
     # "Alternate Source Views (Deminification Support)").  Buffered
     # in memory and serialized into ``source_views.dat`` /
@@ -309,6 +324,33 @@ proc enableColumnAwareSteps*(w: var MultiStreamTraceWriter) =
   ## trace-global; the writer MUST NOT mix column-aware and line-only
   ## step records within a single trace.
   w.columnAwareSteps = true
+
+proc enableColumnBreakpointsSupport*(w: var MultiStreamTraceWriter) =
+  ## Capability opt-in: declare that this trace's recorder emits
+  ## columns precise enough for the GUI to set per-column breakpoints.
+  ## Sets ``FlagSupportsColumnBreakpoints`` (bit 6) on the meta.dat
+  ## header at ``close()`` time.
+  ##
+  ## Capability bits are meaningless without column data on the wire,
+  ## so this proc auto-enables ``columnAwareSteps`` if it isn't already
+  ## on — this mirrors the spec contract that capability flags
+  ## presuppose ``FlagHasColumnAwareSteps``.  Call before any step is
+  ## emitted; the underlying ``columnAwareSteps`` flip is trace-global.
+  ##
+  ## See ``codetracer-trace-format-spec/internal-files.md`` §
+  ## "Column-Aware Capability Flags".
+  w.columnAwareSteps = true
+  w.supportsColumnBreakpoints = true
+
+proc enableColumnMotionsSupport*(w: var MultiStreamTraceWriter) =
+  ## Capability opt-in: declare that this trace's recorder supports
+  ## per-column step-over / step-in / step-out.  Sets
+  ## ``FlagSupportsColumnMotions`` (bit 7) on the meta.dat header at
+  ## ``close()`` time and — like ``enableColumnBreakpointsSupport`` —
+  ## auto-enables ``columnAwareSteps`` because capability bits without
+  ## wire-format column data is undefined behaviour per spec.
+  w.columnAwareSteps = true
+  w.supportsColumnMotions = true
 
 # ---------------------------------------------------------------------------
 # Filter provenance (TF-M7 — spec §7 / Trace-Filters.md §7)
@@ -928,7 +970,9 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
     filterProvenance = w.filterProvenance,
     emitFilterProvenance = w.recordEmptyFilterProvenance,
     columnAwareSteps = w.columnAwareSteps,
-    alternateSourceViews = hasSourceViews)
+    alternateSourceViews = hasSourceViews,
+    supportsColumnBreakpoints = w.supportsColumnBreakpoints,
+    supportsColumnMotions = w.supportsColumnMotions)
   if metaRes.isErr:
     return err("failed to write meta.dat: " & metaRes.error)
 

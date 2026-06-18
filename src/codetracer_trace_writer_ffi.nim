@@ -1180,6 +1180,43 @@ proc trace_writer_enable_column_aware_steps(
       return
     handle.msWriter.enableColumnAwareSteps()
 
+proc trace_writer_enable_column_breakpoints_support(
+    handle: TraceWriterHandle,
+) {.exportc, cdecl, dynlib.} =
+  ## Capability opt-in: declare this trace's columns are sharp enough
+  ## for per-column breakpoint placement.  Sets
+  ## ``FlagSupportsColumnBreakpoints`` (bit 6) on meta.dat at close.
+  ##
+  ## Implicitly enables column-aware step encoding (capability flags
+  ## require the wire-format flag per spec); recorders that have not
+  ## already called ``trace_writer_enable_column_aware_steps`` get that
+  ## flip for free as a convenience for the common
+  ## "fully column-aware recorder" case.
+  ##
+  ## Single-stream writers (legacy line-only backend) ignore the call:
+  ## there is no column-aware mode to gate.
+  if handle.isNil:
+    return
+  if handle.useMultiStream:
+    if not handle.msWriterReady:
+      return
+    handle.msWriter.enableColumnBreakpointsSupport()
+
+proc trace_writer_enable_column_motions_support(
+    handle: TraceWriterHandle,
+) {.exportc, cdecl, dynlib.} =
+  ## Capability opt-in: declare this trace's step predicate fires per
+  ## statement so the GUI can offer per-column step-over / step-in /
+  ## step-out.  Sets ``FlagSupportsColumnMotions`` (bit 7) on meta.dat
+  ## at close.  Like ``trace_writer_enable_column_breakpoints_support``
+  ## the call implicitly enables column-aware step encoding.
+  if handle.isNil:
+    return
+  if handle.useMultiStream:
+    if not handle.msWriterReady:
+      return
+    handle.msWriter.enableColumnMotionsSupport()
+
 proc trace_writer_register_delta_column(
     handle: TraceWriterHandle,
     column_delta: int64,
@@ -2552,6 +2589,28 @@ proc ct_reader_has_column_aware_steps(h: pointer): cint {.exportc, cdecl, dynlib
     return -1.cint
   let rh = cast[TraceReaderHandle](h)
   if rh[].meta.hasColumnAwareSteps: 1.cint else: 0.cint
+
+proc ct_reader_supports_column_breakpoints(
+    h: pointer): cint {.exportc, cdecl, dynlib.} =
+  ## Return 1 when the trace's recorder advertised support for
+  ## per-column breakpoints (``FlagSupportsColumnBreakpoints``, bit 6),
+  ## 0 otherwise, -1 on a NULL handle.  GUI consumers gate the M6
+  ## per-column breakpoint affordance on this.
+  if h.isNil:
+    return -1.cint
+  let rh = cast[TraceReaderHandle](h)
+  if rh[].meta.supportsColumnBreakpoints: 1.cint else: 0.cint
+
+proc ct_reader_supports_column_motions(
+    h: pointer): cint {.exportc, cdecl, dynlib.} =
+  ## Return 1 when the trace's recorder advertised support for
+  ## per-column step motions (``FlagSupportsColumnMotions``, bit 7),
+  ## 0 otherwise, -1 on a NULL handle.  GUI consumers gate the
+  ## sub-statement step-over / step-in / step-out buttons on this.
+  if h.isNil:
+    return -1.cint
+  let rh = cast[TraceReaderHandle](h)
+  if rh[].meta.supportsColumnMotions: 1.cint else: 0.cint
 
 # ---------------------------------------------------------------------------
 # ct_reader_step_value_count / ct_reader_step_value — structured value access
