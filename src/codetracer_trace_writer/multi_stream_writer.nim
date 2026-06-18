@@ -539,6 +539,73 @@ proc registerStep*(w: var MultiStreamTraceWriter, pathId: uint64,
   w.stepCount += 1
   ok()
 
+proc registerStepWithColumn*(w: var MultiStreamTraceWriter,
+    pathId: uint64,
+    line: uint64,
+    columnDelta: int64,
+    values: openArray[VariableValue]): Result[void, string] =
+  ## Register a step at (pathId, line, column) as a SINGLE wire event.
+  ##
+  ## ``columnDelta`` is the column offset *from column 1* on the
+  ## requested line — the value an FFI caller would otherwise pass to
+  ## a subsequent ``registerColumnStep``.  Folding both into one event
+  ## means line-granular step-over readers don't see an intermediate
+  ## column-1 step boundary that has no variable values attached, so
+  ## ``variables_at(step_id)`` on the resulting step sees the values
+  ## the caller attached to (pathId, line, column).
+  ##
+  ## FU-Writer-redux follow-up: before this proc existed, the FFI
+  ## buffered a line step in ``hasPendingStep`` and (on
+  ## ``register_delta_column``) flushed it as an empty
+  ## ``sekAbsoluteStep`` before buffering a fresh column step.  The
+  ## resulting (line step, column step) pair broke
+  ## ``Replay::load_locals`` because line-granular step-over from the
+  ## call_entry landed on the empty line step.  The combined event
+  ## eliminates that intermediate.
+  ##
+  ## Only callable on writers that have opted into column-aware mode
+  ## (``enableColumnAwareSteps``).  When ``columnDelta == 0`` the
+  ## emitted event is bit-for-bit identical to ``registerStep`` —
+  ## ``globalLineIndex`` is the same offset and the value record
+  ## doesn't carry per-event column information either way.
+  if w.closed:
+    return err("writer is closed")
+  if not w.columnAwareSteps and columnDelta != 0:
+    return err("registerStepWithColumn(columnDelta != 0) called on a " &
+      "writer that has not opted into column-aware mode " &
+      "(call enableColumnAwareSteps first)")
+
+  let baseGli = w.toGlobalLineIndex(pathId, line)
+  let combinedGli = uint64(int64(baseGli) + columnDelta)
+
+  var ev: StepEvent
+  if w.stepCount == 0:
+    # First step must be absolute.
+    ev = StepEvent(kind: sekAbsoluteStep, globalLineIndex: combinedGli)
+  else:
+    let delta = int64(combinedGli) - int64(w.lastGlobalLineIndex)
+    if delta >= -64 and delta <= 63:
+      ev = StepEvent(kind: sekDeltaStep, lineDelta: delta)
+    else:
+      ev = StepEvent(kind: sekAbsoluteStep, globalLineIndex: combinedGli)
+
+  let evRes = w.ctfs.writeEvent(w.execWriter, ev)
+  if evRes.isErr:
+    return err("failed to write step event: " & evRes.error)
+
+  let valRes = w.ctfs.writeStepValues(w.valueWriter, values)
+  if valRes.isErr:
+    return err("failed to write step values: " & valRes.error)
+
+  if w.linehitsBuilder.isSome:
+    w.linehitsBuilder.get().recordHit(combinedGli, w.stepCount)
+
+  w.lastGlobalLineIndex = combinedGli
+  w.lastPathId = pathId
+  w.lastLine = line
+  w.stepCount += 1
+  ok()
+
 proc registerColumnStep*(w: var MultiStreamTraceWriter,
     columnDelta: int64,
     values: openArray[VariableValue]): Result[void, string] =

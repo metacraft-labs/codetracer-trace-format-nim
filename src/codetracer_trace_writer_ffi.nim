@@ -94,23 +94,33 @@ type
     # So we buffer the step info and accumulate values, then flush
     # on the next step or on close.
     #
-    # Two flavours of pending step coexist so the recorder can interleave
-    # ``trace_writer_register_step`` (line) and
-    # ``trace_writer_register_delta_column`` (column) without losing
-    # variables.  M-leo regression: a ``register_step`` →
-    # ``register_delta_column`` → ``register_variable_*`` → ``register_return``
-    # sequence used to lose the trailing variable because the column step
-    # was emitted eagerly with empty values and ``hasPendingStep`` cleared
-    # to false, so the subsequent ``flushPendingStep`` was a no-op.  Now
-    # the column step is buffered too — ``flushPendingStep`` emits
-    # whichever flavour is pending (line OR column) together with the
-    # accumulated values, and any leftover values without a pending step
-    # are flushed via a synthetic zero-column step so they still reach
-    # the value stream.  See ``tests/test_pending_value_after_delta_column.nim``.
+    # ``pendingColumnDelta`` is the column-offset-from-1 the caller
+    # last passed to ``trace_writer_register_delta_column``.  In
+    # FU-Writer-redux (2026-06-18) the column delta no longer
+    # promotes itself to a separate step boundary — it ANNOTATES the
+    # pending line step's position so ``flushPendingStep`` emits a
+    # SINGLE ``sekAbsoluteStep`` carrying both line and column
+    # information via ``registerStepWithColumn``.  Pre-redux the FFI
+    # tracked a separate ``hasPendingColumnStep`` flag that drove
+    # ``registerColumnStep`` (sekDeltaColumn) immediately after the
+    # line step — producing a (line step, column step) PAIR on the
+    # wire that broke ``Replay::load_locals`` because line-granular
+    # step-over landed on the empty line step.  Folding the column
+    # into the pending line step keeps the M-leo orphan-values fix
+    # (the synthetic zero-column drain at return/close) and removes
+    # the regression.
+    #
+    # ``hasOrphanPendingValues`` is the small successor of the
+    # M-leo regression's ``hasPendingColumnStep with 0 values``
+    # signal: when ``register_variable_*`` is called after the last
+    # step has already been flushed (no pending step but the recorder
+    # still wants to emit values), the values accumulate in
+    # ``pendingValues`` and are drained at return/close as a
+    # synthetic zero-column step.  See
+    # ``tests/test_pending_value_after_delta_column.nim``.
     hasPendingStep: bool
     pendingStepPathId: uint64
     pendingStepLine: uint64
-    hasPendingColumnStep: bool
     pendingColumnDelta: int64
     pendingValues: seq[VariableValue]
 
@@ -246,7 +256,7 @@ proc trace_writer_new(
     msWriterReady: false,
     useMultiStream: format == ffiBinary,
     hasPendingStep: false,
-    hasPendingColumnStep: false,
+    pendingColumnDelta: 0,
     programName: prog,
     workdir: "",
     metaArgs: @[],
@@ -389,51 +399,49 @@ proc trace_writer_finish_paths(handle: TraceWriterHandle): cint {.exportc, cdecl
 
 proc flushPendingStep(handle: TraceWriterHandle): cint =
   ## Flush the buffered pending step and its accumulated variable values
-  ## to the multi-stream writer.  Handles three cases:
+  ## to the multi-stream writer.  Handles two cases:
   ##
   ## 1. A pending line step (``hasPendingStep``):
-  ##    emit ``registerStep`` with the accumulated values.
-  ## 2. A pending column step (``hasPendingColumnStep``):
-  ##    emit ``registerColumnStep`` with the accumulated values.
-  ## 3. No pending step but a non-empty ``pendingValues`` queue
+  ##    emit a SINGLE ``registerStepWithColumn`` with the pending
+  ##    column delta and the accumulated values.  When
+  ##    ``pendingColumnDelta == 0`` this is bit-for-bit identical to
+  ##    a legacy ``registerStep`` call.  When non-zero, the wire
+  ##    event still carries one ``sekAbsoluteStep`` (with a
+  ##    pre-adjusted ``globalLineIndex``) instead of the legacy
+  ##    ``sekAbsoluteStep`` + ``sekDeltaColumn`` pair, so
+  ##    line-granular step-over readers see ONE step at the
+  ##    (line, column) the caller requested and
+  ##    ``variables_at(step_id)`` finds the accumulated values.
+  ## 2. No pending step but a non-empty ``pendingValues`` queue
   ##    (M-leo regression: variables were registered after the last
-  ##    ``registerColumnStep`` was flushed, so the values would otherwise
-  ##    be silently dropped on close / return).  Emit a synthetic
+  ##    step was already flushed; the values would otherwise be
+  ##    silently dropped on close / return).  Emit a synthetic
   ##    zero-delta column step so the values still reach the value
   ##    stream parallel to the exec stream.
   ##
   ## Returns 0 on success, 1 on error.
   if handle.hasPendingStep:
-    let res = handle.msWriter.registerStep(
+    let res = handle.msWriter.registerStepWithColumn(
       handle.pendingStepPathId,
       handle.pendingStepLine,
-      handle.pendingValues)
-    if res.isErr:
-      setError(res.error)
-      return 1.cint
-    handle.pendingValues.setLen(0)
-    handle.hasPendingStep = false
-    return 0.cint
-
-  if handle.hasPendingColumnStep:
-    let res = handle.msWriter.registerColumnStep(
       handle.pendingColumnDelta,
       handle.pendingValues)
     if res.isErr:
       setError(res.error)
       return 1.cint
     handle.pendingValues.setLen(0)
-    handle.hasPendingColumnStep = false
+    handle.hasPendingStep = false
+    handle.pendingColumnDelta = 0
     return 0.cint
 
   if handle.pendingValues.len > 0:
-    # M-leo fix: variables registered after a column step was already
-    # emitted (legacy code path) would strand the values in
-    # pendingValues with no step to attach to.  Emit a synthetic
-    # zero-delta column step so the values still surface in the value
-    # stream.  Only valid in column-aware mode and after at least one
-    # step has been emitted; otherwise drop the orphan values rather
-    # than corrupt the stream.
+    # M-leo fix: variables registered after the last step was
+    # already flushed strand the values in pendingValues with no
+    # step to attach to.  Emit a synthetic zero-delta column step
+    # so the values still surface in the value stream.  Only valid
+    # in column-aware mode and after at least one step has been
+    # emitted; otherwise drop the orphan values rather than
+    # corrupt the stream.
     if handle.msWriter.columnAwareSteps and handle.msWriter.stepCount > 0:
       let res = handle.msWriter.registerColumnStep(0'i64, handle.pendingValues)
       if res.isErr:
@@ -1277,14 +1285,30 @@ proc trace_writer_register_delta_column(
     handle: TraceWriterHandle,
     column_delta: int64,
 ) {.exportc, cdecl, dynlib.} =
-  ## Emit a ``sekDeltaColumn`` (tag 0x07) event advancing the cursor's
-  ## column within the current line by ``column_delta`` (signed).
+  ## Annotate the column offset of the most-recent pending line
+  ## step.  When the pending step is finally flushed (driven by the
+  ## next ``register_step`` / ``register_call`` / ``register_return``
+  ## / ``close``) the wire-level emission is a SINGLE
+  ## ``sekAbsoluteStep`` whose ``globalLineIndex`` has the column
+  ## delta folded in — line-granular step-over readers see ONE step
+  ## at (line, column) carrying the accumulated variables, instead
+  ## of the legacy (line step, column step) pair that broke
+  ## ``Replay::load_locals`` because step-over landed on the empty
+  ## line step.
   ##
-  ## Only valid on a multi-stream writer that has already called
-  ## ``trace_writer_enable_column_aware_steps`` and on which an absolute
-  ## step has been registered (so the running ``global_position_index``
-  ## is defined).  Otherwise sets a thread-local error string and
-  ## returns silently.
+  ## When called WITHOUT a pending line step (the caller registered
+  ## a step, the FFI flushed it, and only NOW is a column delta
+  ## arriving), fall back to emitting a stand-alone
+  ## ``registerColumnStep`` so the recorder's
+  ## column-update-after-step pattern still works.  This is the
+  ## same code path the legacy column step took, drained the same
+  ## way through ``flushPendingStep``'s orphan-values branch.
+  ##
+  ## Only valid on a multi-stream writer that has opted into
+  ## column-aware mode via ``trace_writer_enable_column_aware_steps``
+  ## and on which an absolute step has been registered (so the
+  ## running ``global_position_index`` is defined).  Otherwise sets
+  ## a thread-local error string and returns silently.
   if handle.isNil:
     return
   if not handle.useMultiStream:
@@ -1293,19 +1317,28 @@ proc trace_writer_register_delta_column(
     return
   if not handle.msWriterReady:
     return
-  # Flush any buffered step (with its accumulated values) before we
-  # buffer the new column step.  Then buffer the column step itself —
-  # we do NOT emit it eagerly because the recorder may follow it with
-  # ``trace_writer_register_variable_*`` calls (the M-leo
-  # ``register_step → register_delta_column → register_variable_* →
-  # register_return`` sequence used to strand those trailing values).
-  # The column step + accumulated values is emitted at the next
-  # ``flushPendingStep`` (driven by the next register_step / call /
-  # return / close).
-  if flushPendingStep(handle) != 0.cint:
+
+  if handle.hasPendingStep:
+    # FU-Writer-redux: fold the column delta into the pending line
+    # step.  The step has NOT been flushed yet, so the values
+    # accumulated by ``register_variable_*`` after the step call
+    # are still in ``pendingValues`` and will attach to the
+    # combined (line, column) step at flush time.  No wire-level
+    # event yet.
+    handle.pendingColumnDelta += column_delta
     return
-  handle.pendingColumnDelta = column_delta
-  handle.hasPendingColumnStep = true
+
+  # No pending line step — the recorder is updating column after
+  # the previous step was already flushed.  Emit a stand-alone
+  # column step right now with whatever values have accumulated
+  # since the last flush.  Matches the legacy column-step
+  # semantics so the same call sequences keep working.
+  let res = handle.msWriter.registerColumnStep(
+    column_delta, handle.pendingValues)
+  if res.isErr:
+    setError(res.error)
+    return
+  handle.pendingValues.setLen(0)
 
 proc trace_writer_register_path_with_line_lengths(
     handle: TraceWriterHandle,
