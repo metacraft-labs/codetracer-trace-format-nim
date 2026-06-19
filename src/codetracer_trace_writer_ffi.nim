@@ -2675,6 +2675,105 @@ proc ct_reader_step_locations_with_columns(
   written
 
 # ---------------------------------------------------------------------------
+# ct_reader_step_global_line_indices — bulk raw-GLI accessor
+# ---------------------------------------------------------------------------
+#
+# Column-aware-decoding hot path: returns the raw
+# ``global_position_index`` for every step in ``[startN, startN + count)``
+# without applying any (path_id, line) interpretation on the Nim side.
+# Used by the Rust ``codetracer_trace_reader::global_position_decoder``
+# consumer to decode column-aware traces natively without depending on
+# ``decodeGlobalPositionIndex``'s ``meta.hasColumnAwareSteps`` gate (which
+# can be incorrectly false on traces whose writer emitted Layout A
+# ``paths.dat`` data but failed to flip the meta bit at close time).
+#
+# Output buffer must hold at least ``count`` entries.  Returns the number
+# of entries actually written, or ``UINT64_MAX`` on error.
+
+proc ct_reader_step_global_line_indices(
+    h: pointer, startN: uint64, count: uint64,
+    outGlis: ptr uint64
+): uint64 {.exportc, cdecl, dynlib.} =
+  ## Drain raw ``global_position_index`` values for steps
+  ## ``[startN, startN + count)`` into ``outGlis``.  Mirrors the bulk
+  ## semantics of ``ct_reader_step_locations`` but skips the
+  ## ``(path_id, line)`` resolution so downstream consumers (notably the
+  ## Rust ``GlobalPositionDecoder``) can decode against per-file
+  ## line-length tables on their own.
+  if h.isNil or outGlis.isNil:
+    setError("NULL parameter")
+    return high(uint64)
+  if count == 0'u64:
+    return 0
+  let rh = cast[TraceReaderHandle](h)
+
+  let outArr = cast[ptr UncheckedArray[uint64]](outGlis)
+  # ``stepAbsoluteGlobalLineIndices`` writes directly into a Nim-managed
+  # buffer; copy into the caller's C array after the fact.  The Nim
+  # ``openArray`` parameter requires a backing seq.
+  var glis = newSeq[uint64](int(count))
+  let writtenRes = rh[].stepAbsoluteGlobalLineIndices(startN, count, glis)
+  if writtenRes.isErr:
+    setError(writtenRes.error)
+    return high(uint64)
+  let written = writtenRes.get()
+  for i in 0 ..< int(written):
+    outArr[i] = glis[i]
+  written
+
+# ---------------------------------------------------------------------------
+# ct_reader_line_length_raw — Layout A line-length accessor (no meta gate)
+# ---------------------------------------------------------------------------
+#
+# Sibling of ``ct_reader_line_length`` that surfaces per-line addressable
+# column counts even when the trace's ``meta.dat`` does NOT advertise
+# ``FlagHasColumnAwareSteps``.  Used by the codetracer DAP read path to
+# build a pure-Rust ``GlobalPositionDecoder`` on traces whose writer
+# emitted Layout A ``paths.dat`` records but failed to flip the meta bit
+# at close time (a recorder-side bug that surfaces as raw GLI byte
+# offsets in DAP ``stackTrace`` responses; see codetracer §FU-Column-
+# Aware-Nav for the recorder-side context).
+#
+# Returns 0 on success and writes the per-line addressable column count
+# into ``out_value``.  Returns 1 when ``file_id`` is out of range, when
+# ``line_index0`` is past the file's known line table, or when paths.dat
+# carries no Layout A data for this file at all.
+
+proc ct_reader_line_length_raw(
+    h: pointer,
+    file_id: uint64,
+    line_index0: uint32,
+    out_value: ptr uint32,
+): cint {.exportc, cdecl, dynlib.} =
+  if h.isNil or out_value.isNil:
+    return 1.cint
+  let rh = cast[TraceReaderHandle](h)
+  let opt = rh[].lineLengthRaw(file_id, line_index0)
+  if opt.isNone:
+    return 1.cint
+  out_value[] = opt.get()
+  0.cint
+
+# ---------------------------------------------------------------------------
+# ct_reader_line_count_raw — Layout A line-count accessor (no meta gate)
+# ---------------------------------------------------------------------------
+#
+# Companion to ``ct_reader_line_length_raw``: returns the number of lines
+# the trace has registered for ``file_id`` via paths.dat Layout A.
+# Returns 0 when the file has no Layout A data (or ``file_id`` is out of
+# range).  ``UINT64_MAX`` is reserved for error signalling — the proc
+# never returns it because the per-file lookup is total.
+
+proc ct_reader_line_count_raw(
+    h: pointer,
+    file_id: uint64,
+): uint64 {.exportc, cdecl, dynlib.} =
+  if h.isNil:
+    return 0'u64
+  let rh = cast[TraceReaderHandle](h)
+  rh[].lineCountRaw(file_id)
+
+# ---------------------------------------------------------------------------
 # ct_reader_has_column_aware_steps — metadata accessor
 # ---------------------------------------------------------------------------
 
