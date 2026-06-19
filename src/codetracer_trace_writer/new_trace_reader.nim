@@ -161,20 +161,37 @@ proc openNewTraceFromBytes*(data: seq[byte],
   # the per-file line-length table.
   #
   # Defensive recovery: we ALSO speculatively try Layout A parsing when
-  # ``meta.hasColumnAwareSteps`` is false, because a known recorder-side
-  # bug produces traces whose writer emitted Layout A ``paths.dat``
-  # records (and uses column-aware byte-offset ``global_position_index``
-  # encoding on the exec stream) but fails to flip the ``meta.dat`` bit 4
-  # flag at close time.  Surfacing such traces as line-only — which
-  # legacy ``gli.resolve()`` would then interpret as ``(file_id, line)``
-  # using ``DefaultLinesPerFile`` — produces wild "line" numbers (e.g.
-  # line 270 for a 12-line source).  When the speculative Layout A parse
-  # succeeds across every paths.dat record, we promote
-  # ``meta.hasColumnAwareSteps = true`` in-memory so downstream decode
-  # paths see the trace as it was actually written.  When any record
-  # fails to parse as Layout A we leave the flag clear and ``lineLengths``
-  # empty — bit-for-bit identical to the pre-existing pre-extension code
-  # path.
+  # ``meta.hasColumnAwareSteps`` is false, to handle traces whose writer
+  # emitted Layout A ``paths.dat`` records (and uses column-aware
+  # byte-offset ``global_position_index`` encoding on the exec stream)
+  # but failed to flip the ``meta.dat`` bit 4 flag at close time.
+  # Surfacing such traces as line-only — which legacy ``gli.resolve()``
+  # would then interpret as ``(file_id, line)`` using
+  # ``DefaultLinesPerFile`` — produces wild "line" numbers (e.g. line 270
+  # for a 12-line source).
+  #
+  # History (2026-06): before ``708ee44`` ("P6.4: implement DeltaColumn")
+  # the writer's ``close()`` didn't forward ``columnAwareSteps`` to
+  # ``writeMetaDat`` at all, so any recorder that called
+  # ``enableColumnAwareSteps()`` would still produce a trace with bit 4
+  # CLEAR even though Layout A + DeltaColumn events had been emitted.
+  # The blockchain recorders that adopted column-aware mode in mid-June
+  # (cairo ``d594485``, evm/move/flow earlier) recorded fixtures during
+  # that window which then surfaced as ``has_column_aware_steps: false``
+  # in ``ct-print --meta-json`` even though the on-disk byte layout was
+  # column-aware throughout — see 2026-06-19 cross-repo CI debugging.
+  # ``708ee44`` fixed the writer side, but the read-side recovery here
+  # stays as belt-and-suspenders for any legacy fixture lingering in CI
+  # runner caches or developer workspaces; freshly-recorded traces from
+  # current recorders are bit-for-bit consistent (bit 4 SET) and the
+  # speculative parse is a no-op promotion in that case.
+  #
+  # When the speculative Layout A parse succeeds across every paths.dat
+  # record, we promote ``meta.hasColumnAwareSteps = true`` in-memory so
+  # downstream decode paths see the trace as it was actually written.
+  # When any record fails to parse as Layout A we leave the flag clear
+  # and ``lineLengths`` empty — bit-for-bit identical to the pre-existing
+  # pre-extension code path.
   if reader.pathReader.count() > 0:
     let pathTotal = reader.pathReader.count()
     var llsAll = newSeq[seq[uint32]](int(pathTotal))
