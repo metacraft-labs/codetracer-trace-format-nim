@@ -720,25 +720,26 @@ proc registerCall*(w: var MultiStreamTraceWriter, functionId: uint64,
   for i in 0 ..< args.len:
     argsSeq[i] = args[i]
 
-  # CTFS-M entry_step convention: the call_entry event MUST be emitted at
-  # a step index that lies within the trace's [0, stepCount) range so the
-  # downstream reader (ct-print) can place it during its single-pass walk.
-  # The FFI flushes any pending step BEFORE calling registerCall (so the
-  # step that produced the call's argument context is already written),
-  # which means `w.stepCount` here is the count AFTER that flush — i.e.
-  # the index of the NEXT step.  Capturing that value works for non-leaf
-  # callees (the first body step of the callee fills the slot), but for
-  # leaf calls (snforge contract_call / storage_read / etc. that have no
-  # further body steps before register_return) it points past the last
-  # emitted step and the call_entry is silently dropped by ct-print.
-  # Mirror registerReturn's symmetric convention: use the just-flushed
-  # step's index (`stepCount - 1`), which is always within range for any
-  # caller that emitted at least one step before the call.  For the very
-  # first registerCall in a trace (before any step has been flushed), fall
-  # back to 0 so the call_entry still places at the trace's initial step.
+  # CTFS-M entry_step convention: `entryStep` is the index of the FIRST
+  # step that belongs to the callee's body — i.e. the next step that the
+  # writer will emit after this `registerCall`.  At the moment of this
+  # call, `w.stepCount` is the count of already-flushed steps (the FFI
+  # flushed any pending caller step before calling us), so it is exactly
+  # the index of that next step.
+  #
+  # This is the "next-step" semantic.  It puts non-leaf callee bodies on
+  # the correct call frame (the call's range `[entryStep, exitStep]`
+  # covers the callee body's steps, NOT the caller's call-site step).
+  #
+  # Leaf calls (snforge `register_step → register_call → register_return`
+  # with no callee body) need separate handling: at `registerReturn`
+  # time we detect the empty range (`w.stepCount == entryStep`, meaning
+  # no body step was emitted) and clamp `entryStep` to the just-flushed
+  # caller step so the call_entry still surfaces in the trace.  See the
+  # leaf-clamp branch in `registerReturn`.
   w.callStack.add(PendingCall(
     functionId: functionId,
-    entryStep: if w.stepCount > 0: w.stepCount - 1 else: 0,
+    entryStep: w.stepCount,
     depth: w.currentDepth,
     parentCallKey: parentKey,
     callKey: callKey,
@@ -765,10 +766,38 @@ proc registerReturn*(w: var MultiStreamTraceWriter,
 
   let retVal = if returnValue.len == 0: @[VoidReturnMarker] else: returnValue
 
+  # Leaf-call entry-step clamp.  `registerCall` captured `entryStep` as
+  # `stepCount` (the index of the next step to be emitted, i.e. the
+  # first step of the callee's body).  If no body step was emitted
+  # before this `registerReturn` (the snforge `register_step →
+  # register_call → register_return` pattern), `entryStep` ends up
+  # pointing past the last emitted step — the call_entry would land
+  # outside the trace's `[0, stepCount)` walk range and downstream
+  # readers (ct-print, the DAP trace_processor) would silently drop it
+  # or attach it to the wrong frame.
+  #
+  # In that case the callee has no body of its own and the
+  # semantically-meaningful step for the call IS the caller's
+  # just-flushed call-site step (typically the snforge
+  # `contract_call` / `storage_read` / etc. line that produced the
+  # call's argument context).  Clamp `entryStep` to that step so the
+  # call_entry surfaces at the right frame.
+  #
+  # For non-leaf callees `stepCount > pending.entryStep` and we keep
+  # the original `entryStep` so the call's range covers the callee's
+  # body steps without bleeding back into the caller.
+  let entryStep =
+    if w.stepCount > pending.entryStep:
+      pending.entryStep
+    elif w.stepCount > 0:
+      w.stepCount - 1
+    else:
+      0'u64
+
   let rec = call_stream.CallRecord(
     functionId: pending.functionId,
     parentCallKey: pending.parentCallKey,
-    entryStep: pending.entryStep,
+    entryStep: entryStep,
     exitStep: if w.stepCount > 0: w.stepCount - 1 else: 0,
     depth: pending.depth,
     args: pending.args,
