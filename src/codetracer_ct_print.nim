@@ -887,6 +887,19 @@ proc buildFullDocument(reader: var NewTraceReader,
       if c.isOk:
         callsByEntry.add((c.get().entryStep, c.get(), i))
         callsByExit.add((c.get().exitStep, c.get(), i))
+  # call_exit ordering: at the same exit_step, LIFO (innermost frame
+  # closes first).  The natural iteration order is call_key ASC (i.e.
+  # the order calls were registered), which is FIFO — wrong when the
+  # writer's close()-time drain places parent and child at the same
+  # exitStep (parent has no post-recursion body step, so both share
+  # the last step).  Sort by (exitStep ASC, call_key DESC) so the
+  # innermost call's exit comes first in events at any shared step.
+  callsByExit.sort(proc(a, b: (uint64, v4calls.CallRecord, uint64)): int =
+    if a[0] < b[0]: -1
+    elif a[0] > b[0]: 1
+    elif a[2] > b[2]: -1
+    elif a[2] < b[2]: 1
+    else: 0)
 
   var eventsArr = newJArray()
 
