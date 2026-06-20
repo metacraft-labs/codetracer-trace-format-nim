@@ -893,11 +893,12 @@ proc test_meta_dat_strict_unknown_flag_rejection() {.raises: [].} =
   ##   * flags = 0 (pre-extension trace) round-trips cleanly,
   ##   * flags = FlagHasColumnAwareSteps (bit 4, known) round-trips
   ##     cleanly with ``hasColumnAwareSteps = true``,
-  ##   * flags = bit 4 + bit 8 fails because bit 8 is unknown.
-  ##     (Bits 5..7 are now allocated — bit 5 to
+  ##   * flags = bit 4 + bit 9 fails because bit 9 is unknown.
+  ##     (Bits 5..8 are now allocated — bit 5 to
   ##     ``FlagHasAlternateSourceViews``, bits 6 and 7 to the
   ##     M-capability-flags ``FlagSupportsColumnBreakpoints`` /
-  ##     ``FlagSupportsColumnMotions``.  Each time a new bit landed
+  ##     ``FlagSupportsColumnMotions``, and bit 8 to M17a's
+  ##     ``FlagHasCallStream``.  Each time a new bit landed
   ##     this test was retargeted to the next unknown bit so the
   ##     strict-rejection contract stays exercised.)
   proc craft(flags: uint16): seq[byte] {.raises: [].} =
@@ -929,9 +930,19 @@ proc test_meta_dat_strict_unknown_flag_rejection() {.raises: [].} =
     doAssert res.get().hasColumnAwareSteps
 
   block:
-    let res = readMetaDat(craft(FlagHasColumnAwareSteps or 0x100'u16))
+    # M17a: bit 8 (FlagHasCallStream) is now a KNOWN flag and must
+    # round-trip cleanly with ``hasCallStream = true``.
+    let res = readMetaDat(craft(FlagHasCallStream))
+    doAssert res.isOk,
+      "bit 8 (FlagHasCallStream) must round-trip: " &
+      (if res.isErr: res.error else: "ok")
+    doAssert res.get().hasCallStream
+    doAssert not res.get().hasColumnAwareSteps
+
+  block:
+    let res = readMetaDat(craft(FlagHasColumnAwareSteps or 0x200'u16))
     doAssert res.isErr,
-      "bit 4 + bit 8 must reject because bit 8 is unknown"
+      "bit 4 + bit 9 must reject because bit 9 is unknown"
     doAssert "unknown" in res.error,
       "rejection error must mention 'unknown'; got: " & res.error
 

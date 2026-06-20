@@ -1084,7 +1084,12 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
     columnAwareSteps = w.columnAwareSteps,
     alternateSourceViews = hasSourceViews,
     supportsColumnBreakpoints = w.supportsColumnBreakpoints,
-    supportsColumnMotions = w.supportsColumnMotions)
+    supportsColumnMotions = w.supportsColumnMotions,
+    # M17a: the multi-stream writer ALWAYS emits a dedicated calls.dat call
+    # stream (initCallStreamWriter above), so stamp the has_call_stream
+    # capability flag.  Readers may then load the call tree from calls.dat
+    # directly; the flag is the M17a gate for that on-demand path.
+    hasCallStream = true)
   if metaRes.isErr:
     return err("failed to write meta.dat: " & metaRes.error)
 

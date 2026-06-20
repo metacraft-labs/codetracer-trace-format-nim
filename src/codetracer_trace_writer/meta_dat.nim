@@ -128,6 +128,18 @@ const
     ## together with ``FlagHasColumnAwareSteps``.  When clear the GUI
     ## hides the per-column motion buttons; legacy line-only motions
     ## remain available.
+  FlagHasCallStream*: uint16 = 0x100             # bit 8 — M17a
+    ## When set, the materialized `.ct` carries a dedicated call stream
+    ## (`calls.dat` + its companion seekable index `calls.idx`) in
+    ## addition to the unified event stream.  The split lets a reader
+    ## load the call tree independently / on-demand without scanning the
+    ## step+value stream (trace-events.md §"Call Stream (`calls.dat`)").
+    ## This is ADDITIVE: the unified stream is unchanged, and a reader
+    ## that does not know the bit simply ignores `calls.dat`/`calls.idx`.
+    ## The flag is the M17a gate; the dedicated db-backend seekable
+    ## reader that consumes `calls.dat` lands in M17b.  See
+    ## ``codetracer-trace-format-spec/internal-files.md`` §"Metadata
+    ## (meta.dat)" and §"Runtime Tracing (DB Traces)".
 
   KnownFlags*: uint16 = (
     FlagHasMcrFields or
@@ -137,7 +149,8 @@ const
     FlagHasColumnAwareSteps or
     FlagHasAlternateSourceViews or
     FlagSupportsColumnBreakpoints or
-    FlagSupportsColumnMotions)
+    FlagSupportsColumnMotions or
+    FlagHasCallStream)
     ## P6.5 (column-extension back-compat): every flag bit this reader
     ## understands.  ``readMetaDat`` rejects any meta.dat whose flag
     ## word has bits outside this mask set, per
@@ -199,6 +212,13 @@ type
       ## step-out affordances on this; clear means the recorder's step
       ## predicate is line-granular and only line-only motions are
       ## meaningful.
+    hasCallStream*: bool
+      ## M17a: True iff FlagHasCallStream was set on the meta.dat header.
+      ## When set, the trace carries a dedicated `calls.dat` call stream
+      ## (plus its companion `calls.idx`) alongside the unified event
+      ## stream, and readers may load the call tree from it directly.
+      ## Pre-extension traces always have it clear; the unified-stream
+      ## call tree remains the source of truth when it is clear.
 
 proc writeRawBytes(
     c: var Ctfs, f: var CtfsInternalFile,
@@ -243,6 +263,7 @@ proc writeMetaDat*(
     alternateSourceViews: bool = false,
     supportsColumnBreakpoints: bool = false,
     supportsColumnMotions: bool = false,
+    hasCallStream: bool = false,
 ): Result[void, string] =
   ## Write binary meta.dat to a CTFS internal file.
   ##
@@ -293,6 +314,8 @@ proc writeMetaDat*(
     flags = flags or FlagSupportsColumnBreakpoints
   if supportsColumnMotions:
     flags = flags or FlagSupportsColumnMotions
+  if hasCallStream:
+    flags = flags or FlagHasCallStream
   ? c.writeU16LE(f, flags)
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.
@@ -428,6 +451,7 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
     (flags and FlagSupportsColumnBreakpoints) != 0
   contents.supportsColumnMotions =
     (flags and FlagSupportsColumnMotions) != 0
+  contents.hasCallStream = (flags and FlagHasCallStream) != 0
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1, required
   # in v3+: a malformed or missing id rejects the trace at parse time.
@@ -568,6 +592,7 @@ proc writeMetaDatToBuffer*(
     alternateSourceViews: bool = false,
     supportsColumnBreakpoints: bool = false,
     supportsColumnMotions: bool = false,
+    hasCallStream: bool = false,
 ): seq[byte] =
   ## Serialize meta.dat to an in-memory byte buffer.
   ## This is the same format as writeMetaDat but without needing a CTFS container.
@@ -615,6 +640,8 @@ proc writeMetaDatToBuffer*(
     flags = flags or FlagSupportsColumnBreakpoints
   if supportsColumnMotions:
     flags = flags or FlagSupportsColumnMotions
+  if hasCallStream:
+    flags = flags or FlagHasCallStream
   result.appendU16LE(flags)
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.
