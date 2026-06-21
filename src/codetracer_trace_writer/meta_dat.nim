@@ -142,6 +142,26 @@ const
     ## M22.  Must match
     ## ``codetracer_trace_writer::meta_dat::FLAG_HAS_STEP_STREAM`` (Rust)
     ## and the db-backend ``FLAG_HAS_STEP_STREAM`` bit 9.
+  FlagHasValueStream*: uint16 = 0x400            # bit 10 — M23b
+    ## When set, the materialized `.ct` carries a dedicated parallel value
+    ## stream (`values.dat` + its companion seekable index `values.idx`)
+    ## in addition to the unified event stream.  The value stream is
+    ## parallel-indexed to the execution stream — value record N
+    ## corresponds to step N (`steps.dat` record N), with an empty record
+    ## for steps that have no variable activity — so a reader can load a
+    ## step's variable values independently / on-demand without scanning
+    ## the unified stream (trace-events.md §"Value Stream").  Like
+    ## ``FlagHasStepStream`` this is ADDITIVE: the unified stream is
+    ## unchanged, and a reader that does not know the bit simply ignores
+    ## `values.dat`/`values.idx`.  The value stream lives in its OWN CTFS
+    ## file pair (NOT `steps.dat`) because value records are large
+    ## (50-500B) with different Zstd chunk sizing than the tiny (2-4B)
+    ## execution records, and a CTFS internal file is a single seekable
+    ## byte range with one companion index.  The flag is the M23b gate; the
+    ## db-backend seekable value reader that consumes `values.dat` lands in
+    ## M22.  Must match
+    ## ``codetracer_trace_writer::meta_dat::FLAG_HAS_VALUE_STREAM`` (Rust)
+    ## and the db-backend ``FLAG_HAS_VALUE_STREAM`` bit 10.
   FlagHasCallStream*: uint16 = 0x100             # bit 8 — M17a
     ## When set, the materialized `.ct` carries a dedicated call stream
     ## (`calls.dat` + its companion seekable index `calls.idx`) in
@@ -165,7 +185,8 @@ const
     FlagSupportsColumnBreakpoints or
     FlagSupportsColumnMotions or
     FlagHasCallStream or
-    FlagHasStepStream)
+    FlagHasStepStream or
+    FlagHasValueStream)
     ## P6.5 (column-extension back-compat): every flag bit this reader
     ## understands.  ``readMetaDat`` rejects any meta.dat whose flag
     ## word has bits outside this mask set, per
@@ -242,6 +263,15 @@ type
       ## it directly.  Pre-extension traces always have it clear; the
       ## unified-stream step sequence remains the source of truth when it
       ## is clear.
+    hasValueStream*: bool
+      ## M23b: True iff FlagHasValueStream was set on the meta.dat header.
+      ## When set, the trace carries a dedicated `values.dat` parallel
+      ## value stream (plus its companion `values.idx`) alongside the
+      ## unified event stream, parallel-indexed to the execution stream
+      ## (value record N ↔ step N), and readers may load a step's variable
+      ## values from it directly.  Pre-extension traces always have it
+      ## clear; the unified-stream value events remain the source of truth
+      ## when it is clear.
 
 proc writeRawBytes(
     c: var Ctfs, f: var CtfsInternalFile,
@@ -288,6 +318,7 @@ proc writeMetaDat*(
     supportsColumnMotions: bool = false,
     hasCallStream: bool = false,
     hasStepStream: bool = false,
+    hasValueStream: bool = false,
 ): Result[void, string] =
   ## Write binary meta.dat to a CTFS internal file.
   ##
@@ -342,6 +373,8 @@ proc writeMetaDat*(
     flags = flags or FlagHasCallStream
   if hasStepStream:
     flags = flags or FlagHasStepStream
+  if hasValueStream:
+    flags = flags or FlagHasValueStream
   ? c.writeU16LE(f, flags)
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.
@@ -479,6 +512,7 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
     (flags and FlagSupportsColumnMotions) != 0
   contents.hasCallStream = (flags and FlagHasCallStream) != 0
   contents.hasStepStream = (flags and FlagHasStepStream) != 0
+  contents.hasValueStream = (flags and FlagHasValueStream) != 0
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1, required
   # in v3+: a malformed or missing id rejects the trace at parse time.
@@ -621,6 +655,7 @@ proc writeMetaDatToBuffer*(
     supportsColumnMotions: bool = false,
     hasCallStream: bool = false,
     hasStepStream: bool = false,
+    hasValueStream: bool = false,
 ): seq[byte] =
   ## Serialize meta.dat to an in-memory byte buffer.
   ## This is the same format as writeMetaDat but without needing a CTFS container.
@@ -672,6 +707,8 @@ proc writeMetaDatToBuffer*(
     flags = flags or FlagHasCallStream
   if hasStepStream:
     flags = flags or FlagHasStepStream
+  if hasValueStream:
+    flags = flags or FlagHasValueStream
   result.appendU16LE(flags)
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.

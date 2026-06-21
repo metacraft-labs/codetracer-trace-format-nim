@@ -893,13 +893,14 @@ proc test_meta_dat_strict_unknown_flag_rejection() {.raises: [].} =
   ##   * flags = 0 (pre-extension trace) round-trips cleanly,
   ##   * flags = FlagHasColumnAwareSteps (bit 4, known) round-trips
   ##     cleanly with ``hasColumnAwareSteps = true``,
-  ##   * flags = bit 4 + bit 10 fails because bit 10 is unknown.
-  ##     (Bits 5..9 are now allocated — bit 5 to
+  ##   * flags = bit 4 + bit 11 fails because bit 11 is unknown.
+  ##     (Bits 5..10 are now allocated — bit 5 to
   ##     ``FlagHasAlternateSourceViews``, bits 6 and 7 to the
   ##     M-capability-flags ``FlagSupportsColumnBreakpoints`` /
   ##     ``FlagSupportsColumnMotions``, bit 8 to M17a's
-  ##     ``FlagHasCallStream``, and bit 9 to M23a's
-  ##     ``FlagHasStepStream``.  Each time a new bit landed
+  ##     ``FlagHasCallStream``, bit 9 to M23a's
+  ##     ``FlagHasStepStream``, and bit 10 to M23b's
+  ##     ``FlagHasValueStream``.  Each time a new bit landed
   ##     this test was retargeted to the next unknown bit so the
   ##     strict-rejection contract stays exercised.)
   proc craft(flags: uint16): seq[byte] {.raises: [].} =
@@ -960,9 +961,31 @@ proc test_meta_dat_strict_unknown_flag_rejection() {.raises: [].} =
     doAssert resBoth.get().hasStepStream
 
   block:
-    let res = readMetaDat(craft(FlagHasColumnAwareSteps or 0x400'u16))
+    # M23b: bit 10 (FlagHasValueStream) is now a KNOWN flag and must
+    # round-trip cleanly with ``hasValueStream = true``.  A real M23b
+    # bundle sets it alongside ``FlagHasCallStream`` and
+    # ``FlagHasStepStream`` — assert all three round-trip together.
+    let res = readMetaDat(craft(FlagHasValueStream))
+    doAssert res.isOk,
+      "bit 10 (FlagHasValueStream) must round-trip: " &
+      (if res.isErr: res.error else: "ok")
+    doAssert res.get().hasValueStream
+    doAssert not res.get().hasStepStream
+    doAssert not res.get().hasCallStream
+
+    let resAll = readMetaDat(craft(
+      FlagHasCallStream or FlagHasStepStream or FlagHasValueStream))
+    doAssert resAll.isOk,
+      "bit 8 + bit 9 + bit 10 (call+step+value streams) must round-trip: " &
+      (if resAll.isErr: resAll.error else: "ok")
+    doAssert resAll.get().hasCallStream
+    doAssert resAll.get().hasStepStream
+    doAssert resAll.get().hasValueStream
+
+  block:
+    let res = readMetaDat(craft(FlagHasColumnAwareSteps or 0x800'u16))
     doAssert res.isErr,
-      "bit 4 + bit 10 must reject because bit 10 is unknown"
+      "bit 4 + bit 11 must reject because bit 11 is unknown"
     doAssert "unknown" in res.error,
       "rejection error must mention 'unknown'; got: " & res.error
 
