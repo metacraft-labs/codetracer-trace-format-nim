@@ -128,6 +128,20 @@ const
     ## together with ``FlagHasColumnAwareSteps``.  When clear the GUI
     ## hides the per-column motion buttons; legacy line-only motions
     ## remain available.
+  FlagHasStepStream*: uint16 = 0x200             # bit 9 — M23a
+    ## When set, the materialized `.ct` carries a dedicated compact
+    ## execution stream (`steps.dat` + its companion seekable index
+    ## `steps.idx`) in addition to the unified event stream.  The split
+    ## lets a reader load the step timeline independently / on-demand
+    ## without scanning the unified stream
+    ## (trace-events.md §"Execution Stream (`steps.dat`)").  Like
+    ## ``FlagHasCallStream`` this is ADDITIVE: the unified stream is
+    ## unchanged, and a reader that does not know the bit simply ignores
+    ## `steps.dat`/`steps.idx`.  The flag is the M23a gate; the dedicated
+    ## db-backend seekable step reader that consumes `steps.dat` lands in
+    ## M22.  Must match
+    ## ``codetracer_trace_writer::meta_dat::FLAG_HAS_STEP_STREAM`` (Rust)
+    ## and the db-backend ``FLAG_HAS_STEP_STREAM`` bit 9.
   FlagHasCallStream*: uint16 = 0x100             # bit 8 — M17a
     ## When set, the materialized `.ct` carries a dedicated call stream
     ## (`calls.dat` + its companion seekable index `calls.idx`) in
@@ -150,7 +164,8 @@ const
     FlagHasAlternateSourceViews or
     FlagSupportsColumnBreakpoints or
     FlagSupportsColumnMotions or
-    FlagHasCallStream)
+    FlagHasCallStream or
+    FlagHasStepStream)
     ## P6.5 (column-extension back-compat): every flag bit this reader
     ## understands.  ``readMetaDat`` rejects any meta.dat whose flag
     ## word has bits outside this mask set, per
@@ -219,6 +234,14 @@ type
       ## stream, and readers may load the call tree from it directly.
       ## Pre-extension traces always have it clear; the unified-stream
       ## call tree remains the source of truth when it is clear.
+    hasStepStream*: bool
+      ## M23a: True iff FlagHasStepStream was set on the meta.dat header.
+      ## When set, the trace carries a dedicated `steps.dat` compact
+      ## execution stream (plus its companion `steps.idx`) alongside the
+      ## unified event stream, and readers may load the step timeline from
+      ## it directly.  Pre-extension traces always have it clear; the
+      ## unified-stream step sequence remains the source of truth when it
+      ## is clear.
 
 proc writeRawBytes(
     c: var Ctfs, f: var CtfsInternalFile,
@@ -264,6 +287,7 @@ proc writeMetaDat*(
     supportsColumnBreakpoints: bool = false,
     supportsColumnMotions: bool = false,
     hasCallStream: bool = false,
+    hasStepStream: bool = false,
 ): Result[void, string] =
   ## Write binary meta.dat to a CTFS internal file.
   ##
@@ -316,6 +340,8 @@ proc writeMetaDat*(
     flags = flags or FlagSupportsColumnMotions
   if hasCallStream:
     flags = flags or FlagHasCallStream
+  if hasStepStream:
+    flags = flags or FlagHasStepStream
   ? c.writeU16LE(f, flags)
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.
@@ -452,6 +478,7 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
   contents.supportsColumnMotions =
     (flags and FlagSupportsColumnMotions) != 0
   contents.hasCallStream = (flags and FlagHasCallStream) != 0
+  contents.hasStepStream = (flags and FlagHasStepStream) != 0
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1, required
   # in v3+: a malformed or missing id rejects the trace at parse time.
@@ -593,6 +620,7 @@ proc writeMetaDatToBuffer*(
     supportsColumnBreakpoints: bool = false,
     supportsColumnMotions: bool = false,
     hasCallStream: bool = false,
+    hasStepStream: bool = false,
 ): seq[byte] =
   ## Serialize meta.dat to an in-memory byte buffer.
   ## This is the same format as writeMetaDat but without needing a CTFS container.
@@ -642,6 +670,8 @@ proc writeMetaDatToBuffer*(
     flags = flags or FlagSupportsColumnMotions
   if hasCallStream:
     flags = flags or FlagHasCallStream
+  if hasStepStream:
+    flags = flags or FlagHasStepStream
   result.appendU16LE(flags)
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.

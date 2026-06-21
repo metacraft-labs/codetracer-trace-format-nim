@@ -294,6 +294,7 @@ proc buildFullDocument*(reader: var NewTraceReader,
   flagsObj["supports_column_motions"] = newJBool(
     reader.meta.supportsColumnMotions)
   flagsObj["has_call_stream"] = newJBool(reader.meta.hasCallStream)
+  flagsObj["has_step_stream"] = newJBool(reader.meta.hasStepStream)
   meta["flags"] = flagsObj
 
   # ----- trace_filter provenance (TF-M7, spec §7) -----
