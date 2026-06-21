@@ -893,15 +893,16 @@ proc test_meta_dat_strict_unknown_flag_rejection() {.raises: [].} =
   ##   * flags = 0 (pre-extension trace) round-trips cleanly,
   ##   * flags = FlagHasColumnAwareSteps (bit 4, known) round-trips
   ##     cleanly with ``hasColumnAwareSteps = true``,
-  ##   * flags = bit 4 + bit 12 fails because bit 12 is unknown.
-  ##     (Bits 5..11 are now allocated — bit 5 to
+  ##   * flags = bit 4 + bit 13 fails because bit 13 is unknown.
+  ##     (Bits 5..12 are now allocated — bit 5 to
   ##     ``FlagHasAlternateSourceViews``, bits 6 and 7 to the
   ##     M-capability-flags ``FlagSupportsColumnBreakpoints`` /
   ##     ``FlagSupportsColumnMotions``, bit 8 to M17a's
   ##     ``FlagHasCallStream``, bit 9 to M23a's
   ##     ``FlagHasStepStream``, bit 10 to M23b's
-  ##     ``FlagHasValueStream``, and bit 11 to M23c's
-  ##     ``FlagHasIoEventStream``.  Each time a new bit landed
+  ##     ``FlagHasValueStream``, bit 11 to M23c's
+  ##     ``FlagHasIoEventStream``, and bit 12 to M23d's
+  ##     ``FlagHasInterningTables``.  Each time a new bit landed
   ##     this test was retargeted to the next unknown bit so the
   ##     strict-rejection contract stays exercised.)
   proc craft(flags: uint16): seq[byte] {.raises: [].} =
@@ -1009,11 +1010,39 @@ proc test_meta_dat_strict_unknown_flag_rejection() {.raises: [].} =
     doAssert resAll4.get().hasIoEventStream
 
   block:
-    # Bit 12 (0x1000) is still unallocated — retarget the strict-rejection
-    # probe to it now that bit 11 is known.
-    let res = readMetaDat(craft(FlagHasColumnAwareSteps or 0x1000'u16))
+    # M23d: bit 12 (FlagHasInterningTables) is now a KNOWN flag and must
+    # round-trip cleanly with ``hasInterningTables = true``.  A real M23d
+    # bundle sets it alongside ``FlagHasCallStream`` / ``FlagHasStepStream``
+    # / ``FlagHasValueStream`` / ``FlagHasIoEventStream`` — assert all five
+    # round-trip together.
+    let res = readMetaDat(craft(FlagHasInterningTables))
+    doAssert res.isOk,
+      "bit 12 (FlagHasInterningTables) must round-trip: " &
+      (if res.isErr: res.error else: "ok")
+    doAssert res.get().hasInterningTables
+    doAssert not res.get().hasIoEventStream
+    doAssert not res.get().hasValueStream
+    doAssert not res.get().hasStepStream
+    doAssert not res.get().hasCallStream
+
+    let resAll5 = readMetaDat(craft(
+      FlagHasCallStream or FlagHasStepStream or FlagHasValueStream or
+      FlagHasIoEventStream or FlagHasInterningTables))
+    doAssert resAll5.isOk,
+      "bit 8 + bit 9 + bit 10 + bit 11 + bit 12 (all five) must round-trip: " &
+      (if resAll5.isErr: resAll5.error else: "ok")
+    doAssert resAll5.get().hasCallStream
+    doAssert resAll5.get().hasStepStream
+    doAssert resAll5.get().hasValueStream
+    doAssert resAll5.get().hasIoEventStream
+    doAssert resAll5.get().hasInterningTables
+
+  block:
+    # Bit 13 (0x2000) is still unallocated — retarget the strict-rejection
+    # probe to it now that bit 12 is known.
+    let res = readMetaDat(craft(FlagHasColumnAwareSteps or 0x2000'u16))
     doAssert res.isErr,
-      "bit 4 + bit 12 must reject because bit 12 is unknown"
+      "bit 4 + bit 13 must reject because bit 13 is unknown"
     doAssert "unknown" in res.error,
       "rejection error must mention 'unknown'; got: " & res.error
 

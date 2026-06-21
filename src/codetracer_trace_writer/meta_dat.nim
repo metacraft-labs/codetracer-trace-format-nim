@@ -180,6 +180,20 @@ const
     ## it later.  Must match
     ## ``codetracer_trace_writer::meta_dat::FLAG_HAS_IO_EVENT_STREAM``
     ## (Rust) and the db-backend ``FLAG_HAS_IO_EVENT_STREAM`` bit 11.
+  FlagHasInterningTables*: uint16 = 0x1000       # bit 12 — M23d
+    ## When set, the materialized `.ct` carries the binary varint
+    ## interning tables (`paths.dat`+`paths.off`, `funcs.dat`+`funcs.off`,
+    ## `types.dat`+`types.off`, `varnames.dat`+`varnames.off`) in addition
+    ## to the legacy `events.log` / `paths.json` interning.  These use the
+    ## Variable-Size Record Table (`.dat` + `.off`) pattern — a `.dat` of
+    ## serialized records plus a u64-LE offset index for O(1) random
+    ## access by id (internal-files.md §"Interning Tables").  Like
+    ## ``FlagHasIoEventStream`` this is ADDITIVE: `events.log` / `paths.json`
+    ## are unchanged, and a reader that does not know the bit simply
+    ## ignores the eight new files.  The flag is the M23d gate; the
+    ## consumer migration off the legacy interning lands later.  Must
+    ## match ``codetracer_trace_writer::meta_dat::FLAG_HAS_INTERNING_TABLES``
+    ## (Rust) and the db-backend ``FLAG_HAS_INTERNING_TABLES`` bit 12.
   FlagHasCallStream*: uint16 = 0x100             # bit 8 — M17a
     ## When set, the materialized `.ct` carries a dedicated call stream
     ## (`calls.dat` + its companion seekable index `calls.idx`) in
@@ -205,7 +219,8 @@ const
     FlagHasCallStream or
     FlagHasStepStream or
     FlagHasValueStream or
-    FlagHasIoEventStream)
+    FlagHasIoEventStream or
+    FlagHasInterningTables)
     ## P6.5 (column-extension back-compat): every flag bit this reader
     ## understands.  ``readMetaDat`` rejects any meta.dat whose flag
     ## word has bits outside this mask set, per
@@ -301,6 +316,15 @@ type
       ## DISTINCT from the legacy combined `events.log`.  Pre-extension
       ## traces always have it clear; the unified-stream `Event` records
       ## remain the source of truth when it is clear.
+    hasInterningTables*: bool
+      ## M23d: True iff FlagHasInterningTables was set on the meta.dat
+      ## header.  When set, the trace carries the binary varint interning
+      ## tables (`paths.dat`+`paths.off`, `funcs.dat`+`funcs.off`,
+      ## `types.dat`+`types.off`, `varnames.dat`+`varnames.off`) alongside
+      ## the legacy `events.log` / `paths.json` interning, resolvable by id
+      ## with O(1) random access via the `.off` offset indices.  Pre-
+      ## extension traces always have it clear; the legacy interning remains
+      ## the source of truth when it is clear.
 
 proc writeRawBytes(
     c: var Ctfs, f: var CtfsInternalFile,
@@ -349,6 +373,7 @@ proc writeMetaDat*(
     hasStepStream: bool = false,
     hasValueStream: bool = false,
     hasIoEventStream: bool = false,
+    hasInterningTables: bool = false,
 ): Result[void, string] =
   ## Write binary meta.dat to a CTFS internal file.
   ##
@@ -407,6 +432,8 @@ proc writeMetaDat*(
     flags = flags or FlagHasValueStream
   if hasIoEventStream:
     flags = flags or FlagHasIoEventStream
+  if hasInterningTables:
+    flags = flags or FlagHasInterningTables
   ? c.writeU16LE(f, flags)
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.
@@ -546,6 +573,7 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
   contents.hasStepStream = (flags and FlagHasStepStream) != 0
   contents.hasValueStream = (flags and FlagHasValueStream) != 0
   contents.hasIoEventStream = (flags and FlagHasIoEventStream) != 0
+  contents.hasInterningTables = (flags and FlagHasInterningTables) != 0
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1, required
   # in v3+: a malformed or missing id rejects the trace at parse time.
@@ -690,6 +718,7 @@ proc writeMetaDatToBuffer*(
     hasStepStream: bool = false,
     hasValueStream: bool = false,
     hasIoEventStream: bool = false,
+    hasInterningTables: bool = false,
 ): seq[byte] =
   ## Serialize meta.dat to an in-memory byte buffer.
   ## This is the same format as writeMetaDat but without needing a CTFS container.
@@ -745,6 +774,8 @@ proc writeMetaDatToBuffer*(
     flags = flags or FlagHasValueStream
   if hasIoEventStream:
     flags = flags or FlagHasIoEventStream
+  if hasInterningTables:
+    flags = flags or FlagHasInterningTables
   result.appendU16LE(flags)
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.
