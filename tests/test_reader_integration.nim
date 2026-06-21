@@ -61,7 +61,7 @@ proc writeFullTrace(): seq[byte] {.raises: [].} =
     workdir: "/home/test")
   let metaWr = ctfs.writeMetaDat(metaFile, meta,
     @["/src/main.py", "/src/utils.py", "/src/math.py"],
-    recorderId = "m21-integration")
+    recorderId = "m21-integration", hasStepStream = true)
   doAssert metaWr.isOk
 
   # Interning tables
@@ -390,7 +390,7 @@ proc test_reader_cache_eviction() {.raises: [].} =
   doAssert metaFileRes.isOk
   var metaFile = metaFileRes.get()
   let meta = TraceMetadata(recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb", program: "cache_test", args: @[], workdir: "/tmp")
-  let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/cache.py"])
+  let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/cache.py"], hasStepStream = true)
   doAssert metaWr.isOk
 
   let tabRes = initTraceInterningTables(ctfs)
@@ -486,7 +486,7 @@ proc writeTraceWithSortedCalls(): seq[byte] {.raises: [].} =
   doAssert metaFileRes.isOk
   var metaFile = metaFileRes.get()
   let meta = TraceMetadata(recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb", program: "search_test", args: @[], workdir: "/tmp")
-  let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/main.py"])
+  let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/main.py"], hasStepStream = true)
   doAssert metaWr.isOk
 
   let tabRes = initTraceInterningTables(ctfs)

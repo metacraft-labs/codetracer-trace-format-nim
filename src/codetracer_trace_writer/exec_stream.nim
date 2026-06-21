@@ -6,23 +6,49 @@
 ## execution stream packs variable-length StepEvents into fixed-count chunks.
 ## Each chunk holds up to `chunkSize` events, compressed with Zstd.
 ##
-## Data layout (steps.dat):
-##   [compressed chunk 0][compressed chunk 1]...
+## # Wire format (M24a-1: SPEC-canonical layout)
 ##
-## Each chunk's uncompressed content starts with a u32 LE event count,
-## followed by the concatenated encoded events.
+## The on-disk layout matches the canonical spec
+## (``codetracer-trace-format-spec/seekable-zstd.md`` §"Chunk Format" +
+## §"Companion Index Stream") and is BYTE-COMPATIBLE with the Rust
+## ``codetracer_trace_writer::step_stream`` writer /
+## ``codetracer_trace_reader::step_stream_reader`` reader.  A bundle written
+## by this Nim writer can therefore be read directly by the Rust
+## ``StepStreamReader`` (the property the db-backend seekable overlay relies
+## on), and vice versa.
+##
+## Data layout (steps.dat):
+##   [zstd(chunk 0)][zstd(chunk 1)]...
+##
+## Each chunk's uncompressed content is the bare concatenation of encoded
+## step events — there is NO per-chunk inline header (no event count).  The
+## first step record of every chunk is an AbsoluteStep so each chunk is
+## independently decodable (the running absolute global_position_index resets
+## at every chunk boundary).
 ##
 ## Index layout (steps.idx):
 ##   [chunk_size: u32 LE]           # max events per chunk
-##   [total_events: u64 LE]         # total events across all chunks
 ##   [offset_0: u64 LE]             # byte offset of chunk 0 in .dat
 ##   [offset_1: u64 LE]             # ...
 ##
-## To read event N:
-##   1. chunk = N / chunk_size (but last chunk may be partial)
+## There is NO ``total_events`` header or trailer; the total record count is
+## derived by decoding the last chunk (all chunks but the last hold exactly
+## ``chunk_size`` records).  To read event N:
+##   1. chunk = N / chunk_size (the last chunk may be partial)
 ##   2. Decompress chunk at offsets[chunk]
-##   3. Read u32 event_count from decompressed data
-##   4. Scan N % chunk_size events to find the target
+##   3. Decode forward, scanning N % chunk_size events to the target
+##
+## # Backward compatibility (legacy Nim-v4 bundles)
+##
+## Bundles written by the pre-M24a-1 Nim writer carry a different framing:
+## ``steps.idx`` had a ``total_events`` placeholder after the chunk_size header
+## plus a ``total_events`` trailer, and each chunk's uncompressed data started
+## with a ``u32 LE`` event count.  Those bundles never set the ``meta.dat``
+## ``has_step_stream`` flag (bit 9), so the FFI reader distinguishes the two
+## layouts by that flag: flag set ⇒ SPEC layout, flag clear ⇒ legacy layout.
+## ``initExecStreamReader`` accepts an explicit ``legacy`` parameter for this;
+## standalone callers that only ever read freshly-written bundles get the SPEC
+## layout by default.
 
 import results
 import ../codetracer_ctfs/types
@@ -51,10 +77,17 @@ type
     chunkSize*: uint32
     offsets: seq[uint64]       ## chunk byte offsets from steps.idx
     totalEventsVal: uint64
+    legacy: bool               ## true ⇒ legacy Nim-v4 framing (u32 count
+                               ## header per chunk + total_events trailer);
+                               ## false ⇒ SPEC layout (header-less chunks,
+                               ## no trailer).  See module docs.
     # Cache for last decompressed chunk
     cachedChunkIdx: int        ## -1 means no cache
     cachedChunk: seq[byte]
     cachedChunkEventCount: uint32
+    cachedChunkPayloadStart: int ## byte offset within ``cachedChunk`` where the
+                                 ## first encoded event begins: 4 in legacy mode
+                                 ## (past the u32 count header), 0 in SPEC mode.
 
 proc initExecStreamWriter*(ctfs: var Ctfs,
     chunkSize: int = DefaultExecChunkSize): Result[ExecStreamWriter, string] =
@@ -82,12 +115,12 @@ proc initExecStreamWriter*(ctfs: var Ctfs,
     lastGlobalLineIndex: 0,
   )
 
-  # Write index header: u32 chunk_size + u64 total_events (placeholder, updated on flush)
-  var hdr: array[12, byte]
+  # Write index header: just the u32 chunk_size (SPEC layout — no
+  # total_events placeholder, no trailer; matches the Rust step_stream writer).
+  var hdr: array[4, byte]
   let csLE = toBytesLE(uint32(chunkSize))
   for i in 0 ..< 4:
     hdr[i] = csLE[i]
-  # total_events = 0 initially (bytes 4..11)
   let hdrRes = ctfs.writeToFile(writer.indexFile, hdr)
   if hdrRes.isErr:
     return err("failed to write idx header: " & hdrRes.error)
@@ -99,20 +132,16 @@ proc flushChunk(ctfs: var Ctfs, w: var ExecStreamWriter): Result[void, string] =
   if w.eventCount == 0:
     return ok()
 
-  # Prepend u32 LE event count to the uncompressed data
-  var uncompressed = newSeq[byte](4 + w.buffer.len)
-  let ecLE = toBytesLE(uint32(w.eventCount))
-  for i in 0 ..< 4:
-    uncompressed[i] = ecLE[i]
-  for i in 0 ..< w.buffer.len:
-    uncompressed[4 + i] = w.buffer[i]
-
-  let bound = ZSTD_compressBound(csize_t(uncompressed.len))
+  # SPEC layout: the chunk's uncompressed payload is the bare concatenation
+  # of encoded events — no per-chunk event-count header.  (The Rust
+  # step_stream writer emits the same header-less chunks, so a chunk written
+  # here is byte-for-byte decodable by the Rust StepStreamReader.)
+  let bound = ZSTD_compressBound(csize_t(w.buffer.len))
   var compressed = newSeq[byte](int(bound))
 
   let compressedSize = ZSTD_compress(
     addr compressed[0], csize_t(bound),
-    addr uncompressed[0], csize_t(uncompressed.len),
+    addr w.buffer[0], csize_t(w.buffer.len),
     cint(ExecCompressionLevel))
 
   if ZSTD_isError(compressedSize) != 0:
@@ -191,23 +220,13 @@ proc writeEvent*(ctfs: var Ctfs, w: var ExecStreamWriter,
 proc flush*(ctfs: var Ctfs, w: var ExecStreamWriter): Result[void, string] =
   ## Flush any remaining buffered events as a partial final chunk.
   ## Must be called before serializing the CTFS.
-  ## Also updates the total_events field in the index header.
+  ##
+  ## SPEC layout: ``steps.idx`` carries NO ``total_events`` trailer — the
+  ## record count is recoverable from the chunk offsets plus the last chunk's
+  ## decoded record count (all chunks but the last hold exactly ``chunk_size``
+  ## records).  This matches the Rust ``step_stream`` writer, whose ``steps.idx``
+  ## is exactly ``[chunk_size: u32][offset_0: u64]...``.
   ?ctfs.flushChunk(w)
-
-  # Rewrite total_events in the index header (bytes 4..11).
-  # The CTFS container API is append-only, so we write the total as a
-  # trailing u64 that the reader will use instead.
-  var teBytes: array[8, byte]
-  let teLE = toBytesLE(w.totalEvents)
-  for i in 0 ..< 8:
-    teBytes[i] = teLE[i]
-
-  # We can't seek back in the CTFS file, so append total_events as a trailer.
-  # The reader will read it from the known position after all chunk offsets.
-  let res = ctfs.writeToFile(w.indexFile, teBytes)
-  if res.isErr:
-    return err("failed to write total_events trailer: " & res.error)
-
   ok()
 
 proc totalEvents*(w: ExecStreamWriter): uint64 = w.totalEvents
@@ -216,10 +235,52 @@ proc totalEvents*(w: ExecStreamWriter): uint64 = w.totalEvents
 # Reader
 # ---------------------------------------------------------------------------
 
+proc decodeSpecChunkRecordCount(compressed: openArray[byte]): Result[int, string] =
+  ## Decompress a SPEC-layout chunk (header-less payload) and count its
+  ## records by decoding forward to the end of the chunk.  Used to recover the
+  ## last chunk's record count (the SPEC ``steps.idx`` carries no
+  ## ``total_events``), mirroring the Rust ``StepStreamReader::open`` logic.
+  if compressed.len == 0:
+    return err("step chunk has zero compressed size")
+  let frameSize = ZSTD_getFrameContentSize(
+    unsafeAddr compressed[0], csize_t(compressed.len))
+  if frameSize == ZSTD_CONTENTSIZE_UNKNOWN or frameSize == ZSTD_CONTENTSIZE_ERROR:
+    return err("cannot determine decompressed size for last step chunk")
+  var raw = newSeq[byte](int(frameSize))
+  let decompSize = ZSTD_decompress(
+    addr raw[0], csize_t(frameSize),
+    unsafeAddr compressed[0], csize_t(compressed.len))
+  if ZSTD_isError(decompSize) != 0:
+    return err("zstd decompress failed for last step chunk: " &
+      $ZSTD_getErrorName(decompSize))
+  raw.setLen(int(decompSize))
+  var pos = 0
+  var count = 0
+  while pos < raw.len:
+    let ev = decodeStepEvent(raw, pos)
+    if ev.isErr:
+      return err("failed to count records in last step chunk: " & ev.error)
+    inc count
+  ok(count)
+
 proc initExecStreamReader*(ctfsBytes: openArray[byte],
     blockSize: int = 4096,
-    maxEntries: int = 170): Result[ExecStreamReader, string] =
+    maxEntries: int = 170,
+    legacy: bool = false): Result[ExecStreamReader, string] =
   ## Read an execution stream from CTFS bytes.
+  ##
+  ## ``legacy`` selects the on-disk framing (see module docs):
+  ##   * ``false`` (default) — SPEC layout: ``steps.idx`` is
+  ##     ``[chunk_size: u32][offset_0: u64]...`` (no ``total_events``) and each
+  ##     chunk's uncompressed payload is header-less.  Byte-compatible with the
+  ##     Rust ``StepStreamReader``.
+  ##   * ``true`` — legacy Nim-v4 layout: ``steps.idx`` has a ``total_events``
+  ##     placeholder after the header plus a trailing ``total_events`` u64, and
+  ##     each chunk's uncompressed data starts with a ``u32`` event count.
+  ##
+  ## The FFI reader passes ``legacy = not meta.hasStepStream``: pre-M24a-1
+  ## bundles never set the ``has_step_stream`` flag, so a clear flag selects the
+  ## legacy reader and a set flag the SPEC reader.
   let datRes = readInternalFile(ctfsBytes, "steps.dat",
       uint32(blockSize), uint32(maxEntries))
   if datRes.isErr:
@@ -232,13 +293,8 @@ proc initExecStreamReader*(ctfsBytes: openArray[byte],
     return err("failed to read steps.idx: " & idxRes.error)
   let idxData = idxRes.get()
 
-  # Index format:
-  #   [0..3]  u32 chunk_size
-  #   [4..11] u64 total_events (placeholder, ignored — real value is trailer)
-  #   [12..]  u64 offsets...
-  #   [last 8 bytes] u64 total_events (trailer)
-  if idxData.len < 12:
-    return err("index file too small for header")
+  if idxData.len < 4:
+    return err("index file too small for chunk_size header")
 
   var cs4: array[4, byte]
   for i in 0 ..< 4:
@@ -247,40 +303,73 @@ proc initExecStreamReader*(ctfsBytes: openArray[byte],
   if chunkSize == 0:
     return err("chunkSize in index is 0")
 
-  # The layout after the 12-byte header is: N offset entries (8 bytes each),
-  # followed by an 8-byte total_events trailer.
-  let payloadBytes = idxData.len - 12  # after chunk_size + placeholder total
-  if payloadBytes < 8:
-    return err("index file too small for trailer")
+  var offsets: seq[uint64]
+  var totalEvents: uint64
+  let payloadStart = if legacy: 4 else: 0  ## per-chunk payload offset
 
-  # The last 8 bytes are the total_events trailer
-  let trailerStart = idxData.len - 8
-  var te8: array[8, byte]
-  for i in 0 ..< 8:
-    te8[i] = idxData[trailerStart + i]
-  let totalEvents = fromBytesLE(uint64, te8)
+  if legacy:
+    # Legacy index layout:
+    #   [0..3]   u32 chunk_size
+    #   [4..11]  u64 total_events placeholder (ignored)
+    #   [12..]   u64 offsets...
+    #   [last 8] u64 total_events trailer
+    if idxData.len < 12:
+      return err("index file too small for legacy header")
+    let payloadBytes = idxData.len - 12  # after chunk_size + placeholder total
+    if payloadBytes < 8:
+      return err("index file too small for trailer")
+    let trailerStart = idxData.len - 8
+    var te8: array[8, byte]
+    for i in 0 ..< 8:
+      te8[i] = idxData[trailerStart + i]
+    totalEvents = fromBytesLE(uint64, te8)
+    let offsetRegionBytes = trailerStart - 12
+    if offsetRegionBytes mod 8 != 0:
+      return err("index file has trailing bytes in offset region")
+    let numChunks = offsetRegionBytes div 8
+    offsets = newSeq[uint64](numChunks)
+    for i in 0 ..< numChunks:
+      var o8: array[8, byte]
+      for j in 0 ..< 8:
+        o8[j] = idxData[12 + i * 8 + j]
+      offsets[i] = fromBytesLE(uint64, o8)
+  else:
+    # SPEC index layout: [chunk_size: u32][offset_0: u64]...  (no trailer).
+    let offsetRegionBytes = idxData.len - 4
+    if offsetRegionBytes mod 8 != 0:
+      return err("index file has trailing bytes in offset region")
+    let numChunks = offsetRegionBytes div 8
+    offsets = newSeq[uint64](numChunks)
+    for i in 0 ..< numChunks:
+      var o8: array[8, byte]
+      for j in 0 ..< 8:
+        o8[j] = idxData[4 + i * 8 + j]
+      offsets[i] = fromBytesLE(uint64, o8)
 
-  # Offsets are between byte 12 and the trailer
-  let offsetRegionBytes = trailerStart - 12
-  if offsetRegionBytes mod 8 != 0:
-    return err("index file has trailing bytes in offset region")
-  let numChunks = offsetRegionBytes div 8
-
-  var offsets = newSeq[uint64](numChunks)
-  for i in 0 ..< numChunks:
-    var o8: array[8, byte]
-    for j in 0 ..< 8:
-      o8[j] = idxData[12 + i * 8 + j]
-    offsets[i] = fromBytesLE(uint64, o8)
+    # Recover total_events: all chunks but the last hold exactly chunk_size
+    # records; the last holds whatever decodes out of it (Rust parity).
+    if numChunks == 0:
+      totalEvents = 0
+    else:
+      let lastChunk = numChunks - 1
+      let startOff = int(offsets[lastChunk])
+      let endOff = datData.len
+      if startOff > endOff:
+        return err("last chunk offset past end of steps.dat")
+      let lastCount = ?decodeSpecChunkRecordCount(
+        datData.toOpenArray(startOff, endOff - 1))
+      totalEvents = uint64(lastChunk) * uint64(chunkSize) + uint64(lastCount)
 
   ok(ExecStreamReader(
     data: datData,
     chunkSize: chunkSize,
     offsets: offsets,
     totalEventsVal: totalEvents,
+    legacy: legacy,
     cachedChunkIdx: -1,
     cachedChunk: @[],
     cachedChunkEventCount: 0,
+    cachedChunkPayloadStart: payloadStart,
   ))
 
 proc totalEvents*(r: ExecStreamReader): uint64 = r.totalEventsVal
@@ -320,13 +409,25 @@ proc decompressChunk(r: var ExecStreamReader,
 
   r.cachedChunk.setLen(int(decompSize))
 
-  # Read event count from the first 4 bytes of decompressed data
-  if r.cachedChunk.len < 4:
-    return err("decompressed chunk too small for event count header")
-  var ec4: array[4, byte]
-  for i in 0 ..< 4:
-    ec4[i] = r.cachedChunk[i]
-  r.cachedChunkEventCount = fromBytesLE(uint32, ec4)
+  if r.legacy:
+    # Legacy chunk: the first 4 bytes are a u32 LE event count, records follow.
+    if r.cachedChunk.len < 4:
+      return err("decompressed chunk too small for event count header")
+    var ec4: array[4, byte]
+    for i in 0 ..< 4:
+      ec4[i] = r.cachedChunk[i]
+    r.cachedChunkEventCount = fromBytesLE(uint32, ec4)
+  else:
+    # SPEC chunk: header-less payload — count records by decoding forward.
+    var pos = 0
+    var count = 0
+    while pos < r.cachedChunk.len:
+      let ev = decodeStepEvent(r.cachedChunk, pos)
+      if ev.isErr:
+        return err("failed to count records in chunk " & $chunkIdx & ": " &
+          ev.error)
+      inc count
+    r.cachedChunkEventCount = uint32(count)
 
   r.cachedChunkIdx = chunkIdx
   ok()
@@ -342,8 +443,8 @@ proc readEvent*(r: var ExecStreamReader,
 
   ?r.decompressChunk(chunkIdx)
 
-  # Skip past the u32 event count header
-  var pos = 4
+  # Skip past the legacy u32 event count header (0 in SPEC mode).
+  var pos = r.cachedChunkPayloadStart
 
   # Scan forward to the desired event
   for i in 0 ..< eventInChunk:
@@ -379,7 +480,7 @@ proc readChunkEvents*(r: var ExecStreamReader,
     return ok(firstEventIdx)
   output = newSeqOfCap[StepEvent](eventCount)
 
-  var pos = 4
+  var pos = r.cachedChunkPayloadStart
   for i in 0 ..< eventCount:
     let evRes = decodeStepEvent(r.cachedChunk, pos)
     if evRes.isErr:

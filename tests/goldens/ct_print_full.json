@@ -13,7 +13,7 @@
       "supports_column_breakpoints": false,
       "supports_column_motions": false,
       "has_call_stream": true,
-      "has_step_stream": false,
+      "has_step_stream": true,
       "has_value_stream": false,
       "has_io_event_stream": false,
       "has_interning_tables": false

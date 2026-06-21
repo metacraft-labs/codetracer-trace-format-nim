@@ -43,6 +43,10 @@ task test, "Run all tests":
   exec "nim c -r -d:release -p:src tests/test_new_trace_reader.nim"
   exec "nim c -r -d:release -p:src tests/test_reader_calls_events.nim"
   exec "nim c -r -d:release -p:src tests/test_reader_integration.nim"
+  # M24a-1: cross-read proof — a Nim-written production steps.dat is read by
+  # the canonical Rust StepStreamReader (skips cleanly if the sibling Rust repo
+  # or its toolchain is absent).
+  exec "nim c -r -d:release -p:src tests/test_nim_step_stream_crossread.nim"
   exec "nim c -r -p:src tests/test_streaming_value_encoder.nim"
   exec "nim c -r -p:src tests/test_value_ref.nim"
   exec "nim c -r -d:release -p:src tests/test_multi_stream_writer.nim"

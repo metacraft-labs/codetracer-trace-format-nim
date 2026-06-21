@@ -5,6 +5,8 @@
 import std/times
 import results
 import codetracer_ctfs/container
+import codetracer_ctfs/types
+import codetracer_ctfs/zstd_bindings
 import codetracer_trace_writer/step_encoding
 import codetracer_trace_writer/exec_stream
 
@@ -360,9 +362,137 @@ proc test_exec_stream_delta_column_chunk_boundary() {.raises: [].} =
 
   echo "PASS: test_exec_stream_delta_column_chunk_boundary"
 
+proc buildLegacyExecStream(ctfs: var Ctfs, events: seq[StepEvent],
+    chunkSize: int): Result[uint64, string] {.raises: [].} =
+  ## Hand-build a LEGACY-framed steps.dat/steps.idx (the pre-M24a-1 Nim-v4
+  ## layout) so the backward-compat reader path can be exercised even though
+  ## the current writer only emits the SPEC layout.  Legacy framing:
+  ##   * steps.idx: [chunk_size: u32][total_events placeholder: u64]
+  ##                [offset_0: u64]...[total_events trailer: u64]
+  ##   * each chunk's uncompressed payload: [event_count: u32][events...]
+  let datRes = ctfs.addFile("steps.dat")
+  if datRes.isErr: return err(datRes.error)
+  var datFile = datRes.get()
+  let idxRes = ctfs.addFile("steps.idx")
+  if idxRes.isErr: return err(idxRes.error)
+  var idxFile = idxRes.get()
+
+  # Index header: chunk_size + placeholder total_events (zeroed).
+  var hdr: array[12, byte]
+  let csLE = toBytesLE(uint32(chunkSize))
+  for i in 0 ..< 4: hdr[i] = csLE[i]
+  let hdrW = ctfs.writeToFile(idxFile, hdr)
+  if hdrW.isErr: return err(hdrW.error)
+
+  var dataOffset: uint64 = 0
+  var total: uint64 = 0
+  var lastGli: uint64 = 0  ## running absolute position, like the legacy writer
+  var i = 0
+  while i < events.len:
+    let endIdx = min(i + chunkSize, events.len)
+    let count = endIdx - i
+    # uncompressed payload: u32 count header + encoded events
+    var payload = newSeq[byte](4)
+    let ecLE = toBytesLE(uint32(count))
+    for k in 0 ..< 4: payload[k] = ecLE[k]
+    for j in i ..< endIdx:
+      var ev = events[j]
+      # Promote a leading DeltaStep to AbsoluteStep like the writer did,
+      # carrying the running absolute position so chunks stay independently
+      # decodable AND positionally correct.
+      if j == i and ev.kind == sekDeltaStep:
+        ev = StepEvent(kind: sekAbsoluteStep,
+          globalLineIndex: uint64(int64(lastGli) + events[j].lineDelta))
+      # Track lastGli against the (possibly promoted) event.
+      case ev.kind
+      of sekAbsoluteStep: lastGli = ev.globalLineIndex
+      of sekDeltaStep: lastGli = uint64(int64(lastGli) + ev.lineDelta)
+      else: discard
+      encodeStepEvent(ev, payload)
+    let bound = ZSTD_compressBound(csize_t(payload.len))
+    var compressed = newSeq[byte](int(bound))
+    let cs = ZSTD_compress(addr compressed[0], csize_t(bound),
+      addr payload[0], csize_t(payload.len), cint(3))
+    if ZSTD_isError(cs) != 0:
+      return err("legacy zstd compress failed")
+    # offset entry
+    var off: array[8, byte]
+    let offLE = toBytesLE(dataOffset)
+    for k in 0 ..< 8: off[k] = offLE[k]
+    let offW = ctfs.writeToFile(idxFile, off)
+    if offW.isErr: return err(offW.error)
+    let datW = ctfs.writeToFile(datFile, compressed.toOpenArray(0, int(cs) - 1))
+    if datW.isErr: return err(datW.error)
+    dataOffset += uint64(cs)
+    total += uint64(count)
+    i = endIdx
+
+  # total_events trailer
+  var teBytes: array[8, byte]
+  let teLE = toBytesLE(total)
+  for k in 0 ..< 8: teBytes[k] = teLE[k]
+  let teW = ctfs.writeToFile(idxFile, teBytes)
+  if teW.isErr: return err(teW.error)
+  ok(total)
+
+proc test_exec_stream_legacy_back_compat() {.raises: [].} =
+  ## M24a-1 backward-compat: a LEGACY-framed Nim-v4 exec stream (per-chunk
+  ## u32 count header + total_events trailer in steps.idx) must still read
+  ## correctly via ``initExecStreamReader(legacy = true)``.  This protects the
+  ## already-recorded Nim-v4 bundles whose meta.dat never set has_step_stream.
+  let chunkSize = 4
+  var events: seq[StepEvent]
+  events.add(StepEvent(kind: sekAbsoluteStep, globalLineIndex: 1000))
+  for i in 1 ..< 30:
+    if i mod 7 == 0:
+      events.add(StepEvent(kind: sekAbsoluteStep, globalLineIndex: uint64(2000 + i)))
+    else:
+      events.add(StepEvent(kind: sekDeltaStep, lineDelta: 1))
+
+  var ctfs = createCtfs()
+  let totRes = buildLegacyExecStream(ctfs, events, chunkSize)
+  doAssert totRes.isOk, "legacy build failed: " & totRes.error
+  let ctfsBytes = ctfs.toBytes()
+  ctfs.closeCtfs()
+
+  # Reading WITHOUT the legacy flag (SPEC mode) must NOT misinterpret the
+  # bytes as a valid SPEC stream — the legacy trailer/count-headers make the
+  # SPEC reader's record count diverge, so the legacy flag is load-bearing.
+  var legacyRes = initExecStreamReader(ctfsBytes, legacy = true)
+  doAssert legacyRes.isOk, "legacy reader init failed: " & legacyRes.error
+  var reader = legacyRes.get()
+  doAssert reader.totalEvents == uint64(events.len),
+    "legacy totalEvents mismatch: got " & $reader.totalEvents &
+    " expected " & $events.len
+
+  # Walk every event, tracking the absolute position the writer would track.
+  var pos: uint64 = 0
+  for i in 0 ..< events.len:
+    let got = reader.readEvent(uint64(i))
+    doAssert got.isOk, "legacy readEvent failed at " & $i & ": " & got.error
+    let ev = got.get()
+    let orig = events[i]
+    # Expected absolute position from the ORIGINAL stream (boundary promotion
+    # converts a leading DeltaStep to AbsoluteStep but the position is the same).
+    case orig.kind
+    of sekAbsoluteStep: pos = orig.globalLineIndex
+    of sekDeltaStep: pos = uint64(int64(pos) + orig.lineDelta)
+    else: discard
+    case ev.kind
+    of sekAbsoluteStep:
+      doAssert ev.globalLineIndex == pos,
+        "legacy absolute mismatch at " & $i & ": got " & $ev.globalLineIndex &
+        " expected " & $pos
+    of sekDeltaStep:
+      doAssert ev.lineDelta == orig.lineDelta, "legacy delta mismatch at " & $i
+    else: discard
+
+  echo "PASS: test_exec_stream_legacy_back_compat"
+
 test_exec_stream_write_read()
 test_exec_stream_raise_catch()
 test_exec_stream_thread_switch()
 test_exec_stream_delta_column_chunk_boundary()
+test_exec_stream_legacy_back_compat()
 bench_exec_stream_write_throughput()
 echo "ALL PASS: test_exec_stream"

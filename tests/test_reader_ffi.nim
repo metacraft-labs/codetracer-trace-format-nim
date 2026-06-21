@@ -64,7 +64,7 @@ proc writeTestTrace(path: string) =
   var metaFile = metaFileRes.get()
   let meta = TraceMetadata(recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb", program: "test_ffi_prog", args: @["--test"], workdir: "/tmp/ffi")
   let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/main.py", "/src/util.py"],
-    recorderId = "ffi-test")
+    recorderId = "ffi-test", hasStepStream = true)
   doAssert metaWr.isOk
 
   let tabRes = initTraceInterningTables(ctfs)

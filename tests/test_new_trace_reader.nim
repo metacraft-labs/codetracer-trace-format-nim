@@ -56,7 +56,7 @@ proc writeSmallTrace(): seq[byte] {.raises: [].} =
   var metaFile = metaFileRes.get()
   let meta = TraceMetadata(recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb", program: "test_prog", args: @["--run"], workdir: "/tmp")
   let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/main.py", "/src/helper.py"],
-    recorderId = "reader-test")
+    recorderId = "reader-test", hasStepStream = true)
   doAssert metaWr.isOk
 
   # interning tables
@@ -173,7 +173,9 @@ proc writeLargeTrace(numSteps: int, chunkSize: int = DefaultExecChunkSize): seq[
   doAssert metaFileRes.isOk
   var metaFile = metaFileRes.get()
   let meta = TraceMetadata(recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb", program: "bench", args: @[], workdir: "/tmp")
-  let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/bench.py"])
+  # M24a-1: this helper writes a SPEC-framed exec stream, so the bundle must
+  # set has_step_stream for the FFI reader to pick the SPEC layout.
+  let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/bench.py"], hasStepStream = true)
   doAssert metaWr.isOk
 
   let tabRes = initTraceInterningTables(ctfs)

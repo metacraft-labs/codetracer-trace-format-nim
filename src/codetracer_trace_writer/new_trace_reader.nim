@@ -624,7 +624,15 @@ proc decodeGlobalPositionIndex*(r: var NewTraceReader,
 
 proc ensureExecReader(r: var NewTraceReader): Result[void, string] =
   if not r.execLoaded:
-    let res = initExecStreamReader(r.data, int(r.blockSize), int(r.maxEntries))
+    # M24a-1: select the steps.dat/steps.idx framing by the meta.dat
+    # ``has_step_stream`` flag.  Bundles written by the current Nim writer
+    # (and by the Rust writer) set the flag and use the SPEC-canonical layout
+    # (header-less chunks, no total_events trailer) that the Rust
+    # ``StepStreamReader`` reads byte-for-byte.  Pre-M24a-1 Nim-v4 bundles
+    # never set the flag and use the legacy framing (per-chunk u32 count +
+    # total_events trailer); ``legacy = not hasStepStream`` keeps them readable.
+    let res = initExecStreamReader(r.data, int(r.blockSize), int(r.maxEntries),
+      legacy = not r.meta.hasStepStream)
     if res.isErr: return err(res.error)
     r.execReader = res.get()
     r.execLoaded = true

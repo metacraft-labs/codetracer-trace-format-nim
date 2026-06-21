@@ -1098,7 +1098,13 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
     # stream (initCallStreamWriter above), so stamp the has_call_stream
     # capability flag.  Readers may then load the call tree from calls.dat
     # directly; the flag is the M17a gate for that on-demand path.
-    hasCallStream = true)
+    hasCallStream = true,
+    # M24a-1: the writer ALWAYS emits a dedicated steps.dat/steps.idx execution
+    # stream (initExecStreamWriter above) in the SPEC-canonical layout, so stamp
+    # the has_step_stream capability flag (bit 9).  The flag both gates the
+    # Rust/db-backend seekable step path AND, for the Nim FFI reader, marks the
+    # bundle as SPEC-framed (vs the legacy Nim-v4 framing that never set it).
+    hasStepStream = true)
   if metaRes.isErr:
     return err("failed to write meta.dat: " & metaRes.error)
 
