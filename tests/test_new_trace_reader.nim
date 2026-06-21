@@ -55,8 +55,11 @@ proc writeSmallTrace(): seq[byte] {.raises: [].} =
   doAssert metaFileRes.isOk
   var metaFile = metaFileRes.get()
   let meta = TraceMetadata(recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb", program: "test_prog", args: @["--run"], workdir: "/tmp")
+  # M24a-2: this helper writes a SPEC-framed value stream (initValueStreamWriter
+  # + value_stream.flush below), so set has_value_stream so the FFI reader picks
+  # the SPEC values.dat/values.idx layout (not the legacy .off VRT path).
   let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/main.py", "/src/helper.py"],
-    recorderId = "reader-test", hasStepStream = true)
+    recorderId = "reader-test", hasStepStream = true, hasValueStream = true)
   doAssert metaWr.isOk
 
   # interning tables
@@ -161,6 +164,8 @@ proc writeSmallTrace(): seq[byte] {.raises: [].} =
 
   let flushRes = ctfs.flush(execW)
   doAssert flushRes.isOk
+  let valFlush = value_stream.flush(ctfs, valW)
+  doAssert valFlush.isOk
 
   result = ctfs.toBytes()
   ctfs.closeCtfs()
@@ -175,7 +180,9 @@ proc writeLargeTrace(numSteps: int, chunkSize: int = DefaultExecChunkSize): seq[
   let meta = TraceMetadata(recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb", program: "bench", args: @[], workdir: "/tmp")
   # M24a-1: this helper writes a SPEC-framed exec stream, so the bundle must
   # set has_step_stream for the FFI reader to pick the SPEC layout.
-  let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/bench.py"], hasStepStream = true)
+  # M24a-2: likewise a SPEC-framed value stream ⇒ set has_value_stream.
+  let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/bench.py"],
+    hasStepStream = true, hasValueStream = true)
   doAssert metaWr.isOk
 
   let tabRes = initTraceInterningTables(ctfs)
@@ -213,6 +220,8 @@ proc writeLargeTrace(numSteps: int, chunkSize: int = DefaultExecChunkSize): seq[
 
   let flushRes = ctfs.flush(execW)
   doAssert flushRes.isOk
+  let valFlush = value_stream.flush(ctfs, valW)
+  doAssert valFlush.isOk
 
   result = ctfs.toBytes()
   ctfs.closeCtfs()

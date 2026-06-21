@@ -1040,6 +1040,14 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   if flushRes.isErr:
     return err("failed to flush exec stream: " & flushRes.error)
 
+  # M24a-2: flush the last partial values.dat chunk and finalize the companion
+  # values.idx.  This makes the Nim-written `values.dat` byte-compatible with
+  # the Rust `ValueStreamReader` (the SPEC chunked layout); it must run before
+  # meta.dat so the has_value_stream flag (set below) is accurate.
+  let valFlushRes = value_stream.flush(w.ctfs, w.valueWriter)
+  if valFlushRes.isErr:
+    return err("failed to flush value stream: " & valFlushRes.error)
+
   # Emit source_views.dat / source_views.off when the writer has any
   # alternate-view records buffered.  Skipped entirely when none have
   # been registered so pre-extension traces remain byte-for-byte
@@ -1104,7 +1112,14 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
     # the has_step_stream capability flag (bit 9).  The flag both gates the
     # Rust/db-backend seekable step path AND, for the Nim FFI reader, marks the
     # bundle as SPEC-framed (vs the legacy Nim-v4 framing that never set it).
-    hasStepStream = true)
+    hasStepStream = true,
+    # M24a-2: the writer ALWAYS emits a dedicated values.dat/values.idx value
+    # stream (initValueStreamWriter above) in the SPEC-canonical chunked layout,
+    # so stamp the has_value_stream capability flag (bit 10).  The flag both
+    # gates the Rust/db-backend seekable value path AND, for the Nim FFI reader,
+    # marks the bundle as SPEC-framed (vs the legacy Nim-v4 .off VRT framing
+    # that never set it).
+    hasValueStream = true)
   if metaRes.isErr:
     return err("failed to write meta.dat: " & metaRes.error)
 

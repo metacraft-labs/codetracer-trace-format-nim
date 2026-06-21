@@ -815,7 +815,14 @@ proc stepAbsoluteGlobalLineIndices*(r: var NewTraceReader,
 
 proc ensureValueReader(r: var NewTraceReader): Result[void, string] =
   if not r.valueLoaded:
-    let res = initValueStreamReader(r.data, r.blockSize, r.maxEntries)
+    # M24a-2: select the values.dat/values.idx framing by the meta.dat
+    # ``has_value_stream`` flag.  Bundles written by the current Nim writer
+    # (and by the Rust writer) set the flag and use the SPEC-canonical chunked
+    # layout that the Rust ``ValueStreamReader`` reads byte-for-byte.  Pre-M24a-2
+    # Nim-v4 bundles never set the flag and use the legacy ``.off`` VRT framing;
+    # ``legacy = not hasValueStream`` keeps them readable.
+    let res = initValueStreamReader(r.data, r.blockSize, r.maxEntries,
+      legacy = not r.meta.hasValueStream)
     if res.isErr: return err(res.error)
     r.valueReader = res.get()
     r.valueLoaded = true

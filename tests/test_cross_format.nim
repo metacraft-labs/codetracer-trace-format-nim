@@ -73,7 +73,8 @@ proc test_new_format_write_read_roundtrip() =
   )
   let paths = @["/src/main.py", "/src/utils.py"]
   let metaWr = ctfs.writeMetaDat(metaFile, meta, paths,
-    recorderId = "cross-format-test", hasStepStream = true)
+    recorderId = "cross-format-test", hasStepStream = true,
+    hasValueStream = true)
   doAssert metaWr.isOk, "writeMetaDat failed"
 
   # interning tables
@@ -156,6 +157,7 @@ proc test_new_format_write_read_roundtrip() =
 
   let flushRes = ctfs.flush(execW)
   doAssert flushRes.isOk
+  doAssert value_stream.flush(ctfs, valW).isOk
 
   let traceBytes = ctfs.toBytes()
   ctfs.closeCtfs()
@@ -360,7 +362,8 @@ proc test_both_formats_produce_valid_ctfs() =
   doAssert metaFileRes.isOk
   var metaFile = metaFileRes.get()
   let meta = TraceMetadata(recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb", program: "compat_test", args: @[], workdir: "/tmp")
-  let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/test.py"], hasStepStream = true)
+  let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/test.py"],
+    hasStepStream = true, hasValueStream = true)
   doAssert metaWr.isOk
 
   let tabRes = initTraceInterningTables(ctfs)
@@ -382,6 +385,7 @@ proc test_both_formats_produce_valid_ctfs() =
   doAssert v0.isOk
   let flushRes = ctfs.flush(execW)
   doAssert flushRes.isOk
+  doAssert value_stream.flush(ctfs, valW).isOk
 
   let newData = ctfs.toBytes()
   ctfs.closeCtfs()

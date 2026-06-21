@@ -19,10 +19,26 @@ import codetracer_trace_writer/exec_stream
 import codetracer_trace_writer/value_stream
 import codetracer_trace_writer/call_stream
 import codetracer_trace_writer/io_event_stream
+import codetracer_trace_writer/cbor
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+proc cborInt(value: int64, typeId: uint64): seq[byte] {.raises: [].} =
+  ## Real CBOR Int ValueRecord (top-level type_id == typeId) so the SPEC value
+  ## reader reconstructs VariableValue.typeId exactly (M24a-2 wire format).
+  var enc = CborEncoder.init()
+  enc.encodeCborValueRecord(ValueRecord(
+    kind: vrkInt, intVal: value, intTypeId: TypeId(typeId)))
+  enc.getBytes()
+
+proc cborStr(text: string, typeId: uint64): seq[byte] {.raises: [].} =
+  ## Real CBOR String ValueRecord (top-level type_id == typeId).
+  var enc = CborEncoder.init()
+  enc.encodeCborValueRecord(ValueRecord(
+    kind: vrkString, text: text, strTypeId: TypeId(typeId)))
+  enc.getBytes()
 
 proc toBytes(s: string): seq[byte] {.raises: [].} =
   result = newSeq[byte](s.len)
@@ -157,8 +173,8 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
     kind: sekAbsoluteStep, globalLineIndex: step0Idx))
   doAssert wr0.isOk, "step0 failed: " & wr0.error
   let vr0 = ctfs.writeStepValues(valWriter, @[
-    VariableValue(varnameId: 0, typeId: 0, data: "42".toBytes),
-    VariableValue(varnameId: 1, typeId: 1, data: "hello".toBytes),
+    VariableValue(varnameId: 0, typeId: 0, data: cborInt(42, 0)),
+    VariableValue(varnameId: 1, typeId: 1, data: cborStr("hello", 1)),
   ])
   doAssert vr0.isOk, "values0 failed: " & vr0.error
 
@@ -167,8 +183,8 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
     kind: sekDeltaStep, lineDelta: 1))
   doAssert wr1.isOk, "step1 failed: " & wr1.error
   let vr1 = ctfs.writeStepValues(valWriter, @[
-    VariableValue(varnameId: 0, typeId: 0, data: "42".toBytes),
-    VariableValue(varnameId: 1, typeId: 1, data: "hello".toBytes),
+    VariableValue(varnameId: 0, typeId: 0, data: cborInt(42, 0)),
+    VariableValue(varnameId: 1, typeId: 1, data: cborStr("hello", 1)),
   ])
   doAssert vr1.isOk, "values1 failed: " & vr1.error
 
@@ -177,9 +193,9 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
     kind: sekDeltaStep, lineDelta: 1))
   doAssert wr2.isOk, "step2 failed: " & wr2.error
   let vr2 = ctfs.writeStepValues(valWriter, @[
-    VariableValue(varnameId: 0, typeId: 0, data: "42".toBytes),
-    VariableValue(varnameId: 1, typeId: 1, data: "hello".toBytes),
-    VariableValue(varnameId: 2, typeId: 0, data: "52".toBytes),
+    VariableValue(varnameId: 0, typeId: 0, data: cborInt(42, 0)),
+    VariableValue(varnameId: 1, typeId: 1, data: cborStr("hello", 1)),
+    VariableValue(varnameId: 2, typeId: 0, data: cborInt(52, 0)),
   ])
   doAssert vr2.isOk, "values2 failed: " & vr2.error
 
@@ -188,9 +204,9 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
     kind: sekDeltaStep, lineDelta: 1))
   doAssert wr3.isOk, "step3 failed: " & wr3.error
   let vr3 = ctfs.writeStepValues(valWriter, @[
-    VariableValue(varnameId: 0, typeId: 0, data: "42".toBytes),
-    VariableValue(varnameId: 1, typeId: 1, data: "hello".toBytes),
-    VariableValue(varnameId: 2, typeId: 0, data: "52".toBytes),
+    VariableValue(varnameId: 0, typeId: 0, data: cborInt(42, 0)),
+    VariableValue(varnameId: 1, typeId: 1, data: cborStr("hello", 1)),
+    VariableValue(varnameId: 2, typeId: 0, data: cborInt(52, 0)),
   ])
   doAssert vr3.isOk, "values3 failed: " & vr3.error
 
@@ -264,6 +280,8 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
   # ------ 11. Flush all streams ------
   let flushExec = ctfs.flush(execWriter)
   doAssert flushExec.isOk, "flush exec failed: " & flushExec.error
+  let flushVal = value_stream.flush(ctfs, valWriter)
+  doAssert flushVal.isOk, "flush value failed: " & flushVal.error
 
   # ------ 12. Serialize to bytes ------
   let ctfsBytes = ctfs.toBytes()
@@ -274,7 +292,9 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
   doAssert hasInternalFile(ctfsBytes, "steps.dat"), "missing steps.dat"
   doAssert hasInternalFile(ctfsBytes, "steps.idx"), "missing steps.idx"
   doAssert hasInternalFile(ctfsBytes, "values.dat"), "missing values.dat"
-  doAssert hasInternalFile(ctfsBytes, "values.off"), "missing values.off"
+  # M24a-2: the value stream now uses the SPEC chunked layout — companion index
+  # is values.idx (seekable chunk offsets), not the legacy .off VRT offset table.
+  doAssert hasInternalFile(ctfsBytes, "values.idx"), "missing values.idx"
   doAssert hasInternalFile(ctfsBytes, "calls.dat"), "missing calls.dat"
   # CTFS-M20: the call stream is now chunked-Zstd calls.dat + a seekable
   # calls.idx (replacing the pre-M20 calls.off VariableRecordTable layout).
@@ -416,7 +436,7 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
   # 14d. Value stream
   let valReaderRes = initValueStreamReader(ctfsBytes)
   doAssert valReaderRes.isOk, "value reader failed: " & valReaderRes.error
-  let valReader = valReaderRes.get()
+  var valReader = valReaderRes.get()
   doAssert valReader.count() == 8, "value count mismatch: " & $valReader.count()
 
   # Step 0: x=42, y="hello"
@@ -425,17 +445,17 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
   doAssert vals0.get().len == 2, "step0 values count: " & $vals0.get().len
   doAssert vals0.get()[0].varnameId == 0, "step0 val0 varnameId"
   doAssert vals0.get()[0].typeId == 0, "step0 val0 typeId"
-  doAssert vals0.get()[0].data == "42".toBytes, "step0 val0 data"
+  doAssert vals0.get()[0].data == cborInt(42, 0), "step0 val0 data"
   doAssert vals0.get()[1].varnameId == 1, "step0 val1 varnameId"
   doAssert vals0.get()[1].typeId == 1, "step0 val1 typeId"
-  doAssert vals0.get()[1].data == "hello".toBytes, "step0 val1 data"
+  doAssert vals0.get()[1].data == cborStr("hello", 1), "step0 val1 data"
 
   # Step 2: x=42, y="hello", result=52
   let vals2 = valReader.readStepValues(2)
   doAssert vals2.isOk, "readStepValues 2 failed: " & vals2.error
   doAssert vals2.get().len == 3, "step2 values count: " & $vals2.get().len
   doAssert vals2.get()[2].varnameId == 2, "step2 val2 varnameId"
-  doAssert vals2.get()[2].data == "52".toBytes, "step2 val2 data"
+  doAssert vals2.get()[2].data == cborInt(52, 0), "step2 val2 data"
 
   # Step 4: empty values (entering try block)
   let vals4 = valReader.readStepValues(4)
@@ -606,6 +626,7 @@ proc bench_multi_stream_write_throughput() {.raises: [].} =
   # Flush
   let flushRes = ctfs.flush(execW)
   doAssert flushRes.isOk
+  doAssert value_stream.flush(ctfs, valW).isOk
 
   let elapsed = cpuTime() - startTime
   let totalEvents = totalSteps + totalCalls + totalIOEvents
@@ -673,6 +694,7 @@ proc bench_multi_stream_trace_size() {.raises: [].} =
 
   let flushRes = ctfs.flush(execW)
   doAssert flushRes.isOk
+  doAssert value_stream.flush(ctfs, valW).isOk
 
   let ctfsBytes = ctfs.toBytes()
   let newFormatSize = ctfsBytes.len
