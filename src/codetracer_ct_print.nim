@@ -377,6 +377,7 @@ proc printMetaJsonV4(reader: var NewTraceReader) =
   flagsObj["has_call_stream"] = newJBool(reader.meta.hasCallStream)
   flagsObj["has_step_stream"] = newJBool(reader.meta.hasStepStream)
   flagsObj["has_value_stream"] = newJBool(reader.meta.hasValueStream)
+  flagsObj["has_io_event_stream"] = newJBool(reader.meta.hasIoEventStream)
   meta["flags"] = flagsObj
 
   if reader.meta.hasFilterProvenance:
@@ -783,6 +784,7 @@ proc buildFullDocument(reader: var NewTraceReader,
   flagsObj["has_call_stream"] = newJBool(reader.meta.hasCallStream)
   flagsObj["has_step_stream"] = newJBool(reader.meta.hasStepStream)
   flagsObj["has_value_stream"] = newJBool(reader.meta.hasValueStream)
+  flagsObj["has_io_event_stream"] = newJBool(reader.meta.hasIoEventStream)
   meta["flags"] = flagsObj
 
   # ----- trace_filter provenance (TF-M7, spec §7) -----

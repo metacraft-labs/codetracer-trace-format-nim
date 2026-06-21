@@ -162,6 +162,24 @@ const
     ## M22.  Must match
     ## ``codetracer_trace_writer::meta_dat::FLAG_HAS_VALUE_STREAM`` (Rust)
     ## and the db-backend ``FLAG_HAS_VALUE_STREAM`` bit 10.
+  FlagHasIoEventStream*: uint16 = 0x800          # bit 11 — M23c
+    ## When set, the materialized `.ct` carries a dedicated I/O event
+    ## stream (`events.dat` + its companion seekable index `events.idx`)
+    ## in addition to the unified event stream.  It holds the
+    ## ``EventLogKind``-tagged I/O / log events
+    ## (stdout/stderr/file/network/error/log) split out of the unified
+    ## stream; each record carries ``kind`` (u8) / ``step_id`` (varint
+    ## cross-reference to the execution stream) / ``metadata`` / ``content``
+    ## (trace-events.md §"IO Event Stream (`events.dat`)").  Like
+    ## ``FlagHasValueStream`` this is ADDITIVE: the unified stream is
+    ## unchanged, and a reader that does not know the bit simply ignores
+    ## `events.dat`/`events.idx`.  NOTE the file naming — the legacy
+    ## combined stream file is `events.log`; this NEW I/O stream is the
+    ## distinct `events.dat` (do not collide the two).  The flag is the
+    ## M23c gate; the event-log pane that paginates `events.dat` consumes
+    ## it later.  Must match
+    ## ``codetracer_trace_writer::meta_dat::FLAG_HAS_IO_EVENT_STREAM``
+    ## (Rust) and the db-backend ``FLAG_HAS_IO_EVENT_STREAM`` bit 11.
   FlagHasCallStream*: uint16 = 0x100             # bit 8 — M17a
     ## When set, the materialized `.ct` carries a dedicated call stream
     ## (`calls.dat` + its companion seekable index `calls.idx`) in
@@ -186,7 +204,8 @@ const
     FlagSupportsColumnMotions or
     FlagHasCallStream or
     FlagHasStepStream or
-    FlagHasValueStream)
+    FlagHasValueStream or
+    FlagHasIoEventStream)
     ## P6.5 (column-extension back-compat): every flag bit this reader
     ## understands.  ``readMetaDat`` rejects any meta.dat whose flag
     ## word has bits outside this mask set, per
@@ -272,6 +291,16 @@ type
       ## values from it directly.  Pre-extension traces always have it
       ## clear; the unified-stream value events remain the source of truth
       ## when it is clear.
+    hasIoEventStream*: bool
+      ## M23c: True iff FlagHasIoEventStream was set on the meta.dat header.
+      ## When set, the trace carries a dedicated `events.dat` I/O event
+      ## stream (plus its companion `events.idx`) alongside the unified
+      ## event stream, holding the ``EventLogKind``-tagged I/O / log events
+      ## (each record: kind / step_id / metadata / content), and the
+      ## event-log pane may paginate it directly.  NOTE: `events.dat` is
+      ## DISTINCT from the legacy combined `events.log`.  Pre-extension
+      ## traces always have it clear; the unified-stream `Event` records
+      ## remain the source of truth when it is clear.
 
 proc writeRawBytes(
     c: var Ctfs, f: var CtfsInternalFile,
@@ -319,6 +348,7 @@ proc writeMetaDat*(
     hasCallStream: bool = false,
     hasStepStream: bool = false,
     hasValueStream: bool = false,
+    hasIoEventStream: bool = false,
 ): Result[void, string] =
   ## Write binary meta.dat to a CTFS internal file.
   ##
@@ -375,6 +405,8 @@ proc writeMetaDat*(
     flags = flags or FlagHasStepStream
   if hasValueStream:
     flags = flags or FlagHasValueStream
+  if hasIoEventStream:
+    flags = flags or FlagHasIoEventStream
   ? c.writeU16LE(f, flags)
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.
@@ -513,6 +545,7 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
   contents.hasCallStream = (flags and FlagHasCallStream) != 0
   contents.hasStepStream = (flags and FlagHasStepStream) != 0
   contents.hasValueStream = (flags and FlagHasValueStream) != 0
+  contents.hasIoEventStream = (flags and FlagHasIoEventStream) != 0
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1, required
   # in v3+: a malformed or missing id rejects the trace at parse time.
@@ -656,6 +689,7 @@ proc writeMetaDatToBuffer*(
     hasCallStream: bool = false,
     hasStepStream: bool = false,
     hasValueStream: bool = false,
+    hasIoEventStream: bool = false,
 ): seq[byte] =
   ## Serialize meta.dat to an in-memory byte buffer.
   ## This is the same format as writeMetaDat but without needing a CTFS container.
@@ -709,6 +743,8 @@ proc writeMetaDatToBuffer*(
     flags = flags or FlagHasStepStream
   if hasValueStream:
     flags = flags or FlagHasValueStream
+  if hasIoEventStream:
+    flags = flags or FlagHasIoEventStream
   result.appendU16LE(flags)
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.
