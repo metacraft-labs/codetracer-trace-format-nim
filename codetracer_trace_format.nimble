@@ -53,6 +53,7 @@ task test, "Run all tests":
   exec "nim c -r -p:src tests/test_split_trace.nim"
   exec "nim c -r -p:src tests/test_trace_storage_config.nim"
   exec "nim c -r -p:src tests/test_path_filter.nim"
+  exec "nim c -r -d:release -p:src tests/test_ct_print_events_log_fallback.nim"
 
 task regenerateFixtures, "Regenerate .expected golden fixture files":
   exec "nim c -r tests/generate_golden_fixtures.nim"

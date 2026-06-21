@@ -256,6 +256,26 @@ proc readInternalFile*(data: openArray[byte], name: string,
 
   ok(fileBytes)
 
+proc hasInternalFile*(data: openArray[byte], name: string,
+    maxEntries: uint32 = DefaultMaxRootEntries): bool =
+  ## Return true iff the CTFS root directory carries an internal file with
+  ## the given name.  Used by readers to decide which stream layout a bundle
+  ## advertises (e.g. ``steps.dat`` for the split execution stream vs the
+  ## legacy combined ``events.log``).  A name whose root entry has both a
+  ## zero size AND a zero map block is treated as absent, matching the
+  ## sentinel the writer leaves for unallocated root slots.
+  let encoded = base40Encode(name)
+  for i in 0 ..< int(maxEntries):
+    let off = HeaderSize + ExtHeaderSize + i * FileEntrySize
+    if off + FileEntrySize > data.len:
+      break
+    let entryName = readU64LE(data, off + 16)
+    if entryName == encoded:
+      let entrySize = readU64LE(data, off)
+      let entryMap = readU64LE(data, off + 8)
+      return not (entrySize == 0'u64 and entryMap == 0'u64)
+  false
+
 proc hasCtfsMagic*(data: openArray[byte]): bool =
   ## Check whether the first bytes match the CTFS magic.
   if data.len < 5:

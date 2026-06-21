@@ -1540,8 +1540,50 @@ proc main() =
     of adkV4MultiStream, adkUnreadable:
       discard  # fall through to v4 reader (or v2/v3 reader if v4 fails)
 
-  # Try v4 multi-stream reader first
-  let newReaderRes = openNewTrace(filePath)
+  # M23e-1: decide between the split-stream (v4) reader and the legacy
+  # combined-stream (`events.log`) reader by inspecting the on-disk layout.
+  #
+  # The v4 ``NewTraceReader`` sources every event from the split per-kind
+  # streams (``steps.dat`` / ``calls.dat`` / ``values.dat`` / ``events.dat``
+  # + the four interning tables) and NEVER consults ``events.log``.  It opens
+  # successfully on ANY CTFS bundle that merely carries ``meta.dat`` + the
+  # interning tables — including a legacy bundle that has ONLY ``events.log``
+  # and no split streams.  In that degenerate case the lazy stream readers
+  # find nothing and ct-print silently emitted an (almost) empty event array.
+  #
+  # Prefer the split streams when the bundle advertises them (``steps.dat``
+  # present); otherwise, when the bundle is a legacy combined-stream trace
+  # (``events.log`` present, no ``steps.dat``), fall through to the v2/v3
+  # reader below which decodes ``events.log``.  A bundle that carries BOTH
+  # (the additive transition format the canonical Rust writer emits) is read
+  # via the split streams — they are derived from the same event sequence as
+  # ``events.log`` so the split path is the authoritative, richer view.
+  # Follow mode keeps its existing v4 polling path untouched — it reopens the
+  # trace each tick and is only meaningful for a live split-stream writer.
+  var preferSplit = true
+  block decideLayout:
+    if follow:
+      break decideLayout
+    let dataR = ctfs_container.readCtfsFromFile(filePath)
+    if dataR.isErr:
+      break decideLayout  # unreadable here ⇒ let openNewTrace surface the error
+    let layoutBytes = dataR.get()
+    if not ctfs_container.hasCtfsMagic(layoutBytes):
+      break decideLayout  # non-CTFS ⇒ legacy v2/v3 reader handles it below
+    let hasSplitSteps = ctfs_container.hasInternalFile(layoutBytes, "steps.dat")
+    let hasEventsLog = ctfs_container.hasInternalFile(layoutBytes, "events.log")
+    # Only divert to the legacy reader when the split execution stream is
+    # absent AND a combined ``events.log`` is present.  This keeps every
+    # existing split bundle (with or without ``events.log``) on the v4 path
+    # byte-for-byte, and only rescues the events.log-only legacy bundle.
+    if not hasSplitSteps and hasEventsLog:
+      preferSplit = false
+
+  # Try v4 multi-stream reader first (unless the layout check above selected
+  # the legacy combined-stream reader for an events.log-only bundle).
+  let newReaderRes =
+    if preferSplit: openNewTrace(filePath)
+    else: Result[NewTraceReader, string].err("events.log-only: use legacy reader")
   if newReaderRes.isOk:
     if follow:
       followV4(filePath, pollMs)
