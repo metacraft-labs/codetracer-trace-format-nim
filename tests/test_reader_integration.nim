@@ -164,6 +164,9 @@ proc writeFullTrace(): seq[byte] {.raises: [].} =
       children: @[]))
     doAssert cw.isOk
 
+  # CTFS-M20: finalize the call stream (flush last chunk + write calls.idx).
+  doAssert finalizeCallStream(ctfs, callW).isOk
+
   # Write 5 IO events
   for i in 0 ..< 5:
     let kind = if i < 3: ioStdout else: ioStderr
@@ -542,6 +545,9 @@ proc writeTraceWithSortedCalls(): seq[byte] {.raises: [].} =
       args: @[], returnValue: intToStr(i).toBytes, exception: @[],
       children: @[]))
     doAssert cw.isOk
+
+  # CTFS-M20: finalize the call stream (flush last chunk + write calls.idx).
+  doAssert finalizeCallStream(ctfs, callW).isOk
 
   let flushRes = ctfs.flush(execW)
   doAssert flushRes.isOk

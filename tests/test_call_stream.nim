@@ -77,10 +77,12 @@ proc test_call_stream_write_read() {.raises: [].} =
     let r = writeCall(ctfs, writer, rec)
     doAssert r.isOk, "writeCall failed at index " & $i & ": " & r.error
 
+  let finRes = finalizeCallStream(ctfs, writer)
+  doAssert finRes.isOk, "finalizeCallStream failed: " & finRes.error
   let rawBytes = ctfs.toBytes()
   let readerRes = initCallStreamReader(rawBytes)
   doAssert readerRes.isOk, "initCallStreamReader failed: " & readerRes.error
-  let reader = readerRes.get()
+  var reader = readerRes.get()
   doAssert reader.count == uint64(numRecords),
     "count mismatch: got " & $reader.count & " expected " & $numRecords
 
@@ -147,10 +149,12 @@ proc test_call_stream_void_return() {.raises: [].} =
   let r = writeCall(ctfs, writer, rec)
   doAssert r.isOk
 
+  let finRes = finalizeCallStream(ctfs, writer)
+  doAssert finRes.isOk
   let rawBytes = ctfs.toBytes()
   let readerRes = initCallStreamReader(rawBytes)
   doAssert readerRes.isOk
-  let reader = readerRes.get()
+  var reader = readerRes.get()
 
   let got = readCall(reader, 0)
   doAssert got.isOk
@@ -191,10 +195,12 @@ proc test_call_stream_exception_exit() {.raises: [].} =
   let r = writeCall(ctfs, writer, rec)
   doAssert r.isOk
 
+  let finRes = finalizeCallStream(ctfs, writer)
+  doAssert finRes.isOk
   let rawBytes = ctfs.toBytes()
   let readerRes = initCallStreamReader(rawBytes)
   doAssert readerRes.isOk
-  let reader = readerRes.get()
+  var reader = readerRes.get()
 
   let got = readCall(reader, 0)
   doAssert got.isOk
@@ -250,10 +256,12 @@ proc test_call_stream_nested_calls() {.raises: [].} =
     let rc = writeCall(ctfs, writer, child)
     doAssert rc.isOk
 
+  let finRes = finalizeCallStream(ctfs, writer)
+  doAssert finRes.isOk
   let rawBytes = ctfs.toBytes()
   let readerRes = initCallStreamReader(rawBytes)
   doAssert readerRes.isOk
-  let reader = readerRes.get()
+  var reader = readerRes.get()
   doAssert reader.count == 6
 
   # Verify parent
@@ -298,10 +306,12 @@ proc bench_call_tree_viewport_load() {.raises: [].} =
     let r = writeCall(ctfs, writer, rec)
     doAssert r.isOk
 
+  let finRes = finalizeCallStream(ctfs, writer)
+  doAssert finRes.isOk
   let rawBytes = ctfs.toBytes()
   let readerRes = initCallStreamReader(rawBytes)
   doAssert readerRes.isOk
-  let reader = readerRes.get()
+  var reader = readerRes.get()
 
   # Time loading 30 calls (simulating a viewport)
   let startTime = cpuTime()

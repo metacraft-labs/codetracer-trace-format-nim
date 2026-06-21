@@ -145,6 +145,9 @@ proc test_new_format_write_read_roundtrip() =
     returnValue: "hello".toBytes, exception: @[], children: @[]))
   doAssert cw1.isOk
 
+  # CTFS-M20: finalize the call stream (flush last chunk + write calls.idx).
+  doAssert finalizeCallStream(ctfs, callW).isOk
+
   # Write IO event
   let ioWr = ctfs.writeEvent(ioW, IOEvent(
     kind: ioStdout, stepId: 2, data: "hello\n".toBytes))

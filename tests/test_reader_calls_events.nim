@@ -110,6 +110,11 @@ proc writeCallsAndEventsTrace(numCalls: int, numEvents: int): seq[byte] {.raises
       children: children))
     doAssert cr.isOk, "writeCall " & intToStr(i) & " failed: " & cr.error
 
+  # CTFS-M20: flush the last calls.dat chunk and write the companion
+  # calls.idx so the reader can index the seekable call stream.
+  let callFinRes = finalizeCallStream(ctfs, callW)
+  doAssert callFinRes.isOk, "finalizeCallStream failed: " & callFinRes.error
+
   # Write IO events
   let ioRes = initIOEventStreamWriter(ctfs)
   doAssert ioRes.isOk

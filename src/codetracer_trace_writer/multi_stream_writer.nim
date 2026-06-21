@@ -1026,6 +1026,15 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   if drainRes.isErr:
     return err("failed to flush unclosed call records: " & drainRes.error)
 
+  # CTFS-M20: flush the last partial calls.dat chunk and write the companion
+  # calls.idx seek index. This makes the Nim-written `calls.dat` SEEKABLE by
+  # the Rust `CallStreamReader` (db-backend seekable path), byte-compatible
+  # with the Rust writer's calls.dat/calls.idx layout. Must run after the
+  # final flushCompletedCalls (the last writeCall) and before meta.dat.
+  let finalizeRes = call_stream.finalizeCallStream(w.ctfs, w.callWriter)
+  if finalizeRes.isErr:
+    return err("failed to finalize call stream: " & finalizeRes.error)
+
   # Flush exec stream
   let flushRes = w.ctfs.flush(w.execWriter)
   if flushRes.isErr:

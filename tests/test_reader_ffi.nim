@@ -124,6 +124,9 @@ proc writeTestTrace(path: string) =
     returnValue: "43".toBytes,
     exception: @[], children: @[])).isOk
 
+  # CTFS-M20: finalize the call stream (flush last chunk + write calls.idx).
+  doAssert finalizeCallStream(ctfs, callW).isOk
+
   # IO event
   doAssert ctfs.writeEvent(ioW, IOEvent(
     kind: ioStdout, stepId: 1, data: "output\n".toBytes)).isOk

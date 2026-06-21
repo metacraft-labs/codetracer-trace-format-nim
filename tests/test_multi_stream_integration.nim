@@ -257,6 +257,10 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
     exception: "ZeroDivisionError".toBytes, children: @[]))
   doAssert cw2.isOk, "call2 failed: " & cw2.error
 
+  # CTFS-M20: finalize the call stream (flush last chunk + write calls.idx).
+  let callFin = finalizeCallStream(ctfs, callWriter)
+  doAssert callFin.isOk, "finalizeCallStream failed: " & callFin.error
+
   # ------ 11. Flush all streams ------
   let flushExec = ctfs.flush(execWriter)
   doAssert flushExec.isOk, "flush exec failed: " & flushExec.error
@@ -272,7 +276,9 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
   doAssert hasInternalFile(ctfsBytes, "values.dat"), "missing values.dat"
   doAssert hasInternalFile(ctfsBytes, "values.off"), "missing values.off"
   doAssert hasInternalFile(ctfsBytes, "calls.dat"), "missing calls.dat"
-  doAssert hasInternalFile(ctfsBytes, "calls.off"), "missing calls.off"
+  # CTFS-M20: the call stream is now chunked-Zstd calls.dat + a seekable
+  # calls.idx (replacing the pre-M20 calls.off VariableRecordTable layout).
+  doAssert hasInternalFile(ctfsBytes, "calls.idx"), "missing calls.idx"
   doAssert hasInternalFile(ctfsBytes, "events.dat"), "missing events.dat"
   doAssert hasInternalFile(ctfsBytes, "events.off"), "missing events.off"
   doAssert hasInternalFile(ctfsBytes, "paths.dat"), "missing paths.dat"
@@ -439,7 +445,7 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
   # 14e. Call stream
   let callReaderRes = initCallStreamReader(ctfsBytes)
   doAssert callReaderRes.isOk, "call reader failed: " & callReaderRes.error
-  let callReader = callReaderRes.get()
+  var callReader = callReaderRes.get()
   doAssert callReader.count() == 3, "call count mismatch: " & $callReader.count()
 
   # Call 0 (main)
@@ -585,6 +591,10 @@ proc bench_multi_stream_write_throughput() {.raises: [].} =
       depth: 0, args: @[], returnValue: @[VoidReturnMarker],
       exception: @[], children: @[]))
     doAssert cr.isOk
+
+  # CTFS-M20: finalize the call stream (flush last chunk + write calls.idx).
+  let callFin = finalizeCallStream(ctfs, callW)
+  doAssert callFin.isOk
 
   # Write IO events
   for i in 0 ..< totalIOEvents:
