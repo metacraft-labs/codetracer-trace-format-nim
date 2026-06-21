@@ -11,20 +11,25 @@
 ##     tables) — the lazy stream readers then found nothing and ct-print
 ##     silently emitted an (almost) empty event array.  M23e-1 routes such a
 ##     bundle to the legacy `events.log` reader so its events surface.
-##   * A bundle that carries BOTH `events.log` AND the split streams (the
-##     additive transition format the canonical Rust writer emits) is read
-##     via the split streams — they derive from the same event sequence as
-##     `events.log`, so the split view is the authoritative, richer one.
+##   * A bundle that carries `events.log` (with OR without split streams) is
+##     read via the LEGACY `events.log` reader.  M23e-4 boundary: the
+##     production Nim split writer is `events.log`-FREE, so the v4 path is
+##     reserved for it; the SECONDARY Rust `CtfsTraceWriter` emits
+##     `events.log` + split streams additively, but its step/value/io-event
+##     split wire formats are NOT v4-readable — so any `events.log`-bearing
+##     bundle is read via `events.log`.
 ##
 ## What this test pins (the achievable, faithful guarantees):
 ##   1. SPLIT bundle → lowercase `type`-tagged array (`path`/`function`/
 ##      `step`/`call`/…) — the canonical v4 `--json-events` shape the
 ##      reprobuild engine consumes.
-##   2. SPLIT preference: a bundle carrying BOTH a grafted `events.log` and
-##      the split streams reads via the split streams — its `--json-events`
-##      is BYTE-IDENTICAL to the split-only bundle's output.  This is the
-##      directly-testable form of "prefer split when present".
-##   3. events.log FALLBACK safety: an `events.log`-only bundle now produces
+##   2. events.log ROUTING (M23e-4): a bundle carrying BOTH a grafted
+##      `events.log` and the split streams is read via the LEGACY
+##      `events.log` reader (NOT the split path), because an `events.log`-
+##      bearing bundle is treated as a secondary-writer combined bundle whose
+##      splits may not be v4-readable.  Its `--json-events` therefore matches
+##      the events.log-only bundle's legacy output, not the split output.
+##   3. events.log FALLBACK safety: an `events.log`-only bundle produces
 ##      a NON-EMPTY event array (it is routed to the legacy reader) rather
 ##      than the near-empty array the v4 path produced before M23e-1.
 ##
@@ -122,19 +127,21 @@ proc readU64LEloc(buf: seq[byte], off: int): uint64 =
   for i in 0 ..< 8:
     result = result or (uint64(buf[off + i]) shl (8 * i))
 
-proc graftEventsLogInto(splitPath, outPath: string) =
-  ## Produce a COMBINED bundle that carries BOTH layouts (the additive
-  ## transition format) by ADDING an ``events.log`` root-directory entry to
-  ## the split bundle.
+proc graftEntryInto(srcPath, outPath, entryName: string) =
+  ## Produce a COMBINED bundle that carries BOTH layouts by ADDING a
+  ## root-directory entry named ``entryName`` to ``srcPath``.
   ##
   ## We reuse the existing ``meta.dat`` block/size for the new entry's
-  ## payload pointer: the v4 reader NEVER reads ``events.log`` (it sources
-  ## everything from the split streams), so the byte content the entry points
-  ## at is irrelevant — what matters is that ``hasInternalFile("events.log")``
-  ## now reports present while ``steps.dat`` is also present, exercising the
-  ## "both layouts ⇒ prefer split" routing branch.  This keeps the graft a
-  ## pure root-directory edit with no block reallocation.
-  var d = readCtfsFromFile(splitPath).get()
+  ## payload pointer: the routing decision keys only on the PRESENCE of the
+  ## entry name (``hasInternalFile``), never on its byte content, so a filler
+  ## pointer is sufficient and keeps the graft a pure root-directory edit
+  ## with no block reallocation.  We graft a SPLIT stream (``steps.dat``)
+  ## into the events.log bundle so the combined bundle has BOTH an
+  ## (authentic, decodable) ``events.log`` AND a ``steps.dat`` marker —
+  ## exercising the M23e-4 "events.log present ⇒ read via legacy even when a
+  ## split stream is also present" routing branch with a bundle whose
+  ## ``events.log`` is genuinely readable.
+  var d = readCtfsFromFile(srcPath).get()
   const headerSize = 8
   const extHeaderSize = 8
   const feSize = 24
@@ -149,9 +156,9 @@ proc graftEventsLogInto(splitPath, outPath: string) =
       metaSize = readU64LEloc(d, off)
       metaMap = readU64LEloc(d, off + 8)
       break
-  doAssert metaMap != 0, "split bundle has no meta.dat to reuse for graft"
-  # Find the first empty root slot and write an events.log entry into it.
-  let elKey = base40("events.log")
+  doAssert metaMap != 0, "source bundle has no meta.dat to reuse for graft"
+  # Find the first empty root slot and write the new entry into it.
+  let newKey = base40(entryName)
   var grafted = false
   for i in 0 ..< maxEntries:
     let off = headerSize + extHeaderSize + i * feSize
@@ -160,10 +167,10 @@ proc graftEventsLogInto(splitPath, outPath: string) =
        readU64LEloc(d, off + 16) == 0'u64:
       putU64LE(d, off, metaSize)        # size  (filler)
       putU64LE(d, off + 8, metaMap)     # mapBlock (filler)
-      putU64LE(d, off + 16, elKey)      # name = events.log
+      putU64LE(d, off + 16, newKey)     # name = entryName
       grafted = true
       break
-  doAssert grafted, "no empty root slot to graft events.log into"
+  doAssert grafted, "no empty root slot to graft " & entryName & " into"
   writeFile(outPath, cast[string](d))
 
 # ---------------------------------------------------------------------------
@@ -214,7 +221,10 @@ let combinedBundle = tmp / "combined.ct"
 
 buildEventsLogBundle(eventsLogBundle)
 discard buildSplitBundle(splitBundle)
-graftEventsLogInto(splitBundle, combinedBundle)
+# Combined bundle: the events.log bundle (authentic, decodable events.log) with
+# a grafted ``steps.dat`` marker, so it carries BOTH layouts. M23e-4 routes it
+# via the legacy events.log reader (events.log present ⇒ legacy).
+graftEntryInto(eventsLogBundle, combinedBundle, "steps.dat")
 
 block test_split_is_canonical_lowercase:
   let splitOut = jsonEvents(splitBundle)
@@ -226,18 +236,22 @@ block test_split_is_canonical_lowercase:
   doAssert "call" in types, "split bundle missing 'call': " & $types
   echo "[ok] split bundle emits canonical lowercase type-tagged events"
 
-block test_split_preferred_when_both_present:
-  ## A bundle carrying BOTH events.log and the split streams must read via
-  ## the split streams — its output is BYTE-IDENTICAL to the split-only
-  ## bundle. This is the achievable byte-identity oracle (both reads go
-  ## through the split path).
-  let splitOut = jsonEvents(splitBundle)
+block test_events_log_routes_to_legacy_when_both_present:
+  ## M23e-4: a bundle carrying BOTH events.log and a split-stream marker must
+  ## read via the LEGACY events.log reader — its output is BYTE-IDENTICAL to
+  ## the events.log-only bundle's output (both reads go through the legacy
+  ## path), and DISTINCT from the split-only bundle's lowercase output.
+  let eventsLogOut = jsonEvents(eventsLogBundle)
   let combinedOut = jsonEvents(combinedBundle)
-  doAssert splitOut == combinedOut,
-    "split preference broken: combined (events.log+split) output differs " &
-    "from split-only output.\n--- split ---\n" & splitOut &
+  doAssert eventsLogOut == combinedOut,
+    "events.log routing broken: combined (events.log+steps.dat) output differs " &
+    "from events.log-only output.\n--- events.log ---\n" & eventsLogOut &
     "\n--- combined ---\n" & combinedOut
-  echo "[ok] split preferred when both present (byte-identical to split-only)"
+  let splitOut = jsonEvents(splitBundle)
+  doAssert combinedOut != splitOut,
+    "combined bundle must NOT read via the split path (its events.log is the " &
+    "authoritative source under M23e-4)"
+  echo "[ok] events.log present ⇒ legacy reader even when a split marker is present"
 
 block test_events_log_only_fallback_is_populated:
   ## The events.log-only bundle must now produce a NON-EMPTY event array

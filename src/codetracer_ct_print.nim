@@ -1551,13 +1551,24 @@ proc main() =
   # and no split streams.  In that degenerate case the lazy stream readers
   # find nothing and ct-print silently emitted an (almost) empty event array.
   #
-  # Prefer the split streams when the bundle advertises them (``steps.dat``
-  # present); otherwise, when the bundle is a legacy combined-stream trace
-  # (``events.log`` present, no ``steps.dat``), fall through to the v2/v3
-  # reader below which decodes ``events.log``.  A bundle that carries BOTH
-  # (the additive transition format the canonical Rust writer emits) is read
-  # via the split streams — they are derived from the same event sequence as
-  # ``events.log`` so the split path is the authoritative, richer view.
+  # Prefer the split streams ONLY for the production split-stream format: the
+  # Nim ``MultiStreamTraceWriter`` emits the split per-kind streams and NO
+  # ``events.log``.  The v4 ``NewTraceReader`` is matched to THAT writer's wire
+  # formats.  When a combined ``events.log`` is present we fall through to the
+  # v2/v3 reader, which decodes ``events.log``.
+  #
+  # M23e-4 boundary: the SECONDARY Rust ``CtfsTraceWriter`` now also default-
+  # emits the split streams, but ADDITIVELY — alongside ``events.log`` — and its
+  # ``steps.dat`` / ``values.dat`` / ``events.dat`` wire formats are NOT v4-
+  # readable (the Rust index carries a bare ``[chunk_size][offsets…]`` layout
+  # with header-less, content-size-omitting zstd chunks, whereas the v4 exec/
+  # value/event readers expect a ``total_events`` header+trailer, a per-chunk
+  # u32 count, and pledged-content-size frames; only ``calls.dat`` (M20) and the
+  # interning tables (M23d) were cross-matched).  Routing such a bundle through
+  # the v4 reader would yield an empty/garbled event array.  So ANY bundle that
+  # carries ``events.log`` is read via the legacy reader — production Nim split
+  # bundles are ``events.log``-free and stay on the v4 path byte-for-byte; the
+  # secondary Rust-writer combined bundle reads correctly via ``events.log``.
   # Follow mode keeps its existing v4 polling path untouched — it reopens the
   # trace each tick and is only meaningful for a live split-stream writer.
   var preferSplit = true
@@ -1570,13 +1581,13 @@ proc main() =
     let layoutBytes = dataR.get()
     if not ctfs_container.hasCtfsMagic(layoutBytes):
       break decideLayout  # non-CTFS ⇒ legacy v2/v3 reader handles it below
-    let hasSplitSteps = ctfs_container.hasInternalFile(layoutBytes, "steps.dat")
     let hasEventsLog = ctfs_container.hasInternalFile(layoutBytes, "events.log")
-    # Only divert to the legacy reader when the split execution stream is
-    # absent AND a combined ``events.log`` is present.  This keeps every
-    # existing split bundle (with or without ``events.log``) on the v4 path
-    # byte-for-byte, and only rescues the events.log-only legacy bundle.
-    if not hasSplitSteps and hasEventsLog:
+    # Divert to the legacy reader whenever a combined ``events.log`` is present.
+    # The v4 split readers are matched only to the production Nim writer's
+    # ``events.log``-free split bundles; a bundle WITH ``events.log`` is a
+    # secondary Rust-writer combined bundle whose split streams are not v4-
+    # readable for steps/values/events, so we read its ``events.log`` instead.
+    if hasEventsLog:
       preferSplit = false
 
   # Try v4 multi-stream reader first (unless the layout check above selected
