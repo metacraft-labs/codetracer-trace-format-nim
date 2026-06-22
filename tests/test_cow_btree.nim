@@ -15,6 +15,7 @@
 ## verification lives here. A companion Rust test proves a CoW-written image is
 ## readable by selecting the highest-valid-commit-id root.
 
+import std/[os, strutils]
 import codetracer_ctfs/cow_btree
 
 proc descA(key: uint64): seq[byte] =
@@ -274,6 +275,74 @@ proc test_serialize_roundtrip() =
     doAssert t2.lookup(i).get() == d, "roundtrip mismatch for " & $i
   echo "PASS: test_serialize_roundtrip"
 
+# --- Rust → Nim cross-read (M4) ---------------------------------------------
+
+proc parseHexLE(hex: string): seq[byte] {.raises: [ValueError].} =
+  result = newSeq[byte](hex.len div 2)
+  for i in 0 ..< result.len:
+    result[i] = byte(parseHexInt(hex[i * 2 ..< i * 2 + 2]))
+
+proc test_reads_rust_written_cow_image() =
+  ## M4 — the Nim `loadCowBTree` reader reads back a CoW namespace image written
+  ## by the RUST writer (`cow_namespace_writer.rs`), resolving every
+  ## `(key → descriptor)` in the Rust-generated manifest. This is the reverse of
+  ## the Rust `rust_reader_round_trips_nim_cow_image` cross-read and closes the
+  ## bidirectional wire-format loop: the M5/M6 Rust replay-time write path
+  ## persists `coverage.tc` + tagged maps via the Rust writer, so its on-disk
+  ## format must be readable by the Nim side too.
+  ##
+  ## The fixture is produced by the codetracer-side Rust test
+  ## `gen_rust_written_cow_fixture_for_nim`. It lives in the sibling `codetracer`
+  ## repo; the test SKIPS cleanly when that sibling / fixture is absent.
+  let here = currentSourcePath().parentDir()  # codetracer-trace-format-nim/tests
+  # Walk to the workspace root (../../..) and into the codetracer fixtures dir.
+  let fixtureDir = here.parentDir().parentDir() /
+    "codetracer" / "src" / "db-backend" / "tests" / "fixtures" / "cow_namespace"
+  let imagePath = fixtureDir / "cow_btree_rust_typea.cowbt"
+  let manifestPath = fixtureDir / "cow_btree_rust_typea.manifest"
+
+  if not fileExists(imagePath) or not fileExists(manifestPath):
+    echo "SKIPPED: test_reads_rust_written_cow_image (fixture absent at " &
+      imagePath & "; run the Rust gen_rust_written_cow_fixture_for_nim test)"
+    return
+
+  var image: seq[byte]
+  var manifest: string
+  try:
+    let raw = readFile(imagePath)
+    image = newSeq[byte](raw.len)
+    for i in 0 ..< raw.len: image[i] = byte(raw[i])
+    manifest = readFile(manifestPath)
+  except IOError, OSError:
+    echo "SKIPPED: test_reads_rust_written_cow_image (fixture unreadable)"
+    return
+
+  let loaded = loadCowBTreeForTest(image, cltTypeA)
+  doAssert loaded.isOk, "Nim reader rejected a Rust-written CoW image"
+  let t = loaded.get()
+  doAssert t.committedRoot() != 0, "reader must select a committed root"
+
+  var checked = 0
+  for line in manifest.splitLines():
+    let trimmed = line.strip()
+    if trimmed.len == 0: continue
+    let parts = trimmed.splitWhitespace()
+    doAssert parts.len == 2, "bad manifest line: " & trimmed
+    var key: uint64
+    var want: seq[byte]
+    try:
+      key = parseBiggestUInt(parts[0])
+      want = parseHexLE(parts[1])
+    except ValueError:
+      doAssert false, "unparseable manifest line: " & trimmed
+      return
+    let got = t.lookup(key)
+    doAssert got.isOk, "Nim lookup of Rust-written key " & $key & " failed"
+    doAssert got.get() == want, "descriptor mismatch for key " & $key
+    checked += 1
+  doAssert checked > 0, "manifest listed no keys"
+  echo "PASS: test_reads_rust_written_cow_image (" & $checked & " keys)"
+
 when isMainModule:
   test_basic_insert_lookup()
   test_update_existing_key()
@@ -284,4 +353,5 @@ when isMainModule:
   test_freelist_whole_block_reclaim()
   test_btree_page_reclaimed_after_oldest_reader()
   test_serialize_roundtrip()
+  test_reads_rust_written_cow_image()
   echo "All CoW B-tree tests passed."
