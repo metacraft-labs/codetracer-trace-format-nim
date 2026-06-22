@@ -1,3 +1,6 @@
+when defined(nimPreviewSlimSystem):
+  import std/assertions  # doAssert is not in `system` under slim-system
+
 {.push raises: [].}
 
 ## M51: Configurable replication for CTFS storage nodes.

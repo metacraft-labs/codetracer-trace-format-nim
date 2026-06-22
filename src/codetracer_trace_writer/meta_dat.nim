@@ -1,3 +1,6 @@
+when defined(nimPreviewSlimSystem):
+  import std/assertions  # doAssert is not in `system` under slim-system
+
 {.push raises: [].}
 
 ## Binary meta.dat writer for CTFS trace metadata.

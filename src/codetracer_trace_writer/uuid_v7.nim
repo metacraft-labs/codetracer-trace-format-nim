@@ -1,3 +1,6 @@
+when defined(nimPreviewSlimSystem):
+  import std/assertions  # doAssert is not in `system` under slim-system
+
 {.push raises: [].}
 
 ## UUIDv7 generator and validator (RFC 9562, May 2024).
