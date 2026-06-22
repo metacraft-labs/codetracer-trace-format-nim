@@ -2263,6 +2263,22 @@ proc ct_reader_open(path: cstring): pointer {.exportc, cdecl, dynlib.} =
   h[] = res.get()
   return cast[pointer](h)
 
+proc ct_reader_refresh(h: pointer, path: cstring): cint {.exportc, cdecl, dynlib.} =
+  ## Refresh an existing reader handle from the same growing .ct path.
+  ## Returns 0 on success, non-zero on error.
+  if h.isNil:
+    setError("NULL reader handle")
+    return 1
+  if path.isNil:
+    setError("NULL path")
+    return 1
+  let rh = cast[TraceReaderHandle](h)
+  let res = rh[].refresh($path)
+  if res.isErr:
+    setError(res.error)
+    return 1
+  return 0
+
 proc ct_reader_close(h: pointer) {.exportc, cdecl, dynlib.} =
   ## Close and free a reader handle. Passing NULL is a no-op.
   if h.isNil:

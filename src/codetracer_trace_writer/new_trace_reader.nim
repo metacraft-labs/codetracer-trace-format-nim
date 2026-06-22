@@ -402,6 +402,15 @@ proc openNewTrace*(path: string): Result[NewTraceReader, string] =
 
   openNewTraceFromBytes(data)
 
+proc refresh*(r: var NewTraceReader, path: string): Result[void, string] =
+  ## Re-read a growing CTFS container into this handle and invalidate every
+  ## lazily-opened stream reader whose chunk table may have grown.
+  let reopened = openNewTrace(path)
+  if reopened.isErr:
+    return err(reopened.error)
+  r = reopened.get()
+  ok()
+
 # ---------------------------------------------------------------------------
 # Interning table accessors
 # ---------------------------------------------------------------------------
