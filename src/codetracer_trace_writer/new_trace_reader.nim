@@ -974,7 +974,14 @@ proc callRange*(r: var NewTraceReader, start, count: uint64,
 
 proc ensureIOEventReader(r: var NewTraceReader): Result[void, string] =
   if not r.ioEventLoaded:
-    let res = initIOEventStreamReader(r.data, r.blockSize, r.maxEntries)
+    # M24a-3: select the events.dat/events.idx framing by the meta.dat
+    # ``has_io_event_stream`` flag.  Bundles written by the current Nim writer
+    # (and by the Rust writer) set the flag and use the SPEC-canonical chunked
+    # layout that the Rust ``IoEventStreamReader`` reads byte-for-byte.
+    # Pre-M24a-3 Nim-v4 bundles never set the flag and use the legacy ``.off``
+    # VRT framing; ``legacy = not hasIoEventStream`` keeps them readable.
+    let res = initIOEventStreamReader(r.data, r.blockSize, r.maxEntries,
+      legacy = not r.meta.hasIoEventStream)
     if res.isErr: return err(res.error)
     r.ioEventReader = res.get()
     r.ioEventLoaded = true

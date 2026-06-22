@@ -62,7 +62,7 @@ proc writeFullTrace(): seq[byte] {.raises: [].} =
   let metaWr = ctfs.writeMetaDat(metaFile, meta,
     @["/src/main.py", "/src/utils.py", "/src/math.py"],
     recorderId = "m21-integration", hasStepStream = true,
-    hasValueStream = true)
+    hasValueStream = true, hasIoEventStream = true)
   doAssert metaWr.isOk
 
   # Interning tables
@@ -180,6 +180,7 @@ proc writeFullTrace(): seq[byte] {.raises: [].} =
   let flushRes = ctfs.flush(execW)
   doAssert flushRes.isOk
   doAssert value_stream.flush(ctfs, valW).isOk
+  doAssert io_event_stream.flush(ctfs, ioW).isOk
 
   result = ctfs.toBytes()
   ctfs.closeCtfs()

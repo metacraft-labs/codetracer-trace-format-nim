@@ -74,7 +74,7 @@ proc test_new_format_write_read_roundtrip() =
   let paths = @["/src/main.py", "/src/utils.py"]
   let metaWr = ctfs.writeMetaDat(metaFile, meta, paths,
     recorderId = "cross-format-test", hasStepStream = true,
-    hasValueStream = true)
+    hasValueStream = true, hasIoEventStream = true)
   doAssert metaWr.isOk, "writeMetaDat failed"
 
   # interning tables
@@ -158,6 +158,7 @@ proc test_new_format_write_read_roundtrip() =
   let flushRes = ctfs.flush(execW)
   doAssert flushRes.isOk
   doAssert value_stream.flush(ctfs, valW).isOk
+  doAssert io_event_stream.flush(ctfs, ioW).isOk
 
   let traceBytes = ctfs.toBytes()
   ctfs.closeCtfs()

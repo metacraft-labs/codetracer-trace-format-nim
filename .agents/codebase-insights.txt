@@ -32,6 +32,31 @@
   is newer — editing a transitive dep (exec_stream.nim) leaves a STALE binary;
   rm -rf /tmp/ctprint_build before running it after such edits.
 
+## M24a-3: events.dat/events.idx are now SPEC-canonical (Rust-reader-compatible)
+- io_event_stream.nim writes the SPEC layout: events.idx = [chunk_size:u32]
+  [offset:u64]... (NO total_events); each events.dat chunk's uncompressed payload
+  is a concatenation of LENGTH-PREFIXED records (varint rec_len + rec_bytes).
+  Each record is `u8 kind (EventLogKind ordinal), varint step_id, len+metadata,
+  len+content` — byte-identical to the Rust event_stream::IoEventRecord::encode.
+  BYTE-COMPATIBLE with codetracer_trace_reader::io_event_stream_reader::
+  IoEventStreamReader. Proof: tests/test_nim_io_event_stream_crossread.nim shells
+  the Rust test nim_io_event_stream_crossread.rs to read the Nim events.dat.
+- The on-disk kind byte is the EventLogKind ordinal (same u8 as events.log), NOT
+  the coarse 4-value IOEventKind. ioEventKindToOrdinal / ordinalToIOEventKind map
+  between them and ROUND-TRIP every IOEventKind (stdout↔Write(0), stderr↔
+  TraceLogEvent(12), file_op↔ReadFile(4), error↔Error(11)). The IOEvent type now
+  also carries `metadata` (previously dropped on the multi-stream path).
+- multi_stream_writer.close() now sets has_io_event_stream (bit 11) and flushes
+  the events chunk. ensureIOEventReader selects framing by the flag: SET ⇒ SPEC,
+  CLEAR ⇒ legacy `.off` VRT (pre-M24a-3 bundles: u8 IOEventKind, varint stepId,
+  len+data, no metadata). initIOEventStreamReader takes `legacy: bool`.
+- readEvent is now `var` (one-chunk decompression cache), like the value reader.
+- The FFI ct_reader_event_fields STILL returns the coarse IOEventKind ordinal
+  {0,1,2,3} (uint8(ev.kind)), so the db-backend's kind mapping is unchanged.
+- Hand-built bundles read via the FFI reader MUST pass hasIoEventStream=true to
+  writeMetaDat + flush the io writer (done in test_reader_integration/
+  test_reader_calls_events/test_cross_format/test_multi_stream_integration).
+
 ## ct-print reader paths (IMPORTANT, M23e context)
 - ct-print has TWO independent readers:
   * `NewTraceReader` (src/codetracer_trace_writer/new_trace_reader.nim) — the

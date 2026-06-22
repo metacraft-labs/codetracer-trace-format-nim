@@ -930,12 +930,21 @@ proc trace_writer_register_special_event(
     return
 
   if handle.useMultiStream:
-    # Combine metadata + content into IO event data
+    # M24a-3: the SPEC events.dat record carries both metadata AND content
+    # (previously the multi-stream path dropped metadata).  Pass them through
+    # so the dedicated I/O event stream is byte-consistent with what the Rust
+    # IoEventStreamReader expects, and so the event-log pane can surface the
+    # event's metadata.
+    let metadataStr = toNimStr(metadata)
+    var metaBytes = newSeq[byte](metadataStr.len)
+    for i in 0 ..< metadataStr.len:
+      metaBytes[i] = byte(metadataStr[i])
     let contentStr = toNimStr(content)
     var data = newSeq[byte](contentStr.len)
     for i in 0 ..< contentStr.len:
       data[i] = byte(contentStr[i])
-    discard handle.msWriter.registerIOEvent(toIOEventKind(kind), data)
+    discard handle.msWriter.registerIOEvent(toIOEventKind(kind), data,
+      metadata = metaBytes)
     return
 
   discard handle.writer.writeEvent(TraceLowLevelEvent(

@@ -822,8 +822,13 @@ proc registerReturn*(w: var MultiStreamTraceWriter,
 # ---------------------------------------------------------------------------
 
 proc registerIOEvent*(w: var MultiStreamTraceWriter, kind: IOEventKind,
-    data: openArray[byte]): Result[void, string] =
+    data: openArray[byte],
+    metadata: openArray[byte] = []): Result[void, string] =
   ## Register an IO event (stdout, stderr, etc.) at the current step.
+  ##
+  ## ``metadata`` is carried verbatim into the SPEC ``events.dat`` record's
+  ## metadata field (``trace-events.md`` §"IO Event Stream Records"); it defaults
+  ## to empty for callers that only have content bytes.
   if w.closed:
     return err("writer is closed")
 
@@ -831,9 +836,14 @@ proc registerIOEvent*(w: var MultiStreamTraceWriter, kind: IOEventKind,
   for i in 0 ..< data.len:
     dataSeq[i] = data[i]
 
+  var metaSeq = newSeq[byte](metadata.len)
+  for i in 0 ..< metadata.len:
+    metaSeq[i] = metadata[i]
+
   let ev = IOEvent(
     kind: kind,
     stepId: if w.stepCount > 0: w.stepCount - 1 else: 0,
+    metadata: metaSeq,
     data: dataSeq,
   )
 
@@ -1048,6 +1058,14 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   if valFlushRes.isErr:
     return err("failed to flush value stream: " & valFlushRes.error)
 
+  # M24a-3: flush the last partial events.dat chunk and finalize the companion
+  # events.idx.  This makes the Nim-written `events.dat` byte-compatible with
+  # the Rust `IoEventStreamReader` (the SPEC chunked layout); it must run before
+  # meta.dat so the has_io_event_stream flag (set below) is accurate.
+  let ioFlushRes = io_event_stream.flush(w.ctfs, w.ioEventWriter)
+  if ioFlushRes.isErr:
+    return err("failed to flush io event stream: " & ioFlushRes.error)
+
   # Emit source_views.dat / source_views.off when the writer has any
   # alternate-view records buffered.  Skipped entirely when none have
   # been registered so pre-extension traces remain byte-for-byte
@@ -1119,7 +1137,14 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
     # gates the Rust/db-backend seekable value path AND, for the Nim FFI reader,
     # marks the bundle as SPEC-framed (vs the legacy Nim-v4 .off VRT framing
     # that never set it).
-    hasValueStream = true)
+    hasValueStream = true,
+    # M24a-3: the writer ALWAYS emits a dedicated events.dat/events.idx I/O event
+    # stream (initIOEventStreamWriter above) in the SPEC-canonical chunked
+    # layout, so stamp the has_io_event_stream capability flag (bit 11).  The
+    # flag both gates the Rust/db-backend event-log path AND, for the Nim FFI
+    # reader, marks the bundle as SPEC-framed (vs the legacy Nim-v4 .off VRT
+    # framing that never set it).
+    hasIoEventStream = true)
   if metaRes.isErr:
     return err("failed to write meta.dat: " & metaRes.error)
 

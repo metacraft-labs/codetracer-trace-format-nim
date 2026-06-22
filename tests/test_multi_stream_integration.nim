@@ -282,6 +282,8 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
   doAssert flushExec.isOk, "flush exec failed: " & flushExec.error
   let flushVal = value_stream.flush(ctfs, valWriter)
   doAssert flushVal.isOk, "flush value failed: " & flushVal.error
+  let flushIo = io_event_stream.flush(ctfs, ioWriter)
+  doAssert flushIo.isOk, "flush io event failed: " & flushIo.error
 
   # ------ 12. Serialize to bytes ------
   let ctfsBytes = ctfs.toBytes()
@@ -300,7 +302,10 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
   # calls.idx (replacing the pre-M20 calls.off VariableRecordTable layout).
   doAssert hasInternalFile(ctfsBytes, "calls.idx"), "missing calls.idx"
   doAssert hasInternalFile(ctfsBytes, "events.dat"), "missing events.dat"
-  doAssert hasInternalFile(ctfsBytes, "events.off"), "missing events.off"
+  # M24a-3: the I/O event stream now uses the SPEC chunked layout — companion
+  # index is events.idx (seekable chunk offsets), not the legacy .off VRT
+  # offset table.
+  doAssert hasInternalFile(ctfsBytes, "events.idx"), "missing events.idx"
   doAssert hasInternalFile(ctfsBytes, "paths.dat"), "missing paths.dat"
   doAssert hasInternalFile(ctfsBytes, "paths.off"), "missing paths.off"
   doAssert hasInternalFile(ctfsBytes, "funcs.dat"), "missing funcs.dat"
@@ -518,7 +523,7 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
   # 14f. IO events
   let ioReaderRes = initIOEventStreamReader(ctfsBytes)
   doAssert ioReaderRes.isOk, "io reader failed: " & ioReaderRes.error
-  let ioReader = ioReaderRes.get()
+  var ioReader = ioReaderRes.get()
   doAssert ioReader.count() == 1, "io count mismatch: " & $ioReader.count()
 
   let io0 = ioReader.readEvent(0)
@@ -627,6 +632,7 @@ proc bench_multi_stream_write_throughput() {.raises: [].} =
   let flushRes = ctfs.flush(execW)
   doAssert flushRes.isOk
   doAssert value_stream.flush(ctfs, valW).isOk
+  doAssert io_event_stream.flush(ctfs, ioW).isOk
 
   let elapsed = cpuTime() - startTime
   let totalEvents = totalSteps + totalCalls + totalIOEvents
