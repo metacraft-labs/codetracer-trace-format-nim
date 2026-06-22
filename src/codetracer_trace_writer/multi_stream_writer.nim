@@ -24,6 +24,7 @@ import ./step_encoding
 import ./global_line_index
 import ./varint
 import ./linehits_builder
+import ./step_map_builder
 import ./uuid_v7
 import ../codetracer_trace_types
 
@@ -103,6 +104,23 @@ type
 
     # Optional linehits builder
     linehitsBuilder: Option[LinehitsBuilder]
+
+    # M26b — prepopulated breakpoint index (`step-map.ns`).  Accumulates
+    # `(path_id, line) -> [step_id]` during recording and is serialised into
+    # the CTFS container at close() so production `.ct` bundles carry the
+    # spec's `STMP` namespace.  The db-backend's M26 consumer attaches it and
+    # answers breakpoint line->step resolution with an O(unique-lines) index
+    # lookup, WITHOUT materialising the whole step table.
+    #
+    # Enabled BY DEFAULT for line-only traces (the production write path every
+    # non-column-aware recorder drives).  Gated OFF for column-aware traces:
+    # there the exec stream's `global_position_index` is a byte offset, not a
+    # `(path_id << 32) | line` packing, so the reader decodes step locations via
+    # the column-aware path rather than `unpack_global_line_index`, and a
+    # gli-derived `step-map.ns` would not agree with that derivation.  See
+    # `enableColumnAwareSteps` (which clears this) and `step_map_builder.nim`.
+    stepMapBuilder: StepMapBuilder
+    emitStepMap: bool
 
     # State tracking
     stepCount*: uint64
@@ -270,6 +288,12 @@ proc initMultiStreamWriter*(path: string, program: string,
   w.paths = @[]
   w.gliDirty = true
   w.filePath = path
+  # M26b — emit the prepopulated `step-map.ns` breakpoint index by default on
+  # the production (line-only) write path.  `enableColumnAwareSteps` clears
+  # this because the column-aware gli is a byte offset the reader decodes
+  # differently (see the field docs / step_map_builder.nim).
+  w.emitStepMap = true
+  w.stepMapBuilder = initStepMapBuilder()
 
   # Meta.dat placeholder - will be written at close time
   # Init interning tables
@@ -324,6 +348,12 @@ proc enableColumnAwareSteps*(w: var MultiStreamTraceWriter) =
   ## trace-global; the writer MUST NOT mix column-aware and line-only
   ## step records within a single trace.
   w.columnAwareSteps = true
+  # M26b — the column-aware exec stream stores a byte-offset
+  # `global_position_index`, which the db-backend decodes via the
+  # column-aware path rather than `unpack_global_line_index`.  A
+  # gli-derived `step-map.ns` would not match that decode, so suppress
+  # emission for column-aware traces (line-only traces keep it on).
+  w.emitStepMap = false
 
 proc enableColumnBreakpointsSupport*(w: var MultiStreamTraceWriter) =
   ## Capability opt-in: declare that this trace's recorder emits
@@ -341,6 +371,7 @@ proc enableColumnBreakpointsSupport*(w: var MultiStreamTraceWriter) =
   ## "Column-Aware Capability Flags".
   w.columnAwareSteps = true
   w.supportsColumnBreakpoints = true
+  w.emitStepMap = false  # M26b — see enableColumnAwareSteps.
 
 proc enableColumnMotionsSupport*(w: var MultiStreamTraceWriter) =
   ## Capability opt-in: declare that this trace's recorder supports
@@ -351,6 +382,7 @@ proc enableColumnMotionsSupport*(w: var MultiStreamTraceWriter) =
   ## wire-format column data is undefined behaviour per spec.
   w.columnAwareSteps = true
   w.supportsColumnMotions = true
+  w.emitStepMap = false  # M26b — see enableColumnAwareSteps.
 
 # ---------------------------------------------------------------------------
 # Filter provenance (TF-M7 — spec §7 / Trace-Filters.md §7)
@@ -533,6 +565,12 @@ proc registerStep*(w: var MultiStreamTraceWriter, pathId: uint64,
   if w.linehitsBuilder.isSome:
     w.linehitsBuilder.get().recordHit(gli, w.stepCount)
 
+  # M26b — record into the prepopulated breakpoint index, keyed by the SAME
+  # gli the exec stream encoded so the resulting `step-map.ns` matches the
+  # db-backend's `unpack_global_line_index`-derived whole-table build.
+  if w.emitStepMap:
+    w.stepMapBuilder.recordStep(gli, w.stepCount)
+
   w.lastGlobalLineIndex = gli
   w.lastPathId = pathId
   w.lastLine = line
@@ -599,6 +637,13 @@ proc registerStepWithColumn*(w: var MultiStreamTraceWriter,
 
   if w.linehitsBuilder.isSome:
     w.linehitsBuilder.get().recordHit(combinedGli, w.stepCount)
+
+  # M26b — index into the breakpoint map.  In practice `emitStepMap` is only
+  # on for line-only writers (where `columnDelta == 0` and `combinedGli`
+  # packs `(path_id << 32) | line`), so the gli unpacks back to the recorded
+  # `(path_id, line)` exactly as the reader decodes it.
+  if w.emitStepMap:
+    w.stepMapBuilder.recordStep(combinedGli, w.stepCount)
 
   w.lastGlobalLineIndex = combinedGli
   w.lastPathId = pathId
@@ -1105,6 +1150,24 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
       let appendRes = w.ctfs.append(svTable, rec)
       if appendRes.isErr:
         return err("failed to write source_views record: " & appendRes.error)
+
+  # M26b — serialise the prepopulated breakpoint index into the CTFS container
+  # as `step-map.ns` (spec §4.1 `STMP`).  Emitted by default for line-only
+  # traces (suppressed for column-aware ones; see `emitStepMap`).  The file is
+  # additive: only the M26 db-backend consumer reads it; every other reader
+  # ignores the extra root entry, so other streams stay byte-identical and
+  # legacy bundles (no `step-map.ns`) still read via the M26 whole-table
+  # fallback.  An empty trace (no recorded steps) still writes a well-formed
+  # zero-path `STMP` blob so the namespace is always parseable when present.
+  if w.emitStepMap:
+    let stepMapBytes = w.stepMapBuilder.serialize()
+    let smFileRes = w.ctfs.addFile(StepMapFileName)
+    if smFileRes.isErr:
+      return err("failed to add step-map.ns: " & smFileRes.error)
+    var smFile = smFileRes.get()
+    let smWriteRes = w.ctfs.writeToFile(smFile, stepMapBytes)
+    if smWriteRes.isErr:
+      return err("failed to write step-map.ns: " & smWriteRes.error)
 
   # Write meta.dat
   let metaFileRes = w.ctfs.addFile("meta.dat")
