@@ -4,6 +4,7 @@
 
 import std/times
 import results
+import codetracer_ctfs/container
 import codetracer_trace_writer/linehits_builder
 import codetracer_trace_writer/multi_stream_writer
 
@@ -122,6 +123,15 @@ proc test_linehits_via_multi_stream_writer() =
   let closeRes = w.close()
   doAssert closeRes.isOk, "close failed: " & closeRes.error
 
+  let ctfsBytes = w.toBytes()
+  let lhImageRes = readInternalFile(ctfsBytes, "linehits.tc")
+  doAssert lhImageRes.isOk, "linehits.tc missing from MultiStreamTraceWriter output: " & lhImageRes.error
+  let lhImage = lhImageRes.get()
+  doAssert lhImage.len >= 4 and lhImage[0] == byte('N') and
+    lhImage[1] == byte('S') and lhImage[2] == byte('B') and
+    lhImage[3] == byte('1'),
+    "linehits.tc must be an NSB1 CowBTree image, not a legacy namespace blob"
+
   # Verify linehits via the builder (still accessible after close)
   for idx in 0 ..< NumLines:
     let gli = uint64(idx + 1)
@@ -136,6 +146,12 @@ proc test_linehits_via_multi_stream_writer() =
       doAssert hits[i] == exp[i],
         "GLI " & $gli & " hit " & $i & ": got " & $hits[i] &
         " want " & $exp[i]
+    let persistedRes = decodeCowLinehitsPayloadForTest(lhImage, gli)
+    doAssert persistedRes.isOk, "persisted linehits lookup failed for GLI " &
+      $gli & ": " & persistedRes.error
+    let persisted = persistedRes.get()
+    doAssert persisted == exp,
+      "persisted GLI " & $gli & ": got " & $persisted & " want " & $exp
 
   w.closeCtfs()
 

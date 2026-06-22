@@ -1169,6 +1169,24 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
     if smWriteRes.isErr:
       return err("failed to write step-map.ns: " & smWriteRes.error)
 
+  # M8 Production CoW namespaces — when linehits are enabled, persist the
+  # production builder's line-hit index as a CoW namespace image. The old
+  # LinehitsBuilder used the legacy in-memory Namespace object and never wrote
+  # it into the container; this writes `linehits.tc` as an `NSB1` CowBTree whose
+  # descriptors point at the varint step-id payload appended to the namespace
+  # image. Rust opens the index via CowNamespaceReader.
+  if w.linehitsBuilder.isSome:
+    let lhBytesRes = w.linehitsBuilder.get().serializeCowNamespace()
+    if lhBytesRes.isErr:
+      return err("failed to serialize linehits.tc: " & lhBytesRes.error)
+    let lhFileRes = w.ctfs.addFile("linehits.tc")
+    if lhFileRes.isErr:
+      return err("failed to add linehits.tc: " & lhFileRes.error)
+    var lhFile = lhFileRes.get()
+    let lhWriteRes = w.ctfs.writeToFile(lhFile, lhBytesRes.get())
+    if lhWriteRes.isErr:
+      return err("failed to write linehits.tc: " & lhWriteRes.error)
+
   # Write meta.dat
   let metaFileRes = w.ctfs.addFile("meta.dat")
   if metaFileRes.isErr:
