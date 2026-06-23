@@ -397,6 +397,23 @@ proc lookupAt*(t: CowBTree, reader: ReaderHandle,
   ## snapshot isolation regardless of writer commits since the pin.
   t.lookupFrom(reader.rootPage, key)
 
+proc collectKeysFrom(t: CowBTree, page: uint64, into: var seq[uint64]) =
+  if page == 0:
+    return
+  let count = t.nodeCount(page)
+  if t.nodeIsLeaf(page):
+    for i in 0 ..< count:
+      into.add(t.nodeKey(page, i))
+  else:
+    for i in 0 .. count:
+      t.collectKeysFrom(t.nodeChild(page, count, i), into)
+
+proc keys*(t: CowBTree): Result[seq[uint64], string] =
+  ## Return all committed keys in ascending B-tree order.
+  var collected: seq[uint64]
+  t.collectKeysFrom(t.committedRoot(), collected)
+  ok(collected)
+
 # ---------------------------------------------------------------------------
 # Copy-on-write insertion
 # ---------------------------------------------------------------------------
