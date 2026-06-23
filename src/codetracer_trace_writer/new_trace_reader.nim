@@ -487,6 +487,41 @@ proc sourceViewsForPath*(r: NewTraceReader, pathId: uint64): seq[uint64] =
     return @[]
   r.sourceViewsByPath[int(pathId)]
 proc functionCount*(r: NewTraceReader): uint64 = r.funcReader.count()
+
+# ---------------------------------------------------------------------------
+# Lazy-stream load probes (instrumentation)
+# ---------------------------------------------------------------------------
+#
+# The exec (steps), value, call and IO-event stream readers are all
+# initialized LAZILY — only on the first access that needs them (see the
+# ``ensure*Reader`` helpers below).  These read-only probes surface that
+# laziness so a consumer can PROVE which streams a given read path actually
+# touched.  The incremental test runner's seekable executed-function read
+# (codetracer ``ct_test/incremental/ctfs_seekable.nim``) asserts, after
+# building the executed-function set, that ``valueStreamLoaded`` is still
+# false — i.e. it never opened/decoded the (far larger) value stream — and
+# that ``execChunkDecompressions`` stays bounded (it only seeks the chunks
+# holding call-entry steps for best-effort def-line resolution, never
+# scanning the whole step stream).
+
+proc execStreamLoaded*(r: NewTraceReader): bool = r.execLoaded
+  ## True once the steps (exec) stream reader has been initialized.
+
+proc valueStreamLoaded*(r: NewTraceReader): bool = r.valueLoaded
+  ## True once the value stream reader has been initialized.
+
+proc callStreamLoaded*(r: NewTraceReader): bool = r.callLoaded
+  ## True once the call stream reader has been initialized.
+
+proc ioEventStreamLoaded*(r: NewTraceReader): bool = r.ioEventLoaded
+  ## True once the IO-event stream reader has been initialized.
+
+proc execChunkDecompressions*(r: NewTraceReader): uint64 =
+  ## Distinct Zstd chunk inflations the exec (steps) stream reader has
+  ## performed so far.  Zero while the exec stream is unopened.  A targeted
+  ## per-step seek inflates at most one new chunk; a whole-stream scan
+  ## inflates every chunk.  Lets callers prove a step read stayed bounded.
+  if r.execLoaded: r.execReader.chunkDecompressions() else: 0'u64
 proc typeCount*(r: NewTraceReader): uint64 = r.typeReader.count()
 proc varnameCount*(r: NewTraceReader): uint64 = r.varnameReader.count()
 

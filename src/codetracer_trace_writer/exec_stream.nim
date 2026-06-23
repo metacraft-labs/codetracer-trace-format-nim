@@ -83,6 +83,16 @@ type
                                ## no trailer).  See module docs.
     # Cache for last decompressed chunk
     cachedChunkIdx: int        ## -1 means no cache
+    chunkDecompressions: uint64
+      ## Number of *distinct* Zstd chunk inflations performed since this
+      ## reader was opened.  Mirrors the db-backend
+      ## ``SeekableCallStream::chunk_decompressions`` bounded-decompression
+      ## probe: a targeted ``readEvent`` / ``stepAbsoluteGlobalLineIndex``
+      ## inflates at most one new chunk, and clustered reads inside one
+      ## chunk inflate it at most once.  Consumers that must PROVE they
+      ## only touched a bounded slice of the step stream (rather than
+      ## scanning the whole stream) assert this counter stays small.  See
+      ## ``chunkDecompressions`` / ``NewTraceReader.execChunkDecompressions``.
     cachedChunk: seq[byte]
     cachedChunkEventCount: uint32
     cachedChunkPayloadStart: int ## byte offset within ``cachedChunk`` where the
@@ -374,6 +384,10 @@ proc initExecStreamReader*(ctfsBytes: openArray[byte],
 
 proc totalEvents*(r: ExecStreamReader): uint64 = r.totalEventsVal
 
+proc chunkDecompressions*(r: ExecStreamReader): uint64 = r.chunkDecompressions
+  ## Distinct Zstd chunk inflations performed so far (bounded-decompression
+  ## probe; see the ``chunkDecompressions`` field).
+
 proc decompressChunk(r: var ExecStreamReader,
     chunkIdx: int): Result[void, string] =
   ## Decompress chunk at chunkIdx into the cache.
@@ -408,6 +422,10 @@ proc decompressChunk(r: var ExecStreamReader,
       $ZSTD_getErrorName(decompSize))
 
   r.cachedChunk.setLen(int(decompSize))
+  # Account a distinct chunk inflation: we only reach here when the target
+  # chunk differs from the cached one (the early-return above caught the
+  # cache hit), so each increment is a genuinely new inflation.
+  r.chunkDecompressions += 1
 
   if r.legacy:
     # Legacy chunk: the first 4 bytes are a u32 LE event count, records follow.
