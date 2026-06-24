@@ -16,7 +16,15 @@
 ## the Nim CoW writer's on-disk page format is byte-compatible with the Rust
 ## reader, AND that the Rust reader selects the right double-buffered root.
 ##
-## Usage: `gen_cow_btree_crossread_fixture <out.cowbt> <out.manifest>`.
+## Usage:
+##   `gen_cow_btree_crossread_fixture <out.cowbt> <out.manifest>`
+##     — the per-key (`insertAndCommit`) build, as above.
+##   `gen_cow_btree_crossread_fixture <out.cowbt> <out.manifest> --bulk`
+##     — the bottom-up `bulkLoad` build of the SAME keys. The companion Rust
+##       reader test (`reads_nim_bulk_built_cow_image`) proves the Rust reader
+##       reads a BULK-built image identically — the load-bearing cross-read for
+##       the M4-perf bulk-load constructor (the wire format is unchanged; only
+##       the page packing differs, so the reader must not care).
 
 import std/[os, strutils]
 import results
@@ -40,37 +48,54 @@ proc descA(key: uint64): seq[byte] =
 proc main() {.raises: [].} =
   let args = commandLineParams()
   if args.len < 2:
-    fail("usage: gen_cow_btree_crossread_fixture <out.cowbt> <out.manifest>")
+    fail("usage: gen_cow_btree_crossread_fixture <out.cowbt> <out.manifest> [--bulk]")
   let outImage = args[0]
   let outManifest = args[1]
-
-  var t = initCowBTree(cltTypeA)
+  let bulk = args.len >= 3 and args[2] == "--bulk"
 
   # Insert enough keys to force a leaf split and a multi-level tree (Type A leaf
   # order is (4096-8)/16 = 255), so the Rust reader must traverse a real
   # internal→leaf page graph. 300 keeps the committed image small while still
   # exercising splits.
   const N = 300'u64
-  for i in 1'u64 .. N:
-    let r = t.insertAndCommit(i * 3, descA(i * 3))
-    if r.isErr: fail("insert: " & r.error)
-    # Reclaim superseded pages between commits (no reader is pinned, so they are
-    # immediately reusable) to keep the published page image compact: fresh
-    # allocations pop reclaimed pages from the free list instead of growing the
-    # buffer. This exercises the whole-block reclaim path on the WRITE side too.
+  let updated = descA(0xDEADBEEF'u64)
+
+  var image: seq[byte]
+  if bulk:
+    # BULK build: pack the SAME final logical key set (key 3 already carries the
+    # updated descriptor) bottom-up in one commit. The keys are i*3 for
+    # i in 1..N; key 3 (== 1*3) is the updated entry.
+    var t = initCowBTree(cltTypeA)
+    var entries: seq[(uint64, seq[byte])]
+    for i in 1'u64 .. N:
+      let key = i * 3
+      let d = if key == 3'u64: updated else: descA(key)
+      entries.add (key, d)
+    # `bulkLoad` requires a strictly ascending batch; i*3 is already ascending.
+    let r = t.bulkLoad(entries)
+    if r.isErr: fail("bulkLoad: " & r.error)
+    image = t.serialize()
+  else:
+    var t = initCowBTree(cltTypeA)
+    for i in 1'u64 .. N:
+      let r = t.insertAndCommit(i * 3, descA(i * 3))
+      if r.isErr: fail("insert: " & r.error)
+      # Reclaim superseded pages between commits (no reader is pinned, so they
+      # are immediately reusable) to keep the published page image compact:
+      # fresh allocations pop reclaimed pages from the free list instead of
+      # growing the buffer. This exercises the whole-block reclaim path too.
+      discard t.reclaimPending()
+
+    # An in-place UPDATE (same key, new descriptor) exercises the CoW update
+    # path and ensures the Rust reader resolves the LATEST committed value.
+    let ur = t.insertAndCommit(3'u64, updated)  # key 3 was inserted at i=1
+    if ur.isErr: fail("update: " & ur.error)
+
+    # Reclaim superseded pages into the free list (so the published image carries
+    # a non-trivial free list — the reader must ignore free pages entirely).
     discard t.reclaimPending()
 
-  # An in-place UPDATE (same key, new descriptor) exercises the CoW update path
-  # and ensures the Rust reader resolves the LATEST committed value.
-  let updated = descA(0xDEADBEEF'u64)
-  let ur = t.insertAndCommit(3'u64, updated)  # key 3 was inserted at i=1
-  if ur.isErr: fail("update: " & ur.error)
-
-  # Reclaim superseded pages into the free list (so the published image carries
-  # a non-trivial free list — the reader must ignore free pages entirely).
-  discard t.reclaimPending()
-
-  let image = t.serialize()
+    image = t.serialize()
 
   # Write the binary image.
   try:

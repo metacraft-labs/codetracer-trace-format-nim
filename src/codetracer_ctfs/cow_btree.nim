@@ -607,6 +607,123 @@ proc insertAndCommit*(t: var CowBTree, key: uint64,
   ok(newCommit)
 
 # ---------------------------------------------------------------------------
+# Bulk load — bottom-up single-pass constructor (O(N) page writes, ONE commit)
+# ---------------------------------------------------------------------------
+#
+# `insertAndCommit` is the incremental path: each call copy-on-write copies the
+# spine from root to the touched leaf and atomically publishes a NEW root, so
+# building a tree of N keys does N spine-copies + N atomic commits — O(N log N)
+# page writes and N commit-id increments, with every superseded intermediate
+# spine page accumulating in the buffer (the build never calls `reclaimPending`).
+# At 100k keys the M3 benchmark measured this at ~7.5 s.
+#
+# `bulkLoad` builds the SAME logical tree from a PRE-SORTED batch in one
+# bottom-up pass: pack the leaves left-to-right, then build each internal level
+# over the level below, then publish the single final root in ONE commit. It
+# allocates only the LIVE pages (no abandoned spine copies), so the image is
+# both produced in O(N) and is markedly smaller and cleaner.
+#
+# WIRE-FORMAT NOTE: the produced image is the SAME NSB1 wire format every other
+# path emits — a valid `NamespaceHeader` (page 0) selecting a committed root in
+# slot 0 with `commit_id == 1`, plus a well-formed immutable page graph using
+# the documented leaf/internal node layout. It is therefore read identically by
+# `loadCowBTree` (Nim) and `CowNamespaceReader` (Rust); only the page PACKING
+# differs from the per-key build (denser, no superseded pages), NOT the format.
+# A bulk-built tree and a per-key-built tree of the same keys are value- and
+# reader-equivalent but NOT byte-identical (the per-key image carries abandoned
+# CoW pages, a higher commit id, and an alternating root slot).
+#
+# The B-tree separator invariant the lookup relies on: for an internal node with
+# keys `[s0, s1, …]` and children `[c0, c1, …, cn]`, `lookup(key)` takes the
+# `lowerBound(key)` index `i` and descends into `c_{i+1}` when `key == s_i`, else
+# `c_i`. Splits promote the FIRST key of a right leaf (B+-tree-style copy-up), so
+# the separator before child `c` is the SMALLEST key in `c`'s subtree — which is
+# exactly what we use here.
+
+proc bulkLoad*(t: var CowBTree,
+               entries: openArray[(uint64, seq[byte])]): Result[uint64, string] =
+  ## Build a committed tree from a PRE-SORTED, duplicate-free batch of
+  ## `(key, descriptor)` entries in a single bottom-up pass, publishing ONE
+  ## commit (id 1, slot 0). `t` MUST be a fresh, never-committed tree (as from
+  ## `initCowBTree`) — bulk load is a constructor, not a merge.
+  ##
+  ## Requirements (all validated; a violation is an `Err`, never a silent
+  ## mis-build): `t` has no prior commit; `entries` is strictly ascending by key
+  ## (sorted, no duplicates); every descriptor is exactly `descriptorSize` bytes.
+  ## An empty batch leaves the tree empty (`committedRoot == 0`), matching a
+  ## per-key build of zero keys.
+  ##
+  ## Returns the new commit id (always 1 for a fresh tree).
+  if t.committedSlot() >= 0:
+    return err("bulkLoad requires a fresh, never-committed tree")
+  if t.count != 0 or t.nextFreePage != 1 or t.pageCount != 1:
+    return err("bulkLoad requires a pristine tree (no prior allocations)")
+
+  # Validate the batch up front (ascending, unique, correct descriptor width).
+  for i in 0 ..< entries.len:
+    if entries[i][1].len != t.descriptorSize:
+      return err("descriptor size mismatch at entry " & $i & ": got " &
+                 $entries[i][1].len & " expected " & $t.descriptorSize)
+    if i > 0 and entries[i][0] <= entries[i - 1][0]:
+      return err("bulkLoad batch not strictly ascending at entry " & $i)
+
+  if entries.len == 0:
+    # Nothing to commit: leave the empty namespace as-is (no root published).
+    t.writeHeader()
+    return ok(0'u64)
+
+  # ---- pack the leaf level ------------------------------------------------
+  # Split the sorted entries into consecutive runs of at most `order` keys, each
+  # written into a freshly allocated leaf page. We also remember each leaf's
+  # FIRST key (its subtree minimum) — the separator material for the level above.
+  type LevelNode = tuple[page: uint64, minKey: uint64]
+  var level: seq[LevelNode]
+  var i = 0
+  while i < entries.len:
+    let runLen = min(t.order, entries.len - i)
+    var keys = newSeq[uint64](runLen)
+    var descs = newSeq[seq[byte]](runLen)
+    for j in 0 ..< runLen:
+      keys[j] = entries[i + j][0]
+      descs[j] = entries[i + j][1]
+    let page = t.allocPage()
+    t.writeLeaf(page, keys, descs)
+    level.add((page: page, minKey: keys[0]))
+    i += runLen
+
+  # ---- build internal levels until a single root remains ------------------
+  # Each internal node groups up to `order + 1` children from the level below
+  # (so up to `order` separator keys). The separator before child `c` is `c`'s
+  # subtree minimum — the smallest key reachable through it.
+  while level.len > 1:
+    var parent: seq[LevelNode]
+    var c = 0
+    while c < level.len:
+      let groupLen = min(t.order + 1, level.len - c)
+      var keys: seq[uint64]
+      var children = newSeq[uint64](groupLen)
+      for g in 0 ..< groupLen:
+        children[g] = level[c + g].page
+        if g > 0:
+          # Separator before this child == the child's subtree minimum.
+          keys.add(level[c + g].minKey)
+      let page = t.allocPage()
+      t.writeInternal(page, keys, children)
+      # The group's subtree minimum is the leftmost child's minimum.
+      parent.add((page: page, minKey: level[c].minKey))
+      c += groupLen
+    level = parent
+
+  # ---- publish the single root in one commit (slot 0, id 1) ----------------
+  let root = level[0].page
+  t.root0 = root
+  t.commit0 = 1
+  t.lastCommit = 1
+  t.count = uint64(entries.len)
+  t.writeHeader()
+  ok(1'u64)
+
+# ---------------------------------------------------------------------------
 # MVCC reader table + reader-gated reclamation
 # ---------------------------------------------------------------------------
 

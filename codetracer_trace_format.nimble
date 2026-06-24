@@ -31,6 +31,7 @@ task test, "Run all tests":
   exec "nim c -d:release -r tests/test_sub_block_pool.nim"
   exec "nim c -d:release -r tests/test_btree.nim"
   exec "nim c -r -d:release -p:src tests/test_cow_btree.nim"
+  exec "nim c -r -d:release -p:src tests/test_bulk_load_cow_btree.nim"
   exec "nim c -r -d:release -p:src tests/test_namespace.nim"
   exec "nim c -r -d:release -p:src tests/test_ct_space.nim"
   exec "nim c -r -d:release -p:src tests/test_shard_writer.nim"
