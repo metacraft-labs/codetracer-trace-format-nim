@@ -950,69 +950,84 @@ proc buildFullDocument(reader: var NewTraceReader,
           eventsArr.add(callObj)
 
       # 2. Emit the step event itself.
-      var stepObj = newJObject()
-      stepObj["kind"] = newJString("step")
-      stepObj["step_index"] = newJInt(int64(stepIdx))
-      block emitStep:
-        let (pathId, line) = resolveStepLocation(reader, gli, stepGli)
-        stepObj["path_id"] = newJInt(int64(pathId))
-        stepObj["line"] = newJInt(int64(line))
-        let pStr = reader.path(uint64(pathId))
-        if pStr.isOk:
-          stepObj["path"] = newJString(
-            normalizePath(pStr.get(), reader.meta.workdir, opts.stripPaths))
-        # Column-aware traces: surface the step's column by decoding the
-        # absolute global_position_index per the spec.  Pre-extension
-        # traces leave the field absent so the JSON output stays
-        # bit-for-bit compatible with pre-column-aware consumers.
-        if reader.meta.hasColumnAwareSteps:
-          let posRes = reader.decodeGlobalPositionIndex(stepGli)
-          if posRes.isOk:
-            stepObj["column"] = newJInt(int64(posRes.get().column))
+      #
+      # ``sekDeltaColumn`` events are column-only NUDGES on the preceding
+      # real step (Column-Aware-Tracing spec), not standalone logical
+      # steps.  ``logicalStepCount`` (new_trace_reader.nim:766-773)
+      # excludes them from ``counts.steps`` for exactly this reason, so we
+      # must mirror that exclusion here: a DeltaColumn nudge must NOT be
+      # materialized as a ``kind="step"`` entry, otherwise ``events[]``
+      # step entries would be inconsistent with ``counts.steps`` (and
+      # inflated relative to the true logical-step count).  Column-aware
+      # REAL steps (TagStepWithColumn ⇒ AbsoluteStep/DeltaStep events)
+      # are counted by ``logicalStepCount`` and therefore stay.  We still
+      # walk the raw index so call/IO correlation (keyed on the raw step
+      # index) is unaffected.
       let stepEv = reader.step(stepIdx)
-      if stepEv.isOk:
-        let se = stepEv.get()
-        stepObj["step_kind"] = newJString($se.kind)
-        case se.kind
-        of sekRaise:
-          stepObj["exception_type_id"] = newJInt(int64(se.exceptionTypeId))
-          stepObj["exception_message"] = newJString(bytesToUtf8(se.message))
-        of sekCatch:
-          stepObj["catch_exception_type_id"] = newJInt(int64(se.catchExceptionTypeId))
-        of sekThreadStart:
-          stepObj["thread_id"] = newJInt(int64(se.startThreadId))
-        of sekThreadExit:
-          stepObj["thread_id"] = newJInt(int64(se.exitThreadId))
-        of sekThreadSwitch:
-          stepObj["thread_id"] = newJInt(int64(se.threadId))
-        else:
-          discard
-      let callForStep = reader.callForStep(stepIdx)
-      if callForStep.isOk:
-        let cs = callForStep.get()
-        stepObj["function_id"] = newJInt(int64(cs.functionId))
-        let fn = reader.function(cs.functionId)
-        if fn.isOk:
-          stepObj["function"] = newJString(fn.get())
-        stepObj["depth"] = newJInt(int64(cs.depth))
-      # Variable values (decoded)
-      var valsArr = newJArray()
-      let vals = reader.values(stepIdx)
-      if vals.isOk:
-        for v in vals.get():
-          var vObj = newJObject()
-          vObj["varname_id"] = newJInt(int64(v.varnameId))
-          let vn = reader.varname(v.varnameId)
-          if vn.isOk:
-            vObj["varname"] = newJString(vn.get())
-          vObj["type_id"] = newJInt(int64(v.typeId))
-          let tn = reader.typeName(v.typeId)
-          if tn.isOk:
-            vObj["type_name"] = newJString(tn.get())
-          vObj["value"] = decodeValueBytesToJson(v.data)
-          valsArr.add(vObj)
-      stepObj["vars"] = valsArr
-      eventsArr.add(stepObj)
+      let isDeltaColumnNudge = stepEv.isOk and stepEv.get().kind == sekDeltaColumn
+      if not isDeltaColumnNudge:
+        var stepObj = newJObject()
+        stepObj["kind"] = newJString("step")
+        stepObj["step_index"] = newJInt(int64(stepIdx))
+        block emitStep:
+          let (pathId, line) = resolveStepLocation(reader, gli, stepGli)
+          stepObj["path_id"] = newJInt(int64(pathId))
+          stepObj["line"] = newJInt(int64(line))
+          let pStr = reader.path(uint64(pathId))
+          if pStr.isOk:
+            stepObj["path"] = newJString(
+              normalizePath(pStr.get(), reader.meta.workdir, opts.stripPaths))
+          # Column-aware traces: surface the step's column by decoding the
+          # absolute global_position_index per the spec.  Pre-extension
+          # traces leave the field absent so the JSON output stays
+          # bit-for-bit compatible with pre-column-aware consumers.
+          if reader.meta.hasColumnAwareSteps:
+            let posRes = reader.decodeGlobalPositionIndex(stepGli)
+            if posRes.isOk:
+              stepObj["column"] = newJInt(int64(posRes.get().column))
+        if stepEv.isOk:
+          let se = stepEv.get()
+          stepObj["step_kind"] = newJString($se.kind)
+          case se.kind
+          of sekRaise:
+            stepObj["exception_type_id"] = newJInt(int64(se.exceptionTypeId))
+            stepObj["exception_message"] = newJString(bytesToUtf8(se.message))
+          of sekCatch:
+            stepObj["catch_exception_type_id"] = newJInt(int64(se.catchExceptionTypeId))
+          of sekThreadStart:
+            stepObj["thread_id"] = newJInt(int64(se.startThreadId))
+          of sekThreadExit:
+            stepObj["thread_id"] = newJInt(int64(se.exitThreadId))
+          of sekThreadSwitch:
+            stepObj["thread_id"] = newJInt(int64(se.threadId))
+          else:
+            discard
+        let callForStep = reader.callForStep(stepIdx)
+        if callForStep.isOk:
+          let cs = callForStep.get()
+          stepObj["function_id"] = newJInt(int64(cs.functionId))
+          let fn = reader.function(cs.functionId)
+          if fn.isOk:
+            stepObj["function"] = newJString(fn.get())
+          stepObj["depth"] = newJInt(int64(cs.depth))
+        # Variable values (decoded)
+        var valsArr = newJArray()
+        let vals = reader.values(stepIdx)
+        if vals.isOk:
+          for v in vals.get():
+            var vObj = newJObject()
+            vObj["varname_id"] = newJInt(int64(v.varnameId))
+            let vn = reader.varname(v.varnameId)
+            if vn.isOk:
+              vObj["varname"] = newJString(vn.get())
+            vObj["type_id"] = newJInt(int64(v.typeId))
+            let tn = reader.typeName(v.typeId)
+            if tn.isOk:
+              vObj["type_name"] = newJString(tn.get())
+            vObj["value"] = decodeValueBytesToJson(v.data)
+            valsArr.add(vObj)
+        stepObj["vars"] = valsArr
+        eventsArr.add(stepObj)
 
       # 3. Emit IO events at this step.
       for (sid, ev, idx) in ioByStep:
