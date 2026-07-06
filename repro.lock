@@ -1,0 +1,9 @@
+schema = "reprobuild.solved-graph-lock.v2"
+
+[lock]
+platform = "amd64-linux"
+optimal = false
+inputs_digest = "fnv1a64:ee79bdd85e609e63"
+variants = []
+packages = [{ name = "codetracer_trace_format_nim", version = "0.1.0", source = "codetracer_trace_format_nim" }, { name = "gcc", version = "12.0.0", source = "gcc" }, { name = "nim", version = "2.2.0", source = "nim" }, { name = "nimble", version = "1.0.0", source = "nimble" }]
+deps = [{ name = "codetracer-trace-format-nim", path = ".", coord_kind = "vcs", url = "https://github.com/metacraft-labs/codetracer-trace-format-nim", ref = "dev", revision = "839ed880c6340b9d1c4f81feb7f8e9e70b492956", integrity = "git-sha1:839ed880c6340b9d1c4f81feb7f8e9e70b492956", version = "", visibility = "public", participation = "", depends = "", groups = "" }]

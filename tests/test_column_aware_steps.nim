@@ -465,12 +465,15 @@ proc test_strict_meta_flag_rejection() {.raises: [].} =
   ## net that makes the column extension's bit-4 break clean for
   ## older readers (and gives every future bit allocation the same
   ## guarantee).
-  # Bit 8 (= 0x100) is the lowest still-reserved bit after the
-  # M-capability-flags milestone allocated bits 6 and 7.  Earlier
-  # iterations of this test used bit 6 (then 5) — keep the test in
-  # sync with the latest reserved range to keep the unknown-bit
-  # rejection contract enforced.
-  const FirstReservedBit: uint16 = 0x100
+  # Bit 13 (= 0x2000) is a still-reserved bit: bits 0-5 and 8-12 are
+  # allocated in ``KnownFlags`` (MCR/replay/layout/filter/column/
+  # source-views + the M17a/M23a-d call/step/value/io/interning stream
+  # flags — bit 8 is ``FlagHasCallStream``), and bits 6/7 predate them.
+  # Earlier iterations of this test used bit 5 (then 6, then 8) — keep
+  # the test in sync with the latest allocated range so it exercises a
+  # genuinely-unknown bit and keeps the unknown-bit rejection contract
+  # enforced.
+  const FirstReservedBit: uint16 = 0x2000
   let badBuf = handcraftMetaDatWithFlags(FirstReservedBit)
   let badRes = readMetaDat(badBuf)
   doAssert badRes.isErr,

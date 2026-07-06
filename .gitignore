@@ -90,3 +90,5 @@ src/macro_sourcemap_*.json
 
 # reprobuild build artifacts
 .repro/
+# reprobuild build output tree (ct-print, per-test binaries, nimcache)
+/build/
