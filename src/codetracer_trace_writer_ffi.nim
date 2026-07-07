@@ -435,19 +435,37 @@ proc flushPendingStep(handle: TraceWriterHandle): cint =
     return 0.cint
 
   if handle.pendingValues.len > 0:
-    # M-leo fix: variables registered after the last step was
-    # already flushed strand the values in pendingValues with no
-    # step to attach to.  Emit a synthetic zero-delta column step
-    # so the values still surface in the value stream.  Only valid
-    # in column-aware mode and after at least one step has been
-    # emitted; otherwise drop the orphan values rather than
-    # corrupt the stream.
-    if handle.msWriter.columnAwareSteps and handle.msWriter.stepCount > 0:
-      let res = handle.msWriter.registerColumnStep(0'i64, handle.pendingValues)
-      if res.isErr:
-        setError(res.error)
-        return 1.cint
-    handle.pendingValues.setLen(0)
+    # Variables registered after the last step was already flushed
+    # strand the values in ``pendingValues`` with no step to attach
+    # to.  Neither mode may DROP them (spec: a variable registered
+    # for a step must not be lost; a value known only after a call
+    # returns attaches to the binding's step).  The two step models
+    # preserve them differently:
+    #
+    # * Column-aware traces (``columnAwareSteps``): emit a synthetic
+    #   zero-delta column step so the orphan values surface in the
+    #   value stream parallel to the exec stream (the M-leo fix from
+    #   92fce3a).  Requires at least one prior step to anchor against.
+    #
+    # * Line-only traces (``not columnAwareSteps`` — e.g. ton,
+    #   cardano, circom): CARRY the orphan values forward in
+    #   ``pendingValues`` (the pre-92fce3a behavior) so they attach to
+    #   the NEXT ``register_step`` flush.  This is exactly how
+    #   ``var X = call()`` bindings — whose value is known only after
+    #   the callee's own ``register_step`` already flushed the pending
+    #   step — reach the trace.  92fce3a made this branch
+    #   column-aware-only, which silently dropped these values for
+    #   line-only recorders; carrying them forward restores them
+    #   without touching the column-aware wire output.
+    if handle.msWriter.columnAwareSteps:
+      if handle.msWriter.stepCount > 0:
+        let res = handle.msWriter.registerColumnStep(0'i64, handle.pendingValues)
+        if res.isErr:
+          setError(res.error)
+          return 1.cint
+      handle.pendingValues.setLen(0)
+    # else: line-only — leave pendingValues intact to carry forward to
+    # the next step; do NOT clear/drop them.
   0.cint
 
 # ---------------------------------------------------------------------------

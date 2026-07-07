@@ -70,6 +70,10 @@ task test, "Run all tests":
   exec "nim c -r -p:src tests/test_trace_storage_config.nim"
   exec "nim c -r -p:src tests/test_path_filter.nim"
   exec "nim c -r -d:release -p:src tests/test_ct_print_events_log_fallback.nim"
+  # Line-only orphan pending-value carry-forward (92fce3a regression).
+  # `include`s codetracer_trace_writer_ffi, so it needs --mm:arc and the
+  # --nimMainPrefix the FFI's NimMain importc expects (see buildStaticLib).
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_line_only_orphan_carry_forward.nim"
 
 task regenerateFixtures, "Regenerate .expected golden fixture files":
   exec "nim c -r tests/generate_golden_fixtures.nim"
