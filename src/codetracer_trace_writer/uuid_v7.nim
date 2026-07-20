@@ -51,7 +51,18 @@ when defined(nimPreviewSlimSystem):
 ## concern; if a future caller needs strict monotonicity, layer it on
 ## top.
 
-import std/[sysrand, times]
+import std/times
+when defined(ctLeanRecord):
+  # Lean recorder: use libSystem's getentropy() instead of std/sysrand, whose
+  # macOS backend is SecRandomCopyBytes -> links Security.framework (which drags
+  # the whole Foundation/CoreFoundation closure into the injected recorder).
+  proc c_getentropy(buf: pointer, n: csize_t): cint
+    {.importc: "getentropy", header: "<sys/random.h>".}
+  proc urandom(dest: var openArray[byte]): bool =
+    if dest.len == 0: return true
+    c_getentropy(addr dest[0], csize_t(dest.len)) == 0
+else:
+  import std/sysrand
 import results
 
 const
