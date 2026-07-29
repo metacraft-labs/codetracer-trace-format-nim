@@ -101,3 +101,24 @@
 - tests/test_ram_cache.nim: hard-coded perf threshold (<1000 ns/read) fails on
   slower/loaded machines (~2200 ns/read observed on macOS arm64). Timing flake.
 - Neither is in the nimble `test` task's hard path in a way M23e-1 touched.
+
+## Known PRE-EXISTING red tests in the nimble `test` task (found by M34)
+Running every `exec` line of the nimble `test` task independently on
+x86_64-linux (2026-07-29) gives pass=48 fail=3. All three failures are
+hard-coded PERFORMANCE gates inside correctness tests; none is a correctness
+assertion and none is caused by M34's flake. Each reproduces identically in
+the OLD borrowed codetracer-trace-format dev shell and on an idle machine,
+and the first also reproduces under -d:release:
+- tests/test_chunked_compressed_table.nim bench_chunked_table_decompress:
+  `perLookupNs < 50000`, measured ~150_000 ns. Each lookup zstd-decompresses a
+  whole 64 KiB chunk with no chunk cache. Unlike its neighbour
+  bench_chunked_table_write_throughput it has NO `when defined(release)` guard,
+  so it fires in the debug corpus build.
+- tests/test_sub_block_pool.nim: `throughput > 500000.0` allocs/sec, measured
+  303_751 here vs 210_322 in the old borrowed shell.
+- tests/test_new_trace_reader.nim: `medianUs < 100.0`, measured 267.2us here
+  vs 263.1us in the old borrowed shell.
+Consequence: `nimble test` / `just test` exit non-zero on this host at the
+first of these. Fix is real work (a chunk cache in
+ChunkedCompressedTableReader.read; profiling the pool and the reader navigate
+path) or moving the gates into the `bench` task — NOT relaxing the numbers.
