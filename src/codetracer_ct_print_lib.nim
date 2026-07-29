@@ -36,6 +36,44 @@ export json, results
 # GLI helpers
 # ---------------------------------------------------------------------------
 
+proc addEventMetadata*(obj: JsonNode, metadata: seq[byte]) =
+  ## Attach an IO event's ``metadata`` slot to its JSON representation,
+  ## hoisting a correlation-marker payload to the top level when the slot
+  ## holds one.
+  ##
+  ## The metadata slot is opaque to the trace format. Ordinary program
+  ## output tags it with the sink name; **correlation markers** put a
+  ## complete JSON ``MarkerPayload`` there, and that payload is the
+  ## substrate of every cross-process origin chain — it is what pairs a
+  ## value leaving one recording with the same value arriving in another.
+  ##
+  ## Surfacing markers structurally matters because a marker that fails
+  ## to decode is *invisible* rather than merely degraded: the debugger
+  ## silently reports a chain that stops early, with no indication that a
+  ## boundary was missed. A tool that can show them turns that class of
+  ## bug from a mystery into a lookup.
+  if metadata.len == 0:
+    return
+  var text = newString(metadata.len)
+  for i, b in metadata:
+    text[i] = char(b)
+  obj["metadata"] = newJString(text)
+  try:
+    let parsed = parseJson(text)
+    if parsed.kind == JObject and parsed.hasKey("boundary_id") and
+        parsed.hasKey("direction") and parsed.hasKey("key_value"):
+      obj["correlation_marker"] = parsed
+      obj["boundary_id"] = parsed["boundary_id"]
+      obj["direction"] = parsed["direction"]
+      obj["key_value"] = parsed["key_value"]
+  except CatchableError:
+    discard
+
+proc isCorrelationMarker*(event: JsonNode): bool =
+  ## Does this event (as produced by ``buildFullDocument``) carry a
+  ## decoded correlation-marker payload?
+  event.kind == JObject and event.hasKey("correlation_marker")
+
 proc buildGliFromMeta*(meta: MetaDatContents): GlobalLineIndex =
   ## Rebuild the global line index from the meta.dat paths list using the
   ## same DefaultLinesPerFile as the writer.
@@ -532,6 +570,7 @@ proc buildFullDocument*(reader: var NewTraceReader,
             ioObj["text"] = newJString(bytesToUtf8(ev.data))
           ioObj["bytes_b64"] = newJString(base64.encode(ev.data))
           ioObj["bytes_len"] = newJInt(int64(ev.data.len))
+          addEventMetadata(ioObj, ev.metadata)
           eventsArr.add(ioObj)
 
       # 4) call exits at this step
