@@ -65,6 +65,40 @@ when defined(nimPreviewSlimSystem):
 ## `flush` creates: a chunk holding fewer than `chunk_size` records in the
 ## MIDDLE of the stream, after which record index and chunk number can no
 ## longer be related by arithmetic.
+##
+## Two further tests pin the `spans.idx` v2 layout — the entry carries the
+## chunk's CUMULATIVE record total next to its byte offset — and the property
+## that layout exists to buy:
+##
+## * `span_stream_open_decodes_no_chunks` — the format-level assertion. It
+##   builds a container whose NON-FINAL chunk bodies are deliberately
+##   destroyed while `spans.idx` is left intact, then asserts that opening
+##   still succeeds and that `count()`, `chunkCount()` and `recordsInChunk()`
+##   are all exactly right. None of that is derivable from the wrecked chunks,
+##   so it can only have come from the index — which is the point. Reading a
+##   destroyed chunk's records still fails closed, and the intact final chunk
+##   still reads. It also pins the header (`chunk_size` hint, `index_version`,
+##   reserved word), the 16-byte fixed stride, and that a downgraded version
+##   byte is rejected rather than misparsed.
+##
+## * `span_stream_read_span_touches_one_chunk` — the cost assertion, over a
+##   100-chunk stream: open decompresses ZERO chunks, `readSpan` deep in the
+##   stream decompresses exactly ONE, a second read inside the same chunk
+##   decompresses none, and `readSpansSince` decompresses exactly the chunks
+##   after the cursor (none at all for an up-to-date cursor).
+##
+## **Test seam.** The second test reads `spanChunkDecodeCount()`, a monotone
+## counter of zstd frame decompressions that `span_stream.nim` exports for
+## this purpose. Per workspace policy the seam is justified rather than
+## assumed: the property under test is a COST, and the functional results are
+## byte-identical whether the reader decodes one chunk or all of them — which
+## is exactly how the eager whole-stream decode at open survived the original
+## eight scenarios. The alternatives are worse: asserting on wall-clock time is
+## flaky on a shared CI box, and injecting a decompressor interface would mock
+## out the real Zstd frames that every other test in this file deliberately
+## exercises. The counter is not a mock — the production decompressor still
+## runs, unmodified, on real container bytes; the counter only observes it, is
+## never read by any production path, and so cannot change behaviour.
 
 import std/[os, tables]
 import results
@@ -794,6 +828,256 @@ proc span_stream_short_chunk_mid_stream() {.raises: [].} =
   echo "PASS: span_stream_short_chunk_mid_stream"
 
 # ---------------------------------------------------------------------------
+# Supporting: opening reads the INDEX ONLY — no chunk is decoded
+# ---------------------------------------------------------------------------
+
+proc locatePayload(raw: openArray[byte], needle: openArray[byte]): int =
+  ## Byte offset of an internal file's payload inside the container image, or
+  ## -1 when it is not laid out contiguously / not found. Asserts the match is
+  ## UNIQUE, so a patch below can never silently land on the wrong copy.
+  result = -1
+  var matches = 0
+  if needle.len == 0 or needle.len > raw.len:
+    return -1
+  for i in 0 .. raw.len - needle.len:
+    var same = true
+    for j in 0 ..< needle.len:
+      if raw[i + j] != needle[j]:
+        same = false
+        break
+    if same:
+      matches += 1
+      if result < 0:
+        result = i
+  doAssert matches <= 1,
+    "payload occurs " & $matches & " times in the container image; a patch " &
+    "would be ambiguous"
+
+proc u64le(b: openArray[byte], off: int): uint64 =
+  for i in countdown(7, 0):
+    result = (result shl 8) or uint64(b[off + i])
+
+proc span_stream_open_decodes_no_chunks() {.raises: [].} =
+  ## `spans.idx` v2 carries each chunk's CUMULATIVE record total beside its
+  ## byte offset, so `initSpanStreamReader` can answer "how many records" and
+  ## "which chunk holds record i" from the index ALONE. Before that, the reader
+  ## decompressed every chunk at open just to recover the counts — correct, but
+  ## it made opening cost O(whole stream), which is exactly the wrong shape for
+  ## RS-M3's live panel (it re-opens the growing container on every poll) and
+  ## defeated CTFS §7's "fetch the small index, then range-request one chunk".
+  ##
+  ## The property is pinned destructively: the container's NON-FINAL chunk
+  ## bodies are wrecked while `spans.idx` is left intact. A reader that decoded
+  ## chunks at open could not open this container at all, and could not report
+  ## a correct record count for it under any circumstances. One that reads the
+  ## index alone opens it, counts it exactly right, still reads the intact
+  ## final chunk, and still FAILS CLOSED on the wrecked ones.
+  var ctfs = createCtfs()
+  # chunkSize 2 over 8 spans: 4 sealed chunks, so there are three non-final
+  # chunks to destroy and a final one to leave alone.
+  let wRes = initSpanStreamWriter(ctfs, chunkSize = 2)
+  doAssert wRes.isOk, "initSpanStreamWriter failed: " & wRes.error
+  var writer = wRes.get()
+  for i in 1'u64 .. 8'u64:
+    doAssert writeSpan(ctfs, writer,
+      webRequestSpan(i, "GET", "/p/" & $i, "200", i * 10, i * 10 + 5)).isOk
+  doAssert span_stream.flush(ctfs, writer).isOk
+  let pristine = ctfs.toBytes()
+
+  # --- (a) the wire layout of spans.idx ---
+  let idxRes = readInternalFile(pristine, "spans.idx")
+  doAssert idxRes.isOk, "reading spans.idx failed: " & idxRes.error
+  let idx = idxRes.get()
+  doAssert idx.len == SpansIndexHeaderSize + 4 * SpansIndexEntrySize,
+    "spans.idx should be an 8-byte header + 4 fixed 16-byte entries, got " &
+    $idx.len & " bytes"
+  # Header: [chunk_size u32][index_version u16][reserved u16].
+  let chunkSizeHint = uint32(idx[0]) or (uint32(idx[1]) shl 8) or
+    (uint32(idx[2]) shl 16) or (uint32(idx[3]) shl 24)
+  doAssert chunkSizeHint == 2'u32,
+    "the chunk_size upper-bound hint must still be recorded in the header, " &
+    "got " & $chunkSizeHint
+  doAssert SpansIndexVersion == 2'u16,
+    "the spans.idx layout version must be 2 (1 = the never-shipped " &
+    "offsets-only RS-M1 layout)"
+  doAssert (uint16(idx[4]) or (uint16(idx[5]) shl 8)) == SpansIndexVersion,
+    "spans.idx must stamp its layout version"
+  doAssert idx[6] == 0'u8 and idx[7] == 0'u8,
+    "the reserved header word must be zero"
+  # Entries: [offset u64][cumulative_records u64], fixed 16-byte stride.
+  for c in 0 ..< 4:
+    let base = SpansIndexHeaderSize + c * SpansIndexEntrySize
+    doAssert u64le(idx, base + 8) == uint64(2 * (c + 1)),
+      "entry " & $c & " must carry the cumulative record total " &
+      $(2 * (c + 1)) & ", got " & $u64le(idx, base + 8)
+  doAssert u64le(idx, SpansIndexHeaderSize) == 0'u64,
+    "chunk 0 starts at byte 0 of spans.dat"
+
+  # --- (b) wreck every NON-FINAL chunk body, leave spans.idx untouched ---
+  let datRes = readInternalFile(pristine, "spans.dat")
+  doAssert datRes.isOk and datRes.get().len > 0
+  let dat = datRes.get()
+  let datAt = locatePayload(pristine, dat)
+  doAssert datAt >= 0, "could not locate spans.dat payload in the container"
+  let lastChunkStart = int(u64le(idx, SpansIndexHeaderSize + 3 * SpansIndexEntrySize))
+  doAssert lastChunkStart > 0 and lastChunkStart < dat.len
+
+  var raw = pristine
+  for j in 0 ..< lastChunkStart:
+    raw[datAt + j] = raw[datAt + j] xor 0xFF'u8
+
+  # --- (c) opening still works, and every count is exact ---
+  resetSpanChunkDecodeCount()
+  let rRes = initSpanStreamReader(raw)
+  doAssert rRes.isOk,
+    "opening must read spans.idx only, so wrecked chunk bodies cannot " &
+    "prevent it: " & rRes.error
+  doAssert spanChunkDecodeCount() == 0'u64,
+    "opening must decompress no chunks, decompressed " &
+    $spanChunkDecodeCount()
+  var reader = rRes.get()
+
+  doAssert reader.chunkCount == 4,
+    "expected 4 sealed chunks, got " & $reader.chunkCount
+  doAssert reader.count == 8'u64,
+    "count() must be 8, from the index alone, got " & $reader.count
+  doAssert reader.chunkSizeRecords == 2'u32,
+    "the header's chunk_size hint must still be readable"
+  for c in 0 ..< 4:
+    doAssert reader.recordsInChunk(c) == 2,
+      "chunk " & $c & " holds 2 records per the index, got " &
+      $reader.recordsInChunk(c)
+    doAssert reader.firstRecordOfChunk(c) == uint64(2 * c),
+      "chunk " & $c & " starts at record " & $(2 * c)
+  doAssert spanChunkDecodeCount() == 0'u64,
+    "count/recordsInChunk/firstRecordOfChunk must decompress nothing, " &
+    "decompressed " & $spanChunkDecodeCount()
+
+  # --- (d) but reading a wrecked chunk's RECORDS fails closed ---
+  for i in 0'u64 ..< 6'u64:
+    doAssert reader.readSpan(i).isErr,
+      "record " & $i & " lives in a wrecked chunk and must fail the read, " &
+      "not yield a repaired or partial span"
+  doAssert reader.settledSpans().isErr,
+    "a whole-stream read over wrecked chunks must fail, not drop spans"
+
+  # --- (e) ...while the INTACT final chunk still reads, addressed purely by
+  #         the index's cumulative column ---
+  let s6 = reader.readSpan(6)
+  doAssert s6.isOk, "record 6 is in the intact chunk: " & s6.error
+  doAssert s6.get().spanId == 7'u64,
+    "record 6 must be span 7, got " & $s6.get().spanId
+  let s7 = reader.readSpan(7)
+  doAssert s7.isOk and s7.get().spanId == 8'u64
+
+  let delta = reader.readSpansSince(3)
+  doAssert delta.isOk,
+    "a tailing delta over the intact chunk must succeed: " & delta.error
+  doAssert delta.get().len == 2 and delta.get()[0].spanId == 7'u64 and
+    delta.get()[1].spanId == 8'u64,
+    "the delta must be exactly the last chunk's two spans"
+
+  # --- (f) the version marker is enforced, not merely present ---
+  # Downgrade the stamped version to 1 (the never-shipped offsets-only layout)
+  # in place and confirm the reader refuses rather than misparsing.
+  var downgraded = pristine
+  let idxAt = locatePayload(pristine, idx)
+  doAssert idxAt >= 0, "could not locate spans.idx payload in the container"
+  downgraded[idxAt + 4] = 1'u8
+  downgraded[idxAt + 5] = 0'u8
+  let oldVer = initSpanStreamReader(downgraded)
+  doAssert oldVer.isErr,
+    "a spans.idx stamped with the v1 layout must be rejected, not misparsed"
+
+  # A non-zero reserved header word must also be refused, so a future header
+  # field cannot be silently ignored by this build.
+  var reserved = pristine
+  reserved[idxAt + 6] = 1'u8
+  doAssert initSpanStreamReader(reserved).isErr,
+    "a non-zero reserved header word must be rejected"
+
+  echo "PASS: span_stream_open_decodes_no_chunks"
+
+# ---------------------------------------------------------------------------
+# Supporting: readSpan touches exactly one chunk
+# ---------------------------------------------------------------------------
+
+proc span_stream_read_span_touches_one_chunk() {.raises: [].} =
+  ## The cost contract of the v2 index, over a 100-chunk stream. See the module
+  ## header for why `spanChunkDecodeCount()` is an acceptable seam here: the
+  ## property is a COST, and every functional result below is identical whether
+  ## the reader decompresses one chunk or all one hundred.
+  var ctfs = createCtfs()
+  let wRes = initSpanStreamWriter(ctfs, chunkSize = 4)
+  doAssert wRes.isOk, "initSpanStreamWriter failed: " & wRes.error
+  var writer = wRes.get()
+  for i in 1'u64 .. 400'u64:
+    doAssert writeSpan(ctfs, writer,
+      webRequestSpan(i, "GET", "/p/" & $i, "200", i * 10, i * 10 + 5)).isOk
+  doAssert span_stream.flush(ctfs, writer).isOk
+  let raw = ctfs.toBytes()
+
+  # --- open: zero decompressions, regardless of stream length ---
+  resetSpanChunkDecodeCount()
+  let rRes = initSpanStreamReader(raw)
+  doAssert rRes.isOk, "initSpanStreamReader failed: " & rRes.error
+  doAssert spanChunkDecodeCount() == 0'u64,
+    "opening a 100-chunk stream must decompress 0 chunks, decompressed " &
+    $spanChunkDecodeCount()
+  var reader = rRes.get()
+  doAssert reader.chunkCount == 100,
+    "expected 100 chunks, got " & $reader.chunkCount
+  doAssert reader.count == 400'u64,
+    "count() must be 400 from the index alone, got " & $reader.count
+  doAssert spanChunkDecodeCount() == 0'u64, "count() must decompress nothing"
+
+  # --- readSpan deep in the stream: exactly one chunk ---
+  resetSpanChunkDecodeCount()
+  let mid = reader.readSpan(201)          # chunk 50, record 1 within it
+  doAssert mid.isOk, "readSpan(201) failed: " & mid.error
+  doAssert mid.get().spanId == 202'u64,
+    "record 201 must be span 202, got " & $mid.get().spanId
+  doAssert spanChunkDecodeCount() == 1'u64,
+    "readSpan must decompress exactly the target chunk, decompressed " &
+    $spanChunkDecodeCount()
+
+  # --- a sibling record in the SAME chunk: no further decompression ---
+  let sib = reader.readSpan(203)          # chunk 50, record 3 within it
+  doAssert sib.isOk and sib.get().spanId == 204'u64
+  doAssert spanChunkDecodeCount() == 1'u64,
+    "a second read inside the cached chunk must decompress nothing more, " &
+    "total " & $spanChunkDecodeCount()
+
+  # --- a record in a DIFFERENT chunk: exactly one more ---
+  let far = reader.readSpan(7)            # chunk 1, record 3 within it
+  doAssert far.isOk and far.get().spanId == 8'u64
+  doAssert spanChunkDecodeCount() == 2'u64,
+    "jumping to another chunk must cost exactly one more decompression, " &
+    "total " & $spanChunkDecodeCount()
+
+  # --- the tailing delta costs the DELTA, not the stream ---
+  resetSpanChunkDecodeCount()
+  let delta = reader.readSpansSince(98)
+  doAssert delta.isOk, "readSpansSince failed: " & delta.error
+  doAssert delta.get().len == 8,
+    "chunks 98..99 hold 8 records, got " & $delta.get().len
+  doAssert delta.get()[0].spanId == 393'u64 and delta.get()[7].spanId == 400'u64
+  doAssert spanChunkDecodeCount() == 2'u64,
+    "a 2-chunk delta must decompress 2 chunks, decompressed " &
+    $spanChunkDecodeCount()
+
+  # --- an up-to-date cursor decompresses nothing at all (the RS-M3 poll that
+  #     finds no new spans) ---
+  resetSpanChunkDecodeCount()
+  let none = reader.readSpansSince(reader.chunkCount)
+  doAssert none.isOk and none.get().len == 0
+  doAssert spanChunkDecodeCount() == 0'u64,
+    "an up-to-date poll must decompress nothing, decompressed " &
+    $spanChunkDecodeCount()
+
+  echo "PASS: span_stream_read_span_touches_one_chunk"
+
+# ---------------------------------------------------------------------------
 # Supporting: fail-closed decoding (RS-M1 deliverable)
 # ---------------------------------------------------------------------------
 
@@ -1063,6 +1347,8 @@ span_stream_tail_during_active_write()
 span_stream_last_record_wins()
 span_stream_ignored_without_feature_bit()
 span_stream_short_chunk_mid_stream()
+span_stream_open_decodes_no_chunks()
+span_stream_read_span_touches_one_chunk()
 span_stream_fail_closed_decode()
 span_stream_page_by_span_id()
 span_stream_multi_stream_writer_gating()

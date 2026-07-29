@@ -16,11 +16,11 @@
 ##
 ## # Files
 ##
-## | File          | Type               | Contents                              |
-## | ------------- | ------------------ | ------------------------------------- |
-## | `spans.dat`   | Chunked compressed | Span records in append order          |
-## | `spans.idx`   | Companion index    | `[chunk_size u32][offset u64]...`     |
-## | `spantype.ns` | Namespace          | interned `span_type` id -> span ids   |
+## | File          | Type               | Contents                                    |
+## | ------------- | ------------------ | ------------------------------------------- |
+## | `spans.dat`   | Chunked compressed | Span records in append order                |
+## | `spans.idx`   | Companion index    | header + `[offset u64][cumulative u64]`...  |
+## | `spantype.ns` | Namespace          | interned `span_type` id -> span ids         |
 ##
 ## All three are gated by `meta.dat` bit 13 `FlagHasSpanStream`.
 ##
@@ -39,23 +39,68 @@
 ## # Index layout (`spans.idx`) — CTFS §7 companion index
 ##
 ## ```text
-## [chunk_size: u32 LE][offset_0: u64 LE][offset_1: u64 LE]...
+## Header (8 bytes):
+##   [chunk_size: u32 LE][index_version: u16 LE = 2][reserved: u16 LE = 0]
+## Entries (16 bytes each, at 8 + i*16 — a FIXED STRIDE, per CTFS §7):
+##   [offset: u64 LE][cumulative_records: u64 LE]
 ## ```
 ##
-## There is no `total_spans` header or trailer, and — unlike a table whose
-## chunks are all full but the last — a span chunk may be SHORT ANYWHERE in the
-## stream: `flush` seals whatever is buffered, and a live recorder calls it
-## per request so an in-flight span becomes visible immediately.  `chunk_size`
-## is therefore an upper bound per chunk, never a guarantee.
+## `offset_i` is chunk `i`'s first byte in `spans.dat`.  `cumulative_records_i`
+## is the number of span RECORDS held by chunks `0..i` inclusive — a running
+## total, not a per-chunk count.
 ##
-## That costs nothing on the wire, because a chunk is self-describing: its
-## payload is a sequence of length-prefixed records, so its true record count
-## falls out of decoding it.  The reader builds a per-chunk cumulative-count
-## table at init (see `initSpanStreamReader`) and uses it for `count` and for
-## `readSpan`'s random access, instead of assuming uniformity.  The index is
-## appended to as each chunk is sealed and is therefore always current during
-## recording — this is the property that makes the stream tailable (see
-## "Tailing" below).
+## Unlike a table whose chunks are all full but the last, a span chunk may be
+## SHORT ANYWHERE in the stream: `flush` seals whatever is buffered, and a live
+## recorder calls it per request so an in-flight span becomes visible
+## immediately.  `chunk_size` is therefore only an UPPER-BOUND HINT — the
+## writer's seal-at threshold, useful for sizing a read-ahead, never a
+## guarantee, and never a way to locate a record.  The CTFS §7 rule
+## "chunk = N div chunk_size" does NOT hold for this stream; the cumulative
+## column is what addresses a record, and it is authoritative.
+##
+## ## Why cumulative totals rather than a per-chunk record count
+##
+## A per-chunk `[offset u64][record_count u32][pad u32]` entry is the same 16
+## bytes on the wire but strictly weaker: `count()` would have to sum the whole
+## column (O(C)), and any random access would first have to materialise the
+## running total anyway.  Storing the running total directly buys:
+##
+## * `count()` — an O(1) read of the LAST entry's cumulative field.
+## * `readSpan(i)` — an O(log C) binary search over the cumulative column, with
+##   NO per-open table build and NO chunk decoding.
+## * `recordsInChunk(i)` — an O(1) subtraction of two adjacent entries.
+## * a range-fetching reader — entries `i-1` and `i` together give both the
+##   byte range of chunk `i` and the record range it covers, so a consumer can
+##   fetch the small index and then issue ONE range request for the chunk that
+##   holds the span it wants.
+##
+## The column is monotonically non-decreasing by construction, which is exactly
+## the precondition the binary search needs; `initSpanStreamReader` verifies it
+## (along with offset monotonicity and in-bounds-ness) and fails closed
+## otherwise, so a damaged index can never silently mis-address a record.
+##
+## Records inside a chunk are still length-prefixed, so a chunk remains
+## self-describing once decoded; the index only removes the need to decode it
+## in order to COUNT or ADDRESS.  The index is appended to as each chunk is
+## sealed and is therefore always current during recording — this is the
+## property that makes the stream tailable (see "Tailing" below).
+##
+## ## Version marker
+##
+## `index_version` is new: the original RS-M1 layout
+## (`[chunk_size u32][offset u64]...`, no counts, 4-byte header) carried no
+## version field at all.  It is nevertheless not a compatibility problem — the
+## whole span stream is gated on `meta.dat` bit 13 `FlagHasSpanStream`, bit 13
+## is REJECTING for readers that do not know it, and no container in existence
+## carries it — so there is no migration path to write and none is offered.
+## Version 1 names that never-shipped layout; version 2 is what this module
+## reads and writes, and anything else is rejected.  A stale v1 index also
+## fails structurally: its 4-byte header would put `offset_0`'s low half where
+## the version lives (reading as 0) and leave a non-multiple-of-16 entry
+## region.
+##
+## `reserved` must be 0 and is rejected otherwise, so a later header field
+## cannot be silently ignored by this reader.
 ##
 ## # Record model (spec §"Record Model", wire format v1)
 ##
@@ -113,13 +158,21 @@
 ##
 ## # Tailing during active writing
 ##
-## `chunkCount` is the reader's cursor: it is exactly the number of `u64`
+## `chunkCount` is the reader's cursor: it is exactly the number of 16-byte
 ## entries in `spans.idx`.  A live consumer remembers the count it has already
 ## consumed and calls `readSpansSince(reader, knownChunkCount)`, which decodes
 ## ONLY the chunks sealed since then.  There is no finalization step — the
 ## reader re-opens the growing container, observes `spans.idx` having grown,
 ## and range-reads just the new chunks.  This is the primitive RS-M3's
 ## `CtUpdatedHttpRequests` delta is built on.
+##
+## Re-opening is CHEAP BY CONSTRUCTION: `initSpanStreamReader` parses the index
+## and decodes NOTHING.  Zstd frames are touched only on the paths that
+## actually need a chunk's records, so a poll that finds no new chunks does no
+## decompression at all, and a poll that finds one new chunk decompresses
+## exactly that chunk.  (RS-M3's live panel re-opens the growing container on
+## every poll, so an open that decoded the whole stream would make the delta
+## read cost grow with the recording rather than with the delta.)
 ##
 ## Two details make that safe against a writer that is mid-chunk:
 ##
@@ -163,6 +216,20 @@ const
   SpansCompressionLevel = 3
     ## Zstd level.  Compatibility does not depend on the level (zstd decode is
     ## level-agnostic), only on the chunk codec.
+
+  SpansIndexVersion*: uint16 = 2
+    ## `spans.idx` layout version.  1 = the never-shipped RS-M1 layout
+    ## (`[chunk_size u32][offset u64]...`, offsets only, no version field);
+    ## 2 = the current `[offset u64][cumulative_records u64]` layout.  See the
+    ## module header's "Version marker" section for why no migration path is
+    ## needed.
+  SpansIndexHeaderSize* = 8
+    ## `[chunk_size u32][index_version u16][reserved u16]`.  8 bytes rather
+    ## than 4 so every entry field lands 8-byte aligned.
+  SpansIndexEntrySize* = 16
+    ## `[offset u64][cumulative_records u64]`.  A FIXED stride, as CTFS §7
+    ## requires, so entry `i` is at `SpansIndexHeaderSize + i * 16` and a
+    ## reader can seek straight to it.
 
   # `flags` byte (spec §"Record Model")
   SpanFlagOpen* = 0x01'u8       ## bit 0 — open record, completion still to come
@@ -232,6 +299,10 @@ type
     buffer: seq[byte]        ## length-prefixed records for the current chunk
     recordCount: int         ## records buffered in the current chunk
     totalRecords: uint64
+    sealedRecords: uint64
+      ## records already committed to SEALED chunks — the value the next index
+      ## entry's `cumulative_records` field carries.  Distinct from
+      ## `totalRecords`, which also counts what is still buffered.
     dataOffset: uint64       ## running byte offset in spans.dat
     typeIds: Table[string, uint32]   ## span_type -> interned id
     typeOrder: seq[string]           ## interned id -> span_type
@@ -243,15 +314,16 @@ type
       ## cannot rely on comparing against the previous append.
 
   SpanStreamReader* = object
-    data: seq[byte]          ## raw spans.dat content
-    chunkSize: uint32
-    offsets: seq[uint64]     ## chunk byte offsets from spans.idx
-    chunkFirstRecord: seq[uint64]
-      ## `chunkFirstRecord[i]` is the append-order index of chunk `i`'s first
-      ## record — a cumulative-count table, parallel to `offsets`.  Chunks may
-      ## be SHORT anywhere in the stream (a live `flush` seals a partial
-      ## chunk), so record index cannot be derived from `chunkSize`.
-    totalRecordsVal: uint64
+    data: seq[byte]          ## raw (still COMPRESSED) spans.dat content
+    chunkSize: uint32        ## the header's upper-bound hint, not an invariant
+    offsets: seq[uint64]     ## chunk byte offsets, column 1 of spans.idx
+    cumulative: seq[uint64]
+      ## `cumulative[i]` = span records held by chunks `0..i` inclusive —
+      ## column 2 of `spans.idx`, read verbatim off the wire.  Chunks may be
+      ## SHORT anywhere in the stream (a live `flush` seals a partial chunk),
+      ## so a record's chunk cannot be derived from `chunkSize`; it comes from
+      ## a binary search over this column.  Nothing here is derived by decoding
+      ## `spans.dat`.
     cachedChunkIdx: int      ## -1 means no cache
     cachedRecords: seq[seq[byte]]
 
@@ -444,17 +516,27 @@ proc initSpanStreamWriter*(ctfs: var Ctfs,
     buffer: @[],
     recordCount: 0,
     totalRecords: 0,
+    sealedRecords: 0,
     dataOffset: 0,
     typeIds: initTable[string, uint32](),
     typeOrder: @[],
     spanIdsByType: initTable[uint32, HashSet[uint64]](),
   )
 
-  # Index header: the u32 records-per-chunk count (CTFS §7).  No total count.
-  var hdr: array[4, byte]
+  # Index header (CTFS §7): the records-per-chunk UPPER-BOUND HINT, the layout
+  # version, and a reserved u16 that pads the header to the 8-byte alignment
+  # the entries want.  There is deliberately still no total-record count here —
+  # it would have to be rewritten on every seal, which a strictly append-only
+  # index cannot do; the last entry's cumulative field carries it instead.
+  var hdr: array[SpansIndexHeaderSize, byte]
   let csLE = toBytesLE(uint32(chunkSize))
   for i in 0 ..< 4:
     hdr[i] = csLE[i]
+  let verLE = toBytesLE(SpansIndexVersion)
+  hdr[4] = verLE[0]
+  hdr[5] = verLE[1]
+  hdr[6] = 0
+  hdr[7] = 0
   let hdrRes = ctfs.writeToFile(w.indexFile, hdr)
   if hdrRes.isErr:
     return err("failed to write " & SpansIndexFileName & " header: " &
@@ -495,16 +577,24 @@ proc flushChunk(ctfs: var Ctfs, w: var SpanStreamWriter): Result[void, string] =
   ctfs.syncEntry(w.dataFile)
 
   # 2. Only now does the index entry appear — it means "chunk complete".
-  var offBytes: array[8, byte]
+  #    The entry publishes WHERE the chunk starts and HOW MANY records the
+  #    stream holds through it, so a reader never has to decode a chunk to
+  #    learn either.
+  let sealedThroughHere = w.sealedRecords + uint64(w.recordCount)
+  var entry: array[SpansIndexEntrySize, byte]
   let offLE = toBytesLE(chunkStart)
   for i in 0 ..< 8:
-    offBytes[i] = offLE[i]
-  let offRes = ctfs.writeToFile(w.indexFile, offBytes)
+    entry[i] = offLE[i]
+  let cumLE = toBytesLE(sealedThroughHere)
+  for i in 0 ..< 8:
+    entry[8 + i] = cumLE[i]
+  let offRes = ctfs.writeToFile(w.indexFile, entry)
   if offRes.isErr:
-    return err("failed to write " & SpansIndexFileName & " offset: " &
+    return err("failed to write " & SpansIndexFileName & " entry: " &
       offRes.error)
   ctfs.syncEntry(w.indexFile)
 
+  w.sealedRecords = sealedThroughHere
   w.dataOffset += uint64(compressedSize)
   w.buffer.setLen(0)
   w.recordCount = 0
@@ -550,8 +640,9 @@ proc flush*(ctfs: var Ctfs, w: var SpanStreamWriter): Result[void, string] =
   ##
   ## A repeated call deliberately leaves a SHORT chunk in the middle of the
   ## stream; publishing in-flight spans is the whole point of the API.  The
-  ## reader tolerates that by construction: it derives each chunk's record
-  ## count from the chunk itself rather than from `chunkSize`.
+  ## reader tolerates that by construction: the index entry this seal appends
+  ## states the chunk's true cumulative record total, so a short chunk costs
+  ## the reader nothing and is never inferred from `chunkSize`.
   flushChunk(ctfs, w)
 
 proc count*(w: SpanStreamWriter): uint64 =
@@ -737,11 +828,38 @@ proc spanIdsOfType*(entries: openArray[SpanTypeEntry],
 # Reader
 # ---------------------------------------------------------------------------
 
+var spanChunkDecodes: uint64 = 0
+  ## TEST SEAM.  Counts zstd frame decompressions performed by this module.
+  ##
+  ## The whole point of the `spans.idx` cumulative column is that opening a
+  ## stream, counting its records and addressing a record all cost ZERO chunk
+  ## decompressions, and that `readSpan` costs exactly one.  Those are
+  ## performance PROPERTIES, and a test can only observe them by counting the
+  ## decompressions — the functional results are identical either way, which is
+  ## precisely how the eager-decode cost went unnoticed.  Exposing the counter
+  ## is a far smaller seam than the alternatives (injecting a decompressor
+  ## interface, or asserting on wall-clock time, which is flaky).  It is a
+  ## monotone counter with no behavioural effect: nothing in this module ever
+  ## reads it, so no production path can branch on it.  It is deliberately
+  ## unsynchronised — a lost increment across threads costs a diagnostic, never
+  ## correctness — so treat a reading as meaningful only on one thread.
+
+proc spanChunkDecodeCount*(): uint64 =
+  ## Number of span chunks decompressed since `resetSpanChunkDecodeCount`.
+  ## See the note on `spanChunkDecodes`: this exists for tests that pin the
+  ## "open decodes nothing / `readSpan` decodes one chunk" properties.
+  spanChunkDecodes
+
+proc resetSpanChunkDecodeCount*() =
+  ## Zero the chunk-decompression counter.  Tests only.
+  spanChunkDecodes = 0
+
 proc decompressChunkRecords(compressed: openArray[byte]):
     Result[seq[seq[byte]], string] =
   ## Decompress one chunk and split it into its length-prefixed records.
   if compressed.len == 0:
     return ok(newSeq[seq[byte]]())
+  spanChunkDecodes += 1
   let frameSize = ZSTD_getFrameContentSize(
     unsafeAddr compressed[0], csize_t(compressed.len))
   if frameSize == ZSTD_CONTENTSIZE_UNKNOWN or frameSize == ZSTD_CONTENTSIZE_ERROR:
@@ -816,11 +934,24 @@ proc initSpanStreamReader*(ctfsBytes: openArray[byte],
   ## Open the span stream in a container.  Works equally on a finalized
   ## container and on one that is still being written — re-opening a growing
   ## container is exactly how a live consumer observes new chunks.
+  ##
+  ## Opening DECODES NOTHING.  The record count, each chunk's occupancy and the
+  ## chunk that owns any record all come from `spans.idx` alone; the compressed
+  ## `spans.dat` bytes are only fetched, never decompressed, and a zstd frame is
+  ## touched for the first time on the path that actually wants a chunk's
+  ## records (`readSpan`, `readSpansInChunks` and everything built on them).
+  ## Cost is O(C) in the chunk count for the index parse and its monotonicity
+  ## check, and independent of the number of span records.
   let datRes = readInternalFile(ctfsBytes, SpansDataFileName, blockSize,
     maxEntries)
   if datRes.isErr:
     return err("failed to read " & SpansDataFileName & ": " & datRes.error)
-  let datData = datRes.get()
+  # `move`d into the reader below rather than copied: on a long recording this
+  # is the single largest allocation the open touches, and it is now the ONLY
+  # thing about the open that scales with the stream (the compressed bytes are
+  # fetched, never decompressed).
+  var datData = datRes.get()
+  let datLen = datData.len
 
   let idxRes = readInternalFile(ctfsBytes, SpansIndexFileName, blockSize,
     maxEntries)
@@ -828,107 +959,120 @@ proc initSpanStreamReader*(ctfsBytes: openArray[byte],
     return err("failed to read " & SpansIndexFileName & ": " & idxRes.error)
   let idxData = idxRes.get()
 
-  if idxData.len < 4:
-    return err(SpansIndexFileName & " too small for chunk_size header")
+  if idxData.len < SpansIndexHeaderSize:
+    return err(SpansIndexFileName & " too small for its header")
   var cs4: array[4, byte]
   for i in 0 ..< 4:
     cs4[i] = idxData[i]
   let chunkSize = fromBytesLE(uint32, cs4)
   if chunkSize == 0:
     return err("chunkSize in " & SpansIndexFileName & " is 0")
+  let version = getU16LE(idxData, 4)
+  if version != SpansIndexVersion:
+    return err(SpansIndexFileName & ": unsupported index version " & $version &
+      " (this build reads version " & $SpansIndexVersion & ")")
+  if getU16LE(idxData, 6) != 0:
+    return err(SpansIndexFileName & ": reserved header field is not 0")
 
-  let offsetRegionBytes = idxData.len - 4
-  if offsetRegionBytes mod 8 != 0:
-    return err(SpansIndexFileName & " has trailing bytes in offset region")
-  let numChunks = offsetRegionBytes div 8
+  let entryRegionBytes = idxData.len - SpansIndexHeaderSize
+  if entryRegionBytes mod SpansIndexEntrySize != 0:
+    return err(SpansIndexFileName & " has trailing bytes in the entry region")
+  let numChunks = entryRegionBytes div SpansIndexEntrySize
   var offsets = newSeq[uint64](numChunks)
+  var cumulative = newSeq[uint64](numChunks)
   for i in 0 ..< numChunks:
-    var o8: array[8, byte]
-    for j in 0 ..< 8:
-      o8[j] = idxData[4 + i * 8 + j]
-    offsets[i] = fromBytesLE(uint64, o8)
+    let base = SpansIndexHeaderSize + i * SpansIndexEntrySize
+    offsets[i] = getU64LE(idxData, base)
+    cumulative[i] = getU64LE(idxData, base + 8)
 
-  var r = SpanStreamReader(
-    data: datData,
+  # Fail closed on an index that could mis-address a record.  The binary search
+  # in `readSpan` is only sound on a non-decreasing cumulative column, and
+  # `chunkByteRange` is only sound on non-decreasing, in-bounds offsets — so
+  # both are checked here rather than trusted.  O(C) in the chunk count, and
+  # it reads no chunk bytes.
+  for i in 0 ..< numChunks:
+    if offsets[i] > uint64(datLen):
+      return err(SpansIndexFileName & ": chunk " & $i &
+        " offset is past the end of " & SpansDataFileName)
+    if i > 0:
+      if offsets[i] < offsets[i - 1]:
+        return err(SpansIndexFileName & ": chunk offsets are not monotonic " &
+          "at entry " & $i)
+      if cumulative[i] < cumulative[i - 1]:
+        return err(SpansIndexFileName & ": cumulative record counts are not " &
+          "monotonic at entry " & $i)
+
+  ok(SpanStreamReader(
+    data: move(datData),
     chunkSize: chunkSize,
-    offsets: offsets,
-    chunkFirstRecord: newSeq[uint64](numChunks),
-    totalRecordsVal: 0,
+    offsets: move(offsets),
+    cumulative: move(cumulative),
     cachedChunkIdx: -1,
-    cachedRecords: @[])
-
-  # Recover the record count by asking each chunk how many records it actually
-  # holds.  `chunk_size` is an UPPER BOUND, not an invariant: `flush` seals a
-  # partial chunk whenever a live recorder wants an in-flight span published,
-  # so a short chunk can sit anywhere in the stream.  Deriving the count (or a
-  # record's chunk) from `chunk_size` would silently mis-address every record
-  # after the first such flush.
-  #
-  # Cost: init decompresses the whole stream once, O(total records).  That is
-  # affordable precisely for spans — thousands per session, against the
-  # millions `steps.dat` carries — and `settledSpans` / `pageSpans` already
-  # decode everything anyway.  Only the record COUNTS are retained; the record
-  # bytes are dropped again except for the last chunk, which stays cached
-  # because a tailing consumer reads the newest spans first.
-  for c in 0 ..< numChunks:
-    let recs = ?r.decodeChunk(c)
-    r.chunkFirstRecord[c] = r.totalRecordsVal
-    r.totalRecordsVal += uint64(recs.len)
-    if c == numChunks - 1:
-      r.cachedChunkIdx = c
-      r.cachedRecords = recs
-
-  ok(r)
+    cachedRecords: @[]))
 
 proc count*(r: SpanStreamReader): uint64 =
   ## Number of span RECORDS committed to sealed chunks.  An open record and
   ## its later completion are two records; use `settledSpans` for the
   ## last-record-wins view.
-  r.totalRecordsVal
+  ##
+  ## O(1): the last index entry's cumulative field IS the total.
+  if r.cumulative.len == 0: 0'u64 else: r.cumulative[^1]
 
 proc chunkCount*(r: SpanStreamReader): int =
-  ## Number of sealed chunks — equivalently, the number of `u64` entries in
+  ## Number of sealed chunks — equivalently, the number of 16-byte entries in
   ## `spans.idx`.  This is the cursor a live consumer remembers between polls
   ## and hands back to `readSpansSince`.
   r.offsets.len
 
 proc chunkSizeRecords*(r: SpanStreamReader): uint32 =
-  ## Records per chunk, from the `spans.idx` header.  This is the writer's
-  ## seal-at threshold and therefore an UPPER BOUND — a chunk sealed early by
-  ## `flush` holds fewer.  Use `recordsInChunk` for a chunk's actual count.
+  ## The `spans.idx` header's records-per-chunk field: the writer's seal-at
+  ## threshold, and therefore only an UPPER-BOUND HINT — a chunk sealed early
+  ## by `flush` holds fewer, so this can never be used to locate a record.  It
+  ## survives as a hint because it still tells a consumer how much a chunk
+  ## fetch can cost at worst (useful for read-ahead sizing and for choosing a
+  ## page size).  Use `recordsInChunk` for a chunk's actual count.
   r.chunkSize
 
+proc firstRecordOfChunk*(r: SpanStreamReader, chunkNumber: int): uint64 =
+  ## Append-order index of chunk `chunkNumber`'s first record — the exclusive
+  ## prefix total, i.e. the previous entry's cumulative field.  O(1).
+  if chunkNumber <= 0: 0'u64
+  elif chunkNumber > r.cumulative.len: r.count()
+  else: r.cumulative[chunkNumber - 1]
+
 proc recordsInChunk*(r: SpanStreamReader, chunkNumber: int): int =
-  ## Records actually held by chunk `chunkNumber`, from the cumulative table
-  ## built at init.  0 for an out-of-range chunk.
-  if chunkNumber < 0 or chunkNumber >= r.chunkFirstRecord.len:
+  ## Records actually held by chunk `chunkNumber`, straight out of the index —
+  ## the difference of two adjacent cumulative fields.  0 for an out-of-range
+  ## chunk.  O(1), and it decompresses nothing.
+  if chunkNumber < 0 or chunkNumber >= r.cumulative.len:
     return 0
-  let nextStart =
-    if chunkNumber + 1 < r.chunkFirstRecord.len:
-      r.chunkFirstRecord[chunkNumber + 1]
-    else:
-      r.totalRecordsVal
-  int(nextStart - r.chunkFirstRecord[chunkNumber])
+  int(r.cumulative[chunkNumber] - r.firstRecordOfChunk(chunkNumber))
 
 proc readSpan*(r: var SpanStreamReader,
     index: uint64): Result[SpanRecord, string] =
   ## Read the raw span record at `index` in append order, decompressing only
   ## its chunk.  Records are NOT resolved by last-record-wins here.
   ##
-  ## The owning chunk comes from the cumulative-count table, NOT from
-  ## `index div chunkSize` — a `flush` mid-recording seals a short chunk, after
-  ## which the two disagree for every later record.
-  if index >= r.totalRecordsVal:
+  ## O(log C) in the chunk count: a binary search over the index's cumulative
+  ## column locates the owning chunk without touching `spans.dat`, and then
+  ## exactly ONE zstd frame is decompressed (none at all when the chunk is
+  ## already cached, which is the common case for a sequential walk).
+  ##
+  ## The owning chunk comes from that column, NOT from `index div chunkSize` —
+  ## a `flush` mid-recording seals a short chunk, after which the two disagree
+  ## for every later record.
+  let total = r.count()
+  if index >= total:
     return err("span index " & $index & " out of range (count " &
-      $r.totalRecordsVal & ")")
-  # Largest chunk whose first-record index is <= `index`.  `upperBound` returns
-  # the first entry strictly greater, so the predecessor is the owner; empty
-  # chunks (equal consecutive entries) are skipped over correctly because the
-  # LAST of a run of equal starts is the one that holds the record.
-  let chunkNumber = upperBound(r.chunkFirstRecord, index) - 1
-  if chunkNumber < 0 or chunkNumber >= r.chunkFirstRecord.len:
+      $total & ")")
+  # The first chunk whose cumulative total EXCEEDS `index` is the one holding
+  # it.  `upperBound` returns the first entry strictly greater, which is
+  # exactly that chunk; an empty chunk repeats its predecessor's total and is
+  # therefore skipped, as it must be.  `index < total` guarantees a hit.
+  let chunkNumber = upperBound(r.cumulative, index)
+  if chunkNumber < 0 or chunkNumber >= r.cumulative.len:
     return err("span index " & $index & " has no owning chunk")
-  let within = int(index - r.chunkFirstRecord[chunkNumber])
+  let within = int(index - r.firstRecordOfChunk(chunkNumber))
 
   if r.cachedChunkIdx != chunkNumber:
     let recs = ?r.decodeChunk(chunkNumber)
@@ -961,6 +1105,11 @@ proc readSpansSince*(r: SpanStreamReader,
   ##
   ## No finalization step is involved — the caller re-opens the growing
   ## container, compares `chunkCount` with its cursor, and asks for the delta.
+  ##
+  ## Cost is proportional to the DELTA, not to the stream: exactly the chunks
+  ## in `[knownChunkCount, chunkCount)` are decompressed, and an up-to-date
+  ## cursor decompresses nothing.  That holds end to end now, because the
+  ## `initSpanStreamReader` that precedes it decompresses nothing either.
   if knownChunkCount < 0:
     return err("knownChunkCount must not be negative")
   if knownChunkCount > r.offsets.len:
