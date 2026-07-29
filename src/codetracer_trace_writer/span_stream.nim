@@ -1,3 +1,6 @@
+when defined(nimPreviewSlimSystem):
+  import std/assertions  # doAssert is not in `system` under slim-system
+
 {.push raises: [].}
 
 ## Request/interval span streams (RS-M1) — `spans.dat` / `spans.idx` /
@@ -693,23 +696,27 @@ proc getU64LE(data: openArray[byte], off: int): uint64 =
   for i in countdown(7, 0):
     result = (result shl 8) or uint64(data[off + i])
 
-proc serializeSpanTypeNamespace*(w: SpanStreamWriter): seq[byte] =
-  ## Serialise the accumulated span-type index into the `SPTY` wire format.
-  ## Types are emitted sorted by interned id (which is first-appearance
-  ## order), and each span-id list ascending.
+proc encodeSpanTypeNamespace*(typeOrder: openArray[string],
+    idLists: openArray[seq[uint64]]): seq[byte] =
+  ## Serialise a span-type index into the `SPTY` wire format from PLAIN DATA:
+  ## `typeOrder[i]` is the name interned under id `i`, and `idLists[i]` is that
+  ## type's span-id list, which the caller has already sorted ascending.
+  ##
+  ## Split out of `serializeSpanTypeNamespace` so a writer that cannot hold a
+  ## `SpanStreamWriter` can still produce byte-identical `spantype.ns` bytes.
+  ## `ct_recorder` is exactly that case: it keeps its own `ctfs_nim.Ctfs`
+  ## container type, distinct from `codetracer_ctfs.Ctfs`, so it can never
+  ## drive the writer in this module — see the `encodeInterningTable` note in
+  ## `ct_recorder/trace_writer.nim` for the same situation one stream over.
+  ## Having ONE encoder rather than two copies is what keeps the recorder's
+  ## bytes and this module's reader from drifting.
   const
     HeaderSize = 18
     TypeEntrySize = 28
 
-  let typeCount = w.typeOrder.len
-
-  var idLists: seq[seq[uint64]] = @[]
-  for id in 0 ..< typeCount:
-    var ids: seq[uint64] = @[]
-    for spanId in w.spanIdsByType.getOrDefault(uint32(id)):
-      ids.add(spanId)
-    ids.sort()
-    idLists.add(ids)
+  let typeCount = typeOrder.len
+  doAssert idLists.len == typeCount,
+    "encodeSpanTypeNamespace: typeOrder/idLists length mismatch"
 
   # Plan offsets: header | type table | name bytes | span-id lists.
   var cursor = HeaderSize + typeCount * TypeEntrySize
@@ -717,7 +724,7 @@ proc serializeSpanTypeNamespace*(w: SpanStreamWriter): seq[byte] =
   var nameOffsets: seq[int] = @[]
   for id in 0 ..< typeCount:
     nameOffsets.add(cursor)
-    cursor += w.typeOrder[id].len
+    cursor += typeOrder[id].len
 
   var listOffsets: seq[int] = @[]
   for id in 0 ..< typeCount:
@@ -732,7 +739,7 @@ proc serializeSpanTypeNamespace*(w: SpanStreamWriter): seq[byte] =
 
   for id in 0 ..< typeCount:
     let base = HeaderSize + id * TypeEntrySize
-    let name = w.typeOrder[id]
+    let name = typeOrder[id]
     buf.putU32LE(base, uint32(id))
     buf.putU32LE(base + 4, uint32(name.len))
     buf.putU64LE(base + 8, uint64(nameOffsets[id]))
@@ -745,6 +752,19 @@ proc serializeSpanTypeNamespace*(w: SpanStreamWriter): seq[byte] =
       buf.putU64LE(listOffsets[id] + j * 8, idLists[id][j])
 
   buf
+
+proc serializeSpanTypeNamespace*(w: SpanStreamWriter): seq[byte] =
+  ## Serialise the accumulated span-type index into the `SPTY` wire format.
+  ## Types are emitted sorted by interned id (which is first-appearance
+  ## order), and each span-id list ascending.
+  var idLists: seq[seq[uint64]] = @[]
+  for id in 0 ..< w.typeOrder.len:
+    var ids: seq[uint64] = @[]
+    for spanId in w.spanIdsByType.getOrDefault(uint32(id)):
+      ids.add(spanId)
+    ids.sort()
+    idLists.add(ids)
+  encodeSpanTypeNamespace(w.typeOrder, idLists)
 
 proc writeSpanTypeNamespace*(ctfs: var Ctfs,
     w: SpanStreamWriter): Result[void, string] =
