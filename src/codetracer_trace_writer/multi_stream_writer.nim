@@ -20,6 +20,7 @@ import ./exec_stream
 import ./value_stream
 import ./call_stream
 import ./io_event_stream
+import ./span_stream
 import ./step_encoding
 import ./global_line_index
 import ./varint
@@ -87,6 +88,21 @@ type
     valueWriter: ValueStreamWriter
     callWriter: CallStreamWriter
     ioEventWriter: IOEventStreamWriter
+    spanWriter: SpanStreamWriter
+      ## RS-M1 span stream.  Created LAZILY on the first `registerSpan` call —
+      ## see `hasSpans`.
+    hasSpans: bool
+      ## True once at least one span has been registered, which is also when
+      ## `spans.dat` / `spans.idx` were added to the container.
+      ##
+      ## The span stream is the ONLY stream this writer does not always emit.
+      ## `meta.dat` bit 13 is a REJECTING flag for readers that predate it
+      ## (`KnownFlags`), so stamping it unconditionally would make every
+      ## container this writer produces unreadable by older readers, for a
+      ## feature almost no recording uses.  Gating on actual span registration
+      ## keeps a span-free container byte-for-byte identical to what this
+      ## writer produced before RS-M1 — same files, flag word unchanged — which
+      ## is the same back-compat contract `source_views.dat` (bit 5) follows.
     interning: TraceInterningTables
     metadata*: TraceMetadata
     paths*: seq[string]
@@ -866,6 +882,65 @@ proc registerReturn*(w: var MultiStreamTraceWriter,
 # IO events
 # ---------------------------------------------------------------------------
 
+proc registerSpan*(w: var MultiStreamTraceWriter,
+    span: SpanRecord): Result[void, string] =
+  ## Append a span (RS-M1) — a bounded, labeled interval of execution: an HTTP
+  ## request, a process, a test.  See `span_stream.nim` for the record model.
+  ##
+  ## The `spans.dat` / `spans.idx` pair is created on the FIRST call, not at
+  ## writer init, so a recording that never registers a span produces a
+  ## container byte-for-byte identical to the pre-RS-M1 output (see `hasSpans`).
+  ##
+  ## The stream is append-only: to publish an in-flight request, register a
+  ## record with `isOpen = true`, then register the completion later with the
+  ## SAME `spanId`.  Readers resolve the pair by last-record-wins; nothing is
+  ## rewritten.
+  if w.closed:
+    return err("writer is closed")
+
+  if not w.hasSpans:
+    let initRes = initSpanStreamWriter(w.ctfs)
+    if initRes.isErr:
+      return err("failed to init span stream: " & initRes.error)
+    w.spanWriter = initRes.get()
+    w.hasSpans = true
+
+  let res = writeSpan(w.ctfs, w.spanWriter, span)
+  if res.isErr:
+    return err("failed to write span: " & res.error)
+  ok()
+
+proc flushSpans*(w: var MultiStreamTraceWriter): Result[void, string] =
+  ## Seal the current partial span chunk, without closing the writer: the
+  ## buffered records are compressed, appended to `spans.dat` and published in
+  ## `spans.idx`, so they are committed to the container rather than sitting in
+  ## the writer's record buffer.  `close()` calls it anyway, so a batch
+  ## recorder never needs to.  A no-op when no span has been registered.
+  ##
+  ## **This does NOT yet make anything visible to a concurrent reader.**
+  ## `initMultiStreamWriter` builds the container with `createCtfs()`, i.e.
+  ## entirely in memory; the bytes reach the filesystem only when the caller
+  ## serialises them (`toBytes`, which the FFI does at
+  ## `trace_writer_close`).  Sealing a chunk therefore changes what an
+  ## already-materialised image would contain, not what is on disk right now.
+  ##
+  ## Live visibility needs one more change, not made here: the writer would
+  ## have to be built on `createCtfsStreaming(path)` so `syncEntry` lands the
+  ## chunk and its index entry on disk as they are sealed.  The span stream
+  ## itself is already ready for that — `flushChunk` writes the chunk body
+  ## before the index entry and syncs both, and `initSpanStreamReader` /
+  ## `readSpansSince` read a growing container (see
+  ## `span_stream_tail_during_active_write`, which drives exactly that path
+  ## against a streaming container).
+  if not w.hasSpans:
+    return ok()
+  span_stream.flush(w.ctfs, w.spanWriter)
+
+proc spanCount*(w: MultiStreamTraceWriter): uint64 =
+  ## Number of span RECORDS registered (an open record and its completion count
+  ## as two).
+  if not w.hasSpans: 0'u64 else: span_stream.count(w.spanWriter)
+
 proc registerIOEvent*(w: var MultiStreamTraceWriter, kind: IOEventKind,
     data: openArray[byte],
     metadata: openArray[byte] = []): Result[void, string] =
@@ -1111,6 +1186,18 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   if ioFlushRes.isErr:
     return err("failed to flush io event stream: " & ioFlushRes.error)
 
+  # RS-M1: flush the last partial spans.dat chunk and emit the spantype.ns
+  # span-type index.  Skipped entirely when no span was ever registered, so a
+  # span-free container gains no new files and keeps bit 13 clear.  Must run
+  # before meta.dat so the has_span_stream flag below is accurate.
+  if w.hasSpans:
+    let spanFlushRes = span_stream.flush(w.ctfs, w.spanWriter)
+    if spanFlushRes.isErr:
+      return err("failed to flush span stream: " & spanFlushRes.error)
+    let spanNsRes = writeSpanTypeNamespace(w.ctfs, w.spanWriter)
+    if spanNsRes.isErr:
+      return err("failed to write spantype.ns: " & spanNsRes.error)
+
   # Emit source_views.dat / source_views.off when the writer has any
   # alternate-view records buffered.  Skipped entirely when none have
   # been registered so pre-extension traces remain byte-for-byte
@@ -1225,7 +1312,11 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
     # flag both gates the Rust/db-backend event-log path AND, for the Nim FFI
     # reader, marks the bundle as SPEC-framed (vs the legacy Nim-v4 .off VRT
     # framing that never set it).
-    hasIoEventStream = true)
+    hasIoEventStream = true,
+    # RS-M1: unlike the four stream bits above, bit 13 is stamped ONLY when a
+    # span was actually registered.  See `hasSpans` for why this one is
+    # conditional: bit 13 is rejecting, not additive, at the reader.
+    hasSpanStream = w.hasSpans)
   if metaRes.isErr:
     return err("failed to write meta.dat: " & metaRes.error)
 

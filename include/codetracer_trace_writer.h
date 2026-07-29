@@ -159,6 +159,84 @@ void trace_writer_register_special_event(trace_writer_t handle,
     int kind, const char* metadata, const char* content);
 
 /* --------------------------------------------------------------------------
+ * Request / interval spans (RS-M1)
+ *
+ * A span is a bounded, labeled interval of execution — an HTTP request, a
+ * process, a test — recorded into the container's spans.dat stream instead of
+ * a session_manifest.jsonl / codetracer_spans.jsonl sidecar.  Spec:
+ * codetracer-specs/Trace-Files/CTFS-Request-Span-Streams.md.
+ *
+ * Only the binary (multi-stream) backend supports spans.  Registering at
+ * least one span sets meta.dat flag bit 13 (0x2000, FlagHasSpanStream) on the
+ * finished container; a recording that registers none is byte-for-byte
+ * unchanged.  NOTE that bit 13 is REJECTED by readers that predate it, so a
+ * recorder should only emit spans once its consumers understand the bit.
+ *
+ * To publish an in-flight request, call once with SPAN_FLAG_OPEN set and
+ * end_wall_ns / end_step zero, then call again on completion with the SAME
+ * span_id; readers apply last-record-wins.  The stream is append-only.
+ * -------------------------------------------------------------------------- */
+
+/* `flags` bits */
+#define SPAN_FLAG_OPEN     0x01u  /* open record; completion still to come */
+#define SPAN_FLAG_EXTERNAL 0x02u  /* execution lives in another container */
+
+/* `status` values */
+#define SPAN_STATUS_UNKNOWN 0u
+#define SPAN_STATUS_OK      1u
+#define SPAN_STATUS_ERROR   2u
+
+/* `structural` bits (Trace-Spans.md 2.4) */
+#define SPAN_STRUCTURAL_CONTIGUOUS      0x01u /* uninterrupted, one thread   */
+#define SPAN_STRUCTURAL_SHARES_TIMELINE 0x02u /* ordering comparable         */
+#define SPAN_STRUCTURAL_CONCURRENT      0x04u /* siblings may overlap        */
+
+/*
+ * external_recording / external_path are read ONLY when SPAN_FLAG_EXTERNAL is
+ * set (pass NULL otherwise).  metadata_keys / metadata_values are parallel
+ * arrays of NUL-terminated UTF-8 strings of length metadata_count; their ORDER
+ * IS PRESERVED end to end, so emit the well-known HTTP keys in display order.
+ * Returns 0 on success, non-zero on failure (see trace_writer_last_error).
+ */
+int trace_writer_register_span(trace_writer_t handle,
+    uint64_t span_id,
+    uint64_t parent_span_id,
+    uint8_t flags,
+    uint8_t status,
+    uint64_t start_wall_ns,
+    uint64_t end_wall_ns,
+    uint64_t process_ord,
+    uint64_t thread_id,
+    uint64_t start_step,
+    uint64_t end_step,
+    const char* external_recording,
+    const char* external_path,
+    const char* span_type,
+    const char* label,
+    uint8_t structural,
+    const char** metadata_keys,
+    const char** metadata_values,
+    size_t metadata_count);
+
+/*
+ * Seal the current partial span chunk without closing the writer: the spans
+ * registered so far are compressed into spans.dat and published in spans.idx,
+ * so they are committed to the container instead of sitting in the writer's
+ * buffer.  trace_writer_close flushes anyway, so batch recorders never need
+ * this call.
+ *
+ * NOTE: this does NOT make the spans visible to a concurrent reader today.
+ * The multi-stream writer builds the container in memory and the .ct file is
+ * written only by trace_writer_close, so nothing appears on disk mid-session.
+ * Live tailing would additionally require the writer to be created in
+ * streaming mode; the span stream's write/sync ordering and its tailing
+ * reader are already built for that.
+ *
+ * Returns 0 on success.
+ */
+int trace_writer_flush_spans(trace_writer_t handle);
+
+/* --------------------------------------------------------------------------
  * Thread lifecycle events
  *
  * Recorders that observe multi-threaded program execution emit ThreadStart /

@@ -38,6 +38,7 @@ import codetracer_trace_writer/multi_stream_writer
 import codetracer_trace_writer/value_stream
 import codetracer_trace_writer/call_stream
 import codetracer_trace_writer/io_event_stream
+import codetracer_trace_writer/span_stream
 import codetracer_trace_writer/step_encoding
 import codetracer_trace_writer/streaming_value_encoder
 import codetracer_trace_writer/new_trace_reader
@@ -1498,6 +1499,142 @@ proc trace_writer_register_source_view(
     setError(res.error)
     return -1'i64
   int64(res.get())
+
+# ---------------------------------------------------------------------------
+# Request / interval spans (RS-M1)
+# ---------------------------------------------------------------------------
+
+proc trace_writer_register_span(
+    handle: TraceWriterHandle,
+    span_id: uint64,
+    parent_span_id: uint64,
+    flags: uint8,
+    status: uint8,
+    start_wall_ns: uint64,
+    end_wall_ns: uint64,
+    process_ord: uint64,
+    thread_id: uint64,
+    start_step: uint64,
+    end_step: uint64,
+    external_recording: cstring,
+    external_path: cstring,
+    span_type: cstring,
+    label: cstring,
+    structural: uint8,
+    metadata_keys: ptr UncheckedArray[cstring],
+    metadata_values: ptr UncheckedArray[cstring],
+    metadata_count: csize_t,
+): cint {.exportc, cdecl, dynlib.} =
+  ## Append a span — a bounded, labeled interval of execution (an HTTP request,
+  ## a process, a test) — to the container's `spans.dat` stream (RS-M1).  This
+  ## is the entry point the PHP / Ruby / Python / BEAM recorders call instead of
+  ## writing a `session_manifest.jsonl` / `codetracer_spans.jsonl` sidecar.
+  ##
+  ## Argument encoding mirrors the wire format in
+  ## ``codetracer-specs/Trace-Files/CTFS-Request-Span-Streams.md``:
+  ##   * ``flags``      — bit 0 open record, bit 1 external binding.
+  ##   * ``status``     — 0 unknown, 1 ok, 2 error.
+  ##   * ``structural`` — bit 0 contiguous_on_one_thread, bit 1 shares_timeline,
+  ##                      bit 2 concurrent_with_siblings.
+  ##   * ``external_recording`` / ``external_path`` are read ONLY when
+  ##     ``flags`` bit 1 is set; pass NULL otherwise.
+  ##   * ``metadata_keys`` / ``metadata_values`` are parallel arrays of
+  ##     NUL-terminated UTF-8 strings of length ``metadata_count``.  ORDER IS
+  ##     PRESERVED — the reader hands metadata back in exactly this order, so
+  ##     recorders should emit the well-known HTTP keys in display order.
+  ##
+  ## To publish an in-flight request, call once with ``flags`` bit 0 set (and
+  ## ``end_wall_ns`` / ``end_step`` zero), then call again on completion with
+  ## the SAME ``span_id``.  The stream stays append-only; readers resolve the
+  ## pair by last-record-wins.
+  ##
+  ## Only the multi-stream (binary) backend supports spans.  Returns 0 on
+  ## success, non-zero on failure with ``trace_writer_last_error`` set.
+  if handle.isNil:
+    setError("trace_writer_register_span: NULL handle")
+    return 1.cint
+  if not handle.useMultiStream:
+    setError("trace_writer_register_span: only the multi-stream backend " &
+      "supports spans")
+    return 1.cint
+  if not handle.msWriterReady:
+    setError("trace_writer_register_span: writer not ready " &
+      "(call trace_writer_begin_events first)")
+    return 1.cint
+  if status > uint8(ord(high(SpanStatus))):
+    setError("trace_writer_register_span: invalid status " & $status)
+    return 1.cint
+
+  let isExternal = (flags and SpanFlagExternal) != 0
+  var span = SpanRecord(
+    spanId: span_id,
+    parentSpanId: parent_span_id,
+    isOpen: (flags and SpanFlagOpen) != 0,
+    isExternal: isExternal,
+    status: SpanStatus(status),
+    startWallNs: start_wall_ns,
+    endWallNs: end_wall_ns,
+    processOrd: process_ord,
+    threadId: thread_id,
+    startStep: start_step,
+    endStep: end_step,
+    spanType: toNimStr(span_type),
+    label: toNimStr(label),
+    contiguousOnOneThread: (structural and SpanStructuralContiguous) != 0,
+    sharesTimeline: (structural and SpanStructuralSharesTimeline) != 0,
+    concurrentWithSiblings: (structural and SpanStructuralConcurrent) != 0,
+  )
+  # The binding strings only exist on the wire when flags.external is set;
+  # reading them otherwise would make the encoder reject the record.
+  if isExternal:
+    span.externalRecording = toNimStr(external_recording)
+    span.externalPath = toNimStr(external_path)
+
+  if metadata_count > 0:
+    if metadata_keys.isNil or metadata_values.isNil:
+      setError("trace_writer_register_span: metadata_count is " &
+        $metadata_count & " but a metadata array is NULL")
+      return 1.cint
+    for i in 0 ..< int(metadata_count):
+      span.metadata.add((toNimStr(metadata_keys[i]),
+        toNimStr(metadata_values[i])))
+
+  let res = handle.msWriter.registerSpan(span)
+  if res.isErr:
+    setError(res.error)
+    return 1.cint
+  0.cint
+
+proc trace_writer_flush_spans(handle: TraceWriterHandle): cint
+    {.exportc, cdecl, dynlib.} =
+  ## Seal the current partial span chunk WITHOUT closing the writer: the spans
+  ## registered so far are compressed into `spans.dat` and published in
+  ## `spans.idx`, so they are committed to the container instead of sitting in
+  ## the writer's buffer.  `trace_writer_close` flushes anyway, so batch
+  ## recorders never need to call it.
+  ##
+  ## NOTE: this does NOT currently make the spans visible to a concurrent
+  ## reader.  The multi-stream writer builds the container in memory and the
+  ## `.ct` file is written only by `trace_writer_close`, so nothing appears on
+  ## disk mid-session.  A live request panel would additionally require the
+  ## writer to be created in streaming mode (`createCtfsStreaming`); the span
+  ## stream's own write/sync ordering and its tailing reader are already built
+  ## for that.
+  ## Returns 0 on success, non-zero on failure.
+  if handle.isNil:
+    setError("trace_writer_flush_spans: NULL handle")
+    return 1.cint
+  if not handle.useMultiStream:
+    setError("trace_writer_flush_spans: only the multi-stream backend " &
+      "supports spans")
+    return 1.cint
+  if not handle.msWriterReady:
+    return 0.cint
+  let res = handle.msWriter.flushSpans()
+  if res.isErr:
+    setError(res.error)
+    return 1.cint
+  0.cint
 
 # ---------------------------------------------------------------------------
 # Close

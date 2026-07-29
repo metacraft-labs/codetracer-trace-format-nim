@@ -197,6 +197,39 @@ const
     ## consumer migration off the legacy interning lands later.  Must
     ## match ``codetracer_trace_writer::meta_dat::FLAG_HAS_INTERNING_TABLES``
     ## (Rust) and the db-backend ``FLAG_HAS_INTERNING_TABLES`` bit 12.
+  FlagHasSpanStream*: uint16 = 0x2000            # bit 13 — RS-M1
+    ## When set, the materialized `.ct` carries the request/interval span
+    ## streams: `spans.dat` (chunked compressed span records) + its companion
+    ## seekable index `spans.idx`, plus the `spantype.ns` namespace that maps
+    ## an interned `span_type` id to the span ids of that type.  A span is a
+    ## bounded, labeled interval of execution named by the coordinate
+    ## `(process_ord, thread_id, step range)` — HTTP requests, processes,
+    ## tests — replacing the `session_manifest.jsonl` /
+    ## `codetracer_spans.jsonl` sidecars.  See
+    ## ``codetracer-specs/Trace-Files/CTFS-Request-Span-Streams.md``.
+    ##
+    ## **This bit is NOT additive at the reader.**  Unlike the flag-bit notes
+    ## on bits 8-12 above, which describe their streams as "a reader that does
+    ## not know the bit simply ignores the files", ``KnownFlags`` +
+    ## ``readMetaDat`` REJECT any container carrying a bit outside the known
+    ## mask.  A reader built before this constant existed therefore refuses a
+    ## span-bearing container outright rather than ignoring `spans.dat`.  The
+    ## rollout consequence: reader support (this constant, in ``KnownFlags``)
+    ## must ship everywhere before any writer sets the bit.  Accordingly no
+    ## existing writer call site sets it — `hasSpanStream` defaults to false
+    ## on both `writeMetaDat` and `writeMetaDatToBuffer`, so a recorder must
+    ## opt in explicitly and containers without spans are byte-identical to
+    ## what the writer produced before this bit existed.
+    ##
+    ## Bits 14 and 15 are deliberately left UNALLOCATED.  With bits 0-13
+    ## taken, two remain in the `u16` and there are more queued consumers
+    ## than bits; whether the last bit becomes an "extended flag word
+    ## follows" escape (or the field is widened by a meta.dat version bump)
+    ## is a format decision that needs its own milestone, with reader support
+    ## landed first.  See CTFS-Binary-Format.md §"Flag-space exhaustion".
+    ##
+    ## Must match ``codetracer_trace_writer::meta_dat::FLAG_HAS_SPAN_STREAM``
+    ## (Rust) and the db-backend ``FLAG_HAS_SPAN_STREAM`` bit 13 (RS-M2).
   FlagHasCallStream*: uint16 = 0x100             # bit 8 — M17a
     ## When set, the materialized `.ct` carries a dedicated call stream
     ## (`calls.dat` + its companion seekable index `calls.idx`) in
@@ -223,7 +256,8 @@ const
     FlagHasStepStream or
     FlagHasValueStream or
     FlagHasIoEventStream or
-    FlagHasInterningTables)
+    FlagHasInterningTables or
+    FlagHasSpanStream)
     ## P6.5 (column-extension back-compat): every flag bit this reader
     ## understands.  ``readMetaDat`` rejects any meta.dat whose flag
     ## word has bits outside this mask set, per
@@ -328,6 +362,15 @@ type
       ## with O(1) random access via the `.off` offset indices.  Pre-
       ## extension traces always have it clear; the legacy interning remains
       ## the source of truth when it is clear.
+    hasSpanStream*: bool
+      ## RS-M1: True iff FlagHasSpanStream was set on the meta.dat header.
+      ## When set, the trace carries `spans.dat` + `spans.idx` (interval
+      ## records for every `span_type` — web requests, processes, tests) plus
+      ## the `spantype.ns` span-type index, and readers may enumerate spans
+      ## without the retired JSONL sidecars.  Clear means the container has no
+      ## span streams and a span reader must report zero spans (it must not go
+      ## looking for the files).  NOTE: unlike bits 8-12, this bit is not
+      ## additive for readers that predate it — see `FlagHasSpanStream`.
 
 proc writeRawBytes(
     c: var Ctfs, f: var CtfsInternalFile,
@@ -377,6 +420,7 @@ proc writeMetaDat*(
     hasValueStream: bool = false,
     hasIoEventStream: bool = false,
     hasInterningTables: bool = false,
+    hasSpanStream: bool = false,
 ): Result[void, string] =
   ## Write binary meta.dat to a CTFS internal file.
   ##
@@ -437,6 +481,8 @@ proc writeMetaDat*(
     flags = flags or FlagHasIoEventStream
   if hasInterningTables:
     flags = flags or FlagHasInterningTables
+  if hasSpanStream:
+    flags = flags or FlagHasSpanStream
   ? c.writeU16LE(f, flags)
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.
@@ -577,6 +623,7 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
   contents.hasValueStream = (flags and FlagHasValueStream) != 0
   contents.hasIoEventStream = (flags and FlagHasIoEventStream) != 0
   contents.hasInterningTables = (flags and FlagHasInterningTables) != 0
+  contents.hasSpanStream = (flags and FlagHasSpanStream) != 0
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1, required
   # in v3+: a malformed or missing id rejects the trace at parse time.
@@ -722,6 +769,7 @@ proc writeMetaDatToBuffer*(
     hasValueStream: bool = false,
     hasIoEventStream: bool = false,
     hasInterningTables: bool = false,
+    hasSpanStream: bool = false,
 ): seq[byte] =
   ## Serialize meta.dat to an in-memory byte buffer.
   ## This is the same format as writeMetaDat but without needing a CTFS container.
@@ -779,6 +827,8 @@ proc writeMetaDatToBuffer*(
     flags = flags or FlagHasIoEventStream
   if hasInterningTables:
     flags = flags or FlagHasInterningTables
+  if hasSpanStream:
+    flags = flags or FlagHasSpanStream
   result.appendU16LE(flags)
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.

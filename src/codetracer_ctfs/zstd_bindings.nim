@@ -20,6 +20,18 @@ proc ZSTD_compressBound*(srcSize: csize_t): csize_t
 proc ZSTD_getFrameContentSize*(src: pointer, srcSize: csize_t): culonglong
   {.importc, header: "<zstd.h>".}
 
+proc ZSTD_findFrameCompressedSize*(src: pointer, srcSize: csize_t): csize_t
+  {.importc, header: "<zstd.h>".}
+  ## Compressed size of the FIRST zstd frame in `src`, ignoring anything that
+  ## follows it.  Needed when a chunked stream is read while it is still being
+  ## written: the last index-referenced chunk's end offset is not derivable
+  ## from the companion index (there is no following entry yet) and the data
+  ## file may already carry the leading bytes of the next, not-yet-sealed
+  ## chunk.  Feeding that trailing garbage to `ZSTD_decompress` is an error,
+  ## so the tailing reader uses this to find the exact frame boundary instead.
+  ## Returns a zstd error code (test with `ZSTD_isError`) if `src` does not
+  ## begin with a complete frame header.
+
 proc ZSTD_isError*(code: csize_t): cuint
   {.importc, header: "<zstd.h>".}
 

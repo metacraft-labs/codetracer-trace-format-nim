@@ -41,6 +41,9 @@ task test, "Run all tests":
   exec "nim c -r -p:src tests/test_value_stream.nim"
   exec "nim c -r -p:src tests/test_call_stream.nim"
   exec "nim c -r -p:src tests/test_io_event_stream.nim"
+  # RS-M1: spans.dat / spans.idx / spantype.ns writer + reader, and the
+  # meta.dat bit 13 (FlagHasSpanStream) that gates them.
+  exec "nim c -r -p:src tests/test_span_stream.nim"
   exec "nim c -r -d:release -p:src tests/test_multi_stream_integration.nim"
   exec "nim c -r -d:release -p:src tests/test_new_trace_reader.nim"
   exec "nim c -r -d:release -p:src tests/test_reader_calls_events.nim"

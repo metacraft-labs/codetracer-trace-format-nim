@@ -103,7 +103,7 @@ const
   CrossReadPool = "codetracer_trace_format_nim.crossread-serial"
 
 # The reproducible green corpus. It is the union of the nimble ``test``
-# task (50 files) and the four CI-only reader/network tests
+# task (51 files) and the four CI-only reader/network tests
 # (``test_cross_format`` / ``test_query_protocol`` / ``test_network_reader``
 # / ``test_replication``), PLUS the additional in-tree unit tests that
 # compile + run clean on a headless Linux host under ``-d:release -p:src``
@@ -153,6 +153,9 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_value_stream.nim", binary: "build/test-bin/test_value_stream"),
   TestSpec(source: "tests/test_call_stream.nim", binary: "build/test-bin/test_call_stream"),
   TestSpec(source: "tests/test_io_event_stream.nim", binary: "build/test-bin/test_io_event_stream"),
+  # RS-M1: spans.dat / spans.idx / spantype.ns writer + reader, and the
+  # meta.dat bit 13 (FlagHasSpanStream) that gates them.
+  TestSpec(source: "tests/test_span_stream.nim", binary: "build/test-bin/test_span_stream"),
   TestSpec(source: "tests/test_multi_stream_integration.nim", binary: "build/test-bin/test_multi_stream_integration"),
   TestSpec(source: "tests/test_new_trace_reader.nim", binary: "build/test-bin/test_new_trace_reader"),
   TestSpec(source: "tests/test_reader_calls_events.nim", binary: "build/test-bin/test_reader_calls_events"),

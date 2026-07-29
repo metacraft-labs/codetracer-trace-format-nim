@@ -327,6 +327,63 @@ int main(void) {
         trace_writer_register_special_event(w, FFI_EVENT_WRITE, "stdout", "Hello!\n");
         printf("[OK] ms: special event\n");
 
+        /* RS-M1 spans: an in-flight (open) record, its completion for the
+         * SAME span_id (last-record-wins), and an external-bound span. */
+        {
+            const char* keys[] = { "http.method", "http.url",
+                                   "http.status_code", "http.duration_ms" };
+            const char* vals[] = { "GET", "/api/users/42", "200", "12" };
+
+            /* open record: no end fields, status unknown */
+            ASSERT(trace_writer_register_span(w,
+                       1, 0, SPAN_FLAG_OPEN, SPAN_STATUS_UNKNOWN,
+                       1700000000000000000ULL, 0,
+                       0, 7, 100, 0,
+                       NULL, NULL, "web-request", "GET /api/users/42",
+                       SPAN_STRUCTURAL_CONTIGUOUS |
+                           SPAN_STRUCTURAL_SHARES_TIMELINE,
+                       keys, vals, 2) == 0,
+                   "register_span (open)");
+
+            /* a live recorder can publish it before closing */
+            ASSERT(trace_writer_flush_spans(w) == 0, "flush_spans");
+
+            /* completion record for the same span_id */
+            ASSERT(trace_writer_register_span(w,
+                       1, 0, 0, SPAN_STATUS_OK,
+                       1700000000000000000ULL, 1700000000012000000ULL,
+                       0, 7, 100, 350,
+                       NULL, NULL, "web-request", "GET /api/users/42",
+                       SPAN_STRUCTURAL_CONTIGUOUS |
+                           SPAN_STRUCTURAL_SHARES_TIMELINE,
+                       keys, vals, 4) == 0,
+                   "register_span (completion)");
+
+            /* external-bound span: execution lives in another container */
+            ASSERT(trace_writer_register_span(w,
+                       2, 0, SPAN_FLAG_EXTERNAL, SPAN_STATUS_ERROR,
+                       1700000000000000000ULL, 1700000000500000000ULL,
+                       0, 0, 0, 0,
+                       "01949fcc-7d92-7e9c-cccc-dddddddddddd",
+                       "requests/req-0002.ct",
+                       "web-request", "POST /api/orders",
+                       SPAN_STRUCTURAL_SHARES_TIMELINE,
+                       keys, vals, 4) == 0,
+                   "register_span (external)");
+
+            /* an open record carrying end fields must be REJECTED, not
+             * silently normalised — the fail-closed contract at the ABI. */
+            ASSERT(trace_writer_register_span(w,
+                       3, 0, SPAN_FLAG_OPEN, SPAN_STATUS_UNKNOWN,
+                       1700000000000000000ULL, 1700000000000000001ULL,
+                       0, 0, 0, 99,
+                       NULL, NULL, "web-request", "bad",
+                       0, NULL, NULL, 0) != 0,
+                   "register_span must reject an open record with end fields");
+
+            printf("[OK] ms: spans (open + completion + external + reject)\n");
+        }
+
         /* Close — this flushes pending step and writes .ct file */
         ASSERT(trace_writer_close(w) == 0, "close (multi-stream)");
         ASSERT(file_exists("/tmp/ms_test.ct"), "ms_test.ct should exist");
