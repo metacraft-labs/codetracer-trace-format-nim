@@ -21,6 +21,7 @@ import results
 import ./types
 import ./container
 import ./zstd_bindings
+import ./chunk_cache
 
 const DefaultCompressionLevel* = 3
 
@@ -36,15 +37,22 @@ type
     dataOffset: uint64               ## bytes written to .dat so far
     compressionLevel: int
 
+  ChunkMeta = object
+    ## No per-chunk derived state is needed here: records are fixed-size, so a
+    ## record's position inside a decompressed chunk is pure arithmetic.
+    discard
+
   ChunkedCompressedTableReader* = object
     data: seq[byte]          ## raw foo.dat content
     chunkSize: uint32        ## from index header
     recordSize: int
     offsets: seq[uint64]     ## chunk offsets parsed from foo.idx
     totalRecords: uint64     ## computed from chunks
-    # Cache for last decompressed chunk
-    cachedChunkIdx: int      ## -1 means no cache
-    cachedChunk: seq[byte]
+    cache: ChunkCache[ChunkMeta]
+      ## Decompressed chunks, LRU by byte budget.  This used to be a single
+      ## "last chunk" slot, which meant a random-access read pattern spanning
+      ## more than one chunk re-inflated a whole Zstd frame on essentially
+      ## every lookup.
 
 proc initChunkedCompressedTableWriter*(
     ctfs: var Ctfs, baseName: string,
@@ -158,7 +166,8 @@ proc initChunkedCompressedTableReader*(
     ctfsBytes: openArray[byte], baseName: string,
     recordSize: int,
     blockSize: uint32 = DefaultBlockSize,
-    maxEntries: uint32 = DefaultMaxRootEntries
+    maxEntries: uint32 = DefaultMaxRootEntries,
+    cacheBytes: uint64 = DefaultChunkCacheBytes
 ): Result[ChunkedCompressedTableReader, string] =
   ## Read a chunked compressed table from CTFS bytes.
   if recordSize <= 0:
@@ -225,17 +234,27 @@ proc initChunkedCompressedTableReader*(
     recordSize: recordSize,
     offsets: offsets,
     totalRecords: totalRecords,
-    cachedChunkIdx: -1,
-    cachedChunk: @[],
+    cache: initChunkCache[ChunkMeta](offsets.len, cacheBytes),
   ))
 
 proc count*(r: ChunkedCompressedTableReader): uint64 = r.totalRecords
 
-proc decompressChunk(r: var ChunkedCompressedTableReader,
-    chunkIdx: int): Result[void, string] =
-  ## Decompress chunk at chunkIdx into the cache.
-  if r.cachedChunkIdx == chunkIdx:
-    return ok()
+proc cacheHits*(r: ChunkedCompressedTableReader): uint64 = r.cache.hits
+  ## Reads served from an already-decompressed chunk.
+proc cacheMisses*(r: ChunkedCompressedTableReader): uint64 = r.cache.misses
+  ## Reads that had to inflate a Zstd frame.
+proc residentChunks*(r: ChunkedCompressedTableReader): int = r.cache.residentChunks
+proc cacheSlotCount*(r: ChunkedCompressedTableReader): int = r.cache.slotCount
+  ## Chunk buffers the reader holds, resident or pooled for reuse — the real
+  ## memory bound, unlike ``residentChunks``.
+
+proc chunkSlot(r: var ChunkedCompressedTableReader,
+    chunkIdx: int): Result[int, string] =
+  ## Return the cache slot holding chunk ``chunkIdx``, decompressing it first
+  ## if it is not resident.
+  let hit = r.cache.find(chunkIdx)
+  if hit >= 0:
+    return ok(hit)
 
   if chunkIdx >= r.offsets.len:
     return err("chunk index out of range: " & $chunkIdx)
@@ -254,18 +273,25 @@ proc decompressChunk(r: var ChunkedCompressedTableReader,
     unsafeAddr r.data[int(startOff)], csize_t(compressedLen))
   if frameSize == ZSTD_CONTENTSIZE_UNKNOWN or frameSize == ZSTD_CONTENTSIZE_ERROR:
     return err("cannot determine decompressed size for chunk " & $chunkIdx)
+  if frameSize == 0:
+    # The writer never emits an empty chunk, so this is a malformed file.
+    # Guard it explicitly: cache slots start empty, so taking `addr data[0]`
+    # below would index past the end.
+    return err("chunk " & $chunkIdx & " decompresses to zero bytes")
 
-  r.cachedChunk.setLen(int(frameSize))
-  let decompSize = ZSTD_decompress(
-    addr r.cachedChunk[0], csize_t(frameSize),
+  let slot = r.cache.acquire()
+  r.cache.prepare(slot, int(frameSize))
+  let decompSize = zstdDecompressShared(
+    addr r.cache.data(slot)[0], csize_t(frameSize),
     unsafeAddr r.data[int(startOff)], csize_t(compressedLen))
 
   if ZSTD_isError(decompSize) != 0:
+    # The slot was never committed, so it stays free for the next acquire.
     return err("zstd decompress failed for chunk " & $chunkIdx & ": " &
       $ZSTD_getErrorName(decompSize))
 
-  r.cachedChunkIdx = chunkIdx
-  ok()
+  r.cache.commit(slot, chunkIdx)
+  ok(slot)
 
 proc read*(r: var ChunkedCompressedTableReader, index: uint64,
     output: var openArray[byte]): Result[void, string] =
@@ -278,11 +304,10 @@ proc read*(r: var ChunkedCompressedTableReader, index: uint64,
   let chunkIdx = int(index div uint64(r.chunkSize))
   let recordInChunk = int(index mod uint64(r.chunkSize))
 
-  let decRes = r.decompressChunk(chunkIdx)
-  if decRes.isErr:
-    return err(decRes.error)
+  let slot = ?r.chunkSlot(chunkIdx)
 
   let offset = recordInChunk * r.recordSize
-  for i in 0 ..< r.recordSize:
-    output[i] = r.cachedChunk[offset + i]
+  if offset + r.recordSize > r.cache.data(slot).len:
+    return err("record " & $index & " extends past the end of chunk " & $chunkIdx)
+  copyMem(addr output[0], addr r.cache.data(slot)[offset], r.recordSize)
   ok()

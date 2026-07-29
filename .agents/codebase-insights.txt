@@ -102,23 +102,103 @@
   slower/loaded machines (~2200 ns/read observed on macOS arm64). Timing flake.
 - Neither is in the nimble `test` task's hard path in a way M23e-1 touched.
 
-## Known PRE-EXISTING red tests in the nimble `test` task (found by M34)
+## M34b: the nimble `test` task is GREEN (was 48 pass / 3 fail)
 Running every `exec` line of the nimble `test` task independently on
-x86_64-linux (2026-07-29) gives pass=48 fail=3. All three failures are
-hard-coded PERFORMANCE gates inside correctness tests; none is a correctness
-assertion and none is caused by M34's flake. Each reproduces identically in
-the OLD borrowed codetracer-trace-format dev shell and on an idle machine,
-and the first also reproduces under -d:release:
-- tests/test_chunked_compressed_table.nim bench_chunked_table_decompress:
-  `perLookupNs < 50000`, measured ~150_000 ns. Each lookup zstd-decompresses a
-  whole 64 KiB chunk with no chunk cache. Unlike its neighbour
-  bench_chunked_table_write_throughput it has NO `when defined(release)` guard,
-  so it fires in the debug corpus build.
-- tests/test_sub_block_pool.nim: `throughput > 500000.0` allocs/sec, measured
-  303_751 here vs 210_322 in the old borrowed shell.
-- tests/test_new_trace_reader.nim: `medianUs < 100.0`, measured 267.2us here
-  vs 263.1us in the old borrowed shell.
-Consequence: `nimble test` / `just test` exit non-zero on this host at the
-first of these. Fix is real work (a chunk cache in
-ChunkedCompressedTableReader.read; profiling the pool and the reader navigate
-path) or moving the gates into the `bench` task — NOT relaxing the numbers.
+x86_64-linux now gives pass=51 fail=0, and `just test` exits 0. The three red
+gates M34 found were all hard-coded PERFORMANCE thresholds embedded in
+correctness tests. What changed:
+
+- src/codetracer_ctfs/chunk_cache.nim (NEW) — bounded LRU of *decompressed*
+  chunk payloads, keyed by a dense chunkIdx->slot `seq[int32]` (no Table, no
+  hashing), evicting by byte budget (`DefaultChunkCacheBytes` = 64 MiB, a cap
+  not a reservation), with a per-slot metadata type `M` so a reader can cache
+  derived per-chunk state next to the bytes. Protocol is find / acquire /
+  commit: an uncommitted slot is the LRU victim, so a failed decompression
+  leaves the cache untouched. Evicted slots go on a FREE LIST and are reused;
+  do not "simplify" that away — an evicted slot is reachable from neither the
+  key map nor the LRU list, so dropping it strands its payload buffer for the
+  cache's lifetime and the byte budget stops bounding memory at all. The
+  `cacheSlotCount <= 4` assertion in test_chunked_table_chunk_cache_is_correct
+  is the regression guard (it reports 16 buffers for a 2.5-chunk budget if the
+  free list is removed). `prepare()` resizes a slot WITHOUT zero-filling
+  (`setLenUninit`) because the caller immediately overwrites it with a Zstd
+  frame — `setLen`'s zero-fill is a per-element loop and in a debug build it
+  cost MORE than the decompression it precedes.
+  The pre-existing generic `ram_cache.LruCache` was not reused: it is keyed by
+  a Table for sparse keys and its `get` COPIES the value out, which for a
+  64 KiB chunk payload reintroduces most of the cost the cache removes.
+- zstd_bindings.nim — `zstdDecompressShared` uses one thread-local reusable
+  `ZSTD_DCtx` instead of `ZSTD_decompress`, which creates and destroys a
+  context on every call.
+- chunked_compressed_table.nim — `ChunkedCompressedTableReader` had a SINGLE
+  last-chunk slot; on the benchmark's 245-chunk table a uniform random read
+  pattern hit it ~0.4% of the time. Now uses ChunkCache. New public probes:
+  `cacheHits` / `cacheMisses` / `residentChunks`, and an optional
+  `cacheBytes` parameter on `initChunkedCompressedTableReader`.
+  151-161 us -> 54.6 us median per lookup; a repeated read of a resident chunk
+  is 0.35 us (was 155 us).
+- exec_stream.nim — `ExecStreamReader.readEvent` was O(chunkSize): step records
+  are variable-length varints, so reaching record k re-decoded records 0..k-1,
+  and every inflation ALSO re-walked the whole chunk just to count its records.
+  A per-chunk record-start table (`ExecChunkMeta.starts`) is now filled by that
+  same count pass, so readEvent is O(1); the reader also uses ChunkCache
+  instead of one slot. `bench_navigate_to_step`: 263-267 us -> 1.4 us.
+  In legacy framing the record count comes from a u32 header, so the start
+  table is built lazily on the first `readEvent` for that chunk.
+  initExecStreamReader defaults to DefaultStreamChunkCacheBytes (8 MiB), NOT
+  the 64 MiB table budget: ct-print and the bulk FFI accessors walk the step
+  stream sequentially and an LRU keeps everything it sees up to its cap, so
+  that cap is a floor on their peak RSS. Before M34b the reader held one
+  decompressed chunk, so this is the one place the cache costs memory.
+- sub_block_pool.nim — `expandPool` zeroed each new 4096-byte block TWICE
+  (`setLen` zero-fills what it appends, then a hand-written scalar loop did it
+  again) and `allocate` cleared each popped slot with a scalar byte loop.
+  Both are single `zeroMem` calls now (`setLenUninit` + one `zeroMem` in
+  expandPool). 216-226 K -> 573-740 K allocs/sec (569-646 K when re-sampled at
+  load 127 — only ~14% over the 500 K gate, the thinnest margin of the two
+  gates that stayed in `test`).
+  DO NOT remove `expandPool`'s zeroing: namespace.nim serialises the WHOLE
+  pool buffer, including never-allocated slots, into the container, so
+  uninitialised bytes there would make container output nondeterministic.
+
+The chunked-table 50 us per-lookup gate is the one that did NOT come green on
+the reference host and its assertion (plus the 20M records/sec write-throughput
+one next to it) moved VERBATIM into tests/bench_chunked_table.nim, which only
+the `bench` task builds. Reason: 1000 uniform random lookups over 245 chunks
+touch 240 distinct chunks, so 240 Zstd inflations of 64 KiB each are
+compulsory however good the cache is; this host inflates one in 124-175 us
+(86-92 us with the host quiet; `zstd -b3 -B65536` independently reports
+494 MB/s quiet / 382 MB/s busy for the same data), i.e. 22-41 ms of the 50 ms
+budget is spent inside libzstd before any reader code runs. This is a 2012-era
+Xeon E5-2650 @ 2.0 GHz; a CPU doing 1.5-2 GB/s would spend 8-11 ms there.
+The cache behaviour is asserted instead by
+`test_chunked_table_chunk_cache_is_correct` (byte-identity of cold vs cached
+reads, correctness across a chunk change, correctness under forced eviction) —
+counters, not clocks. See Value-Origin-Tracking.milestones.org section M34b.
+
+Be honest about what that move costs: .github/workflows/ci-reprobuild.yml runs
+`just test` and nothing else, and repro.nim deliberately does not model
+benchmarks, so NOTHING IN CI RUNS `just bench`. The 50000 and 20_000_000
+thresholds are still asserted (verified: `nim c -d:release -r
+tests/bench_chunked_table.nim` aborts with AssertionDefect at 54.8-57.3 us on
+this host, 7 of 7 runs at load 101), but only when a human types `just bench`.
+Also measured independently, with a standalone C harness linking libzstd and
+touching no code from this repo: inflating those 240 frames costs 31-40 ms at
+load 120 and ~22 ms with the host quiet, out of the 50 ms budget. So libzstd
+is 62-80% of the budget when busy and ~43% when quiet — it dominates, but it
+does NOT by itself exceed the gate. The gate is MARGINAL on this host, not
+arithmetically impossible; the honest statement is that closing it would take
+a change to how much gets inflated (sub-chunk/seekable access), not a faster
+reader loop.
+
+## A FOURTH marginal timing gate, not in M34b's scope: test_ram_cache
+bench_ram_cache_hit_latency asserts `perReadNs < 1000` and measures 790-890 ns
+on the reference host (10 consecutive samples at load 100), i.e. ~15% headroom.
+Observed to flake once at 1122 ns during a per-command sweep; passed in every
+completed `just test` run and on a re-run of that same command. Root cause if
+it ever goes persistently red: `LruCache.get` returns `Option[V]` and therefore
+COPIES the cached value on every hit; the benchmark caches a 4096-byte block,
+so almost all of the ~830 ns is one alloc + 4 KiB memcpy + free per read. The
+fix is a non-copying accessor, which is an API change to a type
+cached_trace_reader.nim also uses — not a threshold change. This is the same
+property that made ram_cache.LruCache unsuitable as the chunk-payload cache.

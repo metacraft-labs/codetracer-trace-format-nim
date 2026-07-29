@@ -3,10 +3,15 @@ when defined(nimPreviewSlimSystem):
 
 {.push raises: [].}
 
-## Tests and benchmarks for ChunkedCompressedTable.
+## Correctness tests for ChunkedCompressedTable.
+##
+## The two throughput/latency benchmarks that used to live at the bottom of
+## this file are in `tests/bench_chunked_table.nim` (the `bench` task) — see
+## the header there for why.  What they were the only witness for on the
+## reader side, the decompressed-chunk cache, is asserted here instead with
+## counters rather than a clock, in
+## `test_chunked_table_chunk_cache_is_correct`.
 
-import std/monotimes
-import std/times
 import results
 import codetracer_ctfs
 
@@ -240,98 +245,162 @@ proc test_chunked_compressed_partial_write() {.raises: [].} =
   echo "PASS: test_chunked_compressed_partial_write"
 
 # ---------------------------------------------------------------------------
-# bench_chunked_table_decompress
+# test_chunked_table_chunk_cache_is_correct
 # ---------------------------------------------------------------------------
 
-proc bench_chunked_table_decompress() {.raises: [].} =
+proc test_chunked_table_chunk_cache_is_correct() {.raises: [].} =
+  ## `ChunkedCompressedTableReader` keeps decompressed chunks in an LRU cache
+  ## (`src/codetracer_ctfs/chunk_cache.nim`).  A cache that returns stale bytes
+  ## is far worse than a slow reader, so prove three things *without a clock*:
+  ##
+  ##   1. a re-read of an index whose chunk is already resident returns bytes
+  ##      identical to the cold read, and costs no extra Zstd inflation;
+  ##   2. reading a *different* chunk after a cached one is still correct, and
+  ##      going back to the first chunk is a hit rather than a re-inflation;
+  ##   3. the same holds when the budget forces eviction — a chunk that was
+  ##      evicted and re-inflated still yields the same bytes.
   const recordSize = 16
-  const numRecords = 1_000_000
-  const chunkSize = 4096'u32
-  const numReads = 1000
+  const chunkSize = 64'u32
+  const numChunks = 16
+  const numRecords = int(chunkSize) * numChunks
 
   var ctfs = createCtfs()
-  let writerRes = initChunkedCompressedTableWriter(ctfs, "benchd", recordSize, chunkSize)
-  doAssert writerRes.isOk
+  let writerRes = initChunkedCompressedTableWriter(ctfs, "cache", recordSize, chunkSize)
+  doAssert writerRes.isOk, "initWriter failed: " & writerRes.error
   var writer = writerRes.get()
 
   var rec: array[recordSize, byte]
   for i in 0 ..< numRecords:
     fillRecord(rec, i)
     let r = ctfs.append(writer, rec)
-    doAssert r.isOk
-
+    doAssert r.isOk, "append failed at record " & $i & ": " & r.error
   let flushRes = ctfs.flush(writer)
-  doAssert flushRes.isOk
-
+  doAssert flushRes.isOk, "flush failed: " & flushRes.error
   let rawBytes = ctfs.toBytes()
-  let readerRes = initChunkedCompressedTableReader(rawBytes, "benchd", recordSize)
-  doAssert readerRes.isOk
-  var reader = readerRes.get()
 
-  # Generate random indices from different chunks
-  var rng = initRng(54321)
-  var indices = newSeq[uint64](numReads)
-  for i in 0 ..< numReads:
-    indices[i] = rng.next() mod uint64(numRecords)
+  var expected: array[recordSize, byte]
+  var cold: array[recordSize, byte]
+  var warm: array[recordSize, byte]
 
-  var buf: array[recordSize, byte]
-  let startTime = getMonoTime()
-  for i in 0 ..< numReads:
-    let rr = reader.read(indices[i], buf)
-    doAssert rr.isOk
-  let endTime = getMonoTime()
+  # --- (1) + (2): a budget wide enough for the whole table. ---
+  block:
+    let readerRes = initChunkedCompressedTableReader(rawBytes, "cache", recordSize)
+    doAssert readerRes.isOk, "initReader failed: " & readerRes.error
+    var reader = readerRes.get()
 
-  let totalNs = (endTime - startTime).inNanoseconds
-  let perLookupNs = totalNs div int64(numReads)
+    # Cold read of a record in chunk 0.
+    let a = 5'u64
+    doAssert reader.read(a, cold).isOk
+    fillRecord(expected, int(a))
+    for b in 0 ..< recordSize:
+      doAssert cold[b] == expected[b], "cold read wrong at byte " & $b
+    doAssert reader.cacheMisses == 1, "expected one inflation, got " & $reader.cacheMisses
 
-  echo "{\"name\": \"chunked_table_decompress\", \"unit\": \"ns\", \"value\": " & $perLookupNs & "}"
-  doAssert perLookupNs < 50000, "per-lookup latency too high: " & $perLookupNs & "ns (limit 50000ns)"
+    # Repeated read of the SAME index: identical bytes, no new inflation.
+    doAssert reader.read(a, warm).isOk
+    for b in 0 ..< recordSize:
+      doAssert warm[b] == cold[b],
+        "cached re-read differs from cold read at byte " & $b
+    doAssert reader.cacheMisses == 1,
+      "a resident chunk was inflated again: misses=" & $reader.cacheMisses
+    doAssert reader.cacheHits == 1, "expected one cache hit, got " & $reader.cacheHits
 
-  echo "PASS: bench_chunked_table_decompress"
+    # A different index in the SAME chunk: still a hit, still correct.
+    let sameChunk = 40'u64
+    doAssert reader.read(sameChunk, warm).isOk
+    fillRecord(expected, int(sameChunk))
+    for b in 0 ..< recordSize:
+      doAssert warm[b] == expected[b], "same-chunk read wrong at byte " & $b
+    doAssert reader.cacheMisses == 1,
+      "a resident chunk was inflated again: misses=" & $reader.cacheMisses
 
-# ---------------------------------------------------------------------------
-# bench_chunked_table_write_throughput
-# ---------------------------------------------------------------------------
+    # A record in a DIFFERENT chunk must not be served from the cached one.
+    let otherChunk = uint64(chunkSize) * 9 + 17
+    doAssert reader.read(otherChunk, warm).isOk
+    fillRecord(expected, int(otherChunk))
+    for b in 0 ..< recordSize:
+      doAssert warm[b] == expected[b],
+        "read of a different chunk returned stale bytes at byte " & $b
+    doAssert reader.cacheMisses == 2,
+      "expected a second inflation for a second chunk, got " & $reader.cacheMisses
 
-proc bench_chunked_table_write_throughput() {.raises: [].} =
-  const recordSize = 16
-  const numRecords = 10_000_000
-  const chunkSize = 4096'u32
+    # Back to chunk 0: both chunks are resident, so this is a hit.
+    doAssert reader.read(a, warm).isOk
+    for b in 0 ..< recordSize:
+      doAssert warm[b] == cold[b], "return to chunk 0 differs at byte " & $b
+    doAssert reader.cacheMisses == 2,
+      "chunk 0 was evicted by a 2-chunk working set: misses=" & $reader.cacheMisses
+    doAssert reader.residentChunks == 2,
+      "expected 2 resident chunks, got " & $reader.residentChunks
 
-  var ctfs = createCtfs()
-  let writerRes = initChunkedCompressedTableWriter(ctfs, "benchw", recordSize, chunkSize)
-  doAssert writerRes.isOk
-  var writer = writerRes.get()
+    # Every record still reads back correctly with a fully populated cache.
+    for i in 0 ..< numRecords:
+      doAssert reader.read(uint64(i), warm).isOk
+      fillRecord(expected, i)
+      for b in 0 ..< recordSize:
+        doAssert warm[b] == expected[b],
+          "full sweep mismatch at record " & $i & " byte " & $b
 
-  var rec: array[recordSize, byte]
-  # Pre-fill a pattern (same for all records in this throughput test)
-  for i in 0 ..< recordSize:
-    rec[i] = byte(i * 7)
+  # --- (3): a one-chunk budget forces eviction on every chunk change. ---
+  block:
+    let readerRes = initChunkedCompressedTableReader(rawBytes, "cache", recordSize,
+      cacheBytes = uint64(chunkSize) * uint64(recordSize))
+    doAssert readerRes.isOk, "initReader (small budget) failed: " & readerRes.error
+    var reader = readerRes.get()
 
-  let startTime = getMonoTime()
-  for i in 0 ..< numRecords:
-    rec[0] = byte(i mod 256)
-    rec[1] = byte((i shr 8) mod 256)
-    let r = ctfs.append(writer, rec)
-    doAssert r.isOk
-  let flushRes = ctfs.flush(writer)
-  doAssert flushRes.isOk
-  let endTime = getMonoTime()
+    # Alternate between two chunks so each read evicts the other.
+    for round in 0 ..< 4:
+      for idx in [3'u64, uint64(chunkSize) * 11 + 3]:
+        doAssert reader.read(idx, warm).isOk
+        fillRecord(expected, int(idx))
+        for b in 0 ..< recordSize:
+          doAssert warm[b] == expected[b],
+            "evicting cache returned stale bytes for record " & $idx &
+            " byte " & $b & " (round " & $round & ")"
+    doAssert reader.residentChunks == 1,
+      "one-chunk budget kept " & $reader.residentChunks & " chunks resident"
 
-  let totalNs = (endTime - startTime).inNanoseconds
-  let recordsPerSec = int64(numRecords) * 1_000_000_000'i64 div totalNs
+    # And a full sweep is still byte-exact under constant eviction.
+    for i in 0 ..< numRecords:
+      doAssert reader.read(uint64(i), warm).isOk
+      fillRecord(expected, i)
+      for b in 0 ..< recordSize:
+        doAssert warm[b] == expected[b],
+          "evicting-cache sweep mismatch at record " & $i & " byte " & $b
 
-  echo "{\"name\": \"chunked_table_write_throughput\", \"unit\": \"records/sec\", \"value\": " & $recordsPerSec & "}"
-  # Note: this target requires -d:release to hit reliably
-  when defined(release):
-    doAssert recordsPerSec > 20_000_000,
-      "write throughput too low: " & $recordsPerSec & " records/sec (limit 20M)"
+  # --- (4): a budget that is NOT a whole number of chunks. This is the path
+  #     where a slot is admitted first and evicted afterwards, i.e. the one
+  #     that recycles evicted slots; a cache that dropped them instead would
+  #     hold every chunk it ever saw and blow through its own budget.
+  block:
+    const chunkBytes = uint64(chunkSize) * uint64(recordSize)
+    let readerRes = initChunkedCompressedTableReader(rawBytes, "cache", recordSize,
+      cacheBytes = chunkBytes * 5 div 2)
+    doAssert readerRes.isOk, "initReader (fractional budget) failed: " & readerRes.error
+    var reader = readerRes.get()
 
-  echo "PASS: bench_chunked_table_write_throughput"
+    for pass in 0 ..< 3:
+      for i in 0 ..< numRecords:
+        doAssert reader.read(uint64(i), warm).isOk
+        fillRecord(expected, i)
+        for b in 0 ..< recordSize:
+          doAssert warm[b] == expected[b],
+            "fractional-budget sweep mismatch at record " & $i &
+            " byte " & $b & " (pass " & $pass & ")"
+      doAssert reader.residentChunks <= 3,
+        "cache exceeded its byte budget: " & $reader.residentChunks &
+        " chunks resident for a 2.5-chunk budget (pass " & $pass & ")"
+      # The real memory bound: evicted buffers must be recycled, not stranded.
+      doAssert reader.cacheSlotCount <= 4,
+        "cache is holding " & $reader.cacheSlotCount &
+        " chunk buffers for a 2.5-chunk budget after " & $(pass + 1) &
+        " sweeps of a " & $numChunks & "-chunk table — evicted slots are " &
+        "not being reused"
+
+  echo "PASS: test_chunked_table_chunk_cache_is_correct"
 
 # Run all tests
 test_chunked_compressed_table_write_read()
 test_chunked_compressed_table_random_access()
 test_chunked_compressed_partial_write()
-bench_chunked_table_decompress()
-bench_chunked_table_write_throughput()
+test_chunked_table_chunk_cache_is_correct()

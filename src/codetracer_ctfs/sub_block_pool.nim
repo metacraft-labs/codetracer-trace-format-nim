@@ -80,11 +80,15 @@ proc expandPool(pm: var SubBlockPoolManager, poolClass: uint8) =
   ## slots, chain them into the free list, and set the free list head.
   let pc = int(poolClass)
   let oldLen = pm.buffers[pc].len
-  pm.buffers[pc].setLen(oldLen + int(DefaultBlockSize))
-
-  # Zero the new block.
-  for i in oldLen ..< pm.buffers[pc].len:
-    pm.buffers[pc][i] = 0
+  # Zero the new block ONCE.  ``setLen`` already zero-fills what it appends, so
+  # the hand-written zeroing loop that used to follow it was a second full pass
+  # over every byte of every block this pool ever grows by — and a scalar one.
+  # ``setLenUninit`` + a single ``zeroMem`` is one vectorised pass.
+  when compiles(pm.buffers[pc].setLenUninit(oldLen + int(DefaultBlockSize))):
+    pm.buffers[pc].setLenUninit(oldLen + int(DefaultBlockSize))
+  else:
+    pm.buffers[pc].setLen(oldLen + int(DefaultBlockSize))
+  zeroMem(addr pm.buffers[pc][oldLen], int(DefaultBlockSize))
 
   let blockIdx = pm.blockCounts[pc]
   pm.blockCounts[pc] += 1
@@ -127,10 +131,10 @@ proc allocate*(pm: var SubBlockPoolManager, poolClass: uint8): Result[SubBlockAl
   let off = slotOffset(poolClass, head.blockIdx, head.slotIndex)
   let (nextBlock, nextSlot) = readNextPtr(pm.buffers[pc], off)
 
-  # Clear the slot data (zero it out).
+  # Clear the slot data (zero it out).  One ``zeroMem`` rather than a scalar
+  # byte loop: this is the allocator's hot path and the slot is up to 2 KiB.
   let pSize = poolSize(poolClass)
-  for i in 0 ..< pSize:
-    pm.buffers[pc][off + i] = 0
+  zeroMem(addr pm.buffers[pc][off], pSize)
 
   # Update free list head.
   if nextBlock == 0 and nextSlot == 0:

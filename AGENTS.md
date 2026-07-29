@@ -104,37 +104,77 @@ choice the sibling Nim repos `io-mon`, `nim-stackable-hooks` and
 
 - The corpus is declared in the `.nimble` `test` task, not discovered. Adding
   a test file means adding it there (and to `repro.nim`'s `testSpecs`).
-- `tests/test_chunked_compressed_table.nim`'s
-  `bench_chunked_table_write_throughput` gate is guarded by
-  `when defined(release)`. The corpus compiles the file in **debug** on
-  purpose, so that gate is compiled out; it only fires from `just bench`. Do
-  not "promote" the file to a release build. (Its `bench_chunked_table_decompress`
-  neighbour is *not* guarded — see the known-red note below.)
+- **Benchmarks live in the `bench` task, correctness in `test`.** The two
+  ChunkedCompressedTable microbenchmarks (`perLookupNs < 50000` per random
+  lookup; `> 20M` records/sec write throughput) are in
+  `tests/bench_chunked_table.nim`, which only `nimble bench` builds — they
+  moved there from `tests/test_chunked_compressed_table.nim` in M34b,
+  thresholds unchanged. Both measure the host: the decompress gate is
+  ~240 compulsory 64 KiB Zstd inflations inside a 50 ms budget, i.e. "does
+  this machine decompress faster than ~390 MB/s". Do not move them back into
+  `test`, and do not "promote" `test_chunked_compressed_table.nim` to a
+  release build — the corpus compiles it in **debug** on purpose.
+  **Know the cost of that split:** `.github/workflows/ci-reprobuild.yml` runs
+  `just test` and nothing else, and `repro.nim` deliberately does not model
+  benchmarks, so **nothing in CI ever runs `just bench`**. A threshold in
+  `bench` is documentation plus a manual command, not an enforced gate. Run
+  `just bench` by hand when touching the reader or the writer's append path.
+- The reader-side cache those benchmarks used to be the only witness for is
+  asserted deterministically, with counters rather than a clock, by
+  `test_chunked_table_chunk_cache_is_correct` in
+  `tests/test_chunked_compressed_table.nim`: byte-identity of a cold vs. a
+  cached read, correctness across a chunk change, correctness under forced
+  eviction with a one-chunk budget, and — with a budget that is a fractional
+  number of chunks — that `cacheSlotCount` stays bounded, which is what
+  catches an evicted slot's buffer being stranded instead of recycled.
 - `tests/test_path_filter.nim` uses `std/re`, which dlopens libpcre — the dev
   shell puts it on `LD_LIBRARY_PATH`.
-- **Known red, pre-existing (3 tests).** Running every command of the nimble
-  `test` task independently on x86_64-linux gives **48 pass / 3 fail**. All
-  three failures are hard-coded *performance* gates embedded in correctness
-  tests, and all three reproduce under the old borrowed
-  `codetracer-trace-format` dev shell (in two of the three cases by a *wider*
-  margin than in this repo's own shell) — they predate this repo's own flake
-  and are not a provisioning problem. Numbers below are `this shell` /
-  `old borrowed shell` on an idle x86_64-linux host:
-  - `test_chunked_compressed_table.nim` `bench_chunked_table_decompress` —
-    `perLookupNs < 50000`, measured 151 740 / 172 839 ns (in **both** debug
-    and `-d:release`; each lookup zstd-decompresses a whole 64 KiB chunk with
-    no chunk cache).
-  - `test_sub_block_pool.nim` — `throughput > 500000.0` allocs/sec, measured
-    303 751 / 210 322.
-  - `test_new_trace_reader.nim` — `medianUs < 100.0`, measured 267.2 / 263.1 µs.
+- **The corpus is green.** Running every command of the nimble `test` task
+  independently on x86_64-linux gives **51 pass / 0 fail**, and `just test`
+  exits 0. It was 48/3 until M34b; the three red gates were hard-coded
+  *performance* thresholds embedded in correctness tests. Two were closed by
+  real optimisation and still assert in `test`:
+  - `test_new_trace_reader.nim` `medianUs < 100.0` — was 263-267 µs, now
+    **1.4 µs**. `ExecStreamReader.readEvent` re-decoded every preceding record
+    in the chunk to reach record *k* (O(chunkSize) per random seek, and it
+    re-counted the whole chunk on every inflation), and its one-slot chunk
+    cache thrashed on a 3-chunk stream. It now keeps a per-chunk record-start
+    table (built by the count pass it already made) and an LRU chunk cache.
+  - `test_sub_block_pool.nim` `throughput > 500000.0` allocs/sec — was
+    216-226 K, now **573-740 K**. `expandPool` zeroed each new 4 KiB block
+    twice (`setLen` zero-fills, then a hand-written scalar loop did it again)
+    and `allocate` cleared each slot with a scalar byte loop; both are single
+    `zeroMem` calls now. This one has the **thinnest margin of the two**:
+    re-sampled at load 127 it gives 569-646 K, i.e. as little as 14% over the
+    500 K gate. Treat it, like `test_ram_cache`, as a gate that a slow or busy
+    machine can tip red — and if it does, profile rather than relax it.
 
-  Because `nimble test` stops at the first failing command, `just test`
-  currently exits non-zero on this host. Do **not** relax or delete these
-  assertions to get a green run. Fixing them is real work (a chunk cache in
-  `ChunkedCompressedTableReader.read`; profiling the sub-block pool and the
-  reader's navigate path) or moving the gates into the `bench` task, where
-  their machine-dependent siblings already live. See the
-  `## Known PRE-EXISTING red tests` list in `.agents/codebase-insights.txt`.
+  The third could not be met on this host and its assertion moved to `bench`
+  (see above) — but the underlying defect was fixed too:
+  `ChunkedCompressedTableReader` had a *single* last-chunk slot, so a random
+  read pattern re-inflated a 64 KiB frame on ~99.6% of lookups. With the LRU
+  cache the same benchmark went from **151-161 µs** to a median of **54.6 µs**
+  per lookup (12 samples, 42.5-77.1 µs) and a repeated read of a resident
+  chunk costs **0.35 µs** instead of 155 µs. It still misses the 50 µs gate on
+  the reference host because 240 of the 1000 lookups are compulsory misses
+  and this host — a 2012-era Xeon E5-2650 @ 2.0 GHz — inflates a 64 KiB frame
+  in 86 µs (quiet) to 148 µs (busy). `zstd -b3 -B65536` independently reports
+  494 / 382 MB/s here, so 22-41 ms of the 50 ms budget goes into libzstd
+  before a line of reader code runs. Re-sampled with the host at load 23 of
+  32 cores: 37.7 / 48.5 / 53.5 / 56.0 / 72.6 µs — still 3 of 5 over the gate.
+  See `Value-Origin-Tracking.milestones.org` § M34b.
+- **One marginal timing gate remains, and it is NOT one of the three M34b
+  fixed.** `tests/test_ram_cache.nim`'s `bench_ram_cache_hit_latency` asserts
+  `perReadNs < 1000` and typically measures 790-890 ns on the reference host —
+  roughly 15% of headroom. It has been seen to flake once at 1122 ns under a
+  load spike. Nothing in M34b touches `ram_cache.nim`, and the gate passed in
+  every completed `just test` run; but if it ever goes persistently red, the
+  cause is structural and worth fixing rather than relaxing:
+  `LruCache.get` returns `Option[V]`, i.e. it **copies the value out on every
+  hit**, and the benchmark caches a 4096-byte block, so ~95% of that ~830 ns
+  is one allocate + 4 KiB memcpy + free per read. A non-copying accessor
+  (`peek`-style) is the fix; that is an API change to a type
+  `cached_trace_reader.nim` also uses, so it is its own piece of work.
 - `tests/test_reader_ffi.nim` and
   `tests/test_pending_value_after_delta_column.nim` are **not** in the corpus
   (not in the `.nimble` task, not in CI, not in `repro.nim`). They predate the
@@ -148,4 +188,6 @@ choice the sibling Nim repos `io-mon`, `nim-stackable-hooks` and
 - `codetracer-specs/Repo-Requirements.md` — the repo conventions this layout
   implements (Part 1 §§1.1–1.3, 1.7; Part 3 support-repo matrix).
 - `codetracer-specs/Planned-Features/Value-Origin-Tracking.milestones.org`
-  § M34 — the milestone that added this flake, `.envrc` and Justfile.
+  § M34 — the milestone that added this flake, `.envrc` and Justfile;
+  § M34b — the milestone that turned the resulting red `just test` green
+  (chunk cache, exec-stream record index, sub-block pool zeroing).
