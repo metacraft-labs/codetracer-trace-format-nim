@@ -236,6 +236,43 @@ int trace_writer_register_span(trace_writer_t handle,
  */
 int trace_writer_flush_spans(trace_writer_t handle);
 
+/*
+ * The exec-stream index the NEXT event registered on this writer will occupy —
+ * the `start_step` a span opened right now should carry.  A span that runs from
+ * here to there is `start_step = trace_writer_next_step_index()` at entry and
+ * `end_step = trace_writer_next_step_index() - 1` at exit (clamped to
+ * `start_step` when nothing was recorded in between).
+ *
+ * This is the writer's own step counter, NOT a count of
+ * trace_writer_register_step calls: the counter advances for every exec-stream
+ * event (absolute steps, DeltaColumn column moves, raise / catch, thread
+ * start / exit / switch), and that counter is the step id every reader walks
+ * (ct_reader_step(n), a span's start_step / end_step, the Request Panel's
+ * startGeid).  A recorder counting its own register_step calls would drift the
+ * moment it emitted a column delta or a thread event.
+ *
+ * Returns 0 when nothing has been recorded (NULL handle, non-multi-stream
+ * backend, or a writer that has not begun events).
+ */
+uint64_t trace_writer_next_step_index(trace_writer_t handle);
+
+/*
+ * Decode the span stream of the `.ct` container at `path` into a JSON array —
+ * the READ counterpart of trace_writer_register_span, so a recorder's own test
+ * suite can assert on the spans it wrote through the canonical Nim decoder
+ * instead of re-implementing one.
+ *
+ * `settled != 0` applies last-record-wins per span_id and sorts ascending by
+ * span_id (what a panel displays); `settled == 0` returns every record in
+ * append order, open records included (what a test asserting in-flight
+ * publication needs).  Field names are the spec's wire names; `metadata` is an
+ * ARRAY of [key, value] pairs because metadata ORDER is part of the contract.
+ *
+ * Returns NULL with *out_len = 0 on failure (see trace_writer_last_error); an
+ * empty stream is the two-byte document "[]".  Free with ct_free_buffer.
+ */
+uint8_t* ct_spans_json(const char* path, int settled, size_t* out_len);
+
 /* --------------------------------------------------------------------------
  * Thread lifecycle events
  *

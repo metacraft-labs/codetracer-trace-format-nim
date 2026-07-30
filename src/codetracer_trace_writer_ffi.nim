@@ -1636,6 +1636,163 @@ proc trace_writer_flush_spans(handle: TraceWriterHandle): cint
     return 1.cint
   0.cint
 
+proc trace_writer_next_step_index(handle: TraceWriterHandle): uint64
+    {.exportc, cdecl, dynlib.} =
+  ## The exec-stream index the NEXT event registered on this writer will
+  ## occupy — i.e. the `start_step` a span opened right now should carry.
+  ##
+  ## This is the writer's own counter, not a count of `register_step` calls:
+  ## `MultiStreamTraceWriter.stepCount` advances for every exec-stream event
+  ## (absolute steps, `DeltaColumn` column moves, raise / catch, thread
+  ## start / exit / switch), because that counter IS the step id readers walk
+  ## (`ct_reader_step(n)`, a span's `start_step` / `end_step`, the panel's
+  ## `startGeid`).  A recorder that counted its own `register_step` calls would
+  ## drift from it the moment it emitted a column delta or a thread event —
+  ## which is why this accessor exists instead.
+  ##
+  ## The FFI buffers one step so late-arriving variable values can be attached
+  ## to it (`flushPendingStep`), so a buffered-but-unwritten step is counted
+  ## here: it will take index `msWriter.stepCount`, and therefore the next NEW
+  ## event takes `stepCount + 1`.
+  ##
+  ## A span that runs from here to there is then
+  ## `start_step = next_step_index()` at entry and
+  ## `end_step = next_step_index() - 1` at exit (clamped to `start_step` for a
+  ## span during which nothing was recorded).
+  ##
+  ## Returns 0 for a NULL handle, a non-multi-stream backend, or a writer that
+  ## is not ready yet — all cases in which no step has been recorded.
+  if handle.isNil:
+    return 0'u64
+  if not handle.useMultiStream:
+    return 0'u64
+  if not handle.msWriterReady:
+    return 0'u64
+  result = handle.msWriter.stepCount
+  if handle.hasPendingStep:
+    result += 1'u64
+
+# ---------------------------------------------------------------------------
+# Span stream — read side
+# ---------------------------------------------------------------------------
+
+proc spanRecordToJson(s: SpanRecord): string =
+  ## One settled span as JSON, with the wire field names the spec uses
+  ## (`CTFS-Request-Span-Streams.md` §"Record Model") so a consumer reads the
+  ## same names it would find in the binary record.  Metadata is an ARRAY of
+  ## `[key, value]` pairs, never an object: metadata order is part of the wire
+  ## contract and a JSON object does not promise to preserve it.
+  proc esc(s: string): string =
+    result = "\""
+    for ch in s:
+      case ch
+      of '"': result.add("\\\"")
+      of '\\': result.add("\\\\")
+      of '\n': result.add("\\n")
+      of '\r': result.add("\\r")
+      of '\t': result.add("\\t")
+      else:
+        if ch < ' ':
+          const hexDigits = "0123456789abcdef"
+          result.add("\\u00")
+          result.add(hexDigits[int(uint8(ch) shr 4)])
+          result.add(hexDigits[int(uint8(ch) and 0x0f)])
+        else:
+          result.add(ch)
+    result.add("\"")
+
+  result = "{\"span_id\":" & $s.spanId &
+    ",\"parent_span_id\":" & $s.parentSpanId &
+    ",\"is_open\":" & (if s.isOpen: "true" else: "false") &
+    ",\"is_external\":" & (if s.isExternal: "true" else: "false") &
+    ",\"status\":" & $ord(s.status) &
+    ",\"start_wall_ns\":" & $s.startWallNs &
+    ",\"end_wall_ns\":" & $s.endWallNs &
+    ",\"process_ord\":" & $s.processOrd &
+    ",\"thread_id\":" & $s.threadId &
+    ",\"start_step\":" & $s.startStep &
+    ",\"end_step\":" & $s.endStep &
+    ",\"external_recording\":" & esc(s.externalRecording) &
+    ",\"external_path\":" & esc(s.externalPath) &
+    ",\"span_type\":" & esc(s.spanType) &
+    ",\"label\":" & esc(s.label) &
+    ",\"contiguous_on_one_thread\":" &
+      (if s.contiguousOnOneThread: "true" else: "false") &
+    ",\"shares_timeline\":" & (if s.sharesTimeline: "true" else: "false") &
+    ",\"concurrent_with_siblings\":" &
+      (if s.concurrentWithSiblings: "true" else: "false") &
+    ",\"metadata\":["
+  for i, (k, v) in s.metadata:
+    if i > 0: result.add(",")
+    result.add("[" & esc(k) & "," & esc(v) & "]")
+  result.add("]}")
+
+proc ct_spans_json(path: cstring, settled: cint,
+    outLen: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib.} =
+  ## Decode the span stream of the `.ct` container at `path` and return it as
+  ## a JSON array of span records.  This is the READ counterpart of
+  ## `trace_writer_register_span`, so a recorder's own test-suite can assert on
+  ## the spans it wrote without re-implementing the decoder — it goes through
+  ## the canonical Nim reader (`initSpanStreamReader`), the same one
+  ## `ct print -f http` uses.
+  ##
+  ## `settled != 0` applies last-record-wins per `span_id` and sorts ascending
+  ## by `span_id` (`settledSpans`) — what a panel displays.  `settled == 0`
+  ## returns every record in APPEND ORDER (`readAllSpanRecords`), open records
+  ## included, which is what a test asserting on in-flight publication needs.
+  ##
+  ## Returns NULL with `*outLen = 0` and `trace_writer_last_error` set on
+  ## failure, and NULL with `*outLen = 0` for a container with no span stream
+  ## (an empty array is `[]`, length 2, so the two are distinguishable).
+  ## The caller must free the buffer with `ct_free_buffer`.
+  if outLen.isNil:
+    setError("ct_spans_json: NULL outLen")
+    return nil
+  outLen[] = 0
+  if path.isNil:
+    setError("ct_spans_json: NULL path")
+    return nil
+  let p = $path
+  var raw: string
+  try:
+    raw = readFile(p)
+  except IOError, OSError:
+    setError("ct_spans_json: cannot read " & p)
+    return nil
+  var bytes = newSeq[byte](raw.len)
+  for i in 0 ..< raw.len:
+    bytes[i] = byte(raw[i])
+
+  let readerRes = initSpanStreamReader(bytes)
+  if readerRes.isErr:
+    setError("ct_spans_json: " & readerRes.error)
+    return nil
+  let reader = readerRes.get()
+  let spansRes =
+    if settled != 0: reader.settledSpans()
+    else: reader.readAllSpanRecords()
+  if spansRes.isErr:
+    setError("ct_spans_json: " & spansRes.error)
+    return nil
+
+  var doc = "["
+  for i, s in spansRes.get():
+    if i > 0: doc.add(",")
+    doc.add(spanRecordToJson(s))
+  doc.add("]")
+  # Allocated here rather than through the reader section's
+  # `allocStringResult`, which is defined further down the file: the span
+  # entry points sit next to the span WRITER they mirror, and Nim resolves
+  # top-level procs in declaration order.
+  outLen[] = csize_t(doc.len)
+  let buf = cast[ptr uint8](alloc(doc.len))
+  if buf.isNil:
+    outLen[] = 0
+    setError("ct_spans_json: out of memory")
+    return nil
+  copyMem(buf, unsafeAddr doc[0], doc.len)
+  buf
+
 # ---------------------------------------------------------------------------
 # Close
 # ---------------------------------------------------------------------------
