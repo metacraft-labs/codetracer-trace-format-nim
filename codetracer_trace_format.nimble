@@ -84,7 +84,10 @@ task regenerateFixtures, "Regenerate .expected golden fixture files":
 task bench, "Run benchmarks":
   exec "nim c -d:release -r tests/bench_seekable_zstd.nim"
   exec "nim c -d:release -r tests/bench_split_binary.nim"
-  exec "nim c -d:release -r tests/test_chunked_compressed_table.nim"
+  # M34b: the two ChunkedCompressedTable microbenchmarks moved here out of
+  # tests/test_chunked_compressed_table.nim (thresholds carried over verbatim).
+  # Both measure the host — see the header of tests/bench_chunked_table.nim.
+  exec "nim c -d:release -r tests/bench_chunked_table.nim"
   exec "nim c -d:release -r tests/bench_varint.nim"
   exec "nim c -d:release -r -p:src tests/test_exec_stream.nim"
 

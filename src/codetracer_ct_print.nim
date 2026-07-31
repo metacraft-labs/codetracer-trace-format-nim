@@ -40,6 +40,43 @@ import native_decoder
 # Global line index resolution for v4 traces
 # ---------------------------------------------------------------------------
 
+proc addEventMetadata*(obj: JsonNode, metadata: seq[byte]) =
+  ## Attach an IO event's ``metadata`` slot to its JSON representation.
+  ##
+  ## The metadata slot is opaque to the trace format — it carries whatever
+  ## the recorder put there. Two consumers matter today:
+  ##
+  ## * ordinary program output tags it with the sink name ("stdout"),
+  ## * **correlation markers** put a complete JSON ``MarkerPayload`` there,
+  ##   which is what lets the debugger pair a value's departure from one
+  ##   recording with its arrival in another.
+  ##
+  ## Because the second case is the substrate of every cross-process
+  ## origin chain, it is worth surfacing structurally rather than as an
+  ## opaque string: a marker that fails to decode is invisible to the
+  ## debugger, and "invisible" is exactly the failure mode that is hard
+  ## to notice without a tool that shows it. When the slot parses as a
+  ## marker payload the event is additionally tagged
+  ## ``correlation_marker`` with its boundary, direction and key hoisted
+  ## to the top level.
+  if metadata.len == 0:
+    return
+  var text = newString(metadata.len)
+  for i, b in metadata:
+    text[i] = char(b)
+  obj["metadata"] = newJString(text)
+  try:
+    let parsed = parseJson(text)
+    if parsed.kind == JObject and parsed.hasKey("boundary_id") and
+        parsed.hasKey("direction") and parsed.hasKey("key_value"):
+      obj["correlation_marker"] = parsed
+      obj["boundary_id"] = parsed["boundary_id"]
+      obj["direction"] = parsed["direction"]
+      obj["key_value"] = parsed["key_value"]
+  except CatchableError:
+    # Not JSON, or not a marker — the raw string above is all we can say.
+    discard
+
 proc buildGliFromMeta(meta: MetaDatContents): GlobalLineIndex =
   ## Rebuild the global line index from the meta.dat paths list
   ## using the same DefaultLinesPerFile the writer uses.
@@ -740,6 +777,9 @@ proc printJsonEventsV4(reader: var NewTraceReader) =
 
 type FullOpts = object
   stripPaths: bool
+  ## Emit machine-readable JSON instead of the human-readable table.
+  ## Only consulted by `--markers`; the other modes are JSON already.
+  jsonOut: bool
 
 proc buildFullDocument(reader: var NewTraceReader,
     opts: FullOpts): JsonNode =
@@ -1048,6 +1088,7 @@ proc buildFullDocument(reader: var NewTraceReader,
             ioObj["text"] = newJString(bytesToUtf8(ev.data))
           ioObj["bytes_b64"] = newJString(base64.encode(ev.data))
           ioObj["bytes_len"] = newJInt(int64(ev.data.len))
+          addEventMetadata(ioObj, ev.metadata)
           eventsArr.add(ioObj)
 
       # 4. Emit call exit events at this step.
@@ -1134,6 +1175,59 @@ proc printFullV4(reader: var NewTraceReader, opts: FullOpts) =
     echo pretty(root, indent = 2)
   except ValueError:
     echo $root
+
+proc printMarkersV4(reader: var NewTraceReader, opts: FullOpts) =
+  ## List the correlation markers a trace carries.
+  ##
+  ## Correlation markers are the substrate of cross-process debugging:
+  ## each one records that a value left or entered this recording at a
+  ## given source location, tagged with a key that pairs it with the
+  ## matching marker in another recording. When a cross-process origin
+  ## chain fails to cross a boundary, the cause is almost always visible
+  ## here — a missing marker, a mismatched key, or a direction recorded
+  ## the wrong way round.
+  ##
+  ## Without a view like this the failure is silent: the debugger simply
+  ## reports a chain that stops early, with nothing to say why.
+  let root = buildFullDocument(reader, opts)
+  let events = root{"events"}
+  var markers: seq[JsonNode] = @[]
+  if events != nil and events.kind == JArray:
+    for ev in events.elems:
+      if ev.kind == JObject and ev.hasKey("correlation_marker"):
+        markers.add(ev)
+
+  if opts.jsonOut:
+    var arr = newJArray()
+    for m in markers:
+      arr.add(m)
+    echo pretty(arr, indent = 2)
+    return
+
+  echo "program: " & reader.meta.program
+  echo "correlation markers: " & $markers.len
+  if markers.len == 0:
+    echo ""
+    echo "  (none — this recording declares no boundary crossings, so no"
+    echo "   cross-process origin chain can enter or leave it)"
+    return
+  echo ""
+  echo "  #  direction  boundary                  key                  step  location"
+  echo "-".repeat(94)
+  for i, m in markers:
+    let payload = m{"correlation_marker"}
+    let direction = payload{"direction"}.getStr("?")
+    let boundary = payload{"boundary_id"}.getStr("?")
+    let key = payload{"key_value"}.getStr("?")
+    let stepId = m{"step_id"}.getInt(-1)
+    let showValue =
+      if payload{"show_value"} != nil and payload{"show_value"}.kind == JString:
+        payload{"show_value"}.getStr()
+      else:
+        ""
+    echo align($(i + 1), 3) & "  " & alignLeft(direction, 9) & "  " &
+      alignLeft(boundary, 24) & "  " & alignLeft(key, 19) & "  " &
+      align($stepId, 4) & "  " & showValue
 
 proc printEventsJsonlV4(reader: var NewTraceReader, opts: FullOpts) =
   ## Emit one JSON object per line. The first line is the header
@@ -1388,6 +1482,12 @@ Usage:
                                           Suitable for golden snapshots.
   ct-print --events <file.ct>            JSONL: header line + one event per
                                           line (compact, diff-friendly).
+  ct-print --markers <file.ct>           List the trace's correlation
+                                          markers — the boundary crossings
+                                          that let a cross-process origin
+                                          chain enter or leave this
+                                          recording. Add --json-out for
+                                          machine-readable output.
   ct-print --follow <file.ct>            Tail the trace as it is written
                                           (NDJSON output).
   ct-print --strip-paths --full <f.ct>   Replace absolute workdir/tmp prefixes
@@ -1485,6 +1585,7 @@ proc main() =
   var follow = false
   var pollMs = 200
   var stripPaths = false
+  var jsonOut = false
   var nativeMode = "auto"  # "auto" | "force" | "off"
 
   for kind, key, val in getopt():
@@ -1498,8 +1599,10 @@ proc main() =
       of "meta-json": format = "meta-json"
       of "full": format = "full"
       of "events": format = "events"
+      of "markers": format = "markers"
       of "follow": follow = true
       of "strip-paths": stripPaths = true
+      of "json-out": jsonOut = true
       of "native": nativeMode = "force"
       of "no-native": nativeMode = "off"
       of "help", "h": printHelp(); return
@@ -1522,7 +1625,7 @@ proc main() =
     printHelp()
     quit(1)
 
-  let opts = FullOpts(stripPaths: stripPaths)
+  let opts = FullOpts(stripPaths: stripPaths, jsonOut: jsonOut)
 
   # ----- Native MCR shard path (auto-detect or --native) -----
   # The native recorder writes a CTFS shard with per-thread `tNNNN` streams
@@ -1617,6 +1720,7 @@ proc main() =
       var reader = newReaderRes.get()
       case format
       of "summary": printSummaryV4(reader)
+      of "markers": printMarkersV4(reader, opts)
       of "meta-json": printMetaJsonV4(reader)
       of "json": printJsonV4(reader)
       of "json-events": printJsonEventsV4(reader)

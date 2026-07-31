@@ -3336,6 +3336,53 @@ proc ct_reader_event_fields(
   0.cint
 
 # ---------------------------------------------------------------------------
+# ct_reader_event_metadata — the IO event's metadata slot
+# ---------------------------------------------------------------------------
+
+proc ct_reader_event_metadata(
+    h: pointer, index: uint64,
+    outData: ptr ptr uint8, outDataLen: ptr csize_t
+): cint {.exportc, cdecl, dynlib.} =
+  ## Returns the `metadata` bytes of the IO event at `index`.
+  ##
+  ## Exposed separately from `ct_reader_event_fields` so the existing
+  ## ABI keeps its shape; adding a return value there would break every
+  ## compiled consumer.
+  ##
+  ## The metadata slot is opaque to the trace format, but it is where
+  ## **correlation markers** live: a recorder that observes a value
+  ## crossing a process boundary stores the marker payload here. Without
+  ## an accessor the payload is written to disk and then unreachable, so
+  ## the debugger cannot pair the two sides of a boundary and a
+  ## cross-process origin chain silently stops at the edge of the
+  ## recording.
+  ##
+  ## The data pointer is heap-allocated; the caller must free it with
+  ## `ct_free_buffer`. An empty slot yields a NULL pointer and zero
+  ## length, which is not an error.
+  if h.isNil or outData.isNil or outDataLen.isNil:
+    setError("NULL parameter")
+    return 1.cint
+  let rh = cast[TraceReaderHandle](h)
+  let res = rh[].ioEvent(index)
+  if res.isErr:
+    setError(res.error)
+    return 1.cint
+  let ev = res.get()
+  if ev.metadata.len == 0:
+    outData[] = nil
+    outDataLen[] = 0.csize_t
+  else:
+    let buf = cast[ptr uint8](alloc(ev.metadata.len))
+    if buf.isNil:
+      setError("allocation failed")
+      return 1.cint
+    copyMem(buf, unsafeAddr ev.metadata[0], ev.metadata.len)
+    outData[] = buf
+    outDataLen[] = csize_t(ev.metadata.len)
+  0.cint
+
+# ---------------------------------------------------------------------------
 # NimMain — required for static/shared lib initialization
 # ---------------------------------------------------------------------------
 

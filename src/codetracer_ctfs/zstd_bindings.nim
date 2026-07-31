@@ -63,3 +63,28 @@ proc ZSTD_decompressDCtx*(dctx: pointer, dst: pointer, dstCapacity: csize_t,
 const
   ZSTD_CONTENTSIZE_UNKNOWN* = culonglong(0xFFFFFFFFFFFFFFFF'u64)
   ZSTD_CONTENTSIZE_ERROR* = culonglong(0xFFFFFFFFFFFFFFFE'u64)
+
+# ---------------------------------------------------------------------------
+# Shared decompression context
+# ---------------------------------------------------------------------------
+
+var sharedDCtx {.threadvar.}: pointer
+  ## One reusable ``ZSTD_DCtx`` per thread.  ``ZSTD_decompress`` (the one-shot
+  ## API) creates and destroys a context on *every* call, which on a 64 KiB
+  ## frame measures as a double-digit percentage of the whole decompression on
+  ## this project's reference host.  Readers that inflate a frame per seek pay
+  ## that on every cache miss, so they go through ``zstdDecompressShared``
+  ## instead.  The context is never freed: it is a fixed per-thread workspace
+  ## for the life of the process, the same lifetime libzstd's own examples give
+  ## it.  It is thread-local because a ``ZSTD_DCtx`` is not re-entrant.
+
+proc zstdDecompressShared*(dst: pointer, dstCapacity: csize_t,
+                           src: pointer, compressedSize: csize_t): csize_t =
+  ## Decompress a whole Zstd frame using this thread's reusable context.
+  ## Identical in effect to ``ZSTD_decompress``; falls back to it if the
+  ## context cannot be created.
+  if sharedDCtx.isNil:
+    sharedDCtx = ZSTD_createDCtx()
+  if sharedDCtx.isNil:
+    return ZSTD_decompress(dst, dstCapacity, src, compressedSize)
+  ZSTD_decompressDCtx(sharedDCtx, dst, dstCapacity, src, compressedSize)

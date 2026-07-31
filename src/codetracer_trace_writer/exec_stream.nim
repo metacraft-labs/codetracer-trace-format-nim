@@ -54,6 +54,7 @@ import results
 import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
 import ../codetracer_ctfs/zstd_bindings
+import ../codetracer_ctfs/chunk_cache
 import ./step_encoding
 import ./varint
 
@@ -62,6 +63,18 @@ const
   ExecCompressionLevel = 3
 
 type
+  ExecChunkMeta = object
+    ## Per-chunk derived state cached alongside the decompressed payload.
+    eventCount: uint32
+    starts: seq[int32]
+      ## Byte offset of every encoded record inside the decompressed chunk.
+      ## Step records are variable-length varints, so without this table the
+      ## only way to reach record *k* is to decode records 0..k-1 — which made
+      ## a random ``readEvent`` O(chunkSize) and a walk over a chunk O(n²).
+      ## The table is filled by the single forward pass the reader already had
+      ## to make to count the chunk's records, so it costs no extra decoding.
+    startsBuilt: bool
+
   ExecStreamWriter* = object
     dataFile: CtfsInternalFile
     indexFile: CtfsInternalFile
@@ -81,8 +94,11 @@ type
                                ## header per chunk + total_events trailer);
                                ## false ⇒ SPEC layout (header-less chunks,
                                ## no trailer).  See module docs.
-    # Cache for last decompressed chunk
-    cachedChunkIdx: int        ## -1 means no cache
+    cache: ChunkCache[ExecChunkMeta]
+      ## Decompressed chunks, LRU by byte budget.  This used to be a single
+      ## "last chunk" slot: a reader jumping between steps in different chunks
+      ## — which is exactly what "navigate to step N" does — re-inflated a Zstd
+      ## frame on nearly every call.
     chunkDecompressions: uint64
       ## Number of *distinct* Zstd chunk inflations performed since this
       ## reader was opened.  Mirrors the db-backend
@@ -93,11 +109,10 @@ type
       ## only touched a bounded slice of the step stream (rather than
       ## scanning the whole stream) assert this counter stays small.  See
       ## ``chunkDecompressions`` / ``NewTraceReader.execChunkDecompressions``.
-    cachedChunk: seq[byte]
-    cachedChunkEventCount: uint32
-    cachedChunkPayloadStart: int ## byte offset within ``cachedChunk`` where the
-                                 ## first encoded event begins: 4 in legacy mode
-                                 ## (past the u32 count header), 0 in SPEC mode.
+    payloadStart: int          ## byte offset within a decompressed chunk where
+                               ## the first encoded event begins: 4 in legacy
+                               ## mode (past the u32 count header), 0 in SPEC
+                               ## mode.
 
 proc initExecStreamWriter*(ctfs: var Ctfs,
     chunkSize: int = DefaultExecChunkSize): Result[ExecStreamWriter, string] =
@@ -276,7 +291,8 @@ proc decodeSpecChunkRecordCount(compressed: openArray[byte]): Result[int, string
 proc initExecStreamReader*(ctfsBytes: openArray[byte],
     blockSize: int = 4096,
     maxEntries: int = 170,
-    legacy: bool = false): Result[ExecStreamReader, string] =
+    legacy: bool = false,
+    cacheBytes: uint64 = DefaultStreamChunkCacheBytes): Result[ExecStreamReader, string] =
   ## Read an execution stream from CTFS bytes.
   ##
   ## ``legacy`` selects the on-disk framing (see module docs):
@@ -376,10 +392,8 @@ proc initExecStreamReader*(ctfsBytes: openArray[byte],
     offsets: offsets,
     totalEventsVal: totalEvents,
     legacy: legacy,
-    cachedChunkIdx: -1,
-    cachedChunk: @[],
-    cachedChunkEventCount: 0,
-    cachedChunkPayloadStart: payloadStart,
+    cache: initChunkCache[ExecChunkMeta](offsets.len, cacheBytes),
+    payloadStart: payloadStart,
   ))
 
 proc totalEvents*(r: ExecStreamReader): uint64 = r.totalEventsVal
@@ -388,11 +402,13 @@ proc chunkDecompressions*(r: ExecStreamReader): uint64 = r.chunkDecompressions
   ## Distinct Zstd chunk inflations performed so far (bounded-decompression
   ## probe; see the ``chunkDecompressions`` field).
 
-proc decompressChunk(r: var ExecStreamReader,
-    chunkIdx: int): Result[void, string] =
-  ## Decompress chunk at chunkIdx into the cache.
-  if r.cachedChunkIdx == chunkIdx:
-    return ok()
+proc chunkSlot(r: var ExecStreamReader,
+    chunkIdx: int): Result[int, string] =
+  ## Return the cache slot holding chunk ``chunkIdx``, inflating it first if it
+  ## is not resident.
+  let hit = r.cache.find(chunkIdx)
+  if hit >= 0:
+    return ok(hit)
 
   if chunkIdx >= r.offsets.len:
     return err("chunk index out of range: " & $chunkIdx)
@@ -411,68 +427,100 @@ proc decompressChunk(r: var ExecStreamReader,
     unsafeAddr r.data[int(startOff)], csize_t(compressedLen))
   if frameSize == ZSTD_CONTENTSIZE_UNKNOWN or frameSize == ZSTD_CONTENTSIZE_ERROR:
     return err("cannot determine decompressed size for chunk " & $chunkIdx)
+  if frameSize == 0:
+    # The writer never emits an empty chunk, so this is a malformed stream.
+    # Guard it explicitly: cache slots start empty, so taking `addr data[0]`
+    # below would index past the end.
+    return err("chunk " & $chunkIdx & " decompresses to zero bytes")
 
-  r.cachedChunk.setLen(int(frameSize))
-  let decompSize = ZSTD_decompress(
-    addr r.cachedChunk[0], csize_t(frameSize),
+  let slot = r.cache.acquire()
+  r.cache.prepare(slot, int(frameSize))
+  let decompSize = zstdDecompressShared(
+    addr r.cache.data(slot)[0], csize_t(frameSize),
     unsafeAddr r.data[int(startOff)], csize_t(compressedLen))
 
   if ZSTD_isError(decompSize) != 0:
+    # The slot was never committed, so it stays free for the next acquire.
     return err("zstd decompress failed for chunk " & $chunkIdx & ": " &
       $ZSTD_getErrorName(decompSize))
 
-  r.cachedChunk.setLen(int(decompSize))
-  # Account a distinct chunk inflation: we only reach here when the target
-  # chunk differs from the cached one (the early-return above caught the
-  # cache hit), so each increment is a genuinely new inflation.
+  r.cache.prepare(slot, int(decompSize))
+  # Account a distinct chunk inflation: we only reach here on a cache miss, so
+  # each increment is a genuinely new inflation.
   r.chunkDecompressions += 1
 
   if r.legacy:
     # Legacy chunk: the first 4 bytes are a u32 LE event count, records follow.
-    if r.cachedChunk.len < 4:
+    if r.cache.data(slot).len < 4:
       return err("decompressed chunk too small for event count header")
     var ec4: array[4, byte]
     for i in 0 ..< 4:
-      ec4[i] = r.cachedChunk[i]
-    r.cachedChunkEventCount = fromBytesLE(uint32, ec4)
+      ec4[i] = r.cache.data(slot)[i]
+    r.cache.meta(slot).eventCount = fromBytesLE(uint32, ec4)
+    # The record count is authoritative here, so the start table is built
+    # lazily — a caller that only ever asks for the count never pays for it.
+    r.cache.meta(slot).startsBuilt = false
   else:
-    # SPEC chunk: header-less payload — count records by decoding forward.
+    # SPEC chunk: header-less payload — count records by decoding forward, and
+    # record where each one starts while we are already walking them.
     var pos = 0
     var count = 0
-    while pos < r.cachedChunk.len:
-      let ev = decodeStepEvent(r.cachedChunk, pos)
+    var starts: seq[int32] = @[]
+    while pos < r.cache.data(slot).len:
+      starts.add(int32(pos))
+      let ev = decodeStepEvent(r.cache.data(slot), pos)
       if ev.isErr:
         return err("failed to count records in chunk " & $chunkIdx & ": " &
           ev.error)
       inc count
-    r.cachedChunkEventCount = uint32(count)
+    r.cache.meta(slot).eventCount = uint32(count)
+    r.cache.meta(slot).starts = starts
+    r.cache.meta(slot).startsBuilt = true
 
-  r.cachedChunkIdx = chunkIdx
+  r.cache.commit(slot, chunkIdx)
+  ok(slot)
+
+proc ensureRecordStarts(r: var ExecStreamReader, slot: int,
+    chunkIdx: int): Result[void, string] =
+  ## Make sure the chunk in ``slot`` has its record start table.  Only the
+  ## legacy framing can reach here with the table missing (the SPEC path builds
+  ## it during the count pass it has to make anyway).
+  if r.cache.meta(slot).startsBuilt:
+    return ok()
+  let count = int(r.cache.meta(slot).eventCount)
+  var starts = newSeqOfCap[int32](count)
+  var pos = r.payloadStart
+  for i in 0 ..< count:
+    starts.add(int32(pos))
+    let ev = decodeStepEvent(r.cache.data(slot), pos)
+    if ev.isErr:
+      return err("failed to decode event " & $i & " while scanning chunk " &
+        $chunkIdx & ": " & ev.error)
+  r.cache.meta(slot).starts = starts
+  r.cache.meta(slot).startsBuilt = true
   ok()
 
 proc readEvent*(r: var ExecStreamReader,
     eventIndex: uint64): Result[StepEvent, string] =
   ## Read a single event by its global index.
+  ##
+  ## O(1) in the chunk's record count: the containing chunk's record start
+  ## table (built once, when the chunk is inflated) gives the record's byte
+  ## offset directly, instead of re-decoding every preceding record.
   if eventIndex >= r.totalEventsVal:
     return err("event index out of range: " & $eventIndex & " >= " & $r.totalEventsVal)
 
   let chunkIdx = int(eventIndex div uint64(r.chunkSize))
   let eventInChunk = int(eventIndex mod uint64(r.chunkSize))
 
-  ?r.decompressChunk(chunkIdx)
+  let slot = ?r.chunkSlot(chunkIdx)
+  ?r.ensureRecordStarts(slot, chunkIdx)
 
-  # Skip past the legacy u32 event count header (0 in SPEC mode).
-  var pos = r.cachedChunkPayloadStart
+  if eventInChunk >= r.cache.meta(slot).starts.len:
+    return err("event " & $eventIndex & " past the end of chunk " & $chunkIdx)
 
-  # Scan forward to the desired event
-  for i in 0 ..< eventInChunk:
-    let ev = decodeStepEvent(r.cachedChunk, pos)
-    if ev.isErr:
-      return err("failed to decode event " & $i & " while scanning chunk " &
-        $chunkIdx & ": " & ev.error)
-
-  # Decode the target event
-  decodeStepEvent(r.cachedChunk, pos)
+  var pos = int(r.cache.meta(slot).starts[eventInChunk])
+  decodeStepEvent(r.cache.data(slot), pos)
 
 proc readChunkEvents*(r: var ExecStreamReader,
     chunkIdx: int,
@@ -480,27 +528,26 @@ proc readChunkEvents*(r: var ExecStreamReader,
   ## Decode every event of chunk ``chunkIdx`` into ``output`` (cleared
   ## first), returning the chunk's first global event index.
   ##
-  ## This is the streaming counterpart to [readEvent]: it pays the
-  ## chunk's decode cost exactly once and yields all events in order,
-  ## avoiding the O(eventInChunk) re-scan that ``readEvent`` performs
-  ## per call.  Bulk readers (FFI bulk accessors, postprocess-style
-  ## streamers) should walk chunks via this helper instead of looping
-  ## ``readEvent``.
+  ## This is the streaming counterpart to [readEvent]: it yields a whole
+  ## chunk's events in order in a single pass.  Bulk readers (FFI bulk
+  ## accessors, postprocess-style streamers) should walk chunks via this
+  ## helper rather than looping ``readEvent``, which materialises one
+  ## ``StepEvent`` per call.
   if chunkIdx < 0 or chunkIdx >= r.offsets.len:
     return err("chunk index out of range: " & $chunkIdx)
 
-  ?r.decompressChunk(chunkIdx)
+  let slot = ?r.chunkSlot(chunkIdx)
 
   let firstEventIdx = uint64(chunkIdx) * uint64(r.chunkSize)
-  let eventCount = int(r.cachedChunkEventCount)
+  let eventCount = int(r.cache.meta(slot).eventCount)
   output.setLen(0)
   if eventCount == 0:
     return ok(firstEventIdx)
   output = newSeqOfCap[StepEvent](eventCount)
 
-  var pos = r.cachedChunkPayloadStart
+  var pos = r.payloadStart
   for i in 0 ..< eventCount:
-    let evRes = decodeStepEvent(r.cachedChunk, pos)
+    let evRes = decodeStepEvent(r.cache.data(slot), pos)
     if evRes.isErr:
       return err("failed to decode event " & $i & " while streaming chunk " &
         $chunkIdx & ": " & evRes.error)

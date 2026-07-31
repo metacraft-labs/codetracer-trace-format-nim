@@ -79,19 +79,17 @@ type
     ##   * ``binary`` — ``build/test-bin/<stem>`` output.
     ##   * ``pooled`` — run the EXECUTE edge in the capacity-1 cargo pool
     ##     (the three cross-read tests share the sibling Rust target dir).
-    ##   * ``debugOnly`` — compile WITHOUT ``-d:release``.
-    ##     ``test_chunked_compressed_table`` embeds a hard 20M records/sec
-    ##     write-throughput microbenchmark gate that is guarded
-    ##     ``when defined(release)`` (line 327). The repo's OWN ``test``
-    ##     corpus — both the nimble ``test`` task
-    ##     (``codetracer_trace_format.nimble`` line 21) and CI
-    ##     (``.github/workflows/test.yml`` line 40) — compiles this file
-    ##     in DEBUG (no ``-d:release``), so the throughput gate is compiled
-    ##     OUT there; the gate lives only in the ``bench`` task (nimble line
-    ##     80, ``-d:release``). Compiling it ``-d:release`` here would
-    ##     activate a machine-dependent throughput assertion the repo never
-    ##     runs as a correctness test, so this edge matches the corpus:
-    ##     debug build, functional assertions only, no perf gate.
+    ##   * ``debugOnly`` — compile WITHOUT ``-d:release``. Matches the flags
+    ##     the nimble ``test`` task uses for that file.
+    ##     ``test_chunked_compressed_table`` is kept debug-only because that is
+    ##     what the corpus does (the nimble ``test`` task, which is what
+    ##     ``.github/workflows/ci-reprobuild.yml`` runs via ``just test``).
+    ##     As of M34b the file holds
+    ##     correctness assertions only: both of its microbenchmarks — the
+    ##     50 µs per-lookup decompress gate and the 20M records/sec write
+    ##     throughput gate — moved verbatim into ``tests/bench_chunked_table.nim``,
+    ##     which only the ``bench`` task builds. Benchmarks are deliberately
+    ##     NOT modelled here: they measure the host, not the build graph.
     ##   * ``pcre`` — link libpcre into the compile (``test_path_filter``).
     source: string
     binary: string
@@ -115,7 +113,7 @@ const
 #
 # NOT modelled — the two FFI-``include`` tests ``test_reader_ffi`` and
 # ``test_pending_value_after_delta_column``. They are excluded from BOTH
-# the nimble ``test`` task AND CI (``.github/workflows/test.yml``), require
+# the nimble ``test`` task AND CI (``.github/workflows/ci-reprobuild.yml``), require
 # a special ``--nimMainPrefix:codetracerTraceWriter`` compile, and their
 # read-back assertions predate the ``a99ae01`` SPEC-canonical step-stream
 # migration: the reader-FFI value path now returns an empty value array for
