@@ -77,6 +77,10 @@ task test, "Run all tests":
   # `include`s codetracer_trace_writer_ffi, so it needs --mm:arc and the
   # --nimMainPrefix the FFI's NimMain importc expects (see buildStaticLib).
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_line_only_orphan_carry_forward.nim"
+  # The synthetic step invented for ORPHAN call arguments must carry the
+  # callee's definition line, not inherit the previous step's position.
+  # Same FFI-`include` compile requirements as the test above.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_orphan_call_args_step_location.nim"
 
 task regenerateFixtures, "Regenerate .expected golden fixture files":
   exec "nim c -r tests/generate_golden_fixtures.nim"
