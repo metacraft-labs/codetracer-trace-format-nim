@@ -120,6 +120,16 @@ const
 # the fixture, so both fail their own ``doAssert``s in a pristine dev shell.
 # That is a product/test drift in an off-corpus FFI reader path, not a
 # provisioning gap, and fixing it is a separate reader-FFI milestone.
+#
+# ALSO not modelled, for the same ``--mm:arc
+# --nimMainPrefix:codetracerTraceWriter`` compile reason (``TestSpec`` has
+# no field for either flag) — but unlike the two above these DO run, in the
+# nimble ``test`` task and therefore in ``just test``:
+# ``tests/test_line_only_orphan_carry_forward.nim`` and
+# ``tests/test_orphan_call_args_step_location.nim``. Both drive the C FFI
+# entry points directly to pin ``flushPendingStep``'s orphan-values
+# branch. Teaching ``TestSpec`` about the two flags so reprobuild covers
+# them as well is worth doing and is tracked separately.
 const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_base40.nim", binary: "build/test-bin/test_base40"),
   TestSpec(source: "tests/test_container.nim", binary: "build/test-bin/test_container"),

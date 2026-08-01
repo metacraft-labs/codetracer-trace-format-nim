@@ -153,6 +153,12 @@ type
     # accounting code.
     variables: seq[string]
     variableIndex: Table[string, csize_t]
+    # Mirror of the multi-stream writer's interned path list, so the FFI
+    # can answer "is this path ALREADY registered, and under which id?"
+    # without calling ``registerPath`` (which would intern it with an
+    # empty line-length table and permanently cost the file its column
+    # resolution).  See ``registeredPathId``.
+    pathIdIndex: Table[string, uint64]
 
   TraceWriterHandle = ptr TraceWriterState
 
@@ -398,7 +404,31 @@ proc trace_writer_finish_paths(handle: TraceWriterHandle): cint {.exportc, cdecl
 # Multi-stream helpers
 # ---------------------------------------------------------------------------
 
-proc flushPendingStep(handle: TraceWriterHandle): cint =
+proc registeredPathId(handle: TraceWriterHandle, path: string): uint64 =
+  ## Return the writer's interned path id for ``path``, or
+  ## ``high(uint64)`` when the path has NOT been registered yet.
+  ##
+  ## Deliberately a LOOKUP and never a registration: calling
+  ## ``msWriter.registerPath`` here would intern the path with an EMPTY
+  ## per-line length table, and ``registerPath`` only records
+  ## ``pathLineLengths`` on the interning call that first creates the id.
+  ## A later ``trace_writer_register_path_with_line_lengths`` for the same
+  ## file would then be a no-op and the file would silently lose column
+  ## resolution for the whole trace.  Callers that cannot resolve a path
+  ## must fall back rather than register it early.
+  ##
+  ## ``handle.pathIdIndex`` mirrors ``msWriter.paths`` (which the writer
+  ## only ever appends to), so the sync loop below is amortised O(1).
+  if not handle.useMultiStream or not handle.msWriterReady:
+    return high(uint64)
+  if handle.pathIdIndex.len < handle.msWriter.paths.len:
+    for i in handle.pathIdIndex.len ..< handle.msWriter.paths.len:
+      handle.pathIdIndex[handle.msWriter.paths[i]] = uint64(i)
+  handle.pathIdIndex.getOrDefault(path, high(uint64))
+
+proc flushPendingStep(handle: TraceWriterHandle,
+    orphanPathId: uint64 = high(uint64),
+    orphanLine: uint64 = 0'u64): cint =
   ## Flush the buffered pending step and its accumulated variable values
   ## to the multi-stream writer.  Handles two cases:
   ##
@@ -416,9 +446,19 @@ proc flushPendingStep(handle: TraceWriterHandle): cint =
   ## 2. No pending step but a non-empty ``pendingValues`` queue
   ##    (M-leo regression: variables were registered after the last
   ##    step was already flushed; the values would otherwise be
-  ##    silently dropped on close / return).  Emit a synthetic
-  ##    zero-delta column step so the values still reach the value
-  ##    stream parallel to the exec stream.
+  ##    silently dropped on close / return).  Emit a synthetic step so
+  ##    the values still reach the value stream parallel to the exec
+  ##    stream.
+  ##
+  ## ``orphanPathId`` / ``orphanLine`` are the TRUTHFUL source location
+  ## of the orphan values, threaded in by the call site that knows it
+  ## (currently ``trace_writer_register_call``, which resolves the
+  ## callee's definition site from the function registry).  When
+  ## supplied — ``orphanPathId != high(uint64)`` — the synthetic step is
+  ## emitted at that location.  When absent the synthetic step falls
+  ## back to a zero-delta column step, which INHERITS the position of
+  ## whatever step was emitted last; see the branch's comment for why
+  ## that fallback is not good enough on its own.
   ##
   ## Returns 0 on success, 1 on error.
   if handle.hasPendingStep:
@@ -444,9 +484,29 @@ proc flushPendingStep(handle: TraceWriterHandle): cint =
     # preserve them differently:
     #
     # * Column-aware traces (``columnAwareSteps``): emit a synthetic
-    #   zero-delta column step so the orphan values surface in the
-    #   value stream parallel to the exec stream (the M-leo fix from
-    #   92fce3a).  Requires at least one prior step to anchor against.
+    #   step so the orphan values surface in the value stream parallel
+    #   to the exec stream (the M-leo fix from 92fce3a).
+    #
+    #   The synthetic step needs a POSITION.  A zero-delta
+    #   ``registerColumnStep`` gives it the position of the previously
+    #   emitted step, which is only truthful when the orphan values
+    #   belong to the unit that step is in.  They frequently do not:
+    #   ``NimTraceWriter::arg`` registers a callee's arguments as step
+    #   variables just BEFORE ``register_call``, at a moment when the
+    #   caller's own step has already been flushed (by the previous
+    #   ``register_return``).  In a recorded Flask session the previously
+    #   emitted step is then the PREVIOUS request's ``after_request``
+    #   hook return, so a parameterised route's first recorded event
+    #   (which is what a span's ``start_step`` binds to) reported a line
+    #   belonging to a different request entirely, and the Request Panel
+    #   seeked there.
+    #
+    #   So prefer the location the CALL SITE threaded in
+    #   (``orphanPathId`` / ``orphanLine`` — the callee's definition
+    #   site, which is where those argument values are actually in
+    #   scope) and emit a real line step there.  Only when no location
+    #   is available do we fall back to the zero-delta column step,
+    #   which still requires at least one prior step to anchor against.
     #
     # * Line-only traces (``not columnAwareSteps`` — e.g. ton,
     #   cardano, circom): CARRY the orphan values forward in
@@ -459,7 +519,13 @@ proc flushPendingStep(handle: TraceWriterHandle): cint =
     #   line-only recorders; carrying them forward restores them
     #   without touching the column-aware wire output.
     if handle.msWriter.columnAwareSteps:
-      if handle.msWriter.stepCount > 0:
+      if orphanPathId != high(uint64):
+        let res = handle.msWriter.registerStep(
+          orphanPathId, orphanLine, handle.pendingValues)
+        if res.isErr:
+          setError(res.error)
+          return 1.cint
+      elif handle.msWriter.stepCount > 0:
         let res = handle.msWriter.registerColumnStep(0'i64, handle.pendingValues)
         if res.isErr:
           setError(res.error)
@@ -693,11 +759,35 @@ proc trace_writer_register_call(
   ## Any arguments staged via ``trace_writer_register_call_arg`` since the
   ## previous call/return are attached to the new call record and the
   ## staging buffer is cleared.
+  ##
+  ## Recorders stage each argument through a helper that ALSO registers
+  ## it as a step variable (``NimTraceWriter::arg``), so by the time we
+  ## get here ``pendingValues`` may hold the callee's arguments.  When
+  ## the caller's own step has already been flushed (the usual shape:
+  ## the previous event was a ``register_return``) those values are
+  ## orphaned, and ``flushPendingStep`` has to invent a step for them.
+  ## Resolve the callee's DEFINITION site from the function registry and
+  ## thread it in, so that invented step carries the location where
+  ## those arguments are actually in scope instead of inheriting the
+  ## position of the last unrelated step emitted.
   if handle.isNil:
     return
   if handle.useMultiStream:
+    var orphanPathId = high(uint64)
+    var orphanLine = 0'u64
+    if not handle.hasPendingStep and handle.pendingValues.len > 0 and
+        int(function_id) < handle.functions.len:
+      let fn = handle.functions[int(function_id)]
+      if fn.path.len > 0 and fn.line > 0:
+        # LOOKUP only — never register.  An unregistered path means we
+        # cannot name a truthful position yet, so we let the fallback
+        # run rather than intern the path without its line lengths.
+        let pathId = registeredPathId(handle, fn.path)
+        if pathId != high(uint64):
+          orphanPathId = pathId
+          orphanLine = uint64(fn.line)
     if handle.msWriter.stepCount > 0:
-      discard flushPendingStep(handle)
+      discard flushPendingStep(handle, orphanPathId, orphanLine)
     discard handle.msWriter.registerCall(uint64(function_id),
         handle.pendingCallArgs)
     handle.pendingCallArgs.setLen(0)
