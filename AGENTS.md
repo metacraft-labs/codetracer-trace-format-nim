@@ -163,18 +163,58 @@ choice the sibling Nim repos `io-mon`, `nim-stackable-hooks` and
   before a line of reader code runs. Re-sampled with the host at load 23 of
   32 cores: 37.7 / 48.5 / 53.5 / 56.0 / 72.6 µs — still 3 of 5 over the gate.
   See `Value-Origin-Tracking.milestones.org` § M34b.
-- **One marginal timing gate remains, and it is NOT one of the three M34b
-  fixed.** `tests/test_ram_cache.nim`'s `bench_ram_cache_hit_latency` asserts
-  `perReadNs < 1000` and typically measures 790-890 ns on the reference host —
-  roughly 15% of headroom. It has been seen to flake once at 1122 ns under a
-  load spike. Nothing in M34b touches `ram_cache.nim`, and the gate passed in
-  every completed `just test` run; but if it ever goes persistently red, the
-  cause is structural and worth fixing rather than relaxing:
-  `LruCache.get` returns `Option[V]`, i.e. it **copies the value out on every
-  hit**, and the benchmark caches a 4096-byte block, so ~95% of that ~830 ns
-  is one allocate + 4 KiB memcpy + free per read. A non-copying accessor
-  (`peek`-style) is the fix; that is an API change to a type
-  `cached_trace_reader.nim` also uses, so it is its own piece of work.
+- **`ram_cache`'s marginal timing gate is closed (M34c).**
+  `tests/test_ram_cache.nim`'s `bench_ram_cache_hit_latency` used to assert
+  `perReadNs < 1000` against `LruCache.get`, which returns `Option[V]` and so
+  **copies the value out on every hit** — for the benchmark's 4096-byte block
+  that is one allocate + 4 KiB memcpy + free per read, ~95% of the ~830 ns it
+  reported. `LruCache` now has **`tryGet`**, which returns a borrowed `ptr V`
+  (`nil` on a miss), promotes to MRU and keeps the same counters; `get`
+  survives as the *owning* accessor and is implemented over it, so no caller
+  broke. `cached_trace_reader.readBlock` uses `tryGet`.
+  **The 1000 ns threshold is unchanged** and now clears by ~10x: 12
+  consecutive samples at load 126 gave 64-93 ns. The same runs measured the
+  old copying path alongside and it exceeded 1000 ns in **4 of 12** (825-1157
+  ns) — the flake was worse than the recorded 15% headroom suggested.
+  Re-measured during review at load 26 of 32 cores: `tryGet` 42-49 ns,
+  the old copying path 497-540 ns over 12 samples, i.e. 0 of 12 over the gate
+  at that load, and 855 ns for the same path inside a full `nimble test` run.
+  So the copying path's distance from the gate tracks host load closely; the
+  4-of-12 figure is a load-126 number and does not reproduce on a quiet host.
+  The ~11x ratio between the two accessors reproduces at every load measured.
+  The borrow rule (`tryGet`'s pointer is valid until the next `put`/`clear`)
+  is documented on the proc. "No copy" is asserted structurally, not by a
+  clock, by `test_lru_cache_hit_does_not_copy_the_value`: pointer aliasing
+  plus a `=copy`-hook census (0 copies for `tryGet`, exactly 10 000 for `get`
+  over the same loop, so the zero cannot pass vacuously).
+  **`tryGet`'s pointer is only safe by discipline, so the safety property the
+  suite pins is that no borrow leaves the accessor's own expression.** Both
+  in-package consumers (`get`, `cached_trace_reader.readBlock`) dereference
+  immediately and hand back an owned value;
+  `test_borrow_never_escapes_the_cache` asserts that from the outside — the
+  returned value is not an alias (mutating it does not reach the cache), it is
+  a copy and not a *move* (the entry is still readable afterwards), and it
+  outlives both the eviction of its entry and a `clear`. If you add a caller,
+  the rule is the one on the proc: read through the pointer, or copy out of
+  it, before the next `put`/`clear`; a `put` may evict the very entry you are
+  holding, and the entry's node is freed when it leaves both the table and the
+  order list.
+- **The thinnest remaining gate is `test_sub_block_pool`'s
+  `throughput > 500_000.0`, and it has been profiled — do not guess at it.**
+  It flakes on a busy host (seen at 466 K inside a full `nimble test` at load
+  120; 572-704 K standalone at load 98-119). M34c decomposed the cost over
+  the benchmark's own shape: buffer growth alone is 2.24 s, growth + both
+  `zeroMem` passes is 2.14 s, and the same work with the pool buffers
+  **pre-reserved** is 0.16 s. **The cost is entirely the growth of the flat
+  per-class `seq[byte]` pool buffers — geometric-`realloc` copying plus page
+  faults over ~580 MB — and none of it is zeroing.** A change that halved the
+  allocator's zeroing traffic (skipping the redundant re-zero of a
+  never-handed-out slot) moved the number by nothing measurable and was
+  reverted rather than kept. Removing the copy means making the buffer
+  chunked instead of one flat `seq`, and `buffers` is a public field that
+  `namespace.nim` serializes and deserializes directly — a trace-format-adjacent
+  change, not a local one. The profile is recorded in
+  `Value-Origin-Tracking.milestones.org` § M34c's watch-item update.
 - `tests/test_reader_ffi.nim` and
   `tests/test_pending_value_after_delta_column.nim` are **not** in the corpus
   (not in the `.nimble` task, not in CI, not in `repro.nim`). They predate the

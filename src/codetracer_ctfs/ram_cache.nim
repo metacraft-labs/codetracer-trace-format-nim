@@ -7,6 +7,23 @@ when defined(nimPreviewSlimSystem):
 ##
 ## Uses a DoublyLinkedList for O(1) promote/evict and a Table for O(1) lookup.
 ## Eviction is based on total byte size, not entry count.
+##
+## Two accessors, and the difference is not stylistic:
+##
+## * `tryGet` is the **hit path**.  It returns a borrowed ``ptr V`` into the
+##   entry the cache already owns, so a hit costs a hash lookup and two
+##   linked-list pointer swaps and nothing else — no allocation, no copy,
+##   regardless of how large ``V`` is.
+## * `get` is the **owning** accessor.  It returns ``Option[V]``, which means it
+##   allocates and copies the value out on every hit.  For the 4 KiB CTFS
+##   blocks this cache actually holds, that copy was ~95% of the measured cost
+##   of a hit (see `tests/test_ram_cache.nim`), so `get` is for callers that
+##   genuinely need to own the value past the next cache mutation, not for
+##   anyone reading through the cache in a loop.
+##
+## The borrow rule for `tryGet` is the ordinary one: the pointer is valid until
+## the next mutation of the cache (`put`, `clear`, or the eviction `put`
+## triggers).  Nothing in this package holds one across a `put`.
 
 import std/[tables, lists, options]
 
@@ -32,22 +49,41 @@ proc initLruCache*[K, V](maxBytes: uint64 = 256 * 1024 * 1024): LruCache[K, V] =
     misses: 0
   )
 
-proc get*[K, V](cache: var LruCache[K, V], key: K): Option[V] =
-  ## Get a value. Returns none() on miss, some() on hit. Promotes to MRU.
-  try:
-    if key in cache.table:
-      let node = cache.table[key]
-      # Promote to MRU (head of list)
-      cache.order.remove(node)
-      cache.order.prepend(node)
-      cache.hits += 1
-      return some(node.value.value)
-    else:
-      cache.misses += 1
-      return none(V)
-  except KeyError:
+proc tryGet*[K, V](cache: var LruCache[K, V], key: K): ptr V =
+  ## Non-copying accessor — **the hit path**.
+  ##
+  ## Returns a borrowed pointer to the value the cache already owns on a hit,
+  ## and ``nil`` on a miss.  Promotes to MRU, exactly as `get` does, and
+  ## maintains the same hit/miss counters.
+  ##
+  ## The pointer aliases the cache's own storage: it stays valid until the next
+  ## `put` or `clear` on this cache (a `put` may evict the very entry that was
+  ## returned).  Read through it, or copy out of it, before mutating the cache.
+  ##
+  ## `getOrDefault` rather than ``key in table`` + ``table[key]`` is deliberate:
+  ## it is one lookup instead of two, and the entry type is a ref so the "not
+  ## found" default is ``nil``, which needs no ``KeyError`` handler.
+  let node = cache.table.getOrDefault(key)
+  if node.isNil:
     cache.misses += 1
-    return none(V)
+    return nil
+  # Promote to MRU (head of list)
+  cache.order.remove(node)
+  cache.order.prepend(node)
+  cache.hits += 1
+  addr node.value.value
+
+proc get*[K, V](cache: var LruCache[K, V], key: K): Option[V] =
+  ## Owning accessor. Returns none() on miss, some() on hit. Promotes to MRU.
+  ##
+  ## This **copies** the value out — for a 4 KiB block that is an allocation
+  ## plus a 4 KiB memcpy plus a free, per call.  Prefer `tryGet` unless the
+  ## caller has to keep the value past the cache's next mutation.
+  let hit = cache.tryGet(key)
+  if hit.isNil:
+    none(V)
+  else:
+    some(hit[])
 
 proc evictLru[K, V](cache: var LruCache[K, V]) =
   ## Evict the least recently used entry (tail of list).

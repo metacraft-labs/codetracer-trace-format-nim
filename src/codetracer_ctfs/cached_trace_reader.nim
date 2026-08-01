@@ -8,7 +8,6 @@ when defined(nimPreviewSlimSystem):
 ## Reads check RAM first (fast), then disk cache (may trigger a remote
 ## fetch via the BlockFetcher callback), and promote fetched data to RAM.
 
-import std/options
 import results
 import ./partial_trace_cache
 import ./ram_cache
@@ -37,9 +36,14 @@ proc readBlock*(reader: var CachedBlockReader, blockId: uint64): Result[seq[byte
   ## Check RAM cache first, then disk cache, then fetch remotely.
 
   # 1. RAM hit?
-  let ramResult = reader.ramCache.get(blockId)
-  if ramResult.isSome:
-    return ok(ramResult.get())
+  #
+  # `tryGet` borrows rather than copying, so the hit path materialises the
+  # block exactly once — into the `Result` the caller receives — instead of
+  # twice (cache -> Option, Option -> Result).  The borrow does not outlive
+  # this expression, and nothing mutates the cache in between.
+  let ramHit = reader.ramCache.tryGet(blockId)
+  if not ramHit.isNil:
+    return ok(ramHit[])
 
   # 2. Disk cache (may fetch remotely)
   let data = ?reader.diskCache.fetchBlock(blockId)

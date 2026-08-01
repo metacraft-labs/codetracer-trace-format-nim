@@ -21,9 +21,10 @@ when defined(nimPreviewSlimSystem):
 ## * Chunk indices are dense (``0 ..< numChunks``), so the key→slot map is a
 ##   flat ``seq[int32]`` rather than a ``Table``: O(1), no hashing, no
 ##   allocation on the hot path.  (``ram_cache.LruCache`` is the general
-##   ``Table`` + ``DoublyLinkedList`` cache for sparse keys; it also copies its
-##   value out on every hit, which for a 64 KiB chunk payload would reintroduce
-##   a large part of the cost this cache exists to remove.)
+##   ``Table`` + ``DoublyLinkedList`` cache for sparse keys.  It now borrows on
+##   a hit too — ``ram_cache.tryGet`` — so the copy is no longer the reason to
+##   prefer this module; the dense-key, no-hashing slot map and the
+##   caller-supplied per-chunk metadata are.)
 ## * Eviction is by **bytes**, not by entry count, because chunk payloads vary
 ##   in size between streams.  The budget is a cap, not a reservation: a reader
 ##   whose whole stream is smaller than the budget never evicts, and a reader
