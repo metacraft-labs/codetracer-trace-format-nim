@@ -16,6 +16,10 @@ task test, "Run all tests":
   # M38b: appending internal files to an already-closed container. Uses a
   # 4.5 MB internal file, so -d:release keeps it quick.
   exec "nim c -r -d:release tests/test_container_append.nim"
+  # M57: the append's write ORDERING (tail first, block 0 last), which is why
+  # an interrupted append leaves the old valid container. Needs the
+  # fault-injection seam, which is compiled out of every other build.
+  exec "nim c -r -d:release -d:ctfsAppendFaultInjection tests/test_container_append_ordering.nim"
   exec "nim c -r tests/test_streaming.nim"
   exec "nim c -r tests/test_chunk_index.nim"
   exec "nim c -r tests/test_fixed_record_table.nim"

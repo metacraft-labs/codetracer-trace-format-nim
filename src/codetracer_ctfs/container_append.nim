@@ -116,8 +116,38 @@ proc openClosedCtfs*(path: string): Result[Ctfs, string] =
 
   var maxRootEntries = readU32LE(data, 12)
   if maxRootEntries == 0'u32:
-    # A zero means "fill block 0", the same reading the container's own
-    # readers use when a producer leaves the field unset.
+    # A zero means "fill block 0" — `ctfs-container.md` §1's normative reading
+    # of `MaxRootEntries`, which yields 170 entries at the default 4096-byte
+    # block ((4096 - 16) / 24).
+    #
+    # **The readers in this tree do not agree on that, so do not read the
+    # fallback below as the house convention.** Three readings coexist:
+    #
+    #   - auto-fill to 170, as here: the wasm recorder's independent Go reader
+    #     (`internal/ctfs/container.go`'s `locateEntryArray`) and the
+    #     cross-read checker `tests/check_ctfs_container.nim`;
+    #   - **no fallback at all** — `container.nim`'s `readInternalFile` and
+    #     `hasInternalFile` default `maxEntries` to `DefaultMaxRootEntries`
+    #     (31) and scan exactly that many slots, and
+    #     `codetracer_trace_reader.nim` passes the header's value straight
+    #     through, so a declared 0 makes it scan *nothing* and report every
+    #     internal file absent;
+    #   - outright refusal: `native_decoder.nim` errors on `maxRoot == 0`.
+    #
+    # The divergence is harmless *today* only because nothing ever writes a
+    # zero: `createCtfs`'s `maxRootEntries` parameter defaults to
+    # `DefaultMaxRootEntries` = 31 and every caller takes that default
+    # (`multi_stream_writer.nim`, `split_trace.nim`, `createCtfsStreaming`,
+    # and the FFI's `ct_container_create`), while the Rust writer's one
+    # production call site passes a literal 31. Every `.ct` in the workspace
+    # carries 31 in header bytes 12-15, so the branch below is unreachable for
+    # any container these writers produce — and 31 entries are read the same
+    # way by all three readings.
+    #
+    # It is reachable from a *foreign* producer, and the spec's own defaults
+    # table recommends exactly the 0 that half of this tree cannot read. That
+    # makes the split a latent interop hazard rather than a style difference,
+    # which is why it is written down here instead of quietly relied upon.
     maxRootEntries = uint32(
       (int(blockSize) - HeaderSize - ExtHeaderSize) div FileEntrySize)
   if HeaderSize + ExtHeaderSize + int(maxRootEntries) * FileEntrySize > int(blockSize):
@@ -159,6 +189,31 @@ proc syncToDisk(f: File) =
   when defined(posix):
     discard fsync(f.getFileHandle())
 
+when defined(ctfsAppendFaultInjection):
+  var ctfsAppendStopAtMidpoint*: bool = false
+    ## Test-only fault injection: abandon an append **between** its two write
+    ## phases, which is the one instant the durability argument is about.
+    ##
+    ## This is compiled in only under `-d:ctfsAppendFaultInjection`; a normal
+    ## build of this module contains no trace of it, and the release library
+    ## the Rust crate links cannot reach it.
+    ##
+    ## It exists because the ordering in `writeAppendedBlocks` is the whole
+    ## reason an interrupted append leaves the *old valid container* rather
+    ## than a corrupt one, and until M57 nothing tested it. Every append test
+    ## in both repos compares two quiescent snapshots — before the call and
+    ## after it returns — so reversing the two phases changed no observable
+    ## byte and the entire corpus stayed green.
+    ##
+    ## There is no seam in the standard library to observe write ordering from
+    ## the outside (no injectable `File`, no fsync hook), and the container is
+    ## written through concrete `std` calls by design. Stopping at the
+    ## midpoint is therefore the honest way to ask the question: it produces a
+    ## *real* half-finished container on a *real* filesystem, and the test
+    ## then reads it back with the production reader. Nothing is mocked.
+    ##
+    ## See `tests/test_container_append_ordering.nim`.
+
 proc writeAppendedBlocks(c: Ctfs, path: string,
                          firstNewBlock: uint64): Result[void, string] =
   ## Write the appended tail, then block 0. Never touches anything between.
@@ -178,6 +233,18 @@ proc writeAppendedBlocks(c: Ctfs, path: string,
         close(f)
         return err(appendError(path, "short write appending " & $n & " bytes"))
       syncToDisk(f)
+
+    # ---- the midpoint the durability argument turns on ----------------
+    # Everything above is on disk; nothing below has run. A crash here is
+    # the case `CTFS-Binary-Format.md` §5d describes: unreferenced trailing
+    # blocks, and block 0 still the old one. This statement sits *between*
+    # the two phases deliberately, so that swapping them moves the two
+    # writes around it rather than moving it along with either.
+    when defined(ctfsAppendFaultInjection):
+      if ctfsAppendStopAtMidpoint:
+        close(f)
+        return err(appendError(path,
+          "fault injection: abandoned between the tail write and block 0"))
 
     # Only now does anything point at the blocks just written.
     f.setFilePos(0)
