@@ -166,6 +166,33 @@ proc readInternalFile*(data: openArray[byte], name: string,
     blockSize: uint32 = DefaultBlockSize,
     maxEntries: uint32 = DefaultMaxRootEntries): Result[seq[byte], string] =
   ## Read the complete content of an internal CTFS file by following the block mapping.
+  ##
+  ## `CTFS-Binary-Format.md` §5d: a reader MUST accept a container whose length
+  ## is not a whole number of blocks — the state a crash *inside* an append's
+  ## tail write leaves — and ignore the bytes past the last whole block. What
+  ## makes accepting that safe is **flooring**: `wholeBlocks` below is
+  ## `floor(len / blockSize)`, never rounded up, so the incomplete final block
+  ## is unaddressable.
+  ##
+  ## Flooring only helps if the bound is applied on *every* path from a block
+  ## number to bytes, and there are three: the entry's mapping root, each
+  ## mapping block walked to resolve the data block, and the **data block
+  ## itself**. The last is the easy one to miss — it is read directly rather
+  ## than through the same helper as the others, and the final data block's
+  ## copy is clamped to the entry's `Size`, so a short read out of the partial
+  ## region *succeeds*. Bounding only against `data.len` (which is what this
+  ## proc used to do) therefore turns a truncated container into wrong content
+  ## instead of an error, which is strictly worse than refusing the file
+  ## outright. The same gap was found and closed in the Go reader (M57); this
+  ## is the Nim half of it (M58), pinned by `tests/test_partial_tail_bounds.nim`.
+  if blockSize == 0'u32:
+    return err("zero block size")
+  # floor, never `+ blockSize - 1`: rounding up would make the incomplete
+  # final block addressable, which is the one arithmetic §5d forbids.
+  let wholeBlocks = uint64(data.len div int(blockSize))
+  let truncatedNote = " — the container carries " & $wholeBlocks &
+    " whole " & $blockSize & "-byte blocks in " & $data.len &
+    " bytes, so it is truncated or its tail write was interrupted"
   let encoded = base40Encode(name)
   var fileSize: uint64 = 0
   var mapBlock: uint64 = 0
@@ -185,6 +212,11 @@ proc readInternalFile*(data: openArray[byte], name: string,
 
   if fileSize == 0:
     return ok(newSeq[byte](0))
+
+  # Path 1 of 3: the entry's mapping root.
+  if mapBlock == 0'u64 or mapBlock >= wholeBlocks:
+    return err("mapping root block " & $mapBlock & " of internal file " & name &
+      " is out of bounds" & truncatedNote)
 
   var fileBytes = newSeq[byte](int(fileSize))
   let usable = uint64(blockSize) div 8 - 1
@@ -215,6 +247,10 @@ proc readInternalFile*(data: openArray[byte], name: string,
         let chainPtr = readU64LE(data, chainOff)
         if chainPtr == 0:
           return err("missing chain pointer at level " & $level)
+        # Path 2a of 3: a mapping block reached through the chain.
+        if chainPtr >= wholeBlocks:
+          return err("chain pointer at level " & $level & " names block " &
+            $chainPtr & ", which is out of bounds" & truncatedNote)
         currentLevelBlock = chainPtr
 
     var navBlock = currentLevelBlock
@@ -232,6 +268,10 @@ proc readInternalFile*(data: openArray[byte], name: string,
       let childBlock = readU64LE(data, childOff)
       if childBlock == 0:
         return err("missing child block at level " & $navLevel)
+      # Path 2b of 3: a mapping block reached by descending the hierarchy.
+      if childBlock >= wholeBlocks:
+        return err("child block pointer at level " & $navLevel & " names block " &
+          $childBlock & ", which is out of bounds" & truncatedNote)
       navBlock = childBlock
       navIdx = subIdx
       navLevel -= 1
@@ -242,6 +282,15 @@ proc readInternalFile*(data: openArray[byte], name: string,
     let dataBlock = readU64LE(data, ptrOff)
     if dataBlock == 0:
       return err("null data block at index " & $blockIdx)
+
+    # Path 3 of 3, and the one that was missing. The `blockOff + toCopy >
+    # data.len` check below is NOT this bound: `toCopy` is clamped to what is
+    # left of the entry, so a stream whose last data block landed in the
+    # partial region was served successfully out of bytes the container does
+    # not own. Check the block NUMBER, before its bytes are touched.
+    if dataBlock >= wholeBlocks:
+      return err("data block " & $blockIdx & " of internal file " & name &
+        " is block " & $dataBlock & ", which is out of bounds" & truncatedNote)
 
     let blockOff = int(dataBlock) * int(blockSize)
     let toCopy = min(remaining, int(blockSize))

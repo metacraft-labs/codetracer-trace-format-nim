@@ -36,6 +36,19 @@
 ##                               found everything would pass vacuously)
 ## Blank lines and `#` comments are ignored. Exits 0 only when every line
 ## holds, printing `check_ctfs_container: OK`.
+##
+## ## What it accepts, and why that is not laxity
+##
+## Per `CTFS-Binary-Format.md` §5d a reader must accept a container whose
+## length is not a whole number of blocks (what a crash inside an append's tail
+## write leaves) and ignore the partial region. Since this program is the
+## *adjudicating* reader for other implementations' containers, refusing that
+## state would make it disagree with every conforming reader that defers to it.
+## It therefore accepts and says so on stderr; genuine corruption is caught
+## where it can actually be told apart — `readInternalFile` refuses a stream
+## whose mapping root, mapping block or **data block** falls outside the
+## container's whole blocks, so a truncated container loses exactly the streams
+## that were truncated and keeps the rest byte-exact.
 
 import std/[os, strutils]
 import results
@@ -85,9 +98,41 @@ proc main() {.raises: [].} =
   if maxEntries == 0'u32:
     maxEntries = uint32(
       (int(blockSize) - HeaderSize - ExtHeaderSize) div FileEntrySize)
-  if raw.len mod int(blockSize) != 0:
-    fail(args[0] & " is " & $raw.len & " bytes, not a whole number of " &
-      $blockSize & "-byte blocks")
+  # `CTFS-Binary-Format.md` §5d: a **reader** must accept a container whose
+  # length is not a whole number of blocks and ignore the partial tail. This
+  # program adjudicates other implementations' containers, so it has to accept
+  # exactly what the spec says is acceptable — until M58 it refused here,
+  # before reading anything, which meant the wasm recorder's Go reader (which
+  # M57 made accept) deferred to a checker that would have rejected the same
+  # file. An adjudicator that disagrees with the thing it adjudicates is worse
+  # than either answer.
+  #
+  # The refusal was never a corruption detector, either. On a genuinely
+  # *truncated* container the surviving streams still read back byte-exact and
+  # the lost one is refused by name — by `readInternalFile`'s bound against the
+  # container's whole blocks, which is where the check belongs, because it is
+  # the only place that knows whether the missing bytes are actually
+  # referenced. A partial tail is unreferenced by construction (block 0 is the
+  # previous one), so it must not cost the reader the whole file.
+  #
+  # What is still refused is a container that cannot hold its own block 0.
+  if raw.len < int(blockSize):
+    fail(args[0] & " is " & $raw.len & " bytes, which is less than its own " &
+      "declared block size of " & $blockSize & "; block 0 is not present")
+  let partialTail = raw.len mod int(blockSize)
+  if partialTail != 0:
+    # Say it out loud rather than tolerating it silently: a checker that
+    # accepted this state without a word would let a producer regress into
+    # writing torn containers unnoticed.
+    try:
+      stderr.writeLine("check_ctfs_container: note: " & args[0] & " is " &
+        $raw.len & " bytes — " & $(raw.len div int(blockSize)) & " whole " &
+        $blockSize & "-byte blocks plus a " & $partialTail &
+        "-byte partial tail. Accepted per CTFS-Binary-Format.md §5d; the " &
+        "partial region is unaddressable and every stream below is resolved " &
+        "against the whole blocks only.")
+    except IOError, ValueError:
+      discard
 
   var manifest = ""
   try:
@@ -140,7 +185,7 @@ proc main() {.raises: [].} =
 
   try:
     echo "check_ctfs_container: OK (" & $checkedPresent & " present, " &
-      $checkedAbsent & " absent)"
+      $checkedAbsent & " absent, " & $partialTail & "-byte partial tail)"
   except IOError, ValueError:
     discard
 

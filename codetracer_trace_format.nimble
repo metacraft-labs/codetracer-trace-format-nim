@@ -20,6 +20,11 @@ task test, "Run all tests":
   # an interrupted append leaves the old valid container. Needs the
   # fault-injection seam, which is compiled out of every other build.
   exec "nim c -r -d:release -d:ctfsAppendFaultInjection tests/test_container_append_ordering.nim"
+  # M58: §5d's reader rule has a bound attached to it — accepting a partial
+  # tail is only safe while every block number the reader resolves (mapping
+  # root, mapping block, and DATA block) is checked against the container's
+  # whole blocks. -d:release because one fixture is a 2.4 MB two-level file.
+  exec "nim c -r -d:release tests/test_partial_tail_bounds.nim"
   exec "nim c -r tests/test_streaming.nim"
   exec "nim c -r tests/test_chunk_index.nim"
   exec "nim c -r tests/test_fixed_record_table.nim"
