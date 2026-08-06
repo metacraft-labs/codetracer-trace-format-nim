@@ -133,6 +133,7 @@ const
 const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_base40.nim", binary: "build/test-bin/test_base40"),
   TestSpec(source: "tests/test_container.nim", binary: "build/test-bin/test_container"),
+  TestSpec(source: "tests/test_container_append.nim", binary: "build/test-bin/test_container_append"),
   TestSpec(source: "tests/test_streaming.nim", binary: "build/test-bin/test_streaming"),
   TestSpec(source: "tests/test_chunk_index.nim", binary: "build/test-bin/test_chunk_index"),
   TestSpec(source: "tests/test_fixed_record_table.nim", binary: "build/test-bin/test_fixed_record_table"),

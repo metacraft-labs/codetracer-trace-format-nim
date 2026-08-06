@@ -402,5 +402,79 @@ int main(void) {
     }
     printf("\n=== Multi-stream format test passed! ===\n");
 
+    /* ----------------------------------------------------------------
+     * CTFS container — post-hoc internal files (M38b).
+     *
+     * The ABI half of `ct_container_create` / `ct_container_append_files`:
+     * that the symbols are exported, that the three parallel arrays are
+     * read the way the header says, and that a refusal comes back as a
+     * non-zero return with a message rather than as a silent success.
+     * The *layout* these produce is adjudicated elsewhere, by readers that
+     * share no code with the writer — `tests/test_container_append.nim`
+     * and the wasm recorder's `internal/ctfs/ffi_crossread_test.go`.
+     * ---------------------------------------------------------------- */
+    {
+        const char* path = "/tmp/ct_container_append_test.ct";
+        remove(path);
+        ASSERT(ct_container_create(path, 0) == 0, "ct_container_create");
+        ASSERT(file_exists(path), "the container file should exist");
+        printf("[OK] container: create\n");
+
+        {
+            static unsigned char body_a[70000];
+            static const unsigned char body_b[3] = { 7, 8, 9 };
+            const char* names[3] = { "meta.dat", "steps.dat", "snaptab.dat" };
+            const unsigned char* contents[3] = { body_a, body_b, NULL };
+            size_t lengths[3] = { sizeof(body_a), sizeof(body_b), 0 };
+            size_t i;
+            struct stat st;
+            for (i = 0; i < sizeof(body_a); i++) {
+                body_a[i] = (unsigned char)((i * 7 + i / 4096) % 251);
+            }
+            ASSERT(ct_container_append_files(path, names, contents, lengths, 3) == 0,
+                   "ct_container_append_files");
+            ASSERT(stat(path, &st) == 0, "stat the appended container");
+            ASSERT(st.st_size % 4096 == 0,
+                   "an appended container must stay a whole number of blocks");
+            ASSERT((size_t)st.st_size > sizeof(body_a),
+                   "the container should have grown by at least the payload");
+            printf("[OK] container: append (%ld bytes)\n", (long)st.st_size);
+
+            /* Append-only: a name that already exists must be refused, and
+             * the refusal must carry a message. */
+            {
+                const char* dup_names[1] = { "meta.dat" };
+                const unsigned char* dup_contents[1] = { body_b };
+                size_t dup_lengths[1] = { sizeof(body_b) };
+                ASSERT(ct_container_append_files(path, dup_names, dup_contents,
+                                                 dup_lengths, 1) != 0,
+                       "appending an existing name must fail");
+                ASSERT(trace_writer_last_error()[0] != '\0',
+                       "a refused append must set an error message");
+                printf("[OK] container: append refuses an existing name\n");
+            }
+
+            /* A name outside the base40 alphabet must be refused rather than
+             * silently truncated to its encodable prefix. */
+            {
+                const char* bad_names[1] = { "snap!pages" };
+                const unsigned char* bad_contents[1] = { body_b };
+                size_t bad_lengths[1] = { sizeof(body_b) };
+                ASSERT(ct_container_append_files(path, bad_names, bad_contents,
+                                                 bad_lengths, 1) != 0,
+                       "appending an unencodable name must fail");
+                printf("[OK] container: append refuses an unencodable name\n");
+            }
+
+            /* A container that is not a container. */
+            ASSERT(ct_container_append_files("/tmp/ct_container_append_test.missing",
+                                             names, contents, lengths, 1) != 0,
+                   "appending to a nonexistent container must fail");
+            printf("[OK] container: append refuses a nonexistent container\n");
+        }
+        remove(path);
+    }
+    printf("\n=== CTFS container append test passed! ===\n");
+
     return 0;
 }

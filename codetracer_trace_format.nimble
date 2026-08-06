@@ -13,6 +13,9 @@ requires "results"
 task test, "Run all tests":
   exec "nim c -r tests/test_base40.nim"
   exec "nim c -r tests/test_container.nim"
+  # M38b: appending internal files to an already-closed container. Uses a
+  # 4.5 MB internal file, so -d:release keeps it quick.
+  exec "nim c -r -d:release tests/test_container_append.nim"
   exec "nim c -r tests/test_streaming.nim"
   exec "nim c -r tests/test_chunk_index.nim"
   exec "nim c -r tests/test_fixed_record_table.nim"

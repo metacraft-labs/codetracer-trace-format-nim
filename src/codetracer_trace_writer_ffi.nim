@@ -33,6 +33,11 @@
 
 import codetracer_trace_writer
 import codetracer_trace_types
+# The post-hoc container entry points (`ct_container_create` /
+# `ct_container_append_files`) at the bottom of this file.
+import codetracer_ctfs/types
+import codetracer_ctfs/container
+import codetracer_ctfs/container_append
 import codetracer_trace_writer/meta_dat
 import codetracer_trace_writer/multi_stream_writer
 import codetracer_trace_writer/value_stream
@@ -2126,6 +2131,105 @@ proc ct_free_buffer(buf: ptr uint8) {.exportc, cdecl, dynlib.} =
   ## Free a buffer allocated by ct_write_meta_dat_to_buffer.
   if not buf.isNil:
     dealloc(buf)
+
+# ---------------------------------------------------------------------------
+# CTFS container — post-hoc internal files
+#
+# Everything above this point writes a container the caller is still building.
+# These two entry points work on a container **on disk that is already
+# closed**, which is a different operation and is why they take a path rather
+# than a `trace_writer_t`: there is no live writer to hand a handle for.
+#
+# The motivating consumer is a producer of *derived* streams — data computed
+# from a finished trace that, by its own spec, has to live inside the same
+# `.ct` rather than beside it (the WASM replay snapshotter's `snap*`
+# namespaces, `WASM-Replay-Snapshots-And-Slices.md` §6). Such a producer only
+# knows what it wants to store after the trace writer has closed the file.
+# Without these calls its only options were a sidecar file, which its spec
+# forbids, or a second implementation of the container layout — which is what
+# it had, and which drifted from this one on the multi-level block mapping of
+# `CTFS-Binary-Format.md` §4 and silently mis-wrote every stream past ~2 MB.
+# ---------------------------------------------------------------------------
+
+proc ct_container_create(
+    path: cstring,
+    block_size: uint32
+): cint {.exportc, cdecl, dynlib.} =
+  ## Write a new, empty CTFS v4 container at `path`: one block 0 carrying the
+  ## header and an all-free root entry array.
+  ##
+  ## `block_size = 0` selects the default (4096). Returns 0 on success and
+  ## non-zero on failure, with the reason in `trace_writer_last_error()`.
+  if path.isNil:
+    setError("ct_container_create: path is NULL")
+    return 1.cint
+  let bs = if block_size == 0'u32: DefaultBlockSize else: block_size
+  if bs mod 8 != 0'u32 or int(bs) < HeaderSize + ExtHeaderSize + FileEntrySize:
+    setError("ct_container_create: unusable block size " & $bs)
+    return 1.cint
+  var c = createCtfs(blockSize = bs)
+  let res = writeCtfsToFile(c, $path)
+  if res.isErr:
+    setError(res.error)
+    return 1.cint
+  0.cint
+
+proc ct_container_append_files(
+    path: cstring,
+    names: ptr UncheckedArray[cstring],
+    contents: ptr UncheckedArray[ptr uint8],
+    lengths: ptr UncheckedArray[csize_t],
+    count: csize_t
+): cint {.exportc, cdecl, dynlib.} =
+  ## Append `count` internal files to the already-closed container at `path`.
+  ##
+  ## `names[i]` is a NUL-terminated base40-encodable name (at most twelve
+  ## characters from `[0-9a-z./-]`); `contents[i]`/`lengths[i]` is its
+  ## complete content, which may be empty (`contents[i]` may then be NULL).
+  ##
+  ## The batch is published atomically with respect to readers: every new
+  ## data and mapping block is written and flushed first, and the single
+  ## rewrite of block 0 that makes them reachable happens last. There is no
+  ## singular form of this call on purpose — attaching a related set of
+  ## streams one at a time would make a half-attached container reachable.
+  ##
+  ## Returns 0 on success and non-zero on failure, with the reason in
+  ## `trace_writer_last_error()`. On failure nothing is published: either the
+  ## file was never touched, or it carries unreferenced trailing blocks that
+  ## no entry points at.
+  if path.isNil:
+    setError("ct_container_append_files: path is NULL")
+    return 1.cint
+  if count == 0:
+    return 0.cint
+  if names.isNil or lengths.isNil:
+    setError("ct_container_append_files: names/lengths array is NULL")
+    return 1.cint
+
+  var nameSeq = newSeq[string](int(count))
+  var contentSeq = newSeq[seq[byte]](int(count))
+  for i in 0 ..< int(count):
+    if names[i].isNil:
+      setError("ct_container_append_files: names[" & $i & "] is NULL")
+      return 1.cint
+    nameSeq[i] = $names[i]
+    let n = int(lengths[i])
+    if n < 0:
+      setError("ct_container_append_files: lengths[" & $i & "] is negative")
+      return 1.cint
+    contentSeq[i] = newSeq[byte](n)
+    if n > 0:
+      if contents.isNil or contents[i].isNil:
+        setError("ct_container_append_files: contents[" & $i &
+          "] is NULL but its length is " & $n)
+        return 1.cint
+      copyMem(addr contentSeq[i][0], contents[i], n)
+
+  let res = appendInternalFiles($path, nameSeq, contentSeq)
+  if res.isErr:
+    setError(res.error)
+    return 1.cint
+  0.cint
 
 # ---------------------------------------------------------------------------
 # meta.dat — reader handle
