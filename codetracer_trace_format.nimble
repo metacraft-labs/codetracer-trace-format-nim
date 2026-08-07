@@ -25,6 +25,11 @@ task test, "Run all tests":
   # root, mapping block, and DATA block) is checked against the container's
   # whole blocks. -d:release because one fixture is a 2.4 MB two-level file.
   exec "nim c -r -d:release tests/test_partial_tail_bounds.nim"
+  # M61b: the WRITE side of the null-data-block defect. A block number of 0 is
+  # block 0 — the header and root directory — so an unresolved mapping that
+  # `writeToFile` does not refuse overwrites the container rather than one
+  # stream. -d:release because one fixture is a 512-block two-level file.
+  exec "nim c -r -d:release tests/test_write_null_data_block.nim"
   exec "nim c -r tests/test_streaming.nim"
   exec "nim c -r tests/test_chunk_index.nim"
   exec "nim c -r tests/test_fixed_record_table.nim"

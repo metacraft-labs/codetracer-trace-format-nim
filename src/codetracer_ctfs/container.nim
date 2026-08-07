@@ -71,11 +71,35 @@ proc addFile*(c: var Ctfs, name: string): Result[CtfsInternalFile, string] =
 proc writeToFile*(c: var Ctfs, f: var CtfsInternalFile,
                   data: openArray[byte]): Result[void, string] =
   ## Append data to an internal file. Uses multi-level block mapping.
+  ##
+  ## **Every block number this proc turns into a byte offset is checked first,
+  ## and that is a data-integrity rule rather than defensiveness.** Block 0 is
+  ## the container header and the root directory, so a block number of `0` —
+  ## which is what `lookupDataBlock` returns for *any* mapping it cannot
+  ## resolve, at any level — addresses byte offset 0. Writing a caller's
+  ## payload there does not damage one stream, it overwrites the header and
+  ## the entire entry array, so the container stops being a container and
+  ## every stream in it becomes unreachable. Measured before this check
+  ## existed, on a sealed container with one level-1 mapping slot zeroed:
+  ## `writeToFile` returned `ok()`, the CTFS magic was gone, and both members
+  ## came back as `internal file not found`.
+  ##
+  ## This is the destructive twin of the read-side defect M61a closed in nine
+  ## readers (`CTFS-Binary-Format.md` §4 and the write-side note under §5d).
+  ## The read side hands back the wrong bytes; this side deletes the user's
+  ## recording. Pinned by `tests/test_write_null_data_block.nim`.
   if data.len == 0:
     return ok()
 
   let entryOff = c.fileEntryOffset(f.entryIndex)
   let mapBlock = readU64LE(c.data, entryOff + 8)
+  # The entry's mapping root, checked before any walk: a zero here is the state
+  # a crash between publishing an entry's size and publishing its mapping root
+  # leaves, and the walk below would read its pointers out of block 0.
+  if mapBlock == 0'u64 or mapBlock >= c.nextFreeBlock:
+    return err("internal file entry " & $f.entryIndex & " has mapping root block " &
+      $mapBlock & ", which is outside the container's " & $c.nextFreeBlock &
+      " allocated blocks; refusing to write through it")
 
   var written = 0
   while written < data.len:
@@ -95,6 +119,24 @@ proc writeToFile*(c: var Ctfs, f: var CtfsInternalFile,
     else:
       # Mid-block write: look up the existing data block by navigating the chain.
       dataBlock = c.lookupDataBlock(mapBlock, uint64(fileBlockIdx))
+
+    # `lookupDataBlock` answers "unresolved" with 0 — from a null level-1 slot,
+    # a null chain pointer, a null child, or a level overflow — and 0 is block
+    # 0. Refuse it here, where the block number becomes a byte offset, so no
+    # unresolved mapping can put payload into the header and root directory.
+    # The upper bound catches the same failure pointing the other way: a
+    # garbage pointer past the allocator's high-water mark, which would
+    # otherwise index past `c.data` and die with an IndexDefect.
+    if dataBlock == 0'u64:
+      return err("null data block at index " & $fileBlockIdx &
+        " of internal file entry " & $f.entryIndex &
+        ": its mapping does not resolve, and block 0 is the container header " &
+        "and root directory — refusing to write there")
+    if dataBlock >= c.nextFreeBlock:
+      return err("data block " & $fileBlockIdx & " of internal file entry " &
+        $f.entryIndex & " resolves to block " & $dataBlock &
+        ", which is outside the container's " & $c.nextFreeBlock &
+        " allocated blocks")
 
     # Write data into the block.
     let blockStart = c.blockOffset(dataBlock)

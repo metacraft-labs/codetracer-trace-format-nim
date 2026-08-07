@@ -174,6 +174,21 @@ proc insertDataBlock*(c: var Ctfs, rootBlock: uint64, blockIndex: uint64,
 proc navigateAndLookup*(c: Ctfs, mappingBlock: uint64, level: uint32,
                         idxWithinLevel: uint64, usable: uint64): uint64 =
   ## Navigate down through mapping blocks to find a data block pointer.
+  ##
+  ## **Returns 0 when the mapping does not resolve, and 0 is the only such
+  ## signal.** The `level == 1` branch returns the slot verbatim, so a null
+  ## slot already comes back as 0 — adding `if ptr == 0: return 0` there would
+  ## be a no-op, which is why there is none. The multi-level branch's check
+  ## below is not the same thing: without it the walk would *recurse into
+  ## block 0* and resolve pointers out of the container header.
+  ##
+  ## The consequence is that this proc is not where a null slot can be caught.
+  ## Block 0 is the header and the root directory, so `0` is a legal-looking
+  ## block number that addresses byte offset 0 — every caller must therefore
+  ## treat 0 as "unresolved" and refuse it *before* turning it into a byte
+  ## offset. A reader that does not serves the header as content (the read-side
+  ## defect closed in M61a); a writer that does not writes payload over the
+  ## header and destroys the container (`container.nim`'s `writeToFile`, M61b).
   if level == 1:
     return c.readPtr(mappingBlock, idxWithinLevel)
 

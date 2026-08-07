@@ -32,6 +32,15 @@ proc extractFileBytes(c: Ctfs, f: CtfsInternalFile): seq[byte] {.raises: [].} =
   var blockIdx = 0'u64
   while pos < fileSize:
     let dataBlock = c.lookupDataBlock(mapBlock, blockIdx)
+    # `lookupDataBlock` answers "unresolved" with 0, and 0 is block 0 — the
+    # container header and root directory. Without this the helper would
+    # silently splice block 0's bytes in as `meta.dat`'s content and every
+    # assertion below would be about the header. Nothing in this file produces
+    # a broken mapping, so this can only fire on a real regression in the
+    # writer, which is exactly what it is here for (M61b).
+    doAssert dataBlock != 0'u64,
+      "block " & $blockIdx & " of the internal file does not resolve; block 0 " &
+      "is the container header and must not be read as content"
     let blockStart = c.blockOffset(dataBlock)
     let remaining = fileSize - pos
     let toCopy = min(remaining, int(c.blockSize))

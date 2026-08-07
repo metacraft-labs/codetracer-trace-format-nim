@@ -143,6 +143,7 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_container_append.nim", binary: "build/test-bin/test_container_append"),
   TestSpec(source: "tests/test_container_append_ordering.nim", binary: "build/test-bin/test_container_append_ordering", defines: @["ctfsAppendFaultInjection"]),
   TestSpec(source: "tests/test_partial_tail_bounds.nim", binary: "build/test-bin/test_partial_tail_bounds"),
+  TestSpec(source: "tests/test_write_null_data_block.nim", binary: "build/test-bin/test_write_null_data_block"),
   TestSpec(source: "tests/test_streaming.nim", binary: "build/test-bin/test_streaming"),
   TestSpec(source: "tests/test_chunk_index.nim", binary: "build/test-bin/test_chunk_index"),
   TestSpec(source: "tests/test_fixed_record_table.nim", binary: "build/test-bin/test_fixed_record_table"),
