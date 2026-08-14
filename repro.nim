@@ -91,11 +91,18 @@ type
     ##     which only the ``bench`` task builds. Benchmarks are deliberately
     ##     NOT modelled here: they measure the host, not the build graph.
     ##   * ``pcre`` — link libpcre into the compile (``test_path_filter``).
+    ##   * ``defines`` — extra ``-d:`` symbols this file needs, matching the
+    ##     nimble ``test`` task's per-file flags.
+    ##     ``test_container_append_ordering`` needs
+    ##     ``-d:ctfsAppendFaultInjection``: it abandons an append between its
+    ##     two write phases, and that seam is compiled out of every ordinary
+    ##     build (including the FFI static library the Rust crate links).
     source: string
     binary: string
     pooled: bool
     debugOnly: bool
     pcre: bool
+    defines: seq[string]
 
 const
   CrossReadPool = "codetracer_trace_format_nim.crossread-serial"
@@ -133,6 +140,10 @@ const
 const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_base40.nim", binary: "build/test-bin/test_base40"),
   TestSpec(source: "tests/test_container.nim", binary: "build/test-bin/test_container"),
+  TestSpec(source: "tests/test_container_append.nim", binary: "build/test-bin/test_container_append"),
+  TestSpec(source: "tests/test_container_append_ordering.nim", binary: "build/test-bin/test_container_append_ordering", defines: @["ctfsAppendFaultInjection"]),
+  TestSpec(source: "tests/test_partial_tail_bounds.nim", binary: "build/test-bin/test_partial_tail_bounds"),
+  TestSpec(source: "tests/test_write_null_data_block.nim", binary: "build/test-bin/test_write_null_data_block"),
   TestSpec(source: "tests/test_streaming.nim", binary: "build/test-bin/test_streaming"),
   TestSpec(source: "tests/test_chunk_index.nim", binary: "build/test-bin/test_chunk_index"),
   TestSpec(source: "tests/test_fixed_record_table.nim", binary: "build/test-bin/test_fixed_record_table"),
@@ -282,7 +293,10 @@ package codetracer_trace_format_nim:
       # The whole corpus compiles ``-d:release`` (a faithful superset of the
       # nimble task's per-file flags), EXCEPT ``debugOnly`` files that the
       # repo's own ``test`` corpus builds in debug (see ``debugOnly`` doc).
-      let buildDefines = if spec.debugOnly: newSeq[string]() else: @["release"]
+      var buildDefines = if spec.debugOnly: newSeq[string]() else: @["release"]
+      # Per-file defines the nimble task also passes (see ``defines`` doc).
+      for d in spec.defines:
+        buildDefines.add(d)
 
       let edge = buildNimUnittest.build(
         source = spec.source,

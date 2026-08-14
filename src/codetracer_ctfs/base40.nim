@@ -30,6 +30,23 @@ proc base40Encode*(name: string): uint64 =
     multiplier = multiplier * 40
   val
 
+proc base40Encodable*(name: string): bool =
+  ## Report whether `base40Encode` is lossless for `name`.
+  ##
+  ## `base40Encode` maps anything outside the alphabet to the padding index 0,
+  ## so `"snap!pages"` and `"snap"` encode to the *same* u64 — silently, and
+  ## with the container then carrying a stream under a name nobody asked for.
+  ## Any caller that takes a filename from outside the library (an FFI
+  ## consumer naming a derived stream, say) must reject it here first rather
+  ## than discover the collision later.
+  if name.len == 0 or name.len > 12:
+    return false
+  for c in name:
+    if not ((c >= '0' and c <= '9') or (c >= 'a' and c <= 'z') or
+            c == '.' or c == '/' or c == '-'):
+      return false
+  true
+
 proc base40Decode*(val: uint64): string =
   ## Decode a base40-encoded uint64 back to a filename string.
   var remaining = val

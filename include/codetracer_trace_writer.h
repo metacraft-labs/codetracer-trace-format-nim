@@ -313,6 +313,51 @@ int ct_write_meta_dat_to_buffer(
 void ct_free_buffer(uint8_t* buf);
 
 /* --------------------------------------------------------------------------
+ * CTFS container — internal files added after the container was closed
+ *
+ * Every other writer entry point above operates on a `trace_writer_t`, i.e.
+ * on a container the caller is still building.  These two work on a container
+ * **on disk that has already been closed**, which is why they take a path:
+ * there is no live writer to hand a handle for.
+ *
+ * They exist for producers of *derived* streams — data computed from a
+ * finished trace that, by its own specification, must live inside the same
+ * `.ct` rather than beside it.  Such a producer only knows what it wants to
+ * store after the trace writer has sealed the file.
+ *
+ * Both return 0 on success and non-zero on failure; the reason is available
+ * from trace_writer_last_error().
+ * -------------------------------------------------------------------------- */
+
+/* Write a new, empty CTFS v4 container at `path`.
+ * `block_size = 0` selects the default of 4096. */
+int ct_container_create(const char* path, uint32_t block_size);
+
+/* Append `count` internal files to the already-closed container at `path`.
+ *
+ * names[i]     NUL-terminated internal filename; at most twelve characters
+ *              from [0-9a-z./-] (CTFS base40, see CTFS-Binary-Format.md §3).
+ * contents[i]  the file's complete content; may be NULL when lengths[i] == 0.
+ * lengths[i]   its length in bytes.
+ *
+ * The container must be quiescent (no other writer), unencrypted, v4, and a
+ * whole number of blocks.  A name that already exists is refused: CTFS is
+ * append-only and this call will not overwrite a stream.
+ *
+ * The batch is published as a unit.  All new data and mapping blocks are
+ * written and flushed first; the single rewrite of block 0 that makes them
+ * reachable happens last.  A crash in between leaves unreferenced trailing
+ * blocks — wasteful, still readable — never an entry pointing at absent data.
+ * There is deliberately no singular form of this call: attaching a related
+ * set of streams one at a time would make a half-attached container
+ * reachable, and every reader would have to cope with it. */
+int ct_container_append_files(const char* path,
+                              const char* const* names,
+                              const uint8_t* const* contents,
+                              const size_t* lengths,
+                              size_t count);
+
+/* --------------------------------------------------------------------------
  * meta.dat — reader handle
  * -------------------------------------------------------------------------- */
 
