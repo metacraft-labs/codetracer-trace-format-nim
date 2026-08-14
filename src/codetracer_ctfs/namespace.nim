@@ -67,7 +67,7 @@ proc encodeGraduatedDescriptor(ns: var Namespace, data: openArray[byte]):
 
   case ns.leafType
   of ltTypeA:
-    if data.len > int(uint32.high):
+    if uint64(data.len) > uint64(uint32.high):
       return err("Type A graduated entry exceeds 4 GiB")
     if slot > int((1'u64 shl 31) - 1):
       return err("Type A graduated map_block index overflow")
