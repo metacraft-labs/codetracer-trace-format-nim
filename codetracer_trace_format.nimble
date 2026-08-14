@@ -98,6 +98,11 @@ task test, "Run all tests":
   # callee's definition line, not inherit the previous step's position.
   # Same FFI-`include` compile requirements as the test above.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_orphan_call_args_step_location.nim"
+  # #601: an I/O event must be attributed to the step of the line that wrote
+  # it. The FFI buffers one step, so `stepCount - 1` named the PREVIOUS step
+  # and the flow view rendered program output one source line too high.
+  # Same FFI-`include` compile requirements as the two tests above.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_io_event_pending_step_attribution.nim"
 
 task regenerateFixtures, "Regenerate .expected golden fixture files":
   exec "nim c -r tests/generate_golden_fixtures.nim"

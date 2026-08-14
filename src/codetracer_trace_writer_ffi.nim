@@ -1044,6 +1044,15 @@ proc trace_writer_register_special_event(
     return
 
   if handle.useMultiStream:
+    # Every other multi-stream entry point refuses to touch `msWriter` before
+    # `trace_writer_begin_events` has created it; this one did not, and an
+    # event arriving first (a recorder that hooks stdout before it opens the
+    # trace — the shape a `--trace` wrapper produces) indexed an empty stream
+    # table and killed the RECORDED PROCESS with an IndexDefect, since an
+    # unhandled defect cannot be caught across the C boundary.  Dropping the
+    # event is what the same situation already does for steps and calls.
+    if not handle.msWriterReady:
+      return
     # M24a-3: the SPEC events.dat record carries both metadata AND content
     # (previously the multi-stream path dropped metadata).  Pass them through
     # so the dedicated I/O event stream is byte-consistent with what the Rust
@@ -1057,8 +1066,31 @@ proc trace_writer_register_special_event(
     var data = newSeq[byte](contentStr.len)
     for i in 0 ..< contentStr.len:
       data[i] = byte(contentStr[i])
+    # The step this event belongs to is the step the recorder is CURRENTLY on,
+    # which is not necessarily the last step the multi-stream writer emitted:
+    # `trace_writer_register_step` only BUFFERS its step (so late-arriving
+    # variable values can still be attached to it in `flushPendingStep`), and a
+    # `write` is registered while that buffered step is still pending.  Letting
+    # `registerIOEvent` default to `stepCount - 1` therefore attributed every
+    # `console.log` / `print` to the PREVIOUS step, and the flow view rendered
+    # the output one source line too high (issue #601).
+    #
+    # This is the same accounting `trace_writer_next_step_index` documents: a
+    # buffered-but-unwritten step will take index `msWriter.stepCount`.
+    #
+    # Note we deliberately do NOT `flushPendingStep` here (which would also fix
+    # the attribution): flushing early would strand any variable values
+    # registered AFTER the write but belonging to the same step in
+    # `flushPendingStep`'s orphan branch, where they are re-homed onto a
+    # synthetic step.  The JS instrumenter emits exactly that pattern
+    # (`__ct.write` followed by the statement's write-site values), so the
+    # explicit step id is the non-destructive fix.
+    let currentStepId =
+      if handle.hasPendingStep: handle.msWriter.stepCount
+      elif handle.msWriter.stepCount > 0: handle.msWriter.stepCount - 1
+      else: 0'u64
     discard handle.msWriter.registerIOEvent(toIOEventKind(kind), data,
-      metadata = metaBytes)
+      metadata = metaBytes, stepId = some(currentStepId))
     return
 
   discard handle.writer.writeEvent(TraceLowLevelEvent(
