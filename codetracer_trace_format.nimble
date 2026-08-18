@@ -41,6 +41,12 @@ task test, "Run all tests":
   exec "nim c -r tests/test_split_binary.nim"
   exec "nim c -r tests/test_trace_writer.nim"
   exec "nim c -r tests/test_trace_reader.nim"
+  # The same §5d bound in the *other* Nim transcription of the §4 walk:
+  # `codetracer_trace_reader.nim`'s own `readInternalFile`. It bounded byte
+  # offsets only, and read a null mapping root as a walk through block 0 —
+  # the header and root directory — so a damaged trace opened clean or
+  # crashed on an overflowing block number.
+  exec "nim c -r tests/test_trace_reader_null_mapping_root.nim"
   exec "nim c -r tests/test_golden_fixtures.nim"
   exec "nim c -r tests/test_cross_compat.nim"
   exec "nim c -r tests/test_meta_dat.nim"
