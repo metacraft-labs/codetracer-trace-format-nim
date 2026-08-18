@@ -52,6 +52,33 @@
 ##
 ## `locateEntryForAppend` below is that consumer, written out in six lines so
 ## the sequence under test is the real one and not a poke at internals.
+##
+## # The second null-pointer hole: an append that allocates over a damaged slot
+##
+## The four cases above all reach the mapping through `lookupDataBlock`, which
+## `writeToFile` consults only on its **mid-block** path. When the handle's
+## `writePos` *is* a block multiple, `writeToFile` takes the other branch and
+## calls `insertDataBlock` — and both of that proc's null branches
+## (`insertDataBlock`'s chain pointer, `navigateAndInsert`'s child pointer) read
+## a `0` as **"not allocated yet"** and allocate a replacement.
+##
+## Neither can tell "unallocated" from "corrupted" by looking at the pointer,
+## and until the last three cases here existed neither tried: appending to a
+## crash-damaged container overwrote the only pointer to the existing level-2+
+## subtree, orphaning every data block under it, and returned `ok()`. Block 0 is
+## never touched, so it is not the header destruction above — but it is the same
+## zero, on the same write path, and it loses data. The canonical Rust writer
+## had the identical hole at the identical two sites; it is fixed there in the
+## same change, and pinned by `codetracer_ctfs/tests/writer_null_data_block.rs`.
+##
+## They *can* be told apart from the index. A mapping is filled in strictly
+## increasing block-index order, so a pointer is legitimately null exactly when
+## the index being placed is the **first index that pointer covers**: `idx == 0`
+## after rebasing at a level, `subIdx == 0` within a child. Anything else means
+## an earlier index already went through that pointer. `CTFS-Binary-Format.md`
+## §4, "Null pointers during allocation", now states that normatively, because
+## both implementations of the walk had the same hole and the spec did not say
+## which reading was right.
 
 import std/[os, strutils]
 import results
@@ -351,9 +378,180 @@ proc test_an_undamaged_append_still_works() {.raises: [].} =
   dropDir(dir)
   echo "PASS: test_an_undamaged_append_still_works"
 
+# ---------------------------------------------------------------------------
+# The allocation half: a null pointer `insertDataBlock` used to read as
+# "not allocated yet".
+# ---------------------------------------------------------------------------
+
+const Usable = BS div 8 - 1
+  ## Data pointers per mapping block; the last of the `BS div 8` entries is the
+  ## chain pointer. 511 for the default 4096-byte block.
+
+proc ptrAt(data: openArray[byte], blockNum: uint64, index: int): uint64
+    {.raises: [].} =
+  readU64LE(data, int(blockNum) * BS + index * 8)
+
+proc reopenAndAppend(path: string, name: string, tail: seq[byte]):
+    (Result[void, string], seq[byte]) {.raises: [].} =
+  ## Reopen a sealed container, append to an existing stream, and hand back both
+  ## the writer's answer and the image it left. This is the documented consumer
+  ## pattern of `CTFS-Binary-Format.md` §5d, not a poke at internals.
+  let c = openClosedCtfs(path)
+  doAssert c.isOk, "openClosedCtfs: " & c.error
+  var ctfs = c.get()
+  var handle = locateEntryForAppend(ctfs, name)
+  let res = ctfs.writeToFile(handle, tail)
+  (res, ctfs.data)
+
+proc readback(data: openArray[byte], name: string): string {.raises: [].} =
+  ## What a stream reads back as, in one line, for a failure message.
+  let r = readInternalFile(data, name)
+  if r.isErr: "refused by the reader: " & r.error
+  else: $r.get().len & " bytes"
+
+proc test_a_null_chain_pointer_is_refused_rather_than_orphaning_the_subtree()
+    {.raises: [].} =
+  ## A sealed container whose stream is an **exact block multiple**, so the
+  ## append takes `writeToFile`'s allocating branch rather than its mid-block
+  ## one and `lookupDataBlock` — where the first four cases catch the zero — is
+  ## never consulted.
+  let dir = tmpDir("orphan_chain")
+  let path = dir / "t.ct"
+  # 512 data blocks: indices 0..510 live in the level-1 root and index 511 is
+  # the first that needs the level-2 chain, so the chain pointer exists and
+  # covers 511 real data blocks.
+  let files = @[("meta.dat", pattern(BS, 1)), ("big.dat", pattern(BS * 512, 3))]
+  sealedContainer(path, files)
+
+  var damaged = rawBytes(path)
+  doAssert containerIsIntact(damaged, files), "the fixture is not readable to begin with"
+  let root = mapRootOf(damaged, "big.dat")
+  let oldL2 = ptrAt(damaged, root, Usable)
+  doAssert oldL2 != 0'u64, "the fixture does not actually use a level-2 chain"
+  writeU64LE(damaged, int(root) * BS + Usable * 8, 0'u64)
+  putBytes(path, damaged)
+  let beforeAppend = rawBytes(path)
+
+  let (res, image) = reopenAndAppend(path, "big.dat", pattern(BS, 9))
+  let newL2 = ptrAt(image, root, Usable)
+
+  doAssert res.isErr,
+    "writeToFile reported success on a container whose level-2 chain pointer " &
+    "was null. It wrote a fresh mapping block into root[" & $Usable & "] (was " &
+    $oldL2 & " before the damage, 0 after it, now " & $newL2 & "), so the " &
+    $Usable & " data blocks the old level-2 subtree at block " & $oldL2 &
+    " mapped are no longer referenced by anything in the container and cannot " &
+    "be recovered from it. big.dat now " & readback(image, "big.dat")
+  # Checked before the wording, deliberately: refusing is only worth anything if
+  # it also leaves the evidence in place, and the pointer a repair tool would use
+  # to find block `oldL2` again must not have been replaced by a fresh, empty
+  # mapping block. Dropping the chain-pointer rule but keeping the child one
+  # still produces *a* refusal — from one level further down, after the damage
+  # has been done — so an assertion on the message alone would call that a pass
+  # of the wrong kind.
+  doAssert newL2 == 0'u64,
+    "the append was refused but still rewrote root[" & $Usable & "] to " &
+    $newL2 & ", destroying the only thing that says the level-2 subtree at " &
+    "block " & $oldL2 & " ever existed"
+  doAssert "null chain pointer" in res.error,
+    "the refusal does not name the null chain pointer: " & res.error
+  doAssert image == beforeAppend,
+    "the refused append modified the container image — " &
+    block0Damage(beforeAppend, image)
+  doAssert containerIsIntact(image, @[files[0]]),
+    "the undamaged member stopped resolving"
+
+  dropDir(dir)
+  echo "PASS: test_a_null_chain_pointer_is_refused_rather_than_orphaning_the_subtree"
+
+proc test_a_null_level_2_child_is_refused_rather_than_orphaning_the_subtree()
+    {.raises: [].} =
+  ## The same zero one step further down the walk: a level-2 block's child
+  ## pointer, reached by `navigateAndInsert` rather than by `insertDataBlock`'s
+  ## chain loop. Two separate sites, so two cases.
+  let dir = tmpDir("orphan_child")
+  let path = dir / "t.ct"
+  # 1023 data blocks. Rebased at level 2, index i maps to r = i - 511 and the
+  # level-2 block's entry is r div 511. Index 1022 gives r = 511, i.e. entry 1 —
+  # so the level-2 block has two children, and the next append (index 1023,
+  # r = 512) descends through entry 1 at a non-zero remainder.
+  let files = @[("meta.dat", pattern(BS, 1)), ("big.dat", pattern(BS * 1023, 3))]
+  sealedContainer(path, files)
+
+  var damaged = rawBytes(path)
+  doAssert containerIsIntact(damaged, files), "the fixture is not readable to begin with"
+  let root = mapRootOf(damaged, "big.dat")
+  let l2 = ptrAt(damaged, root, Usable)
+  doAssert l2 != 0'u64, "the fixture does not use a level-2 chain"
+  let oldChild = ptrAt(damaged, l2, 1)
+  doAssert oldChild != 0'u64, "the fixture does not use a second level-2 child"
+  writeU64LE(damaged, int(l2) * BS + 8, 0'u64)
+  putBytes(path, damaged)
+  let beforeAppend = rawBytes(path)
+
+  let (res, image) = reopenAndAppend(path, "big.dat", pattern(BS, 9))
+  let newChild = ptrAt(image, l2, 1)
+
+  doAssert res.isErr,
+    "writeToFile reported success on a container whose level-2 child pointer " &
+    "was null. It wrote a fresh mapping block into block " & $l2 & " entry 1 " &
+    "(was " & $oldChild & " before the damage, 0 after it, now " & $newChild &
+    "), orphaning the level-1 subtree at block " & $oldChild & ". big.dat now " &
+    readback(image, "big.dat")
+  doAssert "null mapping pointer" in res.error,
+    "the refusal does not name the null mapping pointer: " & res.error
+
+  doAssert newChild == 0'u64,
+    "the append was refused but still rewrote block " & $l2 & " entry 1 to " &
+    $newChild & ", orphaning the level-1 subtree at block " & $oldChild
+  doAssert image == beforeAppend,
+    "the refused append modified the container image — " &
+    block0Damage(beforeAppend, image)
+
+  dropDir(dir)
+  echo "PASS: test_a_null_level_2_child_is_refused_rather_than_orphaning_the_subtree"
+
+proc test_a_reopened_append_may_still_create_the_level_2_chain_it_needs()
+    {.raises: [].} =
+  ## The control for the two cases above, and the one that says the new refusals
+  ## do not simply stop the writer from ever extending a mapping.
+  ##
+  ## It deliberately crosses the level-1/level-2 boundary **inside the reopened
+  ## session**: the sealed container has 510 data blocks (all in the level-1
+  ## root, no chain pointer at all) and the append takes it to 513, so index 511
+  ## is the first to need level 2 and the chain pointer is legitimately null when
+  ## the reopened writer reaches it. That is the exact state the rule has to keep
+  ## allowing, and it is where a rule stated one index too strictly shows up.
+  let dir = tmpDir("orphan_ok")
+  let path = dir / "t.ct"
+  let head = pattern(BS * 510, 4)
+  let files = @[("meta.dat", pattern(BS * 2, 1)), ("big.dat", head)]
+  sealedContainer(path, files)
+
+  var image0 = rawBytes(path)
+  let root = mapRootOf(image0, "big.dat")
+  doAssert ptrAt(image0, root, Usable) == 0'u64,
+    "the fixture must start with no level-2 chain, or it does not test creating one"
+
+  let tail = pattern(BS * 3, 5)
+  let (res, image) = reopenAndAppend(path, "big.dat", tail)
+  doAssert res.isOk, "a healthy reopened append was refused: " & res.error
+  doAssert ptrAt(image, root, Usable) != 0'u64,
+    "the reopened append did not create the level-2 chain it needed"
+  doAssert containerIsIntact(image, @[
+    ("meta.dat", files[0][1]),
+    ("big.dat", head & tail),
+  ]), "the reopened append did not produce the expected container"
+
+  dropDir(dir)
+  echo "PASS: test_a_reopened_append_may_still_create_the_level_2_chain_it_needs"
+
 when isMainModule:
   test_a_null_level_1_slot_is_refused_rather_than_written_over_block_0()
   test_a_null_chain_pointer_is_refused_rather_than_written_over_block_0()
   test_a_null_mapping_root_is_refused_rather_than_written_over_block_0()
   test_an_undamaged_append_still_works()
+  test_a_null_chain_pointer_is_refused_rather_than_orphaning_the_subtree()
+  test_a_null_level_2_child_is_refused_rather_than_orphaning_the_subtree()
+  test_a_reopened_append_may_still_create_the_level_2_chain_it_needs()
   echo "All CTFS write-side null-data-block tests passed!"

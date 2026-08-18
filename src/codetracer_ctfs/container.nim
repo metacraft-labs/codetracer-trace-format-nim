@@ -111,10 +111,26 @@ proc writeToFile*(c: var Ctfs, f: var CtfsInternalFile,
     var dataBlock: uint64
 
     if offsetInBlock == 0:
-      # Need a new data block.
+      # Need a new data block. It is allocated only *provisionally*: if the
+      # mapping cannot accept the pointer — the container was damaged and
+      # `insertDataBlock` refuses to allocate over a null pointer that an
+      # earlier index already went through — the allocation is rolled back, so a
+      # refused append leaves the in-memory container byte-identical to what it
+      # found. `insertDataBlock` is all-or-nothing itself: with the null-pointer
+      # rule in place, both of its failure branches return before allocating or
+      # writing anything (an allocation there implies a zero remainder, which
+      # cannot fail at any deeper level), so this one rollback is the whole of
+      # it. In *streaming* mode `allocBlock` has already extended the file on
+      # disk by one zero block; that block is unreferenced and a later
+      # `openClosedCtfs` simply counts it as allocated, so it is waste rather
+      # than damage.
+      let blocksBefore = c.nextFreeBlock
+      let bytesBefore = c.data.len
       dataBlock = c.allocBlock()
       let insertRes = c.insertDataBlock(mapBlock, uint64(fileBlockIdx), dataBlock)
       if insertRes.isErr:
+        c.nextFreeBlock = blocksBefore
+        c.data.setLen(bytesBefore)
         return err(insertRes.error)
     else:
       # Mid-block write: look up the existing data block by navigating the chain.
