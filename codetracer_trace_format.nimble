@@ -43,6 +43,11 @@ task test, "Run all tests":
   exec "nim c -r tests/test_trace_reader.nim"
   exec "nim c -r tests/test_golden_fixtures.nim"
   exec "nim c -r tests/test_cross_compat.nim"
+  # Reading a combined-stream bundle written by the sibling Rust
+  # `CtfsTraceWriter`: it prefixes `events.log` with the 8-byte CodeTracer
+  # file header the Nim writer omits, and its chunks are streaming-encoder
+  # frames that do not pledge a decompressed size.
+  exec "nim c -r -p:src tests/test_rust_written_events_log.nim"
   exec "nim c -r tests/test_meta_dat.nim"
   exec "nim c -r tests/test_namespace_descriptor.nim"
   exec "nim c -d:release -r tests/test_sub_block_pool.nim"

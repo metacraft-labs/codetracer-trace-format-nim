@@ -30,6 +30,19 @@ import codetracer_trace_writer/global_line_index as v4_gli
 
 export results, codetracer_trace_types
 
+const
+  EventsLogHeaderV1* = [
+    # "CodeTracer" in hex leetspeak, then file-format version 1, then two
+    # reserved bytes that are zero in this version.
+    byte 0xC0, 0xDE, 0x72, 0xAC, 0xE2,
+    0x01,
+    0x00, 0x00
+  ]
+    ## The 8-byte CodeTracer file header the Rust `CtfsTraceWriter` writes at
+    ## the start of `events.log`, ahead of the first inline chunk header.  The
+    ## Nim `TraceWriter` does not write it, so `readEvents` treats it as
+    ## optional and skips it when present.
+
 # ---------------------------------------------------------------------------
 # Types
 # ---------------------------------------------------------------------------
@@ -612,6 +625,40 @@ proc readEventsV4(reader: var TraceReader): Result[void, string] =
   reader.eventCount = reader.events.len
   ok()
 
+proc decompressFrameOfUnknownSize*(compressed: openArray[byte]): Result[seq[byte], string] =
+  ## Inflate one Zstd frame whose header carries no pledged content size.
+  ##
+  ## Frames written by a streaming encoder omit that field, so the only way
+  ## to size the output is to try, and grow when the destination is too
+  ## small.  Starts at 8x the compressed size (well past the ratio these
+  ## event chunks actually achieve, so one attempt is the normal case) and
+  ## doubles, up to a ceiling that stops a corrupt or hostile frame from
+  ## driving an unbounded allocation.
+  const
+    MinCapacity = 64 * 1024
+    MaxCapacity = 1 shl 30  # 1 GiB — far beyond any single event chunk
+  if compressed.len == 0:
+    return ok(newSeq[byte](0))
+
+  var capacity = max(compressed.len * 8, MinCapacity)
+  while true:
+    var buf = newSeq[byte](capacity)
+    let written = zstdDecompressShared(
+      addr buf[0], csize_t(buf.len),
+      unsafeAddr compressed[0], csize_t(compressed.len))
+    if ZSTD_isError(written) == 0:
+      buf.setLen(int(written))
+      return ok(buf)
+    # `dstSize_tooSmall` is the one error worth retrying; anything else is a
+    # real decoding failure and must not be retried into an OOM.
+    let name = $ZSTD_getErrorName(written)
+    if name != "Destination buffer is too small":
+      return err("zstd decompression failed: " & name)
+    if capacity >= MaxCapacity:
+      return err("zstd decompression failed: chunk exceeds the " &
+                 $(MaxCapacity div (1024 * 1024)) & " MiB decompression ceiling")
+    capacity = min(capacity * 2, MaxCapacity)
+
 proc readEvents*(reader: var TraceReader): Result[void, string] =
   ## Decompress and decode all events. Dispatches to v3 (events.log) or
   ## v4 (multi-stream) based on the file layout detected at openTrace time.
@@ -630,7 +677,19 @@ proc readEvents*(reader: var TraceReader): Result[void, string] =
     return ok()
 
   # Decode all chunks: [16-byte header][compressed data]...
+  #
+  # The Rust `CtfsTraceWriter` prefixes its `events.log` with the 8-byte
+  # CodeTracer file header (`HEADERV1`: C0 DE 72 AC E2 01 00 00) and its
+  # reader skips those bytes before the first chunk header; the Nim
+  # `TraceWriter` writes no such prefix.  Reading a Rust-written container
+  # here used to misread the magic as a chunk header — `compressedSize`
+  # came out as 0xAC72DEC0, ~2.9 GB — and failed with "chunk compressed data
+  # extends beyond events.log".  Skip the prefix when it is there, so both
+  # writers' combined bundles decode; containers without it are untouched.
   var pos = 0
+  if eventsData.len >= EventsLogHeaderV1.len and
+     eventsData.toOpenArray(0, EventsLogHeaderV1.len - 1) == EventsLogHeaderV1:
+    pos = EventsLogHeaderV1.len
   while pos + ChunkIndexEntrySize <= eventsData.len:
     let chunk = decodeChunkHeader(eventsData, pos)
     if chunk.compressedSize == 0:
@@ -648,14 +707,29 @@ proc readEvents*(reader: var TraceReader): Result[void, string] =
     if decompSize == ZSTD_CONTENTSIZE_ERROR:
       return err("failed to get decompressed size for chunk")
 
-    var decompressed = newSeq[byte](int(decompSize))
-    if decompSize > 0:
-      let actualSize = ZSTD_decompress(
-        addr decompressed[0], csize_t(decompressed.len),
-        unsafeAddr compressedSlice[0], csize_t(compressedSlice.len))
-      if ZSTD_isError(actualSize) != 0:
-        return err("zstd decompression failed")
-      decompressed.setLen(int(actualSize))
+    var decompressed: seq[byte]
+    if decompSize == ZSTD_CONTENTSIZE_UNKNOWN:
+      # A frame produced by a *streaming* encoder does not pledge its
+      # decompressed size, so there is nothing to size the destination
+      # buffer from.  The Nim `TraceWriter` uses one-shot `ZSTD_compress`,
+      # which always pledges; the Rust `CtfsTraceWriter` compresses its
+      # chunks through `zstd::encode_all`, which does not.  Reading a
+      # Rust-written container used to crash here with a `RangeDefect`,
+      # because `int(ZSTD_CONTENTSIZE_UNKNOWN)` — 0xFFFF_FFFF_FFFF_FFFF —
+      # does not fit an `int`.  Grow a buffer instead.
+      let sizeless = decompressFrameOfUnknownSize(compressedSlice)
+      if sizeless.isErr:
+        return err(sizeless.error)
+      decompressed = sizeless.get()
+    else:
+      decompressed = newSeq[byte](int(decompSize))
+      if decompSize > 0:
+        let actualSize = ZSTD_decompress(
+          addr decompressed[0], csize_t(decompressed.len),
+          unsafeAddr compressedSlice[0], csize_t(compressedSlice.len))
+        if ZSTD_isError(actualSize) != 0:
+          return err("zstd decompression failed")
+        decompressed.setLen(int(actualSize))
 
     # Decode split-binary events
     let decoded = decodeAllEvents(decompressed)
