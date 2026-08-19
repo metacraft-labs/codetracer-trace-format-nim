@@ -107,3 +107,8 @@ src/macro_sourcemap_*.json
 .repro/
 # reprobuild build output tree (ct-print, per-test binaries, nimcache)
 /build/
+
+# WebAssembly build outputs (wasm/build-*.sh)
+wasm/build/
+wasm/build-standalone/
+wasm/build-emscripten/
