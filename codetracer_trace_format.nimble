@@ -129,5 +129,15 @@ task testFfi, "Build and run C FFI test":
   # emulator) without a duplicate-`NimMain` link error. It MUST match the
   # `proc codetracerTraceWriterNimMain` importc in codetracer_trace_writer_ffi.nim.
   exec "nim c --app:staticlib --mm:arc --noMain -d:release --nimMainPrefix:codetracerTraceWriter --passC:\"-fPIC\" -p:src -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim"
-  exec "gcc -o tests/test_ffi tests/test_ffi.c ./libcodetracer_trace_writer.a -lzstd -lm -I include"
+  # MT1: the three replay-observation chokepoints must be exported symbols so a
+  # replay-time observer (MCR) can interpose on them — guard it explicitly.
+  exec "bash tests/check_chokepoint_symbols.sh libcodetracer_trace_writer.a"
+  # macOS: the static lib pulls in SecRandomCopyBytes (Nim's std randomness),
+  # which lives in the Security framework; CoreFoundation is its transitive dep.
+  # On Linux these are not needed. Without them the link fails with an
+  # "Undefined symbols: _SecRandomCopyBytes" error.
+  when hostOS == "macosx":
+    exec "gcc -o tests/test_ffi tests/test_ffi.c ./libcodetracer_trace_writer.a -lzstd -lm -framework Security -framework CoreFoundation -I include"
+  else:
+    exec "gcc -o tests/test_ffi tests/test_ffi.c ./libcodetracer_trace_writer.a -lzstd -lm -I include"
   exec "./tests/test_ffi"

@@ -613,6 +613,35 @@ proc trace_writer_set_args(
   if handle.useMultiStream and handle.msWriterReady:
     handle.msWriter.metadata.args = handle.metaArgs
 
+# ---------------------------------------------------------------------------
+# Replay observation seam — the three "chokepoints".
+#
+# `trace_writer_register_step`, `trace_writer_register_call`, and
+# `trace_writer_register_return` / `trace_writer_register_return_cbor` are the
+# stable, exported, non-inlined per-event functions that a replay-time observer
+# (MCR) watches to derive native<->VM correlation for mixed traces. Contract
+# (see codetracer-specs/Planned-Features/Mixed-Trace-Debugging.md §4 and
+# codetracer-trace-format-spec/nested-trace-correlation.md §1.3):
+#   * step       = trace_writer_register_step             (per source line)
+#   * call-enter = trace_writer_register_call             (function entry)
+#   * call-exit  = trace_writer_register_return / _cbor   (function exit)
+#
+# These append to in-memory buffers and perform NO stream write and NO syscall
+# per call; the `.ct` container is materialised only at `trace_writer_close`.
+# That is exactly what lets MCR interpose on them at replay (e.g. a breakpoint
+# on the symbol) without perturbing deterministic replay. A value-write is
+# deliberately NOT a chokepoint (YAGNI — general spec §4).
+#
+# Two properties this seam depends on are guarded by tests:
+#   * exported symbols  — the `nm` check in the `testFfi` task
+#     (codetracer_trace_format.nimble) asserts all three symbols are present in
+#     libcodetracer_trace_writer.a; tests/test_ffi.c also links against and
+#     calls them, so a non-exported symbol would fail the link.
+#   * no per-call flush — the "chokepoint buffering" block in tests/test_ffi.c
+#     registers many steps and asserts the container does not materialise until
+#     `trace_writer_close`.
+# ---------------------------------------------------------------------------
+
 proc trace_writer_register_step(
     handle: TraceWriterHandle,
     path: cstring,

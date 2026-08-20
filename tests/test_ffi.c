@@ -402,5 +402,54 @@ int main(void) {
     }
     printf("\n=== Multi-stream format test passed! ===\n");
 
+    /* ================================================================
+     * MT1: replay-observation chokepoint buffering property
+     * The three chokepoints (register_step / register_call /
+     * register_return) that MCR observes at replay append to in-memory
+     * buffers and perform NO per-call disk write; the .ct container is
+     * materialised only at trace_writer_close (which serialises the whole
+     * container via toBytes() and writes it in one shot — see
+     * codetracer_trace_writer_ffi.nim trace_writer_close + the "Replay
+     * observation seam" contract). This is what lets MCR interpose on the
+     * chokepoints at replay without perturbing deterministic replay.
+     * We prove it: drive all three chokepoints 2000x and assert the
+     * container does NOT exist on disk until close, then does after.
+     * No mock: real FFI writer, real /tmp filesystem.
+     * ================================================================ */
+    printf("=== MT1 chokepoint buffering property ===\n\n");
+    {
+        remove("/tmp/cp_buffer_test.ct");
+        trace_writer_t w = trace_writer_new("cp_buffer_test", FFI_TRACE_FORMAT_BINARY);
+        ASSERT(w != NULL, "cp: trace_writer_new");
+        trace_writer_set_workdir(w, "/tmp/cp_workdir");
+        ASSERT(trace_writer_begin_events(w, "/tmp/cp_events.bin") == 0, "cp: begin_events");
+        trace_writer_start(w, "/test/cp.py", 1);
+
+        size_t fn = trace_writer_ensure_function_id(w, "cp_func", "/test/cp.py", 1);
+        ASSERT(fn != (size_t)-1, "cp: ensure_function_id");
+
+        /* Drive all three chokepoints many times. If any performed a per-call
+         * flush, the container would appear on disk before close. */
+        for (int i = 0; i < 2000; i++) {
+            trace_writer_register_step(w, "/test/cp.py", 2 + (i % 8));
+            trace_writer_register_call(w, fn);
+            trace_writer_register_return(w);
+        }
+        ASSERT(!file_exists("/tmp/cp_buffer_test.ct"),
+            "cp: container must NOT be materialised before close (no per-call flush)");
+        printf("[OK] cp: 2000x step/call/return produced no pre-close container (buffered)\n");
+
+        ASSERT(trace_writer_close(w) == 0, "cp: close");
+        {
+            struct stat st;
+            ASSERT(stat("/tmp/cp_buffer_test.ct", &st) == 0 && st.st_size > 0,
+                "cp: container materialises at close");
+            printf("[OK] cp: container materialised at close (%ld bytes)\n", (long)st.st_size);
+        }
+        trace_writer_free(w);
+        remove("/tmp/cp_buffer_test.ct");
+    }
+    printf("\n=== MT1 chokepoint buffering test passed! ===\n");
+
     return 0;
 }
