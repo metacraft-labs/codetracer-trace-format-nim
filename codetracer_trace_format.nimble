@@ -96,6 +96,10 @@ task test, "Run all tests":
   exec "nim c -r -p:src tests/test_trace_storage_config.nim"
   exec "nim c -r -p:src tests/test_path_filter.nim"
   exec "nim c -r -d:release -p:src tests/test_ct_print_events_log_fallback.nim"
+  # A Rust-written `events.log` carries an 8-byte stream header this repo's
+  # legacy reader used to mistake for a chunk header, making every such
+  # container unreadable by `ct-print`.
+  exec "nim c -r -d:release -p:src tests/test_rust_events_log_header.nim"
   # Line-only orphan pending-value carry-forward (92fce3a regression).
   # `include`s codetracer_trace_writer_ffi, so it needs --mm:arc and the
   # --nimMainPrefix the FFI's NimMain importc expects (see buildStaticLib).

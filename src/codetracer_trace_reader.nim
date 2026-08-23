@@ -704,8 +704,25 @@ proc readEvents*(reader: var TraceReader): Result[void, string] =
     reader.eventCount = 0
     return ok()
 
-  # Decode all chunks: [16-byte header][compressed data]...
+  # The SECONDARY (Rust) CTFS writer prefixes `events.log` with the 8-byte
+  # CodeTracer stream header (`HEADERV1` in
+  # `codetracer-trace-format/codetracer_trace_format_cbor_zstd`): the 5-byte
+  # magic `C0 DE 72 AC E2`, a format-version byte, and two reserved bytes.
+  # Both Rust readers (`ctfs_reader.rs`, `seekable_reader.rs`) require it and
+  # skip it before walking chunks.  This reader did not, so it read the magic
+  # as a chunk header: the first four bytes little-endian give a
+  # `compressedSize` of 0xAC72DEC0 (~2.9 GB) and the walk aborted with
+  # "chunk compressed data extends beyond events.log" — a Rust-written
+  # container was unreadable here even though it is valid.
+  #
+  # The Nim writer does NOT emit this prefix (see `codetracer_trace_writer.nim`,
+  # which adds `events.log` and writes chunks straight into it), so the skip
+  # is conditional and Nim-written containers are unaffected.
   var pos = 0
+  if eventsData.len >= HeaderSize and hasCtfsMagic(eventsData):
+    pos = HeaderSize
+
+  # Decode all chunks: [16-byte header][compressed data]...
   while pos + ChunkIndexEntrySize <= eventsData.len:
     let chunk = decodeChunkHeader(eventsData, pos)
     if chunk.compressedSize == 0:
