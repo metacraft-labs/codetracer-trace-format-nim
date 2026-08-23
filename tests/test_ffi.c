@@ -403,20 +403,20 @@ int main(void) {
     printf("\n=== Multi-stream format test passed! ===\n");
 
     /* ================================================================
-     * MT1: replay-observation chokepoint buffering property
+     * MT1/MT2: replay-observation chokepoints on a STREAMING writer
      * The three chokepoints (register_step / register_call /
      * register_return) that MCR observes at replay append to in-memory
-     * buffers and perform NO per-call disk write; the .ct container is
-     * materialised only at trace_writer_close (which serialises the whole
-     * container via toBytes() and writes it in one shot — see
-     * codetracer_trace_writer_ffi.nim trace_writer_close + the "Replay
-     * observation seam" contract). This is what lets MCR interpose on the
-     * chokepoints at replay without perturbing deterministic replay.
-     * We prove it: drive all three chokepoints 2000x and assert the
-     * container does NOT exist on disk until close, then does after.
+     * chunk buffers and perform NO per-call disk write. Under the streaming
+     * writer (createCtfsStreaming, the FFI default), the .ct container is
+     * opened at init and written incrementally as chunks seal DURING
+     * recording -- NOT buffered in RAM and dumped whole at close (the old
+     * blockchain-suited mode). The distinguishing, robust property: the
+     * container file exists on disk while recording is still in progress.
+     * We prove it: begin recording, assert the container is already present
+     * on disk, drive all three chokepoints 2000x, then finalize at close.
      * No mock: real FFI writer, real /tmp filesystem.
      * ================================================================ */
-    printf("=== MT1 chokepoint buffering property ===\n\n");
+    printf("=== MT1/MT2 chokepoint streaming property ===\n\n");
     {
         remove("/tmp/cp_buffer_test.ct");
         trace_writer_t w = trace_writer_new("cp_buffer_test", FFI_TRACE_FORMAT_BINARY);
@@ -425,31 +425,33 @@ int main(void) {
         ASSERT(trace_writer_begin_events(w, "/tmp/cp_events.bin") == 0, "cp: begin_events");
         trace_writer_start(w, "/test/cp.py", 1);
 
+        /* Streaming writer opens the container at init: it is on disk NOW,
+         * mid-recording, which the old buffer-and-dump mode never was until
+         * close. This is the property MCR's shared-writer attach needs. */
+        ASSERT(file_exists("/tmp/cp_buffer_test.ct"),
+            "cp: streaming container exists on disk DURING recording (not buffered to close)");
+        printf("[OK] cp: streaming container present on disk mid-recording\n");
+
         size_t fn = trace_writer_ensure_function_id(w, "cp_func", "/test/cp.py", 1);
         ASSERT(fn != (size_t)-1, "cp: ensure_function_id");
 
-        /* Drive all three chokepoints many times. If any performed a per-call
-         * flush, the container would appear on disk before close. */
         for (int i = 0; i < 2000; i++) {
             trace_writer_register_step(w, "/test/cp.py", 2 + (i % 8));
             trace_writer_register_call(w, fn);
             trace_writer_register_return(w);
         }
-        ASSERT(!file_exists("/tmp/cp_buffer_test.ct"),
-            "cp: container must NOT be materialised before close (no per-call flush)");
-        printf("[OK] cp: 2000x step/call/return produced no pre-close container (buffered)\n");
 
         ASSERT(trace_writer_close(w) == 0, "cp: close");
         {
             struct stat st;
             ASSERT(stat("/tmp/cp_buffer_test.ct", &st) == 0 && st.st_size > 0,
-                "cp: container materialises at close");
-            printf("[OK] cp: container materialised at close (%ld bytes)\n", (long)st.st_size);
+                "cp: streaming container finalized at close");
+            printf("[OK] cp: streaming container finalized at close (%ld bytes)\n", (long)st.st_size);
         }
         trace_writer_free(w);
         remove("/tmp/cp_buffer_test.ct");
     }
-    printf("\n=== MT1 chokepoint buffering test passed! ===\n");
+    printf("\n=== MT1/MT2 chokepoint streaming test passed! ===\n");
 
     return 0;
 }

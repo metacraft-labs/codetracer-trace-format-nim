@@ -335,7 +335,12 @@ proc trace_writer_begin_events(
     let (_, progBase, _) = splitFile(handle.programName)
     let ctPath = outDir / (progBase & ".ct")
 
-    let res = initMultiStreamWriter(ctPath, handle.programName)
+    # Stream to disk as chunks seal (createCtfsStreaming) rather than buffering
+    # the whole trace in RAM and dumping it at close: recorders driven by the
+    # C-ABI FFI are long-lived producers (e.g. the GDScript recorder under a
+    # live Godot process), and this is also the substrate the shared-writer
+    # attach mode (MCR nested container) builds on. ctPath == handle.ctFilePath.
+    let res = initMultiStreamWriter(ctPath, handle.programName, streaming = true)
     if res.isErr:
       setError(res.error)
       return 1.cint
@@ -626,20 +631,24 @@ proc trace_writer_set_args(
 #   * call-enter = trace_writer_register_call             (function entry)
 #   * call-exit  = trace_writer_register_return / _cbor   (function exit)
 #
-# These append to in-memory buffers and perform NO stream write and NO syscall
-# per call; the `.ct` container is materialised only at `trace_writer_close`.
-# That is exactly what lets MCR interpose on them at replay (e.g. a breakpoint
-# on the symbol) without perturbing deterministic replay. A value-write is
-# deliberately NOT a chokepoint (YAGNI — general spec §4).
+# These append to in-memory chunk buffers and perform NO syscall PER CALL; under
+# the streaming writer (createCtfsStreaming, the default for this FFI) a chunk is
+# flushed to the on-disk container only when it SEALS (many calls per chunk), and
+# the container is written incrementally during recording rather than dumped whole
+# at `trace_writer_close`. That is exactly what lets MCR interpose on the
+# chokepoints at replay (e.g. a breakpoint on the symbol) without perturbing
+# deterministic replay. A value-write is deliberately NOT a chokepoint (YAGNI —
+# general spec §4).
 #
 # Two properties this seam depends on are guarded by tests:
 #   * exported symbols  — the `nm` check in the `testFfi` task
 #     (codetracer_trace_format.nimble) asserts all three symbols are present in
 #     libcodetracer_trace_writer.a; tests/test_ffi.c also links against and
 #     calls them, so a non-exported symbol would fail the link.
-#   * no per-call flush — the "chokepoint buffering" block in tests/test_ffi.c
-#     registers many steps and asserts the container does not materialise until
-#     `trace_writer_close`.
+#   * streaming (not buffered-till-close) — the "chokepoint streaming" block in
+#     tests/test_ffi.c registers many steps and asserts the container exists on
+#     disk DURING recording (opened at init by the streaming writer), which the
+#     old buffer-and-dump mode never did until close.
 # ---------------------------------------------------------------------------
 
 proc trace_writer_register_step(
@@ -1935,16 +1944,12 @@ proc trace_writer_close(handle: TraceWriterHandle): cint {.exportc, cdecl, dynli
     if closeRes.isErr:
       setError(closeRes.error)
       return 1.cint
-    # Write the in-memory CTFS bytes to disk
-    let ctfsBytes = handle.msWriter.toBytes()
-    try:
-      var f = open(handle.ctFilePath, fmWrite)
-      if ctfsBytes.len > 0:
-        discard f.writeBuffer(unsafeAddr ctfsBytes[0], ctfsBytes.len)
-      f.close()
-    except IOError:
-      setError("failed to write .ct file: " & handle.ctFilePath)
-      return 1.cint
+    # Streaming writer: the exec/value/call/io/span chunks + meta.dat have been
+    # written into the streaming container at `handle.ctFilePath` as they were
+    # produced; closeCtfs() finalizes the on-disk image (writes the final root
+    # block and closes the file). No separate toBytes()/open(fmWrite) dump —
+    # that was the buffered mode, which balloons RAM and loses the trace if a
+    # long-running producer is killed before close.
     handle.msWriter.closeCtfs()
     return 0.cint
 
