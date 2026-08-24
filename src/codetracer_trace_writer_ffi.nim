@@ -335,12 +335,10 @@ proc trace_writer_begin_events(
     let (_, progBase, _) = splitFile(handle.programName)
     let ctPath = outDir / (progBase & ".ct")
 
-    # Stream to disk as chunks seal (createCtfsStreaming) rather than buffering
-    # the whole trace in RAM and dumping it at close: recorders driven by the
-    # C-ABI FFI are long-lived producers (e.g. the GDScript recorder under a
-    # live Godot process), and this is also the substrate the shared-writer
-    # attach mode (MCR nested container) builds on. ctPath == handle.ctFilePath.
-    let res = initMultiStreamWriter(ctPath, handle.programName, streaming = true)
+    # The multi-stream writer always streams to disk as chunks seal
+    # (createCtfsStreaming) — the buffer-in-RAM-then-dump mode has been removed.
+    # ctPath == handle.ctFilePath.
+    let res = initMultiStreamWriter(ctPath, handle.programName)
     if res.isErr:
       setError(res.error)
       return 1.cint

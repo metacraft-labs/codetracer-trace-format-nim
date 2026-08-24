@@ -279,22 +279,19 @@ proc toGlobalLineIndex(w: var MultiStreamTraceWriter,
 
 proc initMultiStreamWriter*(path: string, program: string,
     chunkSize: int = 4096,
-    recordingId: string = "",
-    streaming: bool = false): Result[MultiStreamTraceWriter, string] =
+    recordingId: string = ""): Result[MultiStreamTraceWriter, string] =
   ## Create a new multi-stream trace writer.
   ##
-  ## When ``streaming`` is false (default), the container is built entirely
-  ## in memory (``createCtfs``) and only reaches ``path`` when the caller
-  ## serialises it (``toBytes`` / ``closeCtfs``) — the buffer-and-dump mode
-  ## suited to short-lived (e.g. blockchain) recordings.
+  ## The container is ALWAYS built on ``createCtfsStreaming(path)``: the
+  ## exec/value/call/io/span stream chunks flush to ``path`` on disk as they are
+  ## written, so a producer does not have to hold the whole trace in RAM until
+  ## close, and the container is durable/observable mid-run.  ``closeCtfs``
+  ## finalizes the on-disk image.
   ##
-  ## When ``streaming`` is true, the container is built on
-  ## ``createCtfsStreaming(path)``: the exec/value/call/io/span stream chunks
-  ## flush to ``path`` on disk as they are written, so a long-running producer
-  ## (e.g. the GDScript recorder under a live Godot process) does not have to
-  ## hold the whole trace until close, and the container is durable/observable
-  ## mid-run.  ``closeCtfs`` finalizes the on-disk image.  This is the mode all
-  ## long-lived CTFS producers should use.
+  ## The old buffer-in-memory-then-dump mode (``createCtfs`` + ``toBytes`` at
+  ## close) has been removed: every CTFS producer streams.  ``toBytes`` still
+  ## returns the full container image for in-memory consumers, and the streamed
+  ## container is byte-identical to what the buffered mode produced.
   ##
   ## ~recordingId~ defaults to a freshly-minted UUIDv7 (M-REC-1).  Pass
   ## an explicit canonical-form id to pin the recording's identity
@@ -312,13 +309,10 @@ proc initMultiStreamWriter*(path: string, program: string,
       return err("recordingId is not a canonical UUIDv7: " & valRes.error)
 
   var w: MultiStreamTraceWriter
-  if streaming:
-    let sres = createCtfsStreaming(path)
-    if sres.isErr:
-      return err("failed to create streaming CTFS container at " & path & ": " & sres.error)
-    w.ctfs = sres.get()
-  else:
-    w.ctfs = createCtfs()
+  let sres = createCtfsStreaming(path)
+  if sres.isErr:
+    return err("failed to create streaming CTFS container at " & path & ": " & sres.error)
+  w.ctfs = sres.get()
   w.metadata = TraceMetadata(
     recordingId: resolvedId, program: program, args: @[], workdir: "")
   w.paths = @[]
