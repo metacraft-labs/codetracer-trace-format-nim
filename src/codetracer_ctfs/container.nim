@@ -45,7 +45,24 @@ proc createCtfs*(
 
 proc addFile*(c: var Ctfs, name: string): Result[CtfsInternalFile, string] =
   ## Add a new named file to the container. Returns a handle for writing.
+  ##
+  ## A DUPLICATE root name is rejected.  Every reader resolves a name to the
+  ## FIRST matching root entry, so appending a second entry with the same name
+  ## does not update that file — it SHADOWS it, and the shadowed member becomes
+  ## unreachable while still occupying the container.  That failure mode is
+  ## invisible (the write "succeeds", the read returns stale bytes), so the
+  ## writer refuses it rather than letting a caller discover it downstream.
   let encodedName = base40Encode(name)
+
+  # Reject a duplicate before allocating anything.
+  for i in 0 ..< int(c.maxRootEntries):
+    let off = c.fileEntryOffset(i)
+    if off + 24 > c.data.len: break
+    if readU64LE(c.data, off + 16) == encodedName and
+       (readU64LE(c.data, off) != 0 or readU64LE(c.data, off + 8) != 0):
+      return err("duplicate CTFS file name '" & name & "': a container may " &
+                 "hold only one member per name (readers take the first, so " &
+                 "a second entry would silently shadow it)")
 
   # Find first empty file entry.
   for i in 0 ..< int(c.maxRootEntries):
@@ -71,11 +88,28 @@ proc addFile*(c: var Ctfs, name: string): Result[CtfsInternalFile, string] =
 proc writeToFile*(c: var Ctfs, f: var CtfsInternalFile,
                   data: openArray[byte]): Result[void, string] =
   ## Append data to an internal file. Uses multi-level block mapping.
+  ##
+  ## **Every block number this proc turns into a byte offset is checked first,
+  ## and that is a data-integrity rule rather than defensiveness.** Block 0 is
+  ## the container header and the root directory, so a block number of `0` —
+  ## which is what `lookupDataBlock` returns for *any* mapping it cannot
+  ## resolve, at any level — addresses byte offset 0. Writing a caller's
+  ## payload there does not damage one stream, it overwrites the header and
+  ## the entire entry array, so the `.ct` stops being a container and every
+  ## member in it becomes unreachable. Pinned by
+  ## `tests/test_ctfs_append_null_data_block.nim`.
   if data.len == 0:
     return ok()
 
   let entryOff = c.fileEntryOffset(f.entryIndex)
   let mapBlock = readU64LE(c.data, entryOff + 8)
+  # The entry's mapping root, checked before any walk: a zero here is the state
+  # a crash between publishing an entry's size and publishing its mapping root
+  # leaves, and the walk below would read its pointers out of block 0.
+  if mapBlock == 0'u64 or mapBlock >= c.nextFreeBlock:
+    return err("internal file entry " & $f.entryIndex & " has mapping root block " &
+      $mapBlock & ", which is outside the container's " & $c.nextFreeBlock &
+      " allocated blocks; refusing to write through it")
 
   var written = 0
   while written < data.len:
@@ -87,14 +121,43 @@ proc writeToFile*(c: var Ctfs, f: var CtfsInternalFile,
     var dataBlock: uint64
 
     if offsetInBlock == 0:
-      # Need a new data block.
+      # Need a new data block. It is allocated only *provisionally*: if the
+      # mapping cannot accept the pointer — the container was damaged and
+      # `insertDataBlock` refuses to allocate over a null pointer that an
+      # earlier index already went through — the allocation is rolled back, so a
+      # refused append does not leave the writer's block count ahead of the
+      # mapping. `insertDataBlock` is all-or-nothing itself: with the
+      # null-pointer rule in place, both of its failure branches return before
+      # allocating or writing anything, so this one rollback is the whole of it.
+      let blocksBefore = c.nextFreeBlock
+      let bytesBefore = c.data.len
       dataBlock = c.allocBlock()
       let insertRes = c.insertDataBlock(mapBlock, uint64(fileBlockIdx), dataBlock)
       if insertRes.isErr:
+        c.nextFreeBlock = blocksBefore
+        c.data.setLen(bytesBefore)
         return err(insertRes.error)
     else:
       # Mid-block write: look up the existing data block by navigating the chain.
       dataBlock = c.lookupDataBlock(mapBlock, uint64(fileBlockIdx))
+
+    # `lookupDataBlock` answers "unresolved" with 0 — from a null level-1 slot,
+    # a null chain pointer, a null child, or a level overflow — and 0 is block
+    # 0. Refuse it here, where the block number becomes a byte offset, so no
+    # unresolved mapping can put payload into the header and root directory.
+    # The upper bound catches the same failure pointing the other way: a
+    # garbage pointer past the allocator's high-water mark, which would
+    # otherwise index past `c.data` and die with an IndexDefect.
+    if dataBlock == 0'u64:
+      return err("null data block at index " & $fileBlockIdx &
+        " of internal file entry " & $f.entryIndex &
+        ": its mapping does not resolve, and block 0 is the container header " &
+        "and root directory — refusing to write there")
+    if dataBlock >= c.nextFreeBlock:
+      return err("data block " & $fileBlockIdx & " of internal file entry " &
+        $f.entryIndex & " resolves to block " & $dataBlock &
+        ", which is outside the container's " & $c.nextFreeBlock &
+        " allocated blocks")
 
     # Write data into the block.
     let blockStart = c.blockOffset(dataBlock)
@@ -113,6 +176,70 @@ proc writeToFile*(c: var Ctfs, f: var CtfsInternalFile,
   # Update file size.
   writeU64LE(c.data, entryOff, f.writePos)
   ok()
+
+proc rewriteFileContent*(c: var Ctfs, f: CtfsInternalFile,
+                         data: openArray[byte]): Result[void, string] =
+  ## Overwrite an internal file's bytes IN PLACE, keeping its size, its
+  ## file-entry slot and its already-allocated data blocks exactly as they
+  ## are.  The new content must be the same length as the old one; anything
+  ## else would need block (de)allocation, which would move every later
+  ## block and change the container layout.
+  ##
+  ## Re-serialising a same-length file over its own blocks keeps the layout
+  ## fixed and touches only the bytes that changed — used for late-decided
+  ## fields such as `meta.dat`'s feature-flag word, whose value cannot be
+  ## known at `openTraceWriter` time and whose blocks must not move.
+  if f.writePos == 0:
+    return err("rewriteFileContent: file has no content to rewrite")
+  if uint64(data.len) != f.writePos:
+    return err("rewriteFileContent: length mismatch (have " & $f.writePos &
+               " bytes, got " & $data.len & ")")
+
+  let entryOff = c.fileEntryOffset(f.entryIndex)
+  let mapBlock = readU64LE(c.data, entryOff + 8)
+
+  var written = 0
+  while written < data.len:
+    let fileBlockIdx = uint64(written) div uint64(c.blockSize)
+    let offsetInBlock = written mod int(c.blockSize)
+    let dataBlock = c.lookupDataBlock(mapBlock, fileBlockIdx)
+    if dataBlock == 0:
+      return err("rewriteFileContent: missing data block " & $fileBlockIdx)
+    let blockStart = c.blockOffset(dataBlock)
+    let toWrite = min(int(c.blockSize) - offsetInBlock, data.len - written)
+    for i in 0 ..< toWrite:
+      c.data[blockStart + offsetInBlock + i] = data[written + i]
+    if c.streaming:
+      c.flushBlock(dataBlock)
+    written += toWrite
+  ok()
+
+proc truncateFileContent*(c: var Ctfs, f: CtfsInternalFile):
+    Result[CtfsInternalFile, string] =
+  ## Point an existing file entry at a FRESH, empty mapping block and return a
+  ## handle at position 0, so the caller can rewrite its content at a
+  ## different length than before.
+  ##
+  ## `rewriteFileContent` cannot do this: it is deliberately length-preserving
+  ## because its callers (e.g. `meta.dat`) must not move any later block. This
+  ## is the opposite case — re-finalising a stream whose new image is a
+  ## different length.
+  ##
+  ## The old mapping and data blocks are abandoned in place.  Nothing
+  ## references them once the entry's pointer moves, and the container's block
+  ## allocator only ever moves forward, so the orphans are inert padding — the
+  ## same trade `addFile` already makes for a file that is created and never
+  ## written.  They are NOT reclaimed, which is why this is an append-time
+  ## finalisation step and not something to call in a loop.
+  let entryOff = c.fileEntryOffset(f.entryIndex)
+  let mapBlock = c.allocBlock()
+  c.zeroBlock(mapBlock)
+  writeU64LE(c.data, entryOff + 8, mapBlock)
+  writeU64LE(c.data, entryOff, 0)
+  if c.streaming:
+    c.flushBlock(0)
+    c.flushBlock(mapBlock)
+  ok(CtfsInternalFile(entryIndex: f.entryIndex, writePos: 0, dataBlockCount: 0))
 
 proc closeCtfs*(c: var Ctfs) =
   ## Close the container. When streaming, flushes all data and closes the file.

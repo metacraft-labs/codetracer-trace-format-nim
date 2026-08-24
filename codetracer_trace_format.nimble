@@ -13,6 +13,10 @@ requires "results"
 task test, "Run all tests":
   exec "nim c -r tests/test_base40.nim"
   exec "nim c -r tests/test_container.nim"
+  # M61/M61b integrity hardening: the write-side null-mapping guards and the
+  # duplicate-name rejection ported from the native-recorder fork.
+  exec "nim c -r tests/test_ctfs_append_null_data_block.nim"
+  exec "nim c -r tests/test_ctfs_duplicate_name.nim"
   exec "nim c -r tests/test_streaming.nim"
   exec "nim c -r tests/test_chunk_index.nim"
   exec "nim c -r tests/test_fixed_record_table.nim"

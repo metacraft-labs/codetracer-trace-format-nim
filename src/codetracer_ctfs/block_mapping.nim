@@ -111,9 +111,24 @@ proc navigateAndInsert*(c: var Ctfs, mappingBlock: uint64, level: uint32,
   assert entryIdx < usable
 
   # Read or allocate the sub-block.
+  #
+  # A null child is only legitimately "not allocated yet" when the index being
+  # placed is the **first index this child covers**, i.e. `subIdx == 0`. A
+  # mapping is filled in strictly increasing block-index order, so any other
+  # remainder means an earlier insert already went through this pointer and a
+  # zero here is damage — allocating over it replaces the only pointer to the
+  # existing level-(k-1) subtree and orphans every data block under it, while
+  # the append reports success. `CTFS-Binary-Format.md` §4, "Null pointers
+  # during allocation". Pinned by `tests/test_ctfs_append_null_data_block.nim`.
   var childBlock = c.readPtr(mappingBlock, entryIdx)
   var didAllocChild = false
   if childBlock == 0:
+    if subIdx != 0:
+      return err("null mapping pointer at block " & $mappingBlock & " index " &
+        $entryIdx & " (level " & $level & "), but the index being placed is " &
+        "not the first that pointer covers (offset " & $subIdx & " within it); " &
+        "the mapping is damaged, and allocating a replacement here would " &
+        "orphan the existing level-" & $(level - 1) & " subtree")
     childBlock = c.allocBlock()
     c.zeroBlock(childBlock)
     c.writePtr(mappingBlock, entryIdx, childBlock)
@@ -132,6 +147,21 @@ proc insertDataBlock*(c: var Ctfs, rootBlock: uint64, blockIndex: uint64,
                       dataBlock: uint64): Result[void, string] =
   ## Insert a data block pointer at the given blockIndex using the
   ## bottom-up chain model matching the Rust CtfsWriter.
+  ##
+  ## **A null pointer encountered on the way is not always "not allocated
+  ## yet".** Both null branches — the chain pointer below and
+  ## `navigateAndInsert`'s child pointer — allocate a replacement mapping block,
+  ## which is right only when the slot has genuinely never been used. On a
+  ## container whose mapping was damaged the replacement overwrites the only
+  ## pointer to the existing subtree, every data block under it becomes
+  ## unreachable and unrecoverable, and the append reports success.
+  ##
+  ## The two cases are distinguishable from the *index*, because a mapping is
+  ## filled in strictly increasing block-index order: a pointer may be null only
+  ## when the index being placed is the **first index that pointer covers**
+  ## (`idx == 0` after rebasing at a level, `subIdx == 0` within a child).
+  ## `CTFS-Binary-Format.md` §4, "Null pointers during allocation", states this
+  ## normatively. Pinned by `tests/test_ctfs_append_null_data_block.nim`.
   let usable = c.usableEntries()
 
   var idx = blockIndex
@@ -152,6 +182,14 @@ proc insertDataBlock*(c: var Ctfs, rootBlock: uint64, blockIndex: uint64,
     # Follow or create the chain pointer from currentLevelBlock[N-1].
     let chainPtr = c.readPtr(currentLevelBlock, usable)
     if chainPtr == 0:
+      # Only legitimate for the first index this chain pointer covers.
+      if idx != 0:
+        return err("null chain pointer at block " & $currentLevelBlock &
+          " following to level " & $level & ", but data block index " &
+          $blockIndex & " is not the first index that pointer covers (offset " &
+          $idx & " within level " & $level & "); the mapping is damaged, and " &
+          "allocating a replacement here would orphan the existing level-" &
+          $level & " subtree")
       let newBlock = c.allocBlock()
       c.zeroBlock(newBlock)
       c.writePtr(currentLevelBlock, usable, newBlock)
