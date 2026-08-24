@@ -107,3 +107,7 @@ src/macro_sourcemap_*.json
 .repro/
 # reprobuild build output tree (ct-print, per-test binaries, nimcache)
 /build/
+
+# Test-output CTFS containers (writers always stream to disk now)
+*.ct
+*.ct.head.json
