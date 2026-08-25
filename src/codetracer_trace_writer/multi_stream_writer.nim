@@ -84,7 +84,29 @@ type
     children: seq[uint64]
 
   MultiStreamTraceWriter* = object
-    ctfs: Ctfs
+    # Stage C — container ownership.  A writer either OWNS its container
+    # (the classic `initMultiStreamWriter` path: `ownedCtfs` holds the
+    # streaming CTFS created for `filePath`) or is ATTACHED to a container
+    # that ANOTHER writer created and owns (`initMultiStreamWriterAttached`:
+    # `sharedCtfs` points at the external container; `ownedCtfs` is unused).
+    #
+    # All stream writers and register procs go through the `container`
+    # accessor rather than touching a field directly, so the two modes share
+    # one data path.  Crucially the accessor computes the target lazily on
+    # every call — it NEVER stores `addr ownedCtfs` in the object — so the
+    # writer stays movable/returnable-by-value without a dangling self
+    # pointer, and the owned path drives the exact same inline `ownedCtfs`
+    # object it always did (byte-identical output; guarded by the corpus +
+    # cross-read proofs).
+    ownedCtfs: Ctfs
+      ## Backing storage for an OWNED writer.  Left default-initialised and
+      ## untouched when `attached` is true.
+    sharedCtfs: ptr Ctfs
+      ## Non-nil only when `attached`.  Points at the externally-owned
+      ## container; the writer writes its streams here but never frees it or
+      ## writes `meta.dat` into it (see `close`).
+    attached: bool
+      ## False (default) = OWNED; true = attached to an external container.
     execWriter: ExecStreamWriter
     valueWriter: ValueStreamWriter
     callWriter: CallStreamWriter
@@ -220,6 +242,19 @@ type
 # Helpers
 # ---------------------------------------------------------------------------
 
+proc container(w: var MultiStreamTraceWriter): var Ctfs =
+  ## The CTFS container this writer writes into — its own inline `ownedCtfs`
+  ## when owned, or the externally-owned container when attached.
+  ##
+  ## Resolved fresh on every call (never cached as `addr w.ownedCtfs` in the
+  ## object) so a by-value move of the writer can never leave a dangling self
+  ## pointer.  In owned mode this returns the very same field the writer used
+  ## before Stage C, so the owned write path is byte-for-byte unchanged.
+  if w.attached:
+    return w.sharedCtfs[]
+  else:
+    return w.ownedCtfs
+
 proc rebuildGli(w: var MultiStreamTraceWriter) =
   ## Rebuild the global line index from the current set of paths.
   ##
@@ -312,7 +347,7 @@ proc initMultiStreamWriter*(path: string, program: string,
   let sres = createCtfsStreaming(path)
   if sres.isErr:
     return err("failed to create streaming CTFS container at " & path & ": " & sres.error)
-  w.ctfs = sres.get()
+  w.ownedCtfs = sres.get()
   w.metadata = TraceMetadata(
     recordingId: resolvedId, program: program, args: @[], workdir: "")
   w.paths = @[]
@@ -327,28 +362,110 @@ proc initMultiStreamWriter*(path: string, program: string,
 
   # Meta.dat placeholder - will be written at close time
   # Init interning tables
-  let intRes = initTraceInterningTables(w.ctfs)
+  let intRes = initTraceInterningTables(w.container)
   if intRes.isErr:
     return err("failed to init interning tables: " & intRes.error)
   w.interning = intRes.get()
 
   # Init stream writers
-  let execRes = initExecStreamWriter(w.ctfs, chunkSize)
+  let execRes = initExecStreamWriter(w.container, chunkSize)
   if execRes.isErr:
     return err("failed to init exec stream: " & execRes.error)
   w.execWriter = execRes.get()
 
-  let valRes = initValueStreamWriter(w.ctfs)
+  let valRes = initValueStreamWriter(w.container)
   if valRes.isErr:
     return err("failed to init value stream: " & valRes.error)
   w.valueWriter = valRes.get()
 
-  let callRes = initCallStreamWriter(w.ctfs)
+  let callRes = initCallStreamWriter(w.container)
   if callRes.isErr:
     return err("failed to init call stream: " & callRes.error)
   w.callWriter = callRes.get()
 
-  let ioRes = initIOEventStreamWriter(w.ctfs)
+  let ioRes = initIOEventStreamWriter(w.container)
+  if ioRes.isErr:
+    return err("failed to init io event stream: " & ioRes.error)
+  w.ioEventWriter = ioRes.get()
+
+  ok(w)
+
+proc initMultiStreamWriterAttached*(ctfs: ptr Ctfs, program: string,
+    chunkSize: int = 4096,
+    recordingId: string = ""): Result[MultiStreamTraceWriter, string] =
+  ## Create a multi-stream trace writer that ATTACHES to a container another
+  ## writer already created and OWNS (Stage C step 1).
+  ##
+  ## Unlike ``initMultiStreamWriter``, this does NOT call
+  ## ``createCtfsStreaming`` — it writes its exec/value/call/io/span streams
+  ## and interning tables into the caller-provided ``ctfs`` exactly as the
+  ## owned path writes into its own container.  Two producers can therefore
+  ## share ONE ``.ct`` as long as they emit DISTINCT stream names; only the
+  ## container's creator owns ``meta.dat`` and the container's lifetime.
+  ##
+  ## Ownership contract this constructor sets up (enforced in ``close``):
+  ##  * ``close`` FLUSHES and finalizes this writer's OWN stream indices
+  ##    (calls.idx, values.idx, events.idx, steps.idx, spantype.ns …) so its
+  ##    streams are complete and seekable, but
+  ##  * it does NOT write ``meta.dat`` (the owner does), and
+  ##  * it does NOT ``closeCtfs`` / free the shared container (the owner does).
+  ##
+  ## ``ctfs`` MUST outlive the returned writer (the writer stores the raw
+  ## pointer and never copies the container).  Passing ``nil`` is rejected.
+  ##
+  ## ``recordingId`` behaves as in ``initMultiStreamWriter`` — it feeds this
+  ## writer's ``metadata`` for callers that read it back, even though the
+  ## attached writer never serialises ``meta.dat`` itself.
+  if ctfs == nil:
+    return err("initMultiStreamWriterAttached: ctfs pointer is nil")
+
+  var resolvedId = recordingId
+  if resolvedId.len == 0:
+    let uuidRes = newUuidV7()
+    if uuidRes.isErr:
+      return err("failed to mint recording_id: " & uuidRes.error)
+    resolvedId = $uuidRes.get()
+  else:
+    let valRes = validateRecordingIdStr(resolvedId)
+    if valRes.isErr:
+      return err("recordingId is not a canonical UUIDv7: " & valRes.error)
+
+  var w: MultiStreamTraceWriter
+  w.attached = true
+  w.sharedCtfs = ctfs
+  w.metadata = TraceMetadata(
+    recordingId: resolvedId, program: program, args: @[], workdir: "")
+  w.paths = @[]
+  w.gliDirty = true
+  w.filePath = ""
+  # Same M26b default as the owned path — line-only writers emit step-map.ns.
+  # It is written into the SHARED container at close(); it is one of this
+  # writer's own additive files, not meta.dat, so it is allowed on the attach
+  # path.  A column-aware attached writer clears it via enableColumnAwareSteps.
+  w.emitStepMap = true
+  w.stepMapBuilder = initStepMapBuilder()
+
+  let intRes = initTraceInterningTables(w.container)
+  if intRes.isErr:
+    return err("failed to init interning tables: " & intRes.error)
+  w.interning = intRes.get()
+
+  let execRes = initExecStreamWriter(w.container, chunkSize)
+  if execRes.isErr:
+    return err("failed to init exec stream: " & execRes.error)
+  w.execWriter = execRes.get()
+
+  let valRes = initValueStreamWriter(w.container)
+  if valRes.isErr:
+    return err("failed to init value stream: " & valRes.error)
+  w.valueWriter = valRes.get()
+
+  let callRes = initCallStreamWriter(w.container)
+  if callRes.isErr:
+    return err("failed to init call stream: " & callRes.error)
+  w.callWriter = callRes.get()
+
+  let ioRes = initIOEventStreamWriter(w.container)
   if ioRes.isErr:
     return err("failed to init io event stream: " & ioRes.error)
   w.ioEventWriter = ioRes.get()
@@ -470,9 +587,9 @@ proc registerPath*(w: var MultiStreamTraceWriter,
   ## and column resolution falls back to surfacing ``None``.
   let idRes =
     if w.columnAwareSteps:
-      w.ctfs.ensurePathIdColumnAware(w.interning, path, lineLengths)
+      w.container.ensurePathIdColumnAware(w.interning, path, lineLengths)
     else:
-      w.ctfs.ensurePathId(w.interning, path)
+      w.container.ensurePathId(w.interning, path)
   if idRes.isErr:
     return err(idRes.error)
   let id = idRes.get()
@@ -543,17 +660,17 @@ proc registerSourceView*(w: var MultiStreamTraceWriter,
 proc registerFunction*(w: var MultiStreamTraceWriter,
     name: string): Result[uint64, string] =
   ## Register a function name and return its interned ID.
-  w.ctfs.ensureFunctionId(w.interning, name)
+  w.container.ensureFunctionId(w.interning, name)
 
 proc registerType*(w: var MultiStreamTraceWriter,
     name: string): Result[uint64, string] =
   ## Register a type name and return its interned ID.
-  w.ctfs.ensureTypeId(w.interning, name)
+  w.container.ensureTypeId(w.interning, name)
 
 proc registerVarname*(w: var MultiStreamTraceWriter,
     name: string): Result[uint64, string] =
   ## Register a variable name and return its interned ID.
-  w.ctfs.ensureVarnameId(w.interning, name)
+  w.container.ensureVarnameId(w.interning, name)
 
 # ---------------------------------------------------------------------------
 # Step registration
@@ -582,12 +699,12 @@ proc registerStep*(w: var MultiStreamTraceWriter, pathId: uint64,
     else:
       ev = StepEvent(kind: sekAbsoluteStep, globalLineIndex: gli)
 
-  let evRes = w.ctfs.writeEvent(w.execWriter, ev)
+  let evRes = w.container.writeEvent(w.execWriter, ev)
   if evRes.isErr:
     return err("failed to write step event: " & evRes.error)
 
   # Write values parallel to this step
-  let valRes = w.ctfs.writeStepValues(w.valueWriter, values)
+  let valRes = w.container.writeStepValues(w.valueWriter, values)
   if valRes.isErr:
     return err("failed to write step values: " & valRes.error)
 
@@ -657,11 +774,11 @@ proc registerStepWithColumn*(w: var MultiStreamTraceWriter,
     else:
       ev = StepEvent(kind: sekAbsoluteStep, globalLineIndex: combinedGli)
 
-  let evRes = w.ctfs.writeEvent(w.execWriter, ev)
+  let evRes = w.container.writeEvent(w.execWriter, ev)
   if evRes.isErr:
     return err("failed to write step event: " & evRes.error)
 
-  let valRes = w.ctfs.writeStepValues(w.valueWriter, values)
+  let valRes = w.container.writeStepValues(w.valueWriter, values)
   if valRes.isErr:
     return err("failed to write step values: " & valRes.error)
 
@@ -708,11 +825,11 @@ proc registerColumnStep*(w: var MultiStreamTraceWriter,
   # a column delta is also a position delta.  The exec-stream writer
   # picks up the running index from `lastGlobalLineIndex` already.
   let ev = StepEvent(kind: sekDeltaColumn, columnDelta: columnDelta)
-  let evRes = w.ctfs.writeEvent(w.execWriter, ev)
+  let evRes = w.container.writeEvent(w.execWriter, ev)
   if evRes.isErr:
     return err("failed to write delta-column event: " & evRes.error)
 
-  let valRes = w.ctfs.writeStepValues(w.valueWriter, values)
+  let valRes = w.container.writeStepValues(w.valueWriter, values)
   if valRes.isErr:
     return err("failed to write step values: " & valRes.error)
 
@@ -753,7 +870,7 @@ proc flushCompletedCalls(w: var MultiStreamTraceWriter): Result[void, string] =
       w.completedCalls[j] = tmp
       dec j
   for entry in w.completedCalls:
-    let res = w.ctfs.writeCall(w.callWriter, entry[1])
+    let res = w.container.writeCall(w.callWriter, entry[1])
     if res.isErr:
       return err("failed to write call record: " & res.error)
     w.callCount += 1
@@ -913,13 +1030,13 @@ proc registerSpan*(w: var MultiStreamTraceWriter,
     return err("writer is closed")
 
   if not w.hasSpans:
-    let initRes = initSpanStreamWriter(w.ctfs)
+    let initRes = initSpanStreamWriter(w.container)
     if initRes.isErr:
       return err("failed to init span stream: " & initRes.error)
     w.spanWriter = initRes.get()
     w.hasSpans = true
 
-  let res = writeSpan(w.ctfs, w.spanWriter, span)
+  let res = writeSpan(w.container, w.spanWriter, span)
   if res.isErr:
     return err("failed to write span: " & res.error)
   ok()
@@ -948,7 +1065,7 @@ proc flushSpans*(w: var MultiStreamTraceWriter): Result[void, string] =
   ## against a streaming container).
   if not w.hasSpans:
     return ok()
-  span_stream.flush(w.ctfs, w.spanWriter)
+  span_stream.flush(w.container, w.spanWriter)
 
 proc spanCount*(w: MultiStreamTraceWriter): uint64 =
   ## Number of span RECORDS registered (an open record and its completion count
@@ -981,7 +1098,7 @@ proc registerIOEvent*(w: var MultiStreamTraceWriter, kind: IOEventKind,
     data: dataSeq,
   )
 
-  let res = w.ctfs.writeEvent(w.ioEventWriter, ev)
+  let res = w.container.writeEvent(w.ioEventWriter, ev)
   if res.isErr:
     return err("failed to write IO event: " & res.error)
   ok()
@@ -1003,12 +1120,12 @@ proc registerRaise*(w: var MultiStreamTraceWriter, exceptionTypeId: uint64,
 
   let ev = StepEvent(kind: sekRaise,
     exceptionTypeId: exceptionTypeId, message: msgSeq)
-  let res = w.ctfs.writeEvent(w.execWriter, ev)
+  let res = w.container.writeEvent(w.execWriter, ev)
   if res.isErr:
     return err("failed to write raise event: " & res.error)
 
   # Write empty values to keep streams in sync
-  let valRes = w.ctfs.writeStepValues(w.valueWriter, @[])
+  let valRes = w.container.writeStepValues(w.valueWriter, @[])
   if valRes.isErr:
     return err("failed to write raise values: " & valRes.error)
 
@@ -1023,12 +1140,12 @@ proc registerCatch*(w: var MultiStreamTraceWriter,
     return err("writer is closed")
 
   let ev = StepEvent(kind: sekCatch, catchExceptionTypeId: exceptionTypeId)
-  let res = w.ctfs.writeEvent(w.execWriter, ev)
+  let res = w.container.writeEvent(w.execWriter, ev)
   if res.isErr:
     return err("failed to write catch event: " & res.error)
 
   # Write empty values to keep streams in sync
-  let valRes = w.ctfs.writeStepValues(w.valueWriter, @[])
+  let valRes = w.container.writeStepValues(w.valueWriter, @[])
   if valRes.isErr:
     return err("failed to write catch values: " & valRes.error)
 
@@ -1061,11 +1178,11 @@ proc registerThreadSwitch*(w: var MultiStreamTraceWriter,
     return err("writer is closed")
 
   let ev = StepEvent(kind: sekThreadSwitch, threadId: threadId)
-  let res = w.ctfs.writeEvent(w.execWriter, ev)
+  let res = w.container.writeEvent(w.execWriter, ev)
   if res.isErr:
     return err("failed to write thread_switch event: " & res.error)
 
-  let valRes = w.ctfs.writeStepValues(w.valueWriter, @[])
+  let valRes = w.container.writeStepValues(w.valueWriter, @[])
   if valRes.isErr:
     return err("failed to write thread_switch values: " & valRes.error)
 
@@ -1080,11 +1197,11 @@ proc registerThreadStart*(w: var MultiStreamTraceWriter,
     return err("writer is closed")
 
   let ev = StepEvent(kind: sekThreadStart, startThreadId: threadId)
-  let res = w.ctfs.writeEvent(w.execWriter, ev)
+  let res = w.container.writeEvent(w.execWriter, ev)
   if res.isErr:
     return err("failed to write thread_start event: " & res.error)
 
-  let valRes = w.ctfs.writeStepValues(w.valueWriter, @[])
+  let valRes = w.container.writeStepValues(w.valueWriter, @[])
   if valRes.isErr:
     return err("failed to write thread_start values: " & valRes.error)
 
@@ -1099,11 +1216,11 @@ proc registerThreadExit*(w: var MultiStreamTraceWriter,
     return err("writer is closed")
 
   let ev = StepEvent(kind: sekThreadExit, exitThreadId: threadId)
-  let res = w.ctfs.writeEvent(w.execWriter, ev)
+  let res = w.container.writeEvent(w.execWriter, ev)
   if res.isErr:
     return err("failed to write thread_exit event: " & res.error)
 
-  let valRes = w.ctfs.writeStepValues(w.valueWriter, @[])
+  let valRes = w.container.writeStepValues(w.valueWriter, @[])
   if valRes.isErr:
     return err("failed to write thread_exit values: " & valRes.error)
 
@@ -1175,12 +1292,12 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   # the Rust `CallStreamReader` (db-backend seekable path), byte-compatible
   # with the Rust writer's calls.dat/calls.idx layout. Must run after the
   # final flushCompletedCalls (the last writeCall) and before meta.dat.
-  let finalizeRes = call_stream.finalizeCallStream(w.ctfs, w.callWriter)
+  let finalizeRes = call_stream.finalizeCallStream(w.container, w.callWriter)
   if finalizeRes.isErr:
     return err("failed to finalize call stream: " & finalizeRes.error)
 
   # Flush exec stream
-  let flushRes = w.ctfs.flush(w.execWriter)
+  let flushRes = w.container.flush(w.execWriter)
   if flushRes.isErr:
     return err("failed to flush exec stream: " & flushRes.error)
 
@@ -1188,7 +1305,7 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   # values.idx.  This makes the Nim-written `values.dat` byte-compatible with
   # the Rust `ValueStreamReader` (the SPEC chunked layout); it must run before
   # meta.dat so the has_value_stream flag (set below) is accurate.
-  let valFlushRes = value_stream.flush(w.ctfs, w.valueWriter)
+  let valFlushRes = value_stream.flush(w.container, w.valueWriter)
   if valFlushRes.isErr:
     return err("failed to flush value stream: " & valFlushRes.error)
 
@@ -1196,7 +1313,7 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   # events.idx.  This makes the Nim-written `events.dat` byte-compatible with
   # the Rust `IoEventStreamReader` (the SPEC chunked layout); it must run before
   # meta.dat so the has_io_event_stream flag (set below) is accurate.
-  let ioFlushRes = io_event_stream.flush(w.ctfs, w.ioEventWriter)
+  let ioFlushRes = io_event_stream.flush(w.container, w.ioEventWriter)
   if ioFlushRes.isErr:
     return err("failed to flush io event stream: " & ioFlushRes.error)
 
@@ -1205,10 +1322,10 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   # span-free container gains no new files and keeps bit 13 clear.  Must run
   # before meta.dat so the has_span_stream flag below is accurate.
   if w.hasSpans:
-    let spanFlushRes = span_stream.flush(w.ctfs, w.spanWriter)
+    let spanFlushRes = span_stream.flush(w.container, w.spanWriter)
     if spanFlushRes.isErr:
       return err("failed to flush span stream: " & spanFlushRes.error)
-    let spanNsRes = writeSpanTypeNamespace(w.ctfs, w.spanWriter)
+    let spanNsRes = writeSpanTypeNamespace(w.container, w.spanWriter)
     if spanNsRes.isErr:
       return err("failed to write spantype.ns: " & spanNsRes.error)
 
@@ -1231,7 +1348,7 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   let hasSourceViews = w.sourceViews.len > 0
   if hasSourceViews:
     let svTableRes = initVariableRecordTableWriter(
-      w.ctfs, SourceViewsBaseName)
+      w.container, SourceViewsBaseName)
     if svTableRes.isErr:
       return err("failed to init source_views table: " & svTableRes.error)
     var svTable = svTableRes.get()
@@ -1248,7 +1365,7 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
       encodeVarint(uint64(sv.sourcemapV3.len), rec)
       for b in sv.sourcemapV3:
         rec.add(b)
-      let appendRes = w.ctfs.append(svTable, rec)
+      let appendRes = w.container.append(svTable, rec)
       if appendRes.isErr:
         return err("failed to write source_views record: " & appendRes.error)
 
@@ -1262,11 +1379,11 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   # zero-path `STMP` blob so the namespace is always parseable when present.
   if w.emitStepMap:
     let stepMapBytes = w.stepMapBuilder.serialize()
-    let smFileRes = w.ctfs.addFile(StepMapFileName)
+    let smFileRes = w.container.addFile(StepMapFileName)
     if smFileRes.isErr:
       return err("failed to add step-map.ns: " & smFileRes.error)
     var smFile = smFileRes.get()
-    let smWriteRes = w.ctfs.writeToFile(smFile, stepMapBytes)
+    let smWriteRes = w.container.writeToFile(smFile, stepMapBytes)
     if smWriteRes.isErr:
       return err("failed to write step-map.ns: " & smWriteRes.error)
 
@@ -1280,21 +1397,32 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
     let lhBytesRes = w.linehitsBuilder.get().serializeCowNamespace()
     if lhBytesRes.isErr:
       return err("failed to serialize linehits.tc: " & lhBytesRes.error)
-    let lhFileRes = w.ctfs.addFile("linehits.tc")
+    let lhFileRes = w.container.addFile("linehits.tc")
     if lhFileRes.isErr:
       return err("failed to add linehits.tc: " & lhFileRes.error)
     var lhFile = lhFileRes.get()
-    let lhWriteRes = w.ctfs.writeToFile(lhFile, lhBytesRes.get())
+    let lhWriteRes = w.container.writeToFile(lhFile, lhBytesRes.get())
     if lhWriteRes.isErr:
       return err("failed to write linehits.tc: " & lhWriteRes.error)
 
+  # Stage C — attached writers stop here.  Everything above finalized THIS
+  # writer's own streams and additive namespaces (calls.idx/values.idx/
+  # events.idx/steps.idx, spantype.ns, srcviews, step-map.ns, linehits.tc) into
+  # the shared container, so its streams are complete and seekable.  But
+  # `meta.dat` belongs to the container's OWNER, and the shared container's
+  # lifetime is the owner's too, so an attached `close` must not write meta.dat
+  # or `closeCtfs` — it just marks itself closed and returns.
+  if w.attached:
+    w.closed = true
+    return ok()
+
   # Write meta.dat
-  let metaFileRes = w.ctfs.addFile("meta.dat")
+  let metaFileRes = w.container.addFile("meta.dat")
   if metaFileRes.isErr:
     return err("failed to add meta.dat: " & metaFileRes.error)
   var metaFile = metaFileRes.get()
 
-  let metaRes = w.ctfs.writeMetaDat(
+  let metaRes = w.container.writeMetaDat(
     metaFile, w.metadata, w.paths,
     filterProvenance = w.filterProvenance,
     emitFilterProvenance = w.recordEmptyFilterProvenance,
@@ -1339,8 +1467,14 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
 
 proc toBytes*(w: var MultiStreamTraceWriter): seq[byte] =
   ## Get the serialized CTFS bytes. Must call close() first.
-  w.ctfs.toBytes()
+  w.container.toBytes()
 
 proc closeCtfs*(w: var MultiStreamTraceWriter) =
   ## Release any resources held by the underlying CTFS container.
-  w.ctfs.closeCtfs()
+  ##
+  ## No-op for an ATTACHED writer: the container is owned by another writer,
+  ## which is responsible for finalizing and closing it.  Only the owner's
+  ## `closeCtfs` may write the final root block and close the stream file.
+  if w.attached:
+    return
+  w.container.closeCtfs()

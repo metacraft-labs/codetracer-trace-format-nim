@@ -178,6 +178,7 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_streaming_value_encoder.nim", binary: "build/test-bin/test_streaming_value_encoder"),
   TestSpec(source: "tests/test_value_ref.nim", binary: "build/test-bin/test_value_ref"),
   TestSpec(source: "tests/test_multi_stream_writer.nim", binary: "build/test-bin/test_multi_stream_writer"),
+  TestSpec(source: "tests/test_multi_stream_attach.nim", binary: "build/test-bin/test_multi_stream_attach"),
   TestSpec(source: "tests/test_linehits_builder.nim", binary: "build/test-bin/test_linehits_builder"),
   TestSpec(source: "tests/test_memwrites_builder.nim", binary: "build/test-bin/test_memwrites_builder"),
   TestSpec(source: "tests/test_step_map_builder.nim", binary: "build/test-bin/test_step_map_builder"),
