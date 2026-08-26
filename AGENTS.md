@@ -85,6 +85,18 @@ choice the sibling Nim repos `io-mon`, `nim-stackable-hooks` and
 
 - `src/codetracer_ctfs.nim` — the CTFS container (Base40 filenames, multi-level
   block mapping, streaming writes, COW B-tree, sub-block pool).
+- `src/codetracer_ctfs/container_append.nim` — adding an internal file to a
+  container that has **already been closed** (`CTFS-Binary-Format.md` §5d).
+  Distinct from `container.nim`'s `addFile`/`writeToFile`, which run mid-write.
+  It reopens the sealed image, recovers `NextFreeBlock` from the file length,
+  and then drives the *same* `addFile`/`writeToFile`/`insertDataBlock` — it
+  owns no mapping arithmetic of its own, deliberately. Exposed to C as
+  `ct_container_append_files` / `ct_container_create`. This is what let the
+  wasm recorder delete its second CTFS writer; before it existed, that writer
+  drifted on §4's multi-level mapping and silently mis-wrote every stream past
+  ~2 MB. **Do not add a singular one-file-at-a-time form**: the batch is
+  published by a single rewrite of block 0, which is what makes a
+  half-attached set of streams unobservable.
 - `src/codetracer_trace_types.nim` — the shared record/value types.
 - `src/codetracer_trace_writer.nim` — the multi-stream production writer
   (`steps.dat`, `values.dat`, `calls.dat`, `events.dat`, line-hit and
@@ -99,6 +111,13 @@ choice the sibling Nim repos `io-mon`, `nim-stackable-hooks` and
 - `include/codetracer_trace_writer.h` — the C header for the FFI.
 - `tests/` — the corpus; the canonical list is the `test` task in
   `codetracer_trace_format.nimble`.
+- `tests/check_nsb1_namespace.nim`, `tests/check_ctfs_container.nim` —
+  **helper binaries, not tests** (deliberately absent from the nimble `test`
+  task and from `repro.nim`): they adjudicate an artefact only a foreign
+  producer can make. The wasm recorder shells out to them so that "the Go side
+  wrote a real namespace / a real container" is a claim the canonical Nim
+  implementation settles rather than one Go makes about itself. They only have
+  to compile and run.
 
 ## Testing notes
 

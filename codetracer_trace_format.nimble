@@ -17,6 +17,23 @@ task test, "Run all tests":
   # duplicate-name rejection ported from the native-recorder fork.
   exec "nim c -r tests/test_ctfs_append_null_data_block.nim"
   exec "nim c -r tests/test_ctfs_duplicate_name.nim"
+  # M38b: appending internal files to an already-closed container. Uses a
+  # 4.5 MB internal file, so -d:release keeps it quick.
+  exec "nim c -r -d:release tests/test_container_append.nim"
+  # M57: the append's write ORDERING (tail first, block 0 last), which is why
+  # an interrupted append leaves the old valid container. Needs the
+  # fault-injection seam, which is compiled out of every other build.
+  exec "nim c -r -d:release -d:ctfsAppendFaultInjection tests/test_container_append_ordering.nim"
+  # M58: §5d's reader rule has a bound attached to it — accepting a partial
+  # tail is only safe while every block number the reader resolves (mapping
+  # root, mapping block, and DATA block) is checked against the container's
+  # whole blocks. -d:release because one fixture is a 2.4 MB two-level file.
+  exec "nim c -r -d:release tests/test_partial_tail_bounds.nim"
+  # M61b: the WRITE side of the null-data-block defect. A block number of 0 is
+  # block 0 — the header and root directory — so an unresolved mapping that
+  # `writeToFile` does not refuse overwrites the container rather than one
+  # stream. -d:release because one fixture is a 512-block two-level file.
+  exec "nim c -r -d:release tests/test_write_null_data_block.nim"
   exec "nim c -r tests/test_streaming.nim"
   exec "nim c -r tests/test_chunk_index.nim"
   exec "nim c -r tests/test_fixed_record_table.nim"
@@ -28,6 +45,12 @@ task test, "Run all tests":
   exec "nim c -r tests/test_split_binary.nim"
   exec "nim c -r tests/test_trace_writer.nim"
   exec "nim c -r tests/test_trace_reader.nim"
+  # The same §5d bound in the *other* Nim transcription of the §4 walk:
+  # `codetracer_trace_reader.nim`'s own `readInternalFile`. It bounded byte
+  # offsets only, and read a null mapping root as a walk through block 0 —
+  # the header and root directory — so a damaged trace opened clean or
+  # crashed on an overflowing block number.
+  exec "nim c -r tests/test_trace_reader_null_mapping_root.nim"
   exec "nim c -r tests/test_golden_fixtures.nim"
   exec "nim c -r tests/test_cross_compat.nim"
   exec "nim c -r tests/test_meta_dat.nim"
@@ -78,6 +101,10 @@ task test, "Run all tests":
   exec "nim c -r -p:src tests/test_trace_storage_config.nim"
   exec "nim c -r -p:src tests/test_path_filter.nim"
   exec "nim c -r -d:release -p:src tests/test_ct_print_events_log_fallback.nim"
+  # A Rust-written `events.log` carries an 8-byte stream header this repo's
+  # legacy reader used to mistake for a chunk header, making every such
+  # container unreadable by `ct-print`.
+  exec "nim c -r -d:release -p:src tests/test_rust_events_log_header.nim"
   # Line-only orphan pending-value carry-forward (92fce3a regression).
   # `include`s codetracer_trace_writer_ffi, so it needs --mm:arc and the
   # --nimMainPrefix the FFI's NimMain importc expects (see buildStaticLib).
@@ -86,6 +113,11 @@ task test, "Run all tests":
   # callee's definition line, not inherit the previous step's position.
   # Same FFI-`include` compile requirements as the test above.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_orphan_call_args_step_location.nim"
+  # #601: an I/O event must be attributed to the step of the line that wrote
+  # it. The FFI buffers one step, so `stepCount - 1` named the PREVIOUS step
+  # and the flow view rendered program output one source line too high.
+  # Same FFI-`include` compile requirements as the two tests above.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_io_event_pending_step_attribution.nim"
 
 task regenerateFixtures, "Regenerate .expected golden fixture files":
   exec "nim c -r tests/generate_golden_fixtures.nim"

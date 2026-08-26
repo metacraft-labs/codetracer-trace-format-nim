@@ -5,7 +5,7 @@ when defined(nimPreviewSlimSystem):
 
 ## Tests for the call stream writer/reader.
 
-import std/times
+import std/[monotimes, times]
 import results
 import codetracer_ctfs/container
 import codetracer_trace_writer/call_stream
@@ -314,14 +314,14 @@ proc bench_call_tree_viewport_load() {.raises: [].} =
   var reader = readerRes.get()
 
   # Time loading 30 calls (simulating a viewport)
-  let startTime = cpuTime()
+  let startTime = getMonoTime()
 
   for i in 0 ..< viewportSize:
     let readRes = readCall(reader, uint64(i))
     doAssert readRes.isOk
 
-  let elapsed = cpuTime() - startTime
-  let elapsedMs = elapsed * 1000.0
+  let elapsedNs = (getMonoTime() - startTime).inNanoseconds
+  let elapsedMs = float(elapsedNs) / 1_000_000.0
 
   echo "bench_call_tree_viewport_load: " & $viewportSize &
     " calls in " & $elapsedMs & " ms"

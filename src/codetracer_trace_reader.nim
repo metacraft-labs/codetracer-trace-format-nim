@@ -60,8 +60,14 @@ type
 # ---------------------------------------------------------------------------
 
 proc findInternalFileEntry(data: openArray[byte], name: string,
-    maxEntries: uint32): tuple[size: uint64, mapBlock: uint64] =
-  ## Search file entries in block 0 for the given name. Returns (size, mapBlock).
+    maxEntries: uint32): tuple[found: bool, size: uint64, mapBlock: uint64] =
+  ## Search file entries in block 0 for the given name.
+  ##
+  ## `found` is reported separately from the two values, because `(0, 0)` is a
+  ## legitimate entry — an empty stream — as well as the shape of "no such
+  ## name", and conflating them is how a **damaged** entry used to slip
+  ## through: a stream with `Size > 0` and a null mapping root is neither
+  ## absent nor intact, and the caller has to be able to say so.
   let encoded = base40Encode(name)
   for i in 0 ..< int(maxEntries):
     let off = HeaderSize + ExtHeaderSize + i * FileEntrySize
@@ -71,16 +77,48 @@ proc findInternalFileEntry(data: openArray[byte], name: string,
     let entryMap = readU64LE(data, off + 8)
     let entryName = readU64LE(data, off + 16)
     if entryName == encoded:
-      return (entrySize, entryMap)
-  (0'u64, 0'u64)
+      return (true, entrySize, entryMap)
+  (false, 0'u64, 0'u64)
 
 proc readInternalFile(data: openArray[byte], name: string,
                       blockSize: uint32,
                       maxEntries: uint32): Result[seq[byte], string] =
   ## Read the complete content of an internal CTFS file by following the block mapping.
-  let (fileSize, mapBlock) = findInternalFileEntry(data, name, maxEntries)
-  if fileSize == 0 and mapBlock == 0:
+  ##
+  ## Every block number this walk resolves is bounded against
+  ## `floor(len / blockSize)` before it is turned into a byte offset —
+  ## `CTFS-Binary-Format.md` §5d, the same three paths `container.nim`'s
+  ## `readInternalFile` bounds: the entry's mapping root, every mapping block
+  ## walked, and the data block. Checking byte offsets against `data.len` is
+  ## **not** this bound: the last data block's copy is clamped to what is left
+  ## of the entry, so a short read out of a truncated container's partial
+  ## region succeeds and is returned as content.
+  ##
+  ## A `0` is refused separately from an out-of-range number, because it means
+  ## something different — "unallocated", §4 — and because block 0 is the root
+  ## directory, so an unrefused null resolves *into* the container's own
+  ## header and entry array and reads it back as the stream.
+  let (found, fileSize, mapBlock) = findInternalFileEntry(data, name, maxEntries)
+  if not found:
     return err("internal file not found: " & name)
+  if fileSize == 0:
+    return ok(newSeq[byte](0))
+
+  # Floor, never round up: the incomplete final block of a container whose tail
+  # write was interrupted must stay unaddressable.
+  let wholeBlocks = uint64(data.len) div uint64(blockSize)
+  let truncatedNote =
+    " — the container carries " & $wholeBlocks & " whole " & $blockSize &
+    "-byte blocks in " & $data.len & " bytes, so it is truncated or its tail " &
+    "write was interrupted"
+
+  if mapBlock == 0:
+    return err("mapping root block of internal file " & name & " is null, so " &
+      "the stream's mapping was never allocated or has been overwritten; " &
+      "block 0 is the container's root directory and no stream may name it")
+  if mapBlock >= wholeBlocks:
+    return err("mapping root block of internal file " & name & " names block " &
+      $mapBlock & ", which is out of bounds" & truncatedNote)
 
   var fileBytes = newSeq[byte](int(fileSize))
   let usable = uint64(blockSize) div 8 - 1
@@ -116,6 +154,11 @@ proc readInternalFile(data: openArray[byte], name: string,
         let chainPtr = readU64LE(data, chainOff)
         if chainPtr == 0:
           return err("missing chain pointer at level " & $level)
+        # Path 2a of 3: a mapping block reached through the chain.
+        if chainPtr >= wholeBlocks:
+          return err("chain pointer at level " & $level & " of internal file " &
+            name & " names block " & $chainPtr & ", which is out of bounds" &
+            truncatedNote)
         currentLevelBlock = chainPtr
 
     # Navigate down from level to find the data block
@@ -134,6 +177,11 @@ proc readInternalFile(data: openArray[byte], name: string,
       let childBlock = readU64LE(data, childOff)
       if childBlock == 0:
         return err("missing child block at level " & $navLevel)
+      # Path 2b of 3: a mapping block reached by descending the hierarchy.
+      if childBlock >= wholeBlocks:
+        return err("child block pointer at level " & $navLevel &
+          " of internal file " & name & " names block " & $childBlock &
+          ", which is out of bounds" & truncatedNote)
       navBlock = childBlock
       navIdx = subIdx
       navLevel -= 1
@@ -145,6 +193,14 @@ proc readInternalFile(data: openArray[byte], name: string,
     let dataBlock = readU64LE(data, ptrOff)
     if dataBlock == 0:
       return err("null data block at index " & $blockIdx)
+    # Path 3 of 3, and the one §5d calls the easy one to miss. It must be
+    # checked here rather than after the multiply below: `dataBlock` is read
+    # out of the container, so on a damaged one it can be large enough that
+    # `int(dataBlock) * int(blockSize)` overflows and kills the process
+    # instead of returning an error.
+    if dataBlock >= wholeBlocks:
+      return err("data block " & $blockIdx & " of internal file " & name &
+        " names block " & $dataBlock & ", which is out of bounds" & truncatedNote)
 
     let blockOff = int(dataBlock) * int(blockSize)
     let toCopy = min(remaining, int(blockSize))
@@ -195,8 +251,12 @@ proc openTrace*(path: string): Result[TraceReader, string] =
 
   # Detect v4 (multi-stream) by absence of events.log.  v3 traces always
   # contain events.log; v4 traces never do (they use per-kind streams).
-  let isV4 = findInternalFileEntry(data, "events.log", maxEntries).size == 0 and
-             findInternalFileEntry(data, "events.log", maxEntries).mapBlock == 0
+  #
+  # The question is whether the *entry* is there, not whether it resolves: a
+  # v3 trace whose `events.log` mapping root was lost to a torn write still
+  # has the entry, and classifying it v4 would silently answer "this recording
+  # has no events" instead of reporting the damage.
+  let isV4 = not findInternalFileEntry(data, "events.log", maxEntries).found
 
   var reader = TraceReader(
     ctfsData: data,
@@ -209,9 +269,18 @@ proc openTrace*(path: string): Result[TraceReader, string] =
     isV4: isV4,
   )
 
-  # Try meta.dat first (new binary format), fall back to meta.json + paths.json
-  let metaDatRes = readInternalFile(data, "meta.dat", blockSize, maxEntries)
-  if metaDatRes.isOk:
+  # Try meta.dat first (new binary format), fall back to meta.json + paths.json.
+  #
+  # "meta.dat is not in this container" and "meta.dat is in this container but
+  # its blocks are not" are different answers, and only the first one may fall
+  # back. Reading a damaged entry as an absent one is what let a trace whose
+  # `meta.dat` mapping root had been lost open **successfully**, with an empty
+  # program name and no source paths, instead of reporting the damage.
+  if findInternalFileEntry(data, "meta.dat", maxEntries).found:
+    let metaDatRes = readInternalFile(data, "meta.dat", blockSize, maxEntries)
+    if metaDatRes.isErr:
+      return err("meta.dat is present in this container but its blocks are " &
+                 "not: " & metaDatRes.error)
     let parsed = readMetaDat(metaDatRes.get())
     if parsed.isOk:
       let contents = parsed.get()
@@ -228,6 +297,9 @@ proc openTrace*(path: string): Result[TraceReader, string] =
     # M-REC-1: pre-1.0 the spec rejects metadata without recording_id,
     # so we require the JSON to carry one too.
     let metaRes = readInternalFile(data, "meta.json", blockSize, maxEntries)
+    if metaRes.isErr and findInternalFileEntry(data, "meta.json", maxEntries).found:
+      return err("meta.json is present in this container but its blocks are " &
+                 "not: " & metaRes.error)
     if metaRes.isOk:
       let metaStr = bytesToString(metaRes.get())
       var recordingIdFromJson = ""
@@ -260,6 +332,9 @@ proc openTrace*(path: string): Result[TraceReader, string] =
       reader.metadata.recordingId = recordingIdFromJson
 
     let pathsRes = readInternalFile(data, "paths.json", blockSize, maxEntries)
+    if pathsRes.isErr and findInternalFileEntry(data, "paths.json", maxEntries).found:
+      return err("paths.json is present in this container but its blocks are " &
+                 "not: " & pathsRes.error)
     if pathsRes.isOk:
       let pathsStr = bytesToString(pathsRes.get())
       try:
@@ -629,8 +704,25 @@ proc readEvents*(reader: var TraceReader): Result[void, string] =
     reader.eventCount = 0
     return ok()
 
-  # Decode all chunks: [16-byte header][compressed data]...
+  # The SECONDARY (Rust) CTFS writer prefixes `events.log` with the 8-byte
+  # CodeTracer stream header (`HEADERV1` in
+  # `codetracer-trace-format/codetracer_trace_format_cbor_zstd`): the 5-byte
+  # magic `C0 DE 72 AC E2`, a format-version byte, and two reserved bytes.
+  # Both Rust readers (`ctfs_reader.rs`, `seekable_reader.rs`) require it and
+  # skip it before walking chunks.  This reader did not, so it read the magic
+  # as a chunk header: the first four bytes little-endian give a
+  # `compressedSize` of 0xAC72DEC0 (~2.9 GB) and the walk aborted with
+  # "chunk compressed data extends beyond events.log" — a Rust-written
+  # container was unreadable here even though it is valid.
+  #
+  # The Nim writer does NOT emit this prefix (see `codetracer_trace_writer.nim`,
+  # which adds `events.log` and writes chunks straight into it), so the skip
+  # is conditional and Nim-written containers are unaffected.
   var pos = 0
+  if eventsData.len >= HeaderSize and hasCtfsMagic(eventsData):
+    pos = HeaderSize
+
+  # Decode all chunks: [16-byte header][compressed data]...
   while pos + ChunkIndexEntrySize <= eventsData.len:
     let chunk = decodeChunkHeader(eventsData, pos)
     if chunk.compressedSize == 0:

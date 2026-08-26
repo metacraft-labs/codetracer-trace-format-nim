@@ -19,6 +19,9 @@ import ct_pretty_print
 
 const FixtureDir = currentSourcePath().parentDir / "fixtures"
 
+proc readExpectedText(path: string): string =
+  readFile(path).replace("\r\n", "\n")
+
 # ---------------------------------------------------------------------------
 # Diff helper
 # ---------------------------------------------------------------------------
@@ -155,7 +158,7 @@ proc test_split_binary_events() =
   let data = generateSplitBinaryEvents()
   let actual = prettyPrintEvents(data)
   let expectedPath = FixtureDir / "split_binary_events.expected"
-  let expected = readFile(expectedPath)
+  let expected = readExpectedText(expectedPath)
   doAssert actual == expected,
     "Split-binary events output differs from expected:\n" & diffStrings(actual, expected)
   echo "PASS: test_split_binary_events"
@@ -164,7 +167,7 @@ proc test_ctfs_basic() =
   let data = generateCtfsBasic()
   let actual = prettyPrintCtFile(data)
   let expectedPath = FixtureDir / "ctfs_basic.expected"
-  let expected = readFile(expectedPath)
+  let expected = readExpectedText(expectedPath)
   doAssert actual == expected,
     "CTFS basic output differs from expected:\n" & diffStrings(actual, expected)
   echo "PASS: test_ctfs_basic"
@@ -173,7 +176,7 @@ proc test_seekable_zstd() =
   let data = generateSeekableZstd3Frames()
   let actual = prettyPrintSeekableZstd(data)
   let expectedPath = FixtureDir / "seekable_zstd_3frames.expected"
-  let expected = readFile(expectedPath)
+  let expected = readExpectedText(expectedPath)
   doAssert actual == expected,
     "Seekable Zstd output differs from expected:\n" & diffStrings(actual, expected)
   echo "PASS: test_seekable_zstd"
@@ -182,7 +185,7 @@ proc test_trace_complete() =
   let data = generateTraceComplete()
   let actual = prettyPrintCtFile(data)
   let expectedPath = FixtureDir / "trace_complete.expected"
-  let expected = readFile(expectedPath)
+  let expected = readExpectedText(expectedPath)
   doAssert actual == expected,
     "Trace complete output differs from expected:\n" & diffStrings(actual, expected)
   echo "PASS: test_trace_complete"

@@ -1074,12 +1074,24 @@ proc spanCount*(w: MultiStreamTraceWriter): uint64 =
 
 proc registerIOEvent*(w: var MultiStreamTraceWriter, kind: IOEventKind,
     data: openArray[byte],
-    metadata: openArray[byte] = []): Result[void, string] =
+    metadata: openArray[byte] = [],
+    stepId: Option[uint64] = none(uint64)): Result[void, string] =
   ## Register an IO event (stdout, stderr, etc.) at the current step.
   ##
   ## ``metadata`` is carried verbatim into the SPEC ``events.dat`` record's
   ## metadata field (``trace-events.md`` §"IO Event Stream Records"); it defaults
   ## to empty for callers that only have content bytes.
+  ##
+  ## ``stepId`` names the exec-stream step the event belongs to.  When it is
+  ## ``none`` the event is attributed to the LAST step this writer emitted
+  ## (``stepCount - 1``), which is correct only for callers that write their
+  ## steps eagerly.  Callers that BUFFER a step before emitting it — the C FFI
+  ## does, so that variable values registered after
+  ## ``trace_writer_register_step`` still attach to that step
+  ## (``flushPendingStep``) — must pass the id explicitly: at the moment a
+  ## write is registered the step for the writing line has not been emitted
+  ## yet, so ``stepCount - 1`` would name the PREVIOUS step and the debugger
+  ## would render the output one line too high (issue #601).
   if w.closed:
     return err("writer is closed")
 
@@ -1093,7 +1105,10 @@ proc registerIOEvent*(w: var MultiStreamTraceWriter, kind: IOEventKind,
 
   let ev = IOEvent(
     kind: kind,
-    stepId: if w.stepCount > 0: w.stepCount - 1 else: 0,
+    stepId:
+      if stepId.isSome: stepId.get()
+      elif w.stepCount > 0: w.stepCount - 1
+      else: 0,
     metadata: metaSeq,
     data: dataSeq,
   )

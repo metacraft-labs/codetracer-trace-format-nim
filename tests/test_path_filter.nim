@@ -255,6 +255,12 @@ proc test_chain_composition_via_files() {.raises: [].} =
   doAssert classify(c, "/repo/lib/std/other.nim").exec == eaSkip
   echo "PASS: test_chain_composition_via_files"
 
+proc test_crlf_blank_lines() {.raises: [].} =
+  let toml = "[scope]\r\n\r\ndefault_exec = \"skip\"\r\n"
+  let c = ensureOk(compileFiltersInline(toml, "<crlf>"), "crlf")
+  doAssert classify(c, "/anything").exec == eaSkip
+  echo "PASS: test_crlf_blank_lines"
+
 # ---------------------------------------------------------------------------
 # 5. Validation
 # ---------------------------------------------------------------------------
@@ -455,6 +461,7 @@ proc main() {.raises: [].} =
   # Filter chain composition
   test_chain_composition_via_inline()
   test_chain_composition_via_files()
+  test_crlf_blank_lines()
 
   # Validation
   test_bad_toml_returns_err()

@@ -9,7 +9,7 @@
 ## test-only traversal anywhere in the path.
 ##
 ## Its first caller is `codetracer-wasm-recorder`'s Go page-CAS
-## (`internal/wasmsnapshot`), whose `wcppages.ns` stream is a Leaf Type B
+## (`internal/wasmsnapshot`), whose `snappages.ns` stream is a Leaf Type B
 ## namespace written straight from `CTFS-Binary-Format.md` §10. Its Go test
 ## `TestTheProductionNimReaderLooksUpEveryPage` shells out to this binary and
 ## fails if it exits non-zero, so "the Go writer emits a real namespace" is a

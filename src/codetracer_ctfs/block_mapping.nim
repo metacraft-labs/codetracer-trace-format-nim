@@ -116,10 +116,10 @@ proc navigateAndInsert*(c: var Ctfs, mappingBlock: uint64, level: uint32,
   # placed is the **first index this child covers**, i.e. `subIdx == 0`. A
   # mapping is filled in strictly increasing block-index order, so any other
   # remainder means an earlier insert already went through this pointer and a
-  # zero here is damage — allocating over it replaces the only pointer to the
-  # existing level-(k-1) subtree and orphans every data block under it, while
-  # the append reports success. `CTFS-Binary-Format.md` §4, "Null pointers
-  # during allocation". Pinned by `tests/test_ctfs_append_null_data_block.nim`.
+  # zero here is damage — allocating over it would replace the only pointer to
+  # the existing level-(k-1) subtree and orphan every data block under it, while
+  # the append reported success. `CTFS-Binary-Format.md` §4, "Null pointers
+  # during allocation". Pinned by `tests/test_write_null_data_block.nim`.
   var childBlock = c.readPtr(mappingBlock, entryIdx)
   var didAllocChild = false
   if childBlock == 0:
@@ -152,16 +152,20 @@ proc insertDataBlock*(c: var Ctfs, rootBlock: uint64, blockIndex: uint64,
   ## yet".** Both null branches — the chain pointer below and
   ## `navigateAndInsert`'s child pointer — allocate a replacement mapping block,
   ## which is right only when the slot has genuinely never been used. On a
-  ## container whose mapping was damaged the replacement overwrites the only
-  ## pointer to the existing subtree, every data block under it becomes
-  ## unreachable and unrecoverable, and the append reports success.
+  ## container whose mapping was damaged (a crash between two flushes, say) the
+  ## replacement overwrites the only pointer to the existing subtree, every data
+  ## block under it becomes unreachable and unrecoverable, and the append
+  ## reports success. That is data loss on the write path; block 0 survives, so
+  ## it is not the header destruction `container.nim`'s `writeToFile` guards
+  ## against, but it is the same zero on the same path.
   ##
   ## The two cases are distinguishable from the *index*, because a mapping is
   ## filled in strictly increasing block-index order: a pointer may be null only
   ## when the index being placed is the **first index that pointer covers**
   ## (`idx == 0` after rebasing at a level, `subIdx == 0` within a child).
   ## `CTFS-Binary-Format.md` §4, "Null pointers during allocation", states this
-  ## normatively. Pinned by `tests/test_ctfs_append_null_data_block.nim`.
+  ## normatively; the canonical Rust writer applies the identical rule at the
+  ## identical two sites. Pinned by `tests/test_write_null_data_block.nim`.
   let usable = c.usableEntries()
 
   var idx = blockIndex
@@ -212,6 +216,21 @@ proc insertDataBlock*(c: var Ctfs, rootBlock: uint64, blockIndex: uint64,
 proc navigateAndLookup*(c: Ctfs, mappingBlock: uint64, level: uint32,
                         idxWithinLevel: uint64, usable: uint64): uint64 =
   ## Navigate down through mapping blocks to find a data block pointer.
+  ##
+  ## **Returns 0 when the mapping does not resolve, and 0 is the only such
+  ## signal.** The `level == 1` branch returns the slot verbatim, so a null
+  ## slot already comes back as 0 — adding `if ptr == 0: return 0` there would
+  ## be a no-op, which is why there is none. The multi-level branch's check
+  ## below is not the same thing: without it the walk would *recurse into
+  ## block 0* and resolve pointers out of the container header.
+  ##
+  ## The consequence is that this proc is not where a null slot can be caught.
+  ## Block 0 is the header and the root directory, so `0` is a legal-looking
+  ## block number that addresses byte offset 0 — every caller must therefore
+  ## treat 0 as "unresolved" and refuse it *before* turning it into a byte
+  ## offset. A reader that does not serves the header as content (the read-side
+  ## defect closed in M61a); a writer that does not writes payload over the
+  ## header and destroys the container (`container.nim`'s `writeToFile`, M61b).
   if level == 1:
     return c.readPtr(mappingBlock, idxWithinLevel)
 

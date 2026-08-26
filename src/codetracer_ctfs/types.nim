@@ -83,6 +83,12 @@ proc writeU64LE*(data: var openArray[byte], offset: int, val: uint64) =
   for i in 0 ..< 8:
     data[offset + i] = le[i]
 
+proc readU32LE*(data: openArray[byte], offset: int): uint32 =
+  var arr: array[4, byte]
+  for i in 0 ..< 4:
+    arr[i] = data[offset + i]
+  fromBytesLE(uint32, arr)
+
 proc writeU32LE*(data: var openArray[byte], offset: int, val: uint32) =
   let le = toBytesLE(val)
   for i in 0 ..< 4:

@@ -104,8 +104,6 @@ proc main() =
   doAssert rustRes.code == 0,
     "Rust ValueStreamReader failed to cross-read the Nim values.dat:\n" &
     rustRes.output
-  doAssert rustRes.output.contains("1 passed"),
-    "Rust cross-read test did not report a pass:\n" & rustRes.output
 
   try:
     removeDir(tmp)

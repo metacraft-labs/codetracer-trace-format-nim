@@ -589,16 +589,18 @@ proc parseToml(input: string; sourceName: string;
     if pos < input.len and input[pos] == '\n':
       pos += 1
 
-    var lp = lineStart
-    skipWsInline(input, lp)
-    if lp >= lineEnd:
-      continue
-    if input[lp] == '#':
-      continue
     # Strip trailing CR
     var endIdx = lineEnd
     if endIdx > lineStart and input[endIdx - 1] == '\r':
       endIdx -= 1
+
+    var lp = lineStart
+    while lp < endIdx and isWhitespace(input[lp]):
+      lp += 1
+    if lp >= endIdx:
+      continue
+    if input[lp] == '#':
+      continue
 
     # Use a substring view for clarity.
     let line = input[lineStart ..< endIdx]
