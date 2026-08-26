@@ -33,6 +33,7 @@
 
 import codetracer_trace_writer
 import codetracer_trace_types
+import codetracer_ctfs
 import codetracer_trace_writer/meta_dat
 import codetracer_trace_writer/multi_stream_writer
 import codetracer_trace_writer/value_stream
@@ -88,6 +89,7 @@ type
     msWriter: MultiStreamTraceWriter
     msWriterReady: bool
     useMultiStream: bool
+    attachedToShared: bool  ## true when msWriter attached to MCR's shared container
 
     # Pending step buffering for multi-stream mode:
     # The old FFI registers step FIRST, then variables one-at-a-time.
@@ -315,6 +317,37 @@ proc trace_writer_finish_metadata(handle: TraceWriterHandle): cint {.exportc, cd
     return 1.cint
   0.cint
 
+# --- Mixed-trace shared container detection (Stage C) -----------------------
+# MCR's cooperative recorder, when linked into the same process, exports
+# `ct_mcr_shared_ctfs(): pointer` returning its streaming CTFS container (created
+# just before main). We resolve it WEAKLY at runtime via dlsym(RTLD_DEFAULT) so
+# this library links + runs unchanged when MCR is absent (standalone recording).
+when defined(windows):
+  proc getModuleHandleA(name: cstring): pointer {.importc, stdcall, dynlib: "kernel32".}
+  proc getProcAddress(m: pointer, name: cstring): pointer {.importc, stdcall, dynlib: "kernel32".}
+  proc resolveMcrSharedCtfsSym(): pointer {.raises: [].} =
+    let m = getModuleHandleA(nil)  # this process's own image
+    if m.isNil: return nil
+    getProcAddress(m, "ct_mcr_shared_ctfs")
+else:
+  proc dlsym(handle: pointer, symbol: cstring): pointer {.importc, header: "<dlfcn.h>".}
+  # RTLD_DEFAULT: search every loaded image in the process. -2 on macOS, 0 on Linux/glibc.
+  when defined(macosx):
+    const RtldDefault = cast[pointer](-2)
+  else:
+    const RtldDefault = cast[pointer](0)
+  proc resolveMcrSharedCtfsSym(): pointer {.raises: [].} =
+    dlsym(RtldDefault, "ct_mcr_shared_ctfs")
+
+proc ctMcrSharedContainer(): ptr Ctfs {.raises: [].} =
+  ## The MCR-owned streaming container to attach to, or nil (standalone).
+  let symAddr = resolveMcrSharedCtfsSym()
+  if symAddr.isNil:
+    return nil
+  # ct_mcr_shared_ctfs(): pointer — returns addr of MCR's Ctfs (nil until created).
+  let fn = cast[proc(): pointer {.cdecl, raises: [], gcsafe.}](symAddr)
+  cast[ptr Ctfs](fn())
+
 proc trace_writer_begin_events(
     handle: TraceWriterHandle,
     path: cstring,
@@ -335,9 +368,33 @@ proc trace_writer_begin_events(
     let (_, progBase, _) = splitFile(handle.programName)
     let ctPath = outDir / (progBase & ".ct")
 
-    # The multi-stream writer always streams to disk as chunks seal
-    # (createCtfsStreaming) — the buffer-in-RAM-then-dump mode has been removed.
-    # ctPath == handle.ctFilePath.
+    # Mixed-trace shared container (Stage C): when this recorder runs INSIDE an
+    # MCR recording (the patched engine links both this CTFS writer and the MCR
+    # cooperative recorder), MCR has already created the streaming container just
+    # before main and publishes it via the C-ABI `ct_mcr_shared_ctfs()`. If that
+    # symbol resolves and returns a non-nil container, ATTACH our VM streams to
+    # it (initMultiStreamWriterAttached) instead of creating our own .ct: the two
+    # recorders write distinct stream names (MCR: tNNN/iNNN/meta.dat; us:
+    # steps/values/calls/paths) into ONE container, and MCR owns meta.dat + the
+    # container lifetime. Absent (standalone) -> create our own, byte-identical to
+    # before. Resolved weakly via dlsym(RTLD_DEFAULT) so a build without MCR links
+    # and runs unchanged.
+    let sharedCtfs = ctMcrSharedContainer()
+    if not sharedCtfs.isNil:
+      let ares = initMultiStreamWriterAttached(sharedCtfs, handle.programName)
+      if ares.isErr:
+        setError(ares.error)
+        return 1.cint
+      handle.msWriter = ares.get()
+      handle.msWriter.metadata.workdir = handle.workdir
+      handle.msWriter.metadata.args = handle.metaArgs
+      handle.msWriterReady = true
+      handle.attachedToShared = true
+      handle.ctFilePath = ""  # owner (MCR) owns the container path
+      return 0.cint
+
+    # Standalone: the multi-stream writer always streams to disk as chunks seal
+    # (createCtfsStreaming). ctPath == handle.ctFilePath.
     let res = initMultiStreamWriter(ctPath, handle.programName)
     if res.isErr:
       setError(res.error)
