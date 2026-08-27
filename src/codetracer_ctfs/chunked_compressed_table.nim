@@ -32,6 +32,32 @@ type
     chunkSize: uint32                ## records per chunk
     recordSize: int                  ## bytes per record
     buffer: seq[byte]                ## accumulates records until chunk is full
+    scratch: seq[byte]
+      ## Compression destination, allocated ONCE here rather than per flush.
+      ##
+      ## `flushChunk` used to do `newSeq[byte](ZSTD_compressBound(srcSize))` on
+      ## every single seal.  The size it was computing is not a runtime unknown:
+      ## `srcSize` is `chunkSize * recordSize` for every chunk except the last
+      ## partial one, and `ZSTD_compressBound` is monotonic in `srcSize`, so the
+      ## bound for a FULL chunk bounds every chunk this writer will ever emit.
+      ## A quantity that never changes was being recomputed and re-allocated at
+      ## the one point in the writer that is already the latency spike (measured
+      ## at 636 us median / 880 us p99 for a 256 KiB seal of real recorded event
+      ## bytes — see `MCR-Ring-Drain-Modes.md` §6A), which is the worst place to
+      ## put an allocator call: it lands inside the burst rather than between
+      ## bursts, and on the pre-dyld recorder paths the allocator is reached
+      ## from inside a hook on a thread the recorder does not own.
+      ##
+      ## It lives next to `buffer` and is allocated by the same `newSeq` at the
+      ## same point in the same proc, deliberately.  A raw `alloc` would give
+      ## this object one managed field and one unmanaged one, and since there is
+      ## no close/destroy proc for this writer that means either a leak or a
+      ## dangling pointer the moment the object is copied — while buying nothing,
+      ## because `buffer` right above it already proves `newSeq` is available
+      ## wherever this writer can be constructed at all.
+      ##
+      ## It is pure scratch: written by `ZSTD_compress`, copied to the container,
+      ## and dead before `flushChunk` returns.  Nothing reads it across calls.
     recordCount: int                 ## records in current buffer
     totalRecords: uint64             ## total records written
     dataOffset: uint64               ## bytes written to .dat so far
@@ -80,6 +106,11 @@ proc initChunkedCompressedTableWriter*(
     chunkSize: chunkSize,
     recordSize: recordSize,
     buffer: newSeq[byte](int(chunkSize) * recordSize),
+    # `compressBound` of a FULL chunk, which bounds the partial final chunk too
+    # (the bound is monotonic in srcSize).  See the field's comment for why this
+    # is not computed inside `flushChunk`.
+    scratch: newSeq[byte](
+      int(ZSTD_compressBound(csize_t(int(chunkSize) * recordSize)))),
     recordCount: 0,
     totalRecords: 0,
     dataOffset: 0,
@@ -103,11 +134,20 @@ proc flushChunk(ctfs: var Ctfs, w: var ChunkedCompressedTableWriter): Result[voi
     return ok()
 
   let srcSize = w.recordCount * w.recordSize
+  # The pre-sized scratch must actually cover this chunk.  It always does for a
+  # writer built by `initChunkedCompressedTableWriter`, so a failure here means
+  # the writer was constructed some other way (a future zero-init, a hand-built
+  # object literal) — and the alternative to saying so is `ZSTD_compress`
+  # writing past the end of a short buffer, which is silent memory corruption
+  # rather than a failed flush.
   let bound = ZSTD_compressBound(csize_t(srcSize))
-  var compressed = newSeq[byte](int(bound))
+  if w.scratch.len < int(bound):
+    return err("compression scratch is " & $w.scratch.len &
+      " bytes but this chunk needs " & $int(bound) &
+      "; the writer was not initialised by initChunkedCompressedTableWriter")
 
   let compressedSize = ZSTD_compress(
-    addr compressed[0], csize_t(bound),
+    addr w.scratch[0], csize_t(w.scratch.len),
     addr w.buffer[0], csize_t(srcSize),
     cint(w.compressionLevel))
 
@@ -124,7 +164,8 @@ proc flushChunk(ctfs: var Ctfs, w: var ChunkedCompressedTableWriter): Result[voi
     return err("failed to write offset to idx: " & idxRes.error)
 
   # Write compressed data to .dat
-  let datRes = ctfs.writeToFile(w.dataFile, compressed.toOpenArray(0, int(compressedSize) - 1))
+  let datRes = ctfs.writeToFile(w.dataFile,
+    w.scratch.toOpenArray(0, int(compressedSize) - 1))
   if datRes.isErr:
     return err("failed to write compressed chunk: " & datRes.error)
 
