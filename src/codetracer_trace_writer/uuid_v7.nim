@@ -52,16 +52,39 @@ when defined(nimPreviewSlimSystem):
 ## top.
 
 import std/times
-when defined(ctLeanRecord):
-  # Lean recorder: use libSystem's getentropy() instead of std/sysrand, whose
-  # macOS backend is SecRandomCopyBytes -> links Security.framework (which drags
-  # the whole Foundation/CoreFoundation closure into the injected recorder).
+when defined(macosx) or defined(ios) or defined(freebsd) or defined(openbsd):
+  # `getentropy(2)` DIRECTLY, on every Apple/BSD build — not behind a define.
+  #
+  # `std/sysrand`'s macOS backend is `SecRandomCopyBytes`, which carries a
+  # `{.passl: "-framework Security".}`.  That single flag is not a library, it
+  # is a CLOSURE: Security pulls CoreFoundation, Foundation and the Swift
+  # runtime, and dyld maps all of them into whatever process links the object.
+  # For the trace writer that process is the RECORDED PROGRAM — this module is
+  # compiled into `libct_interpose.dylib` and into the cooperative static
+  # archive, both of which are loaded inside the tracee.  MEASURED with an
+  # in-process `_dyld_image_count()` fixture on macOS 26.5.1 arm64: a trivial C
+  # program loads 45 images bare and 349 under `ct-mcr record`, 40 of them
+  # Foundation/Swift.  Every one of those runs an initializer in the tracee's
+  # own `libsystem_malloc` heap, in the window before `_ct_hooks_ready` where
+  # nothing can be recorded, and that heap is exactly what the boundary-C
+  # determinism gate compares.
+  #
+  # Nothing is given up.  `SecRandomCopyBytes` is a wrapper over the same
+  # kernel entropy this call reaches directly; on Darwin `getentropy(2)` IS the
+  # CSPRNG, capped at 256 bytes per call, and the only draw here is 10 bytes.
+  # So this is a removal, not a capability gate — which is why it is
+  # unconditional rather than another `when defined(...)` arm to be forgotten.
+  # It replaces the `ctLeanRecord` arm that used to guard it, because a knob
+  # that has to be remembered is a knob that will be missed by the build that
+  # needs it most.
   proc c_getentropy(buf: pointer, n: csize_t): cint
     {.importc: "getentropy", header: "<sys/random.h>".}
   proc urandom(dest: var openArray[byte]): bool =
     if dest.len == 0: return true
     c_getentropy(addr dest[0], csize_t(dest.len)) == 0
 else:
+  # Linux/Windows: `std/sysrand` is `getrandom(2)` / `BCryptGenRandom`, neither
+  # of which drags a framework closure behind it.
   import std/sysrand
 import results
 
