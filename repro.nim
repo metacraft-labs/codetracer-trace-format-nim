@@ -202,6 +202,9 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_trace_storage_config.nim", binary: "build/test-bin/test_trace_storage_config"),
   TestSpec(source: "tests/test_path_filter.nim", binary: "build/test-bin/test_path_filter", pcre: true),
   TestSpec(source: "tests/test_ct_print_events_log_fallback.nim", binary: "build/test-bin/test_ct_print_events_log_fallback"),
+  # A streaming-compressed `events.log` chunk pledges no content size;
+  # CONTENTSIZE_UNKNOWN used to reach `int(...)` and raise a RangeDefect.
+  TestSpec(source: "tests/test_events_log_unpledged_frame.nim", binary: "build/test-bin/test_events_log_unpledged_frame"),
   # CI-only (not in the nimble task) reader / network suites.
   TestSpec(source: "tests/test_cross_format.nim", binary: "build/test-bin/test_cross_format"),
   TestSpec(source: "tests/test_query_protocol.nim", binary: "build/test-bin/test_query_protocol"),

@@ -687,6 +687,103 @@ proc readEventsV4(reader: var TraceReader): Result[void, string] =
   reader.eventCount = reader.events.len
   ok()
 
+const
+  # A frame that does not pledge its content size has to be inflated into a
+  # buffer this reader guesses.  The first guess is 16x the compressed bytes
+  # (the same heuristic `native_decoder.decompressZstdFrame` uses), then
+  # doubling up to `UnknownSizeMaxFactor`.  The cap is what stops a damaged
+  # frame -- one whose header merely CLAIMS to be unpledged -- from driving an
+  # unbounded allocation: the walk is bounded to six doublings and to a fixed
+  # ceiling, so a hostile chunk costs a bounded amount of memory and then a
+  # named error rather than an OOM.
+  UnknownSizeInitialFactor = 16
+  UnknownSizeMaxFactor = 1024
+  UnknownSizeMinBytes = 4096
+  UnknownSizeCeilingBytes = 512 * 1024 * 1024
+
+proc inflateEventsLogChunk(compressed: openArray[byte]):
+    Result[seq[byte], string] =
+  ## Inflate one `events.log` chunk, whether or not its Zstd frame header
+  ## pledges the decompressed size.
+  ##
+  ## `ZSTD_getFrameContentSize` answers one of three things, and the two
+  ## sentinels are ORDINARY RETURN VALUES, not errors -- they are compared
+  ## against the `ZSTD_CONTENTSIZE_*` constants in
+  ## `codetracer_ctfs/zstd_bindings.nim`, never against an error STRING.  This
+  ## matters: `ZSTD_getErrorName`'s text is not a stable API and a zstd bump
+  ## can reword it, whereas the two sentinel values are fixed by the format.
+  ## Every other stream module in this repo tests the same two constants
+  ## (`exec_stream`, `value_stream`, `call_stream`, `io_event_stream`,
+  ## `span_stream`, `chunked_compressed_table`, `native_decoder`); this reader
+  ## was the sole exception, testing only `_ERROR`, so `_UNKNOWN`
+  ## (0xFFFFFFFFFFFFFFFF) flowed into `int(...)` and killed the process with a
+  ## RangeDefect instead of being handled or refused.
+  ##
+  ## An unpledged frame is what a streaming encoder produces.  The Rust
+  ## `CtfsTraceWriter` compresses `events.log` chunks that way when it cannot
+  ## reach libzstd -- notably every container written from
+  ## `wasm32-unknown-unknown`, where the pure-Rust encoder emits
+  ## `frame_content_size: None` unconditionally.
+  if compressed.len == 0:
+    var empty: seq[byte] = @[]
+    return ok(empty)
+
+  let contentSize = ZSTD_getFrameContentSize(
+    unsafeAddr compressed[0], csize_t(compressed.len))
+
+  if contentSize == ZSTD_CONTENTSIZE_ERROR:
+    return err("failed to get decompressed size for chunk")
+
+  if contentSize != ZSTD_CONTENTSIZE_UNKNOWN:
+    # The ordinary path: the frame pledges its size, so one exactly-sized
+    # allocation and one call.  Byte-for-byte the behaviour this reader has
+    # always had for pledged frames.
+    let pledged = int(contentSize)
+    var decompressed = newSeq[byte](pledged)
+    if pledged > 0:
+      let actualSize = ZSTD_decompress(
+        addr decompressed[0], csize_t(decompressed.len),
+        unsafeAddr compressed[0], csize_t(compressed.len))
+      if ZSTD_isError(actualSize) != 0:
+        return err("zstd decompression failed")
+      decompressed.setLen(int(actualSize))
+    return ok(decompressed)
+
+  # Unpledged: grow and retry, bounded.
+  #
+  # A failed `ZSTD_decompress` is not distinguished here between "destination
+  # too small" and "corrupt frame", because the binding surface exposes only
+  # `ZSTD_getErrorName` for that and its text is not a contract.  Retrying a
+  # genuinely corrupt frame is harmless -- it costs at most six doublings and
+  # then reports the error -- whereas keying the decision off a string would
+  # silently change behaviour the next time zstd rewords a message.
+  var capacity = compressed.len * UnknownSizeInitialFactor
+  if capacity < UnknownSizeMinBytes:
+    capacity = UnknownSizeMinBytes
+  var limit = compressed.len * UnknownSizeMaxFactor
+  if limit < UnknownSizeMinBytes:
+    limit = UnknownSizeMinBytes
+  if limit > UnknownSizeCeilingBytes:
+    limit = UnknownSizeCeilingBytes
+  if capacity > limit:
+    capacity = limit
+
+  while true:
+    var decompressed = newSeq[byte](capacity)
+    let actualSize = ZSTD_decompress(
+      addr decompressed[0], csize_t(decompressed.len),
+      unsafeAddr compressed[0], csize_t(compressed.len))
+    if ZSTD_isError(actualSize) == 0:
+      decompressed.setLen(int(actualSize))
+      return ok(decompressed)
+    if capacity >= limit:
+      return err(
+        "zstd decompression failed: chunk declares no content size and did " &
+        "not fit in " & $limit & " bytes")
+    capacity = capacity * 2
+    if capacity > limit:
+      capacity = limit
+
 proc readEvents*(reader: var TraceReader): Result[void, string] =
   ## Decompress and decode all events. Dispatches to v3 (events.log) or
   ## v4 (multi-stream) based on the file layout detected at openTrace time.
@@ -732,22 +829,13 @@ proc readEvents*(reader: var TraceReader): Result[void, string] =
     if pos + int(chunk.compressedSize) > eventsData.len:
       return err("chunk compressed data extends beyond events.log")
 
-    # Decompress the chunk
+    # Decompress the chunk.  Handles both a frame that pledges its content
+    # size and one that does not; see `inflateEventsLogChunk`.
     let compressedSlice = eventsData[pos ..< pos + int(chunk.compressedSize)]
-    let decompSize = ZSTD_getFrameContentSize(
-      unsafeAddr compressedSlice[0], csize_t(compressedSlice.len))
-
-    if decompSize == ZSTD_CONTENTSIZE_ERROR:
-      return err("failed to get decompressed size for chunk")
-
-    var decompressed = newSeq[byte](int(decompSize))
-    if decompSize > 0:
-      let actualSize = ZSTD_decompress(
-        addr decompressed[0], csize_t(decompressed.len),
-        unsafeAddr compressedSlice[0], csize_t(compressedSlice.len))
-      if ZSTD_isError(actualSize) != 0:
-        return err("zstd decompression failed")
-      decompressed.setLen(int(actualSize))
+    let inflated = inflateEventsLogChunk(compressedSlice)
+    if inflated.isErr:
+      return err(inflated.unsafeError)
+    let decompressed = inflated.get()
 
     # Decode split-binary events
     let decoded = decodeAllEvents(decompressed)

@@ -106,6 +106,11 @@ task test, "Run all tests":
   # legacy reader used to mistake for a chunk header, making every such
   # container unreadable by `ct-print`.
   exec "nim c -r -d:release -p:src tests/test_rust_events_log_header.nim"
+  # An `events.log` chunk compressed by a STREAMING encoder pledges no
+  # content size, so `ZSTD_getFrameContentSize` answers CONTENTSIZE_UNKNOWN.
+  # This reader tested only for CONTENTSIZE_ERROR and converted the UNKNOWN
+  # sentinel to `int`, killing `ct-print` with a RangeDefect.
+  exec "nim c -r -d:release -p:src tests/test_events_log_unpledged_frame.nim"
   # Line-only orphan pending-value carry-forward (92fce3a regression).
   # `include`s codetracer_trace_writer_ffi, so it needs --mm:arc and the
   # --nimMainPrefix the FFI's NimMain importc expects (see buildStaticLib).
