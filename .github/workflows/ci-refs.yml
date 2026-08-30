@@ -1,0 +1,110 @@
+# Gate: no CI reference may name a branch that does not exist, or a legacy
+# `main`/`master` the target repository has moved off.
+#
+# Installed here while this repo's `dev` is CLEAN, which is the point. Every
+# instance of this rot in the family began in a repo that was fine until
+# someone added a file; the cheapest moment to install a check is while it
+# passes. See `ci/check-ci-refs.sh` for what each shape of the defect costs
+# and why they are deliberately not all treated as fatal.
+#
+# This file's own trigger list names `dev` and `stable` and NOT `main`,
+# because `main` was deleted from this remote and a workflow filtered on a
+# branch that no longer exists never runs -- which is exactly the failure
+# this gate exists to catch. The gate checks itself along with everything
+# else, so reintroducing `main` here fails the very job that would be doing
+# it.
+name: CI refs
+
+on:
+  push:
+    branches: [dev, stable]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check-refs:
+    name: workflow refs resolve
+    runs-on: eph-linux-x64
+    steps:
+      - uses: actions/checkout@v4
+
+      # Some repos this gate resolves are private, and an unauthenticated
+      # `git ls-remote` against them cannot be distinguished from an outage.
+      # The gate treats an unreachable remote as a FAILURE under $CI, so it
+      # must be able to read every repo it is asked about -- otherwise it
+      # would report a private repo as broken.
+      - name: Mint a CI token
+        id: ci_token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
+      - name: Authenticate git for private repos
+        run: |
+          git config --global \
+            url."https://x-access-token:${{ steps.ci_token.outputs.token }}@github.com/".insteadOf \
+            "https://github.com/"
+
+      # The self-tests run FIRST and are hermetic: they stub the resolver, so
+      # they prove the checker's logic independently of the network and of
+      # what happens to be true of these repos today. If the checker were
+      # silently matching nothing, the non-vacuity case here is what fails.
+      - name: Self-test the checker
+        run: ci/check-ci-refs.sh --self-test
+
+      - name: Check this repo's workflow references
+        run: ci/check-ci-refs.sh
+
+      # `ci/check-ci-refs.sh` is a vendored copy of the upstream checker in
+      # codetracer-trace-format (see the VENDOR-BLOCK header for why it is a
+      # copy and not a shared action). Two copies drift, and drift between
+      # checkers is silent by nature, so it is surfaced here.
+      #
+      # Severity is deliberate: divergence is a WARNING, not a failure. Both
+      # copies still work when they differ, so by the checker's own asymmetry
+      # this is "will mislead later" rather than "broken now" -- and a job
+      # that reddens this repo because a *different* repo merged something is
+      # a job people switch off. An upstream that cannot be read at all IS
+      # fatal, consistent with how the checker treats every other resolution
+      # failure under $CI.
+      - name: Vendored copy matches upstream
+        run: |
+          set -uo pipefail
+          upstream=metacraft-labs/codetracer-trace-format
+          path=ci/check-ci-refs.sh
+
+          # A plain shallow clone, deliberately not `--filter=blob:none`: a
+          # blobless clone defers blob fetches to an on-demand promisor
+          # request, which adds a network failure mode *inside* the check.
+          # The whole tree at depth 1 is a couple of megabytes.
+          if ! git clone --quiet --depth 1 --branch dev --no-tags \
+                 "https://github.com/$upstream" /tmp/upstream; then
+            echo "ERROR: cannot clone $upstream at dev to compare the vendored checker."
+            echo "Either the remote is unreachable, this runner cannot authenticate"
+            echo "to it, or $upstream no longer has a 'dev' branch. A drift check"
+            echo "that cannot reach its upstream is not a drift check."
+            exit 1
+          fi
+
+          # Reachable but no file yet: the upstream PR that introduces the
+          # checker has not landed on `dev`. That is a fact about another
+          # repo's merge queue, not a defect here, so it warns and stops.
+          if [ ! -f "/tmp/upstream/$path" ]; then
+            echo "::warning title=Upstream checker not on dev yet::$upstream has no $path on dev, so the vendored copy cannot be compared. Expected until the upstream gate PR lands; if it has landed, the file moved and the vendor pin needs updating."
+            exit 0
+          fi
+
+          # Strip only the vendor header, delimited by explicit sentinels, and
+          # compare the remainder. The strip is exact: a freshly copied file
+          # diffs empty.
+          awk '/^# --- VENDOR-BLOCK BEGIN /{s=1} !s; /^# --- VENDOR-BLOCK END /{s=0}' \
+            "$path" > /tmp/local-check.sh
+
+          if diff -u "/tmp/upstream/$path" /tmp/local-check.sh > /tmp/drift.diff; then
+            echo "vendored checker is identical to $upstream@dev"
+          else
+            echo "::warning title=Vendored checker has drifted::ci/check-ci-refs.sh differs from $upstream@dev. Change upstream first, then re-copy and bump the revision in the VENDOR-BLOCK header."
+            cat /tmp/drift.diff
+          fi
