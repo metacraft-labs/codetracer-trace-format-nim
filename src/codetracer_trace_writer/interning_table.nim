@@ -14,6 +14,7 @@ when defined(nimPreviewSlimSystem):
 ## Used for: paths.dat/off, funcs.dat/off, types.dat/off, varnames.dat/off.
 
 import std/tables
+import std/strutils
 import results
 import ../codetracer_ctfs/types
 import ../codetracer_ctfs/variable_record_table
@@ -40,27 +41,62 @@ proc initInterningTableWriter*(ctfs: var Ctfs, baseName: string): Result[Interni
     nextId: 0
   ))
 
-proc ensureId*(ctfs: var Ctfs, it: var InterningTableWriter, name: string): Result[uint64, string] =
-  ## Return the ID for name. If name hasn't been seen, append it to the table
-  ## and return a new ID. If already interned, return the existing ID.
-  let existing = it.lookup.getOrDefault(name, high(uint64))
+const InterningUnitSeparator* = '\x1f'
+  ## ASCII unit separator (0x1f). Never a valid byte in a path or identifier,
+  ## so it is used to join the qualifier and the bare name inside a single
+  ## interning payload: ``qualifier & US & name``. See spec
+  ## ``Interning-Table-Coexistence.md`` §3.
+
+proc qualifiedPayload*(qualifier, name: string): string =
+  ## Build the stored payload for a fully-qualified interning key.
+  ##
+  ## When ``qualifier == ""`` the BARE ``name`` is returned (no separator) —
+  ## this is what guarantees byte-identical output to the pre-qualifier format
+  ## for every existing/standalone trace. Otherwise the payload is
+  ## ``qualifier & US & name``.
+  if qualifier.len == 0:
+    name
+  else:
+    qualifier & InterningUnitSeparator & name
+
+proc ensureQualifiedId*(ctfs: var Ctfs, it: var InterningTableWriter,
+    qualifier, name: string): Result[uint64, string] =
+  ## Return the ID for the fully-qualified key ``(qualifier, name)``.
+  ##
+  ## The dedup lookup and the on-disk payload are keyed on the *composite*
+  ## payload (``qualifiedPayload``), so the same bare ``name`` under two
+  ## different qualifiers gets two distinct ids, while a genuine repeat of the
+  ## same ``(qualifier, name)`` dedups to one id. An empty qualifier stores the
+  ## bare name and is byte-identical to the old ``ensureId`` output.
+  let payload = qualifiedPayload(qualifier, name)
+  let existing = it.lookup.getOrDefault(payload, high(uint64))
   if existing != high(uint64):
     return ok(existing)
 
   let id = it.nextId
   it.nextId += 1
 
-  # Convert string to bytes and append to the variable record table
-  var nameBytes = newSeq[byte](name.len)
-  for i in 0 ..< name.len:
-    nameBytes[i] = byte(name[i])
+  # Convert payload to bytes and append to the variable record table
+  var payloadBytes = newSeq[byte](payload.len)
+  for i in 0 ..< payload.len:
+    payloadBytes[i] = byte(payload[i])
 
-  let appendRes = ctfs.append(it.table, nameBytes)
+  let appendRes = ctfs.append(it.table, payloadBytes)
   if appendRes.isErr:
     return err(appendRes.error)
 
-  it.lookup[name] = id
+  it.lookup[payload] = id
   ok(id)
+
+proc ensureId*(ctfs: var Ctfs, it: var InterningTableWriter, name: string): Result[uint64, string] =
+  ## Return the ID for name. If name hasn't been seen, append it to the table
+  ## and return a new ID. If already interned, return the existing ID.
+  ##
+  ## This is the unqualified entry point: it interns through the SAME
+  ## nextId/lookup/table mechanism as ``ensureQualifiedId`` with an empty
+  ## qualifier, so there is a single allocation path and the bytes it produces
+  ## are provably the old bytes.
+  ensureQualifiedId(ctfs, it, "", name)
 
 proc ensurePathIdColumnAware*(ctfs: var Ctfs, it: var InterningTableWriter,
     path: string, lineLengths: openArray[uint32]): Result[uint64, string] =
@@ -146,6 +182,20 @@ proc readRawById*(r: InterningTableReader,
   ## raw bytes as a Latin-1 string, mangling the trailing varints).
   r.table.read(id)
 
+proc splitInterningPayload*(payload: string): tuple[qualifier, name: string] =
+  ## Split a stored interning payload back into ``(qualifier, name)``.
+  ##
+  ## Splits on the FIRST unit separator (0x1f): present ⇒ ``(qualifier, name)``;
+  ## absent ⇒ ``("", payload)``, the unqualified/single-producer case (every
+  ## existing trace). Only the first separator is significant — any further
+  ## 0x1f bytes are impossible in a well-formed payload but, if present, stay in
+  ## ``name`` rather than being lost.
+  let sep = payload.find(InterningUnitSeparator)
+  if sep < 0:
+    ("", payload)
+  else:
+    (payload[0 ..< sep], payload[sep + 1 .. ^1])
+
 proc count*(r: InterningTableReader): uint64 = r.table.count()
 
 # ---------------------------------------------------------------------------
@@ -186,3 +236,24 @@ proc ensureTypeId*(ctfs: var Ctfs, t: var TraceInterningTables, name: string): R
 
 proc ensureVarnameId*(ctfs: var Ctfs, t: var TraceInterningTables, name: string): Result[uint64, string] =
   ctfs.ensureId(t.varnames, name)
+
+# Qualifier-aware wrappers. These do not replace the bare forms above (existing
+# callers — multi_stream_writer.nim, MCR — keep compiling unchanged); they let a
+# producer that opts into fully-qualified keys intern through the same owner
+# tables. An empty qualifier is byte-identical to the bare form.
+
+proc ensureQualifiedPathId*(ctfs: var Ctfs, t: var TraceInterningTables,
+    qualifier, path: string): Result[uint64, string] =
+  ctfs.ensureQualifiedId(t.paths, qualifier, path)
+
+proc ensureQualifiedFunctionId*(ctfs: var Ctfs, t: var TraceInterningTables,
+    qualifier, name: string): Result[uint64, string] =
+  ctfs.ensureQualifiedId(t.funcs, qualifier, name)
+
+proc ensureQualifiedTypeId*(ctfs: var Ctfs, t: var TraceInterningTables,
+    qualifier, name: string): Result[uint64, string] =
+  ctfs.ensureQualifiedId(t.types, qualifier, name)
+
+proc ensureQualifiedVarnameId*(ctfs: var Ctfs, t: var TraceInterningTables,
+    qualifier, name: string): Result[uint64, string] =
+  ctfs.ensureQualifiedId(t.varnames, qualifier, name)

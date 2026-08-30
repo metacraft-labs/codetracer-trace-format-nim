@@ -64,6 +64,7 @@ task test, "Run all tests":
   exec "nim c -r -d:release -p:src tests/test_shard_writer.nim"
   exec "nim c -r -p:src tests/test_step_encoding.nim"
   exec "nim c -r -p:src tests/test_interning_table.nim"
+  exec "nim c -r -p:src tests/test_qualified_interning.nim"
   exec "nim c -r -p:src tests/test_exec_stream.nim"
   exec "nim c -r -p:src tests/test_value_stream.nim"
   exec "nim c -r -p:src tests/test_call_stream.nim"

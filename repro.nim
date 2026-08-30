@@ -173,6 +173,7 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_shard_writer.nim", binary: "build/test-bin/test_shard_writer"),
   TestSpec(source: "tests/test_step_encoding.nim", binary: "build/test-bin/test_step_encoding"),
   TestSpec(source: "tests/test_interning_table.nim", binary: "build/test-bin/test_interning_table"),
+  TestSpec(source: "tests/test_qualified_interning.nim", binary: "build/test-bin/test_qualified_interning"),
   TestSpec(source: "tests/test_exec_stream.nim", binary: "build/test-bin/test_exec_stream"),
   TestSpec(source: "tests/test_value_stream.nim", binary: "build/test-bin/test_value_stream"),
   TestSpec(source: "tests/test_call_stream.nim", binary: "build/test-bin/test_call_stream"),
