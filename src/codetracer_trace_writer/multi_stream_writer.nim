@@ -127,6 +127,26 @@ type
       ## writer produced before RS-M1 — same files, flag word unchanged — which
       ## is the same back-compat contract `source_views.dat` (bit 5) follows.
     interning: TraceInterningTables
+      ## The writer's OWN interning tables.  Used only when
+      ## ``sharedInterning`` is nil (the classic owned/standalone path, and an
+      ## attach that was NOT handed an owner's tables).
+    sharedInterning: ptr TraceInterningTables
+      ## IC-M2 — non-nil when this writer interns THROUGH tables another
+      ## producer created and owns (the Stage C shared writer: MCR owns the four
+      ## tables, this attached materialized writer binds to them).  When set,
+      ## ``initMultiStreamWriterAttached`` did NOT create its own tables, so only
+      ## ONE ``addFile("paths.dat")`` per kind ever happens across both producers
+      ## and the single ``nextId``/``lookup`` per kind is shared — ids are unique
+      ## across producers by construction.  Resolved via the ``interningPtr``
+      ## accessor (never cached as ``addr w.interning``) so the writer stays
+      ## movable, mirroring the ``container`` accessor.
+    qualifier*: string
+      ## IC-M2 — the fully-qualified-key origin namespace this producer stamps
+      ## on every interned string (spec ``Interning-Table-Coexistence.md`` §2):
+      ## "" for a standalone trace (byte-identical to the pre-qualifier format),
+      ## the VM language (e.g. "gdscript") for a materialized writer sharing a
+      ## container with MCR.  Empty by default, so every existing caller keeps
+      ## producing bare payloads.
     metadata*: TraceMetadata
     paths*: seq[string]
     pathLineLengths: seq[seq[uint32]]
@@ -254,6 +274,18 @@ proc container(w: var MultiStreamTraceWriter): var Ctfs =
     return w.sharedCtfs[]
   else:
     return w.ownedCtfs
+
+proc interningPtr(w: var MultiStreamTraceWriter): ptr TraceInterningTables =
+  ## The interning tables this writer interns into — the externally-owned tables
+  ## when bound to a shared owner (IC-M2), else its own inline ``interning``.
+  ##
+  ## Returned as a raw ``ptr`` (not ``var``) and dereferenced at the call site so
+  ## the borrow of ``w`` ends here: a by-value move of the writer can never leave
+  ## a dangling ``addr w.interning``, exactly as ``container`` guards ``ownedCtfs``.
+  if w.sharedInterning != nil:
+    w.sharedInterning
+  else:
+    addr w.interning
 
 proc rebuildGli(w: var MultiStreamTraceWriter) =
   ## Rebuild the global line index from the current set of paths.
@@ -392,7 +424,9 @@ proc initMultiStreamWriter*(path: string, program: string,
 
 proc initMultiStreamWriterAttached*(ctfs: ptr Ctfs, program: string,
     chunkSize: int = 4096,
-    recordingId: string = ""): Result[MultiStreamTraceWriter, string] =
+    recordingId: string = "",
+    sharedInterning: ptr TraceInterningTables = nil,
+    qualifier: string = ""): Result[MultiStreamTraceWriter, string] =
   ## Create a multi-stream trace writer that ATTACHES to a container another
   ## writer already created and OWNS (Stage C step 1).
   ##
@@ -433,6 +467,7 @@ proc initMultiStreamWriterAttached*(ctfs: ptr Ctfs, program: string,
   var w: MultiStreamTraceWriter
   w.attached = true
   w.sharedCtfs = ctfs
+  w.qualifier = qualifier
   w.metadata = TraceMetadata(
     recordingId: resolvedId, program: program, args: @[], workdir: "")
   w.paths = @[]
@@ -445,10 +480,20 @@ proc initMultiStreamWriterAttached*(ctfs: ptr Ctfs, program: string,
   w.emitStepMap = true
   w.stepMapBuilder = initStepMapBuilder()
 
-  let intRes = initTraceInterningTables(w.container)
-  if intRes.isErr:
-    return err("failed to init interning tables: " & intRes.error)
-  w.interning = intRes.get()
+  # IC-M2 — interning ownership.  When the caller hands us the owner's tables
+  # (the Stage C shared writer: MCR created + owns them over the SAME container),
+  # BIND to them rather than creating our own: this is what prevents the second
+  # `addFile("paths.dat")` the M61 dup-name guard would reject, and it makes the
+  # single per-kind `nextId`/`lookup` shared so ids are unique across producers.
+  # Absent (a plain attach, e.g. an attach test or a materialized writer not
+  # sharing with MCR), create our own tables exactly as before — byte-identical.
+  if sharedInterning != nil:
+    w.sharedInterning = sharedInterning
+  else:
+    let intRes = initTraceInterningTables(w.container)
+    if intRes.isErr:
+      return err("failed to init interning tables: " & intRes.error)
+    w.interning = intRes.get()
 
   let execRes = initExecStreamWriter(w.container, chunkSize)
   if execRes.isErr:
@@ -587,9 +632,13 @@ proc registerPath*(w: var MultiStreamTraceWriter,
   ## and column resolution falls back to surfacing ``None``.
   let idRes =
     if w.columnAwareSteps:
-      w.container.ensurePathIdColumnAware(w.interning, path, lineLengths)
+      # Column-aware paths key their dedup on the bare path (the on-disk record
+      # is the self-describing Layout A form); IC-M2's qualifier applies to the
+      # line-only producers (MCR, the GDScript VM), so column-aware attach keeps
+      # the bare record.
+      w.container.ensurePathIdColumnAware(w.interningPtr[], path, lineLengths)
     else:
-      w.container.ensurePathId(w.interning, path)
+      w.container.ensureQualifiedPathId(w.interningPtr[], w.qualifier, path)
   if idRes.isErr:
     return err(idRes.error)
   let id = idRes.get()
@@ -660,17 +709,17 @@ proc registerSourceView*(w: var MultiStreamTraceWriter,
 proc registerFunction*(w: var MultiStreamTraceWriter,
     name: string): Result[uint64, string] =
   ## Register a function name and return its interned ID.
-  w.container.ensureFunctionId(w.interning, name)
+  w.container.ensureQualifiedFunctionId(w.interningPtr[], w.qualifier, name)
 
 proc registerType*(w: var MultiStreamTraceWriter,
     name: string): Result[uint64, string] =
   ## Register a type name and return its interned ID.
-  w.container.ensureTypeId(w.interning, name)
+  w.container.ensureQualifiedTypeId(w.interningPtr[], w.qualifier, name)
 
 proc registerVarname*(w: var MultiStreamTraceWriter,
     name: string): Result[uint64, string] =
   ## Register a variable name and return its interned ID.
-  w.container.ensureVarnameId(w.interning, name)
+  w.container.ensureQualifiedVarnameId(w.interningPtr[], w.qualifier, name)
 
 # ---------------------------------------------------------------------------
 # Step registration

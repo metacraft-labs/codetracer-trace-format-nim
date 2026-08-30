@@ -41,6 +41,7 @@ import codetracer_ctfs/container
 import codetracer_ctfs/container_append
 import codetracer_trace_writer/meta_dat
 import codetracer_trace_writer/multi_stream_writer
+import codetracer_trace_writer/interning_table
 import codetracer_trace_writer/value_stream
 import codetracer_trace_writer/call_stream
 import codetracer_trace_writer/io_event_stream
@@ -142,6 +143,14 @@ type
 
     ctFilePath: string  # path to the .ct output file (set in begin_events)
     programName: string  # stored from trace_writer_new, used when creating .ct
+    interningQualifier: string
+      ## IC-M2 — the fully-qualified-key origin namespace this writer stamps on
+      ## every interned string (paths/funcs/types/varnames).  Set by
+      ## ``trace_writer_set_interning_qualifier`` (the VM language, e.g.
+      ## "gdscript") BEFORE ``trace_writer_begin_events``; propagated to the
+      ## multi-stream writer at attach so native (MCR, "native") vs VM strings
+      ## in the SHARED interning tables are distinct by construction.  Empty by
+      ## default -> bare payloads -> byte-identical standalone output.
     workdir: string
     metaArgs: seq[string]
       ## Program argv recorded in meta.dat (CTFS spec §7).  Set via
@@ -334,6 +343,10 @@ when defined(windows):
     let m = getModuleHandleA(nil)  # this process's own image
     if m.isNil: return nil
     getProcAddress(m, "ct_mcr_shared_ctfs")
+  proc resolveMcrSharedInterningSym(): pointer {.raises: [].} =
+    let m = getModuleHandleA(nil)
+    if m.isNil: return nil
+    getProcAddress(m, "ct_mcr_shared_interning")
 else:
   proc dlsym(handle: pointer, symbol: cstring): pointer {.importc, header: "<dlfcn.h>".}
   # RTLD_DEFAULT: search every loaded image in the process. -2 on macOS, 0 on Linux/glibc.
@@ -343,6 +356,8 @@ else:
     const RtldDefault = cast[pointer](0)
   proc resolveMcrSharedCtfsSym(): pointer {.raises: [].} =
     dlsym(RtldDefault, "ct_mcr_shared_ctfs")
+  proc resolveMcrSharedInterningSym(): pointer {.raises: [].} =
+    dlsym(RtldDefault, "ct_mcr_shared_interning")
 
 proc ctMcrSharedContainer(): ptr Ctfs {.raises: [].} =
   ## The MCR-owned streaming container to attach to, or nil (standalone).
@@ -352,6 +367,22 @@ proc ctMcrSharedContainer(): ptr Ctfs {.raises: [].} =
   # ct_mcr_shared_ctfs(): pointer — returns addr of MCR's Ctfs (nil until created).
   let fn = cast[proc(): pointer {.cdecl, raises: [], gcsafe.}](symAddr)
   cast[ptr Ctfs](fn())
+
+proc ctMcrSharedInterning(): ptr TraceInterningTables {.raises: [].} =
+  ## IC-M2 — the MCR-owned four interning tables to intern THROUGH, or nil.
+  ##
+  ## Mirrors ``ctMcrSharedContainer``: MCR's cooperative recorder exports
+  ## ``ct_mcr_shared_interning(): pointer`` returning ``addr`` of the four
+  ## ``TraceInterningTables`` it owns over the SHARED container (lazily created
+  ## on first call).  When present, the attached materialized writer interns
+  ## through them instead of creating its own, so only ONE ``addFile`` per table
+  ## happens and ids are unique across producers.  Resolved weakly so a build
+  ## without MCR runs unchanged.
+  let symAddr = resolveMcrSharedInterningSym()
+  if symAddr.isNil:
+    return nil
+  let fn = cast[proc(): pointer {.cdecl, raises: [], gcsafe.}](symAddr)
+  cast[ptr TraceInterningTables](fn())
 
 proc trace_writer_begin_events(
     handle: TraceWriterHandle,
@@ -386,7 +417,16 @@ proc trace_writer_begin_events(
     # and runs unchanged.
     let sharedCtfs = ctMcrSharedContainer()
     if not sharedCtfs.isNil:
-      let ares = initMultiStreamWriterAttached(sharedCtfs, handle.programName)
+      # IC-M2 — also bind to MCR's owner interning tables so both producers share
+      # ONE set (one addFile per table, one nextId/lookup per kind).  Qualify our
+      # entries with the VM language so native vs VM strings are distinct by
+      # construction.  If MCR does not export the interning accessor (older build),
+      # sharedInterning is nil and the attach creates its own tables — the M61
+      # dup-name guard would then reject a --source MCR, which is exactly the
+      # latent collision IC-M2 removes.
+      let sharedInterning = ctMcrSharedInterning()
+      let ares = initMultiStreamWriterAttached(sharedCtfs, handle.programName,
+        sharedInterning = sharedInterning, qualifier = handle.interningQualifier)
       if ares.isErr:
         setError(ares.error)
         return 1.cint
@@ -650,6 +690,24 @@ proc trace_writer_set_workdir(
       handle.msWriter.metadata.workdir = handle.workdir
   elif handle.writerReady:
     handle.writer.metadata.workdir = handle.workdir
+
+proc trace_writer_set_interning_qualifier(
+    handle: TraceWriterHandle,
+    qualifier: cstring,
+) {.exportc, cdecl, dynlib.} =
+  ## IC-M2 — set the fully-qualified-key origin namespace this writer stamps on
+  ## every interned string (paths/funcs/types/varnames): the VM language (e.g.
+  ## "gdscript") when this materialized writer shares a container with MCR.
+  ##
+  ## SHOULD be called BEFORE ``trace_writer_begin_events`` so the qualifier is in
+  ## place when the writer attaches to (and binds its interning tables to) MCR's
+  ## owner tables.  Passing "" (or never calling this) keeps the bare/unqualified
+  ## payloads, byte-identical to a standalone trace.  A NULL handle is a no-op.
+  if handle.isNil:
+    return
+  handle.interningQualifier = toNimStr(qualifier)
+  if handle.useMultiStream and handle.msWriterReady:
+    handle.msWriter.qualifier = handle.interningQualifier
 
 proc trace_writer_set_args(
     handle: TraceWriterHandle,

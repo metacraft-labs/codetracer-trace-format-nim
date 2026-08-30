@@ -112,6 +112,13 @@ int trace_writer_finish_paths(trace_writer_t handle);
 
 void trace_writer_start(trace_writer_t handle, const char* path, int64_t line);
 void trace_writer_set_workdir(trace_writer_t handle, const char* workdir);
+/* IC-M2: stamp a fully-qualified-key origin namespace (the VM language, e.g.
+ * "gdscript") on every interned string when this materialized writer shares a
+ * container with the native recorder (MCR).  Call BEFORE trace_writer_begin_events.
+ * Passing "" (or never calling it) keeps bare payloads, byte-identical to a
+ * standalone trace. */
+void trace_writer_set_interning_qualifier(trace_writer_t handle,
+                                          const char* qualifier);
 void trace_writer_register_step(trace_writer_t handle,
                                 const char* path, int64_t line);
 
