@@ -12,6 +12,7 @@ import codetracer_trace_writer/step_encoding
 import codetracer_trace_writer/call_stream
 import codetracer_trace_writer/io_event_stream
 import codetracer_trace_writer/value_stream
+import codetracer_trace_writer/span_stream
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -358,10 +359,70 @@ proc test_raise_catch() {.raises: [].} =
 
 
 # ---------------------------------------------------------------------------
+# Native<->VM crossing spans (Mixed-Trace-Debugging.md §3)
+# ---------------------------------------------------------------------------
+
+proc test_crossing_spans() {.raises: [].} =
+  ## beginCrossing/endCrossing mint a 1-based span_id, snapshot start_step at
+  ## begin and settle end_step = stepCount-1 at end, and NEST correctly (a VM
+  ## frame entering another VM frame before the first returns).
+  let writerRes = initMultiStreamWriter("test_crossing.ct", "test_crossing")
+  doAssert writerRes.isOk, "initMultiStreamWriter failed: " & writerRes.error
+  var w = writerRes.get()
+  let p0 = w.registerPath("/vm/prog.src")
+  doAssert p0.isOk
+
+  # step idx 0
+  doAssert w.registerStep(0, 1, @[]).isOk
+  # OUTER crossing opens at step idx 1
+  let outer = w.beginCrossing("gdscript-frame")
+  doAssert outer == 1'u64, "first crossing span_id must be 1, got " & $outer
+  doAssert w.registerStep(0, 2, @[]).isOk       # idx 1 (inside outer)
+  # INNER (nested) crossing opens at step idx 2
+  let inner = w.beginCrossing("gdscript-call")
+  doAssert inner == 2'u64, "second crossing span_id must be 2, got " & $inner
+  doAssert w.registerStep(0, 3, @[]).isOk       # idx 2 (inside inner)
+  doAssert w.endCrossing(inner).isOk       # inner: [2, 2]
+  doAssert w.registerStep(0, 4, @[]).isOk       # idx 3 (still inside outer)
+  doAssert w.endCrossing(outer).isOk       # outer: [1, 3]
+
+  # An unknown / already-settled span_id is an error, never a silent no-op.
+  doAssert w.endCrossing(inner).isErr, "re-ending a settled crossing must err"
+  doAssert w.endCrossing(999'u64).isErr, "unknown span_id must err"
+
+  let closeRes = w.close()
+  doAssert closeRes.isOk, "close failed: " & closeRes.error
+  let ctfsBytes = w.toBytes()
+  w.closeCtfs()
+
+  let rRes = initSpanStreamReader(ctfsBytes)
+  doAssert rRes.isOk, "initSpanStreamReader failed: " & rRes.error
+  let settledRes = rRes.get().settledSpans()
+  doAssert settledRes.isOk, "settledSpans failed: " & settledRes.error
+  let spans = settledRes.get()
+  doAssert spans.len == 2, "expected 2 crossing spans, got " & $spans.len
+
+  # settledSpans sorts ascending by span_id: outer (1) then inner (2).
+  doAssert spans[0].spanId == 1'u64
+  doAssert spans[0].spanType == "gdscript-frame", spans[0].spanType
+  doAssert spans[0].startStep == 1'u64, "outer start " & $spans[0].startStep
+  doAssert spans[0].endStep == 3'u64, "outer end " & $spans[0].endStep
+  doAssert not spans[0].isOpen
+
+  doAssert spans[1].spanId == 2'u64
+  doAssert spans[1].spanType == "gdscript-call", spans[1].spanType
+  doAssert spans[1].startStep == 2'u64, "inner start " & $spans[1].startStep
+  doAssert spans[1].endStep == 2'u64, "inner end " & $spans[1].endStep
+  doAssert not spans[1].isOpen
+
+  echo "PASS: test_crossing_spans"
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 
 test_basic_round_trip()
 test_calls_and_returns()
 test_raise_catch()
+test_crossing_spans()
 echo "ALL PASS: test_multi_stream_writer"

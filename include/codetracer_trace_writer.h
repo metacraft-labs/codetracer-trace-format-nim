@@ -244,6 +244,34 @@ int trace_writer_register_span(trace_writer_t handle,
 int trace_writer_flush_spans(trace_writer_t handle);
 
 /*
+ * Open a native<->VM crossing span (Mixed-Trace-Debugging.md §3) and return its
+ * minted span_id — the handle to pass to trace_writer_end_crossing.  The
+ * crossing's start_step is the index of the first materialized step inside the
+ * VM frame; the buffered pending step is flushed first (as
+ * trace_writer_register_call does) so a crossing wrapping a call gets the same
+ * start_step the call gets as its entryStep.  span_type names the crossing kind
+ * (e.g. "gdscript-frame"), discriminated like "web-request" / "process".
+ *
+ * Crossings index the materialized step space, so ONLY the multi-stream backend
+ * supports them.  Returns 0 (never a valid 1-based span id) on any error — NULL
+ * handle, a non-multi-stream backend, a not-ready or closed writer — with
+ * trace_writer_last_error set.
+ */
+uint64_t trace_writer_begin_crossing(trace_writer_t handle,
+    const char* span_type);
+
+/*
+ * Settle the crossing opened as span_id: its SpanRecord is written with
+ * end_step = the last materialized step inside the frame, then the span stream
+ * is flushed so the record is committed to the container immediately (mid-run
+ * visibility, §3).  The pending step is flushed first (as
+ * trace_writer_register_return does).  Returns 0 on success, non-zero (with
+ * trace_writer_last_error set) on a NULL handle, a non-multi-stream backend, a
+ * not-ready writer, or an unknown span_id.
+ */
+int trace_writer_end_crossing(trace_writer_t handle, uint64_t span_id);
+
+/*
  * The exec-stream index the NEXT event registered on this writer will occupy —
  * the `start_step` a span opened right now should carry.  A span that runs from
  * here to there is `start_step = trace_writer_next_step_index()` at entry and

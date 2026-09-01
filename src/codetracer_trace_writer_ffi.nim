@@ -1914,6 +1914,74 @@ proc trace_writer_flush_spans(handle: TraceWriterHandle): cint
     return 1.cint
   0.cint
 
+proc trace_writer_begin_crossing(
+    handle: TraceWriterHandle,
+    span_type: cstring,
+): uint64 {.exportc, cdecl, dynlib.} =
+  ## Open a native↔VM crossing span (Mixed-Trace-Debugging.md §3) and return its
+  ## minted `span_id` — the handle the caller passes to
+  ## `trace_writer_end_crossing`.  The crossing's `start_step` is the index of
+  ## the NEXT materialized step, i.e. the first step that runs inside the VM
+  ## frame; to make that true the buffered pending step is flushed FIRST, exactly
+  ## as `trace_writer_register_call` does, so a crossing wrapping a call gets the
+  ## same `start_step` the call gets as its `entryStep`.
+  ##
+  ## Crossings index the materialized step space, so ONLY the multi-stream
+  ## backend supports them.  Returns 0 (never a valid 1-based span id) on any
+  ## error — NULL handle, a non-multi-stream backend, a not-ready or closed
+  ## writer — with `trace_writer_last_error` set.
+  if handle.isNil:
+    setError("trace_writer_begin_crossing: NULL handle")
+    return 0'u64
+  if not handle.useMultiStream:
+    setError("trace_writer_begin_crossing: only the multi-stream backend " &
+      "supports crossings")
+    return 0'u64
+  if not handle.msWriterReady:
+    setError("trace_writer_begin_crossing: writer not ready " &
+      "(call trace_writer_begin_events first)")
+    return 0'u64
+  # Flush the buffered caller step so `w.stepCount` reflects it before we
+  # snapshot `start_step` — mirrors `trace_writer_register_call`.
+  if handle.msWriter.stepCount > 0'u64:
+    discard flushPendingStep(handle)
+  let spanId = handle.msWriter.beginCrossing(toNimStr(span_type))
+  if spanId == 0'u64:
+    setError("trace_writer_begin_crossing: writer is closed")
+  spanId
+
+proc trace_writer_end_crossing(
+    handle: TraceWriterHandle,
+    span_id: uint64,
+): cint {.exportc, cdecl, dynlib.} =
+  ## Settle the crossing opened as `span_id`: its `SpanRecord` is written with
+  ## `end_step` = the last materialized step inside the frame, then the span
+  ## stream is flushed so the record is committed to the container immediately
+  ## (mid-run visibility, §3).  The pending step is flushed FIRST (mirroring
+  ## `trace_writer_register_return`) so a step recorded right before the frame
+  ## exit is counted in `end_step`.
+  ##
+  ## Returns 0 on success; non-zero with `trace_writer_last_error` set on a NULL
+  ## handle, a non-multi-stream backend, a not-ready writer, or an unknown
+  ## `span_id`.
+  if handle.isNil:
+    setError("trace_writer_end_crossing: NULL handle")
+    return 1.cint
+  if not handle.useMultiStream:
+    setError("trace_writer_end_crossing: only the multi-stream backend " &
+      "supports crossings")
+    return 1.cint
+  if not handle.msWriterReady:
+    setError("trace_writer_end_crossing: writer not ready " &
+      "(call trace_writer_begin_events first)")
+    return 1.cint
+  discard flushPendingStep(handle)
+  let res = handle.msWriter.endCrossing(span_id)
+  if res.isErr:
+    setError(res.error)
+    return 1.cint
+  0.cint
+
 proc trace_writer_next_step_index(handle: TraceWriterHandle): uint64
     {.exportc, cdecl, dynlib.} =
   ## The exec-stream index the NEXT event registered on this writer will

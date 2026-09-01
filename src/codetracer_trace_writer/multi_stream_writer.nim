@@ -10,6 +10,7 @@
 ## single-stream events.log + meta.json + paths.json.
 
 import std/options
+import std/tables
 import results
 import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
@@ -69,6 +70,17 @@ type
       ## ``pathId``.  Length-zero is the spec-allowed "no sourcemap"
       ## marker.
 
+  PendingCrossing = object
+    ## An OPEN native↔VM crossing span (Mixed-Trace-Debugging.md §3), stashed
+    ## between `beginCrossing` and `endCrossing`.  `startStep` is snapshotted
+    ## from `w.stepCount` at `beginCrossing` — the index of the first
+    ## materialized step that will run inside the crossing — mirroring the
+    ## `entryStep` capture in `registerCall`.  Crossings NEST (a VM frame can
+    ## enter another VM frame before returning), so pending entries live in a
+    ## table keyed by the minted `span_id`, not a single slot.
+    spanType: string
+    startStep: uint64
+
   PendingCall = object
     functionId: uint64
     entryStep: uint64
@@ -114,6 +126,19 @@ type
     spanWriter: SpanStreamWriter
       ## RS-M1 span stream.  Created LAZILY on the first `registerSpan` call —
       ## see `hasSpans`.
+    nextSpanId: uint64
+      ## Monotonic span-id generator for spans this writer MINTS itself — i.e.
+      ## native↔VM crossing spans (`beginCrossing`/`endCrossing`,
+      ## Mixed-Trace-Debugging.md §3).  Span ids are 1-based (matching the
+      ## process-span convention `process_ord + 1`), so a 0 here means "no id
+      ## issued yet" and the first crossing gets id 1.  The externally-supplied
+      ## `registerSpan` path (web-request / process spans) carries its OWN
+      ## span_id and does NOT draw from this counter; a writer must not mix the
+      ## two id spaces.
+    pendingCrossings: Table[uint64, PendingCrossing]
+      ## Open crossings awaiting their `endCrossing`, keyed by minted span_id so
+      ## nested crossings pair unambiguously.  Empty for every writer that never
+      ## opens a crossing.
     hasSpans: bool
       ## True once at least one span has been registered, which is also when
       ## `spans.dat` / `spans.idx` were added to the container.
@@ -1120,6 +1145,87 @@ proc spanCount*(w: MultiStreamTraceWriter): uint64 =
   ## Number of span RECORDS registered (an open record and its completion count
   ## as two).
   if not w.hasSpans: 0'u64 else: span_stream.count(w.spanWriter)
+
+# ---------------------------------------------------------------------------
+# Native↔VM crossing spans (Mixed-Trace-Debugging.md §3)
+# ---------------------------------------------------------------------------
+#
+# A host process enters and leaves an embedded VM many times; each crossing is
+# recorded as an ordinary `SpanRecord` whose `[start_step, end_step]` bound the
+# materialized steps executed inside the VM frame (§3: "the span IS a coordinate
+# in the container — (process, thread, step range)").  These two helpers emit
+# that span INCREMENTALLY into the live span stream at VM-frame boundaries,
+# replacing the earlier plan of reopening a finalized container after the fact.
+#
+# The step space they index is THIS writer's own — the same counter
+# `registerCall`/`registerReturn` capture for a call's `[entryStep, exitStep]`
+# — so the crossing helper is writer-native and the span_id is minted here,
+# where the step space is owned.  The FFI wrapper flushes any buffered step
+# BEFORE `beginCrossing` (exactly as `trace_writer_register_call` does), so at
+# snapshot time `w.stepCount` is the index of the first step of the frame's
+# body, aligning a crossing's `start_step` with the enclosed call's `entryStep`.
+#
+# SCOPE: crossings index the materialized step space, so they are only
+# meaningful on the multi-stream writer (the FFI rejects other backends).  In
+# the COMBINED native+VM recording the attached VM writer is the SOLE
+# span-stream owner — MCR does not also emit into the shared span stream (the
+# M61 dup-name guard would fire), so these ids never collide with an MCR span.
+
+proc beginCrossing*(w: var MultiStreamTraceWriter, spanType: string): uint64 =
+  ## Open a native↔VM crossing span and return its minted `span_id` (the
+  ## caller's handle to pass back to `endCrossing`).  `start_step` is snapshotted
+  ## now from `w.stepCount` — the index of the next materialized step, i.e. the
+  ## first step that will run inside the crossing.
+  ##
+  ## Returns 0 (never a valid 1-based span id) if the writer is closed.  The
+  ## crossing is not written to the stream until `endCrossing`; nesting is
+  ## supported because each open crossing is stashed under its own span_id.
+  if w.closed:
+    return 0'u64
+  if w.nextSpanId == 0'u64:
+    w.nextSpanId = 1'u64
+  let spanId = w.nextSpanId
+  w.nextSpanId += 1
+  w.pendingCrossings[spanId] = PendingCrossing(
+    spanType: spanType, startStep: w.stepCount)
+  spanId
+
+proc endCrossing*(w: var MultiStreamTraceWriter,
+    spanId: uint64): Result[void, string] =
+  ## Settle the crossing opened as `spanId`: build its `SpanRecord` with
+  ## `end_step = stepCount - 1` (the last materialized step inside the frame,
+  ## clamped to 0 when nothing was recorded — the same clamp `registerReturn`
+  ## uses for `exitStep`), append it via `registerSpan`, and `flushSpans` so it
+  ## is sealed into the container's span stream immediately (mid-run visibility
+  ## per §3).  An unknown `spanId` is an error, never a silent no-op.
+  if w.closed:
+    return err("writer is closed")
+  if not w.pendingCrossings.hasKey(spanId):
+    return err("endCrossing: no open crossing with span_id " & $spanId)
+  let pending = w.pendingCrossings.getOrDefault(spanId)
+  w.pendingCrossings.del(spanId)
+
+  let span = SpanRecord(
+    spanId: spanId,
+    parentSpanId: 0'u64,
+    isOpen: false,
+    isExternal: false,
+    status: spanStatusOk,
+    startWallNs: 0'u64,
+    endWallNs: 0'u64,
+    processOrd: 0'u64,
+    threadId: 0'u64,
+    startStep: pending.startStep,
+    endStep: (if w.stepCount > 0'u64: w.stepCount - 1'u64 else: 0'u64),
+    spanType: pending.spanType,
+    label: "",
+    contiguousOnOneThread: true,
+    sharesTimeline: true,
+    concurrentWithSiblings: false,
+  )
+  ?w.registerSpan(span)
+  ?w.flushSpans()
+  ok()
 
 proc registerIOEvent*(w: var MultiStreamTraceWriter, kind: IOEventKind,
     data: openArray[byte],
