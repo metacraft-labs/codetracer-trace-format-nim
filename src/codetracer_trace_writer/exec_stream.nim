@@ -53,6 +53,7 @@
 import results
 import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
+import ../codetracer_ctfs/streaming
 import ../codetracer_ctfs/zstd_bindings
 import ../codetracer_ctfs/chunk_cache
 import ./step_encoding
@@ -149,6 +150,7 @@ proc initExecStreamWriter*(ctfs: var Ctfs,
   let hdrRes = ctfs.writeToFile(writer.indexFile, hdr)
   if hdrRes.isErr:
     return err("failed to write idx header: " & hdrRes.error)
+  ctfs.syncEntry(writer.indexFile)
 
   ok(writer)
 
@@ -172,20 +174,28 @@ proc flushChunk(ctfs: var Ctfs, w: var ExecStreamWriter): Result[void, string] =
   if ZSTD_isError(compressedSize) != 0:
     return err("zstd compress failed: " & $ZSTD_getErrorName(compressedSize))
 
-  # Write byte offset to index
+  let chunkStart = w.dataOffset
+
+  # DATA-FIRST-THEN-INDEX ordering (matches span_stream.flushChunk): append the
+  # compressed chunk to steps.dat and sync its size FIRST, then append the
+  # chunk's byte offset to steps.idx and sync.  A concurrent follow reader that
+  # observes N index entries can then always assume chunks 0..N-1 are fully on
+  # disk; the reverse order could publish an offset for bytes not yet written,
+  # yielding a transient short/zero decode.
+  let datRes = ctfs.writeToFile(w.dataFile,
+      compressed.toOpenArray(0, int(compressedSize) - 1))
+  if datRes.isErr:
+    return err("failed to write compressed chunk: " & datRes.error)
+  ctfs.syncEntry(w.dataFile)
+
   var offBytes: array[8, byte]
-  let offLE = toBytesLE(w.dataOffset)
+  let offLE = toBytesLE(chunkStart)
   for i in 0 ..< 8:
     offBytes[i] = offLE[i]
   let idxRes = ctfs.writeToFile(w.indexFile, offBytes)
   if idxRes.isErr:
     return err("failed to write offset to idx: " & idxRes.error)
-
-  # Write compressed data to .dat
-  let datRes = ctfs.writeToFile(w.dataFile,
-      compressed.toOpenArray(0, int(compressedSize) - 1))
-  if datRes.isErr:
-    return err("failed to write compressed chunk: " & datRes.error)
+  ctfs.syncEntry(w.indexFile)
 
   w.dataOffset += uint64(compressedSize)
   w.eventCount = 0

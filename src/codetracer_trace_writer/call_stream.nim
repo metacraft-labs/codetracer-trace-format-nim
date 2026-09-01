@@ -53,6 +53,7 @@ import std/options
 import results
 import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
+import ../codetracer_ctfs/streaming
 import ../codetracer_ctfs/variable_record_table
 import ../codetracer_ctfs/zstd_bindings
 import ./varint
@@ -85,15 +86,18 @@ type
 
   CallStreamWriter* = object
     ## Buffers encoded records and flushes them to `calls.dat` one Zstd chunk
-    ## at a time. `finalizeCallStream` flushes the last partial chunk and
-    ## writes `calls.idx`.
+    ## at a time. Each sealed chunk publishes its byte offset to `calls.idx`
+    ## INCREMENTALLY (header written by `initCallStreamWriter`, one offset per
+    ## sealed chunk by `flushChunk`), so a still-recording container is already
+    ## seekable by a follow reader. `finalizeCallStream` only seals the last
+    ## partial chunk.
     datFile: CtfsInternalFile      ## calls.dat handle
+    indexFile: CtfsInternalFile    ## calls.idx handle
     chunkSize: int                 ## records per chunk
     zstdLevel: int                 ## zstd compression level
     pending: seq[byte]             ## current chunk's length-prefixed records
     pendingCount: int              ## records buffered in `pending`
     datOffset: uint64              ## running byte offset within calls.dat
-    chunkOffsets: seq[uint64]      ## byte offset of each flushed chunk
     recordCount: uint64            ## total records appended
     finalized: bool
 
@@ -252,30 +256,72 @@ proc zstdDecompress(src: openArray[byte]): Result[seq[byte], string] {.raises: [
 
 proc initCallStreamWriter*(ctfs: var Ctfs,
     chunkSize: int = DefaultCallsChunkSize): Result[CallStreamWriter, string] =
-  ## Create the `calls.dat` file. `calls.idx` is written by
-  ## `finalizeCallStream`. `chunkSize` is the records-per-chunk seek
-  ## granularity (matches the Rust writer's default).
+  ## Create the `calls.dat` / `calls.idx` stream pair and write the index
+  ## header. `calls.idx` is grown INCREMENTALLY (one offset per sealed chunk,
+  ## in `flushChunk`) so a still-recording container is seekable mid-run, exactly
+  ## like the sibling `steps.idx` / `values.idx` / `events.idx` / `spans.idx`
+  ## streams. `chunkSize` is the records-per-chunk seek granularity (matches the
+  ## Rust writer's default).
   let cs = max(chunkSize, 1)
   let datFileRes = ctfs.addFile("calls.dat")
   if datFileRes.isErr:
     return err("failed to create calls.dat: " & datFileRes.error)
-  ok(CallStreamWriter(
+  let idxFileRes = ctfs.addFile("calls.idx")
+  if idxFileRes.isErr:
+    return err("failed to create calls.idx: " & idxFileRes.error)
+
+  var w = CallStreamWriter(
     datFile: datFileRes.get(),
+    indexFile: idxFileRes.get(),
     chunkSize: cs,
     zstdLevel: DefaultCallsZstdLevel,
-    chunkOffsets: @[],
-  ))
+  )
+
+  # calls.idx header: [chunk_size: u32 LE]  (seekable-zstd.md).  The Rust
+  # `CallStreamReader::parse` reads exactly this 4-byte header before the u64
+  # chunk offsets, so writing it at init makes the index parseable the moment
+  # the first chunk seals — the on-disk FORMAT is unchanged, only WHEN the
+  # bytes appear.
+  var hdr: array[4, byte]
+  writeU32LE(hdr, 0, uint32(cs))
+  let hdrRes = ctfs.writeToFile(w.indexFile, hdr)
+  if hdrRes.isErr:
+    return err("failed to write calls.idx header: " & hdrRes.error)
+  ctfs.syncEntry(w.indexFile)
+
+  ok(w)
 
 proc flushChunk(ctfs: var Ctfs, w: var CallStreamWriter): Result[void, string] {.raises: [].} =
-  ## Compress the buffered chunk, append it to calls.dat, and record its
-  ## offset. No-op when nothing is pending.
+  ## Compress the buffered chunk, append it to calls.dat, and publish its byte
+  ## offset in calls.idx. No-op when nothing is pending.
+  ##
+  ## DATA-FIRST-THEN-INDEX ordering (matches `span_stream.flushChunk` and the
+  ## other chunked streams): the compressed chunk is appended to `calls.dat` and
+  ## that file's size synced FIRST, and only then is the chunk's byte offset
+  ## appended to `calls.idx` and synced. A concurrent follow reader that observes
+  ## N index entries can therefore always assume chunks `0..N-1` are fully
+  ## committed to `calls.dat`; the reverse order could publish an offset for
+  ## bytes not yet on disk, yielding a transient short/zero decode.
   if w.pendingCount == 0:
     return ok()
-  w.chunkOffsets.add(w.datOffset)
+  let chunkStart = w.datOffset
   let compressed = ?zstdCompress(w.pending, w.zstdLevel)
+
+  # 1. Chunk body first, then publish its size to concurrent readers.
   let writeRes = ctfs.writeToFile(w.datFile, compressed)
   if writeRes.isErr:
     return err("calls.dat chunk write failed: " & writeRes.error)
+  ctfs.syncEntry(w.datFile)
+
+  # 2. Only now the index entry appears — it means "this chunk is complete
+  #    and starts at chunkStart".
+  var offBuf: array[8, byte]
+  writeU64LE(offBuf, 0, chunkStart)
+  let idxRes = ctfs.writeToFile(w.indexFile, offBuf)
+  if idxRes.isErr:
+    return err("calls.idx offset write failed: " & idxRes.error)
+  ctfs.syncEntry(w.indexFile)
+
   w.datOffset += uint64(compressed.len)
   w.pending.setLen(0)
   w.pendingCount = 0
@@ -296,31 +342,19 @@ proc writeCall*(ctfs: var Ctfs, w: var CallStreamWriter,
   ok()
 
 proc finalizeCallStream*(ctfs: var Ctfs, w: var CallStreamWriter): Result[void, string] =
-  ## Flush the final partial chunk and write the companion `calls.idx`.
-  ## MUST be called once after the last `writeCall`, before serializing the
-  ## container. Idempotent.
+  ## Seal the final partial chunk. The companion `calls.idx` is written
+  ## INCREMENTALLY by `flushChunk` (header at init, one offset per sealed
+  ## chunk), so a still-recording container is already seekable; this only
+  ## flushes whatever remains buffered. MUST be called once after the last
+  ## `writeCall`, before serializing the container. Idempotent.
+  ##
+  ## The on-disk `calls.idx` is byte-identical to the pre-incremental layout —
+  ## `[chunk_size: u32 LE][offset_0: u64 LE]...` — because the same header and
+  ## the same offsets are written, only earlier; a fully-closed container is
+  ## unchanged.
   if w.finalized:
     return ok()
   ?flushChunk(ctfs, w)
-
-  # calls.idx: [chunk_size: u32 LE][offset_0: u64 LE]...  (seekable-zstd.md)
-  var idx: seq[byte] = @[]
-  var u32buf: array[4, byte]
-  writeU32LE(u32buf, 0, uint32(w.chunkSize))
-  for b in u32buf: idx.add(b)
-  for off in w.chunkOffsets:
-    var u64buf: array[8, byte]
-    writeU64LE(u64buf, 0, off)
-    for b in u64buf: idx.add(b)
-
-  let idxFileRes = ctfs.addFile("calls.idx")
-  if idxFileRes.isErr:
-    return err("failed to create calls.idx: " & idxFileRes.error)
-  var idxFile = idxFileRes.get()
-  if idx.len > 0:
-    let writeRes = ctfs.writeToFile(idxFile, idx)
-    if writeRes.isErr:
-      return err("calls.idx write failed: " & writeRes.error)
   w.finalized = true
   ok()
 

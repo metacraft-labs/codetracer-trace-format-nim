@@ -5,9 +5,10 @@ when defined(nimPreviewSlimSystem):
 
 ## Tests for the call stream writer/reader.
 
-import std/[monotimes, times]
+import std/[monotimes, times, os]
 import results
 import codetracer_ctfs/container
+import codetracer_ctfs/streaming
 import codetracer_trace_writer/call_stream
 
 # ---------------------------------------------------------------------------
@@ -288,6 +289,143 @@ proc test_call_stream_nested_calls() {.raises: [].} =
   echo "PASS: test_call_stream_nested_calls"
 
 # ---------------------------------------------------------------------------
+# test_call_stream_readable_mid_run
+#
+# F1 regression guard: `calls.idx` must be written INCREMENTALLY as chunks
+# seal, so a still-recording container is readable BEFORE `finalizeCallStream`.
+# Previously the index was created only at finalize, so mid-run every call
+# reader saw an empty (or absent) `calls.idx` and the whole call tree was dead
+# while recording.
+# ---------------------------------------------------------------------------
+
+proc test_call_stream_readable_mid_run() {.raises: [].} =
+  # Small chunk size so multiple chunks seal during the writes below.
+  const chunkSize = 4
+  const numWritten = 10   # 2 full chunks (8 calls) seal; 2 remain buffered.
+  const sealedExpected = 8
+
+  var ctfs = createCtfs()
+  let writerRes = initCallStreamWriter(ctfs, chunkSize)
+  doAssert writerRes.isOk, "initCallStreamWriter failed: " & writerRes.error
+  var writer = writerRes.get()
+
+  var rng = initRng(1234)
+  for i in 0 ..< numWritten:
+    let rec = makeCallRecord(rng, i)
+    let r = writeCall(ctfs, writer, rec)
+    doAssert r.isOk, "writeCall failed at index " & $i & ": " & r.error
+
+  # BEFORE finalize: calls.idx must already exist and expose the sealed chunks.
+  let midBytes = ctfs.toBytes()
+  let midReaderRes = initCallStreamReader(midBytes)
+  doAssert midReaderRes.isOk,
+    "mid-run initCallStreamReader failed (calls.idx missing?): " &
+    midReaderRes.error
+  var midReader = midReaderRes.get()
+  doAssert midReader.count == uint64(sealedExpected),
+    "mid-run count mismatch: got " & $midReader.count & " expected " &
+    $sealedExpected & " (calls.idx not written incrementally)"
+
+  # Every sealed call must decode correctly mid-run, matching a fresh replay.
+  var replayRng = initRng(1234)
+  for i in 0 ..< sealedExpected:
+    let expected = makeCallRecord(replayRng, i)
+    let got = readCall(midReader, uint64(i))
+    doAssert got.isOk, "mid-run readCall failed at " & $i & ": " & got.error
+    doAssert got.get().functionId == expected.functionId,
+      "mid-run call " & $i & ": functionId mismatch"
+    doAssert got.get().entryStep == expected.entryStep,
+      "mid-run call " & $i & ": entryStep mismatch"
+
+  # Now finalize: the trailing partial chunk seals and the full stream reads.
+  let finRes = finalizeCallStream(ctfs, writer)
+  doAssert finRes.isOk, "finalizeCallStream failed: " & finRes.error
+  let finalBytes = ctfs.toBytes()
+  let finalReaderRes = initCallStreamReader(finalBytes)
+  doAssert finalReaderRes.isOk, "final initCallStreamReader failed: " &
+    finalReaderRes.error
+  var finalReader = finalReaderRes.get()
+  doAssert finalReader.count == uint64(numWritten),
+    "final count mismatch: got " & $finalReader.count & " expected " &
+    $numWritten
+
+  var replay2 = initRng(1234)
+  for i in 0 ..< numWritten:
+    let expected = makeCallRecord(replay2, i)
+    let got = readCall(finalReader, uint64(i))
+    doAssert got.isOk, "final readCall failed at " & $i & ": " & got.error
+    doAssert got.get().functionId == expected.functionId,
+      "final call " & $i & ": functionId mismatch"
+
+  echo "PASS: test_call_stream_readable_mid_run"
+
+# ---------------------------------------------------------------------------
+# test_call_stream_streaming_tail_from_disk
+#
+# The on-disk counterpart of the mid-run guard: with a real streaming CTFS
+# (`createCtfsStreaming`), a reader that reopens the growing file mid-recording
+# sees the sealed calls via the incrementally-synced `calls.idx` — this is the
+# path `syncEntry` publishes.
+# ---------------------------------------------------------------------------
+
+proc test_call_stream_streaming_tail_from_disk() {.raises: [].} =
+  const chunkSize = 4
+  const numWritten = 10
+  const sealedExpected = 8
+
+  var path: string
+  try:
+    path = getTempDir() / "ct_call_stream_tail_test.ct"
+    removeFile(path)
+  except OSError, IOError:
+    doAssert false, "failed to prepare temp path"
+
+  let ctfsRes = createCtfsStreaming(path)
+  doAssert ctfsRes.isOk, "createCtfsStreaming failed: " & ctfsRes.error
+  var ctfs = ctfsRes.get()
+  let writerRes = initCallStreamWriter(ctfs, chunkSize)
+  doAssert writerRes.isOk, "initCallStreamWriter failed: " & writerRes.error
+  var writer = writerRes.get()
+
+  var rng = initRng(555)
+  for i in 0 ..< numWritten:
+    let rec = makeCallRecord(rng, i)
+    let r = writeCall(ctfs, writer, rec)
+    doAssert r.isOk, "writeCall failed at index " & $i & ": " & r.error
+
+  # Reopen the growing file from disk WITHOUT closing the writer.
+  var diskBytes: seq[byte] = @[]
+  try:
+    diskBytes = cast[seq[byte]](readFile(path))
+  except IOError, OSError:
+    doAssert false, "failed to read streaming file mid-run"
+
+  let readerRes = initCallStreamReader(diskBytes)
+  doAssert readerRes.isOk,
+    "mid-run disk initCallStreamReader failed (calls.idx not synced?): " &
+    readerRes.error
+  var reader = readerRes.get()
+  doAssert reader.count == uint64(sealedExpected),
+    "mid-run disk count mismatch: got " & $reader.count & " expected " &
+    $sealedExpected
+
+  var replayRng = initRng(555)
+  for i in 0 ..< sealedExpected:
+    let expected = makeCallRecord(replayRng, i)
+    let got = readCall(reader, uint64(i))
+    doAssert got.isOk, "mid-run disk readCall failed at " & $i & ": " & got.error
+    doAssert got.get().functionId == expected.functionId,
+      "mid-run disk call " & $i & ": functionId mismatch"
+
+  doAssert finalizeCallStream(ctfs, writer).isOk, "finalize failed"
+  ctfs.closeCtfs()
+  try:
+    removeFile(path)
+  except OSError, IOError:
+    discard
+  echo "PASS: test_call_stream_streaming_tail_from_disk"
+
+# ---------------------------------------------------------------------------
 # bench_call_tree_viewport_load
 # ---------------------------------------------------------------------------
 
@@ -335,4 +473,6 @@ test_call_stream_write_read()
 test_call_stream_void_return()
 test_call_stream_exception_exit()
 test_call_stream_nested_calls()
+test_call_stream_readable_mid_run()
+test_call_stream_streaming_tail_from_disk()
 bench_call_tree_viewport_load()
