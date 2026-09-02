@@ -107,6 +107,40 @@ int trace_writer_begin_paths(trace_writer_t handle, const char* path);
 int trace_writer_finish_paths(trace_writer_t handle);
 
 /* --------------------------------------------------------------------------
+ * In-memory container — the filesystem-free alternative to begin_events
+ *
+ * trace_writer_begin_events derives a .ct path from the events path it is
+ * given, and trace_writer_close opens that path and writes to it.  An embedder
+ * with no filesystem -- a wasm module, or a host that wants the bytes rather
+ * than a file -- calls trace_writer_begin_in_memory INSTEAD.  Everything
+ * between begin and close is identical; only where the container ends up
+ * differs.
+ *
+ * Call ONE of the two.  Both begins are idempotent no-ops on an already-open
+ * writer, so the second one made is REFUSED (non-zero, with a message naming
+ * the mode) rather than silently ignored.
+ *
+ * After trace_writer_close:
+ *
+ *     if (trace_writer_container_ready(w)) {
+ *         const uint8_t* p = trace_writer_container_ptr(w);
+ *         size_t         n = trace_writer_container_len(w);
+ *         ...                         // p is valid until trace_writer_free
+ *     }
+ *
+ * Read the READY flag rather than testing the length: an empty container is a
+ * legitimate result (a recording with no events still carries a meta.dat), so
+ * a zero length cannot stand in for "not finished yet".  The pointer is NULL
+ * for a zero-length container and the bytes are owned by the handle -- they
+ * are NOT to be freed by the caller, and they die with trace_writer_free.
+ * -------------------------------------------------------------------------- */
+
+int      trace_writer_begin_in_memory(trace_writer_t handle);
+int      trace_writer_container_ready(trace_writer_t handle);
+size_t   trace_writer_container_len(trace_writer_t handle);
+uint8_t* trace_writer_container_ptr(trace_writer_t handle);
+
+/* --------------------------------------------------------------------------
  * Tracing primitives
  * -------------------------------------------------------------------------- */
 

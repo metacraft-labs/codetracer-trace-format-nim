@@ -108,6 +108,12 @@ task test, "Run all tests":
   # and the flow view rendered program output one source line too high.
   # Same FFI-`include` compile requirements as the two tests above.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_io_event_pending_step_attribution.nim"
+  # The C ABI's in-memory constructors: an embedder with no filesystem gets a
+  # container's BYTES rather than a file. Carries its own positive control (the
+  # file arm, in the same directory) and its own mutation control (one extra
+  # step), which is what showed that a container's LENGTH cannot tell two
+  # traces apart. Same FFI-`include` compile requirements as the tests above.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_in_memory.nim"
 
 task regenerateFixtures, "Regenerate .expected golden fixture files":
   exec "nim c -r tests/generate_golden_fixtures.nim"

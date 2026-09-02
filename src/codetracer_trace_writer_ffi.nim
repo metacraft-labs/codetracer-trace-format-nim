@@ -139,6 +139,22 @@ type
     pendingCallArgs: seq[CallArg]
 
     ctFilePath: string  # path to the .ct output file (set in begin_events)
+
+    # IN-MEMORY MODE. Set by `trace_writer_begin_in_memory` INSTEAD of
+    # `trace_writer_begin_events`, for an embedder that has no filesystem —
+    # a wasm module, or a host that wants the container's bytes rather than a
+    # file. `trace_writer_close` then retains the finished bytes here instead
+    # of opening `ctFilePath`, and `trace_writer_container_ptr` /
+    # `trace_writer_container_len` hand them back.
+    #
+    # The bytes are RETAINED rather than returned, because they must outlive
+    # the container: `closeCtfs` releases the writer's own storage, so a
+    # pointer into it would dangle the moment the writer is torn down. This
+    # copy is owned by the handle and lives until `trace_writer_free`.
+    inMemory: bool
+    containerData: seq[byte]
+    containerReady: bool
+
     programName: string  # stored from trace_writer_new, used when creating .ct
     workdir: string
     metaArgs: seq[string]
@@ -269,6 +285,9 @@ proc trace_writer_new(
     useMultiStream: format == ffiBinary,
     hasPendingStep: false,
     pendingColumnDelta: 0,
+    inMemory: false,
+    containerData: @[],
+    containerReady: false,
     programName: prog,
     workdir: "",
     metaArgs: @[],
@@ -331,6 +350,14 @@ proc trace_writer_begin_events(
     setError("NULL handle")
     return 1.cint
 
+  # The symmetric half of `trace_writer_begin_in_memory`'s guard. Both `begin`s
+  # are idempotent no-ops on an already-open writer, so without this a caller
+  # that made both would silently get whichever it made first — and the one it
+  # got would be the one it did NOT ask for second.
+  if handle.inMemory:
+    setError("this writer is already open in memory; call trace_writer_begin_in_memory or trace_writer_begin_events, not both")
+    return 1.cint
+
   if handle.useMultiStream:
     if handle.msWriterReady:
       return 0.cint
@@ -373,6 +400,109 @@ proc trace_writer_begin_events(
   handle.writer = res.get()
   handle.writerReady = true
   0.cint
+
+proc trace_writer_begin_in_memory(
+    handle: TraceWriterHandle,
+): cint {.exportc, cdecl, dynlib.} =
+  ## The filesystem-free sibling of `trace_writer_begin_events`.
+  ##
+  ## `trace_writer_begin_events` takes an events PATH, derives a `.ct` path
+  ## from its parent directory, and `trace_writer_close` opens that path and
+  ## writes to it. An embedder with no filesystem — a wasm module, or a host
+  ## that wants the bytes rather than a file — had no way in at all: every
+  ## constructor on this C ABI was file-based.
+  ##
+  ## The layer below was already in memory. `initMultiStreamWriter` builds on
+  ## `createCtfs()` and keeps `path` only as `filePath` metadata, and
+  ## `newTraceWriterInMemory` is the single-stream equivalent. What was
+  ## missing was a way to reach either of them from C, and a way to get the
+  ## finished bytes back. This is that way; `trace_writer_container_ptr` and
+  ## `trace_writer_container_len` are the other half.
+  ##
+  ## Call this OR `trace_writer_begin_events`, never both: the second call
+  ## on a ready writer is a no-op in both, so a caller that made both would
+  ## silently get whichever it made first. Returns 0 on success.
+  if handle.isNil:
+    setError("NULL handle")
+    return 1.cint
+
+  if handle.useMultiStream:
+    if handle.msWriterReady:
+      if not handle.inMemory:
+        setError("this writer is already open on a file; in-memory mode must be chosen before the first begin")
+        return 1.cint
+      return 0.cint
+
+    # The empty path is deliberate and is not a placeholder for a real one:
+    # `filePath` is metadata the container never reads back, and an in-memory
+    # writer has no file to name. `trace_writer_close` refuses to write one.
+    let res = initMultiStreamWriter("", handle.programName)
+    if res.isErr:
+      setError(res.error)
+      return 1.cint
+
+    handle.msWriter = res.get()
+    handle.msWriter.metadata.workdir = handle.workdir
+    handle.msWriter.metadata.args = handle.metaArgs
+    handle.msWriterReady = true
+    handle.inMemory = true
+    handle.ctFilePath = ""
+    return 0.cint
+
+  if handle.writerReady:
+    if not handle.inMemory:
+      setError("this writer is already open on a file; in-memory mode must be chosen before the first begin")
+      return 1.cint
+    return 0.cint
+
+  let res = newTraceWriterInMemory(handle.programName, @[], handle.workdir)
+  if res.isErr:
+    setError(res.error)
+    return 1.cint
+
+  handle.writer = res.get()
+  handle.writerReady = true
+  handle.inMemory = true
+  handle.ctFilePath = ""
+  0.cint
+
+proc trace_writer_container_len(
+    handle: TraceWriterHandle,
+): csize_t {.exportc, cdecl, dynlib.} =
+  ## Length of the finished container, in bytes. Zero before `trace_writer_close`
+  ## and zero for a writer that is not in in-memory mode — which are two
+  ## different situations, so `trace_writer_container_ready` distinguishes them
+  ## rather than leaving a caller to read a zero two ways.
+  if handle.isNil:
+    setError("NULL handle")
+    return 0.csize_t
+  csize_t(handle.containerData.len)
+
+proc trace_writer_container_ready(
+    handle: TraceWriterHandle,
+): cint {.exportc, cdecl, dynlib.} =
+  ## 1 once `trace_writer_close` has retained a container, 0 before that.
+  ##
+  ## An EMPTY container is a legitimate result — a recording with no events
+  ## still has a `meta.dat` — so a zero length cannot stand in for "not
+  ## finished yet". This is the flag that can.
+  if handle.isNil:
+    setError("NULL handle")
+    return 0.cint
+  if handle.containerReady: 1.cint else: 0.cint
+
+proc trace_writer_container_ptr(
+    handle: TraceWriterHandle,
+): ptr uint8 {.exportc, cdecl, dynlib.} =
+  ## Pointer to the finished container's bytes, valid until
+  ## `trace_writer_free`. NULL before `trace_writer_close`, and NULL for a
+  ## zero-length container — read the length and the ready flag first.
+  if handle.isNil:
+    setError("NULL handle")
+    return nil
+  if handle.containerData.len == 0:
+    return nil
+  addr handle.containerData[0]
 
 proc trace_writer_finish_events(handle: TraceWriterHandle): cint {.exportc, cdecl, dynlib.} =
   if handle.isNil:
@@ -1943,16 +2073,22 @@ proc trace_writer_close(handle: TraceWriterHandle): cint {.exportc, cdecl, dynli
     if closeRes.isErr:
       setError(closeRes.error)
       return 1.cint
-    # Write the in-memory CTFS bytes to disk
     let ctfsBytes = handle.msWriter.toBytes()
-    try:
-      var f = open(handle.ctFilePath, fmWrite)
-      if ctfsBytes.len > 0:
-        discard f.writeBuffer(unsafeAddr ctfsBytes[0], ctfsBytes.len)
-      f.close()
-    except IOError:
-      setError("failed to write .ct file: " & handle.ctFilePath)
-      return 1.cint
+    if handle.inMemory:
+      # RETAIN BEFORE RELEASING. `closeCtfs` frees the writer's own storage,
+      # so the copy has to be taken while it is still alive; a pointer into
+      # the writer would dangle at the next line.
+      handle.containerData = ctfsBytes
+      handle.containerReady = true
+    else:
+      try:
+        var f = open(handle.ctFilePath, fmWrite)
+        if ctfsBytes.len > 0:
+          discard f.writeBuffer(unsafeAddr ctfsBytes[0], ctfsBytes.len)
+        f.close()
+      except IOError:
+        setError("failed to write .ct file: " & handle.ctFilePath)
+        return 1.cint
     handle.msWriter.closeCtfs()
     return 0.cint
 
@@ -1963,6 +2099,9 @@ proc trace_writer_close(handle: TraceWriterHandle): cint {.exportc, cdecl, dynli
   if res.isErr:
     setError(res.error)
     return 1.cint
+  if handle.inMemory:
+    handle.containerData = handle.writer.containerBytes()
+    handle.containerReady = true
   0.cint
 
 # ---------------------------------------------------------------------------
