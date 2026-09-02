@@ -114,6 +114,11 @@ task test, "Run all tests":
   # step), which is what showed that a container's LENGTH cannot tell two
   # traces apart. Same FFI-`include` compile requirements as the tests above.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_in_memory.nim"
+  # The C ABI builds for a target with no filesystem, and `ctHasFilesystem`
+  # removes EXACTLY the two entry points that name a file. Re-runs the compiler
+  # over src/ with `--os:any --cpu:wasm32 --compileOnly` and reads the emitted
+  # C, so it needs no cross toolchain.
+  exec "nim c -r -d:release -p:src tests/test_freestanding_writer_surface.nim"
 
 task regenerateFixtures, "Regenerate .expected golden fixture files":
   exec "nim c -r tests/generate_golden_fixtures.nim"

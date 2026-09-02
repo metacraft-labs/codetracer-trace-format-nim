@@ -7,7 +7,7 @@
 ## and IO-event streams are initialized lazily on first access.
 
 import results
-import std/[os, json, options]
+import std/[json, options]
 import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
 import ../codetracer_ctfs/variable_record_table
@@ -19,6 +19,23 @@ import ./call_stream
 import ./io_event_stream
 import ./step_encoding
 import ./varint
+
+const ctHasFilesystem* = defined(posix) or defined(windows)
+  ## Whether the target this reader is being compiled for has an
+  ## operating-system filesystem.
+  ##
+  ## Derived from the target rather than from a define a caller must remember:
+  ## `--os:linux` / `--os:macosx` define `posix`, `--os:windows` defines
+  ## `windows`, and the freestanding targets (`--os:any`, `--os:standalone`)
+  ## define neither. `container_append.nim` gates `fsync` the same way.
+  ##
+  ## Everything this reader can do is reachable through
+  ## `openNewTraceFromBytes`, which is unconditional. Only the two entry points
+  ## that take a **path** — `openNewTrace` and `refresh` — sit behind this
+  ## constant, so a freestanding build loses the door, not the room.
+
+when ctHasFilesystem:
+  import std/os
 
 type
   SourceView* = object
@@ -382,34 +399,39 @@ proc openNewTraceFromBytes*(data: seq[byte],
 
   ok(reader)
 
-proc openNewTrace*(path: string): Result[NewTraceReader, string] =
-  ## Open a multi-stream trace file from disk.
-  ## Loads meta.dat and interning tables at startup.
-  ## All other streams are loaded lazily on first access.
+when ctHasFilesystem:
+  # The only two entry points in this module that name a file. Everything
+  # below them reads bytes that are already in memory, so this is the whole
+  # filesystem surface of the reader.
 
-  if not fileExists(path):
-    return err("file not found: " & path)
+  proc openNewTrace*(path: string): Result[NewTraceReader, string] =
+    ## Open a multi-stream trace file from disk.
+    ## Loads meta.dat and interning tables at startup.
+    ## All other streams are loaded lazily on first access.
 
-  var data: seq[byte]
-  try:
-    let f = open(path, fmRead)
-    let size = f.getFileSize()
-    data = newSeq[byte](size)
-    discard f.readBytes(data, 0, size)
-    f.close()
-  except:
-    return err("failed to read file: " & path)
+    if not fileExists(path):
+      return err("file not found: " & path)
 
-  openNewTraceFromBytes(data)
+    var data: seq[byte]
+    try:
+      let f = open(path, fmRead)
+      let size = f.getFileSize()
+      data = newSeq[byte](size)
+      discard f.readBytes(data, 0, size)
+      f.close()
+    except:
+      return err("failed to read file: " & path)
 
-proc refresh*(r: var NewTraceReader, path: string): Result[void, string] =
-  ## Re-read a growing CTFS container into this handle and invalidate every
-  ## lazily-opened stream reader whose chunk table may have grown.
-  let reopened = openNewTrace(path)
-  if reopened.isErr:
-    return err(reopened.error)
-  r = reopened.get()
-  ok()
+    openNewTraceFromBytes(data)
+
+  proc refresh*(r: var NewTraceReader, path: string): Result[void, string] =
+    ## Re-read a growing CTFS container into this handle and invalidate every
+    ## lazily-opened stream reader whose chunk table may have grown.
+    let reopened = openNewTrace(path)
+    if reopened.isErr:
+      return err(reopened.error)
+    r = reopened.get()
+    ok()
 
 # ---------------------------------------------------------------------------
 # Interning table accessors

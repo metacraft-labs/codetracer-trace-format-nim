@@ -2925,36 +2925,42 @@ proc allocStringResult(s: string, outLen: ptr csize_t): ptr uint8 =
 # Reader lifecycle
 # ---------------------------------------------------------------------------
 
-proc ct_reader_open(path: cstring): pointer {.exportc, cdecl, dynlib.} =
-  ## Open a .ct trace file. Returns opaque reader handle or nil on failure.
-  ## Check trace_writer_last_error() for error message on failure.
-  if path.isNil:
-    setError("NULL path")
-    return nil
-  let p = $path
-  let res = openNewTrace(p)
-  if res.isErr:
-    setError(res.error)
-    return nil
-  let h = cast[TraceReaderHandle](alloc0(sizeof(NewTraceReader)))
-  h[] = res.get()
-  return cast[pointer](h)
+when ctHasFilesystem:
+  # The two reader entry points that name a file, and the only two in this
+  # family that do. The handle-based accessors below are byte readers and
+  # compile everywhere; on a target without a filesystem a handle comes from
+  # `openNewTraceFromBytes` instead.
 
-proc ct_reader_refresh(h: pointer, path: cstring): cint {.exportc, cdecl, dynlib.} =
-  ## Refresh an existing reader handle from the same growing .ct path.
-  ## Returns 0 on success, non-zero on error.
-  if h.isNil:
-    setError("NULL reader handle")
-    return 1
-  if path.isNil:
-    setError("NULL path")
-    return 1
-  let rh = cast[TraceReaderHandle](h)
-  let res = rh[].refresh($path)
-  if res.isErr:
-    setError(res.error)
-    return 1
-  return 0
+  proc ct_reader_open(path: cstring): pointer {.exportc, cdecl, dynlib.} =
+    ## Open a .ct trace file. Returns opaque reader handle or nil on failure.
+    ## Check trace_writer_last_error() for error message on failure.
+    if path.isNil:
+      setError("NULL path")
+      return nil
+    let p = $path
+    let res = openNewTrace(p)
+    if res.isErr:
+      setError(res.error)
+      return nil
+    let h = cast[TraceReaderHandle](alloc0(sizeof(NewTraceReader)))
+    h[] = res.get()
+    return cast[pointer](h)
+
+  proc ct_reader_refresh(h: pointer, path: cstring): cint {.exportc, cdecl, dynlib.} =
+    ## Refresh an existing reader handle from the same growing .ct path.
+    ## Returns 0 on success, non-zero on error.
+    if h.isNil:
+      setError("NULL reader handle")
+      return 1
+    if path.isNil:
+      setError("NULL path")
+      return 1
+    let rh = cast[TraceReaderHandle](h)
+    let res = rh[].refresh($path)
+    if res.isErr:
+      setError(res.error)
+      return 1
+    return 0
 
 proc ct_reader_close(h: pointer) {.exportc, cdecl, dynlib.} =
   ## Close and free a reader handle. Passing NULL is a no-op.
