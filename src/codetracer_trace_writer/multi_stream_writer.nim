@@ -10,7 +10,6 @@
 ## single-stream events.log + meta.json + paths.json.
 
 import std/options
-import std/tables
 import results
 import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
@@ -76,8 +75,11 @@ type
     ## from `w.stepCount` at `beginCrossing` — the index of the first
     ## materialized step that will run inside the crossing — mirroring the
     ## `entryStep` capture in `registerCall`.  Crossings NEST (a VM frame can
-    ## enter another VM frame before returning), so pending entries live in a
-    ## table keyed by the minted `span_id`, not a single slot.
+    ## enter another VM frame before returning) and close strictly LIFO, so
+    ## pending entries live on a flat stack (see `pendingCrossings`); each
+    ## carries its own minted `spanId` so `endCrossing` can check that the caller
+    ## is closing the innermost open crossing.
+    spanId: uint64
     spanType: string
     startStep: uint64
 
@@ -135,10 +137,15 @@ type
       ## `registerSpan` path (web-request / process spans) carries its OWN
       ## span_id and does NOT draw from this counter; a writer must not mix the
       ## two id spaces.
-    pendingCrossings: Table[uint64, PendingCrossing]
-      ## Open crossings awaiting their `endCrossing`, keyed by minted span_id so
-      ## nested crossings pair unambiguously.  Empty for every writer that never
-      ## opens a crossing.
+    pendingCrossings: seq[PendingCrossing]
+      ## Open crossings awaiting their `endCrossing`, as a flat LIFO stack: a
+      ## crossing is a call frame, so the innermost open crossing is always the
+      ## one that closes next (`beginCrossing` pushes, `endCrossing` pops the
+      ## top).  A stack rather than a `Table` keyed by span_id removes the
+      ## per-crossing hash lookup and — more importantly — is a contiguous,
+      ## memory-readable structure, the shape MCR reads from recreated memory on
+      ## the replay path (nested-trace-correlation.md §1.2).  Empty for every
+      ## writer that never opens a crossing.
     hasSpans: bool
       ## True once at least one span has been registered, which is also when
       ## `spans.dat` / `spans.idx` were added to the container.
@@ -1177,17 +1184,56 @@ proc beginCrossing*(w: var MultiStreamTraceWriter, spanType: string): uint64 =
   ## now from `w.stepCount` — the index of the next materialized step, i.e. the
   ## first step that will run inside the crossing.
   ##
-  ## Returns 0 (never a valid 1-based span id) if the writer is closed.  The
-  ## crossing is not written to the stream until `endCrossing`; nesting is
-  ## supported because each open crossing is stashed under its own span_id.
+  ## Streaming correctness (nested-trace-correlation.md §1.4): the crossing is
+  ## written **open-at-begin, settled-at-close**.  This proc IMMEDIATELY appends
+  ## an OPEN `SpanRecord` (`flags.open`, `end_step = 0`, `status` unknown) and
+  ## flushes it, so a reader sees the in-flight frame BEFORE `endCrossing`;
+  ## `endCrossing` later appends the settled record with the SAME `span_id`
+  ## (last-record-wins).  The open record MUST carry `end_step = 0` /
+  ## `end_wall_ns = 0` — the span decoder rejects an open record otherwise
+  ## (`span_stream.nim` `decodeSpanRecord`).
+  ##
+  ## Returns 0 (never a valid 1-based span id) if the writer is closed or if
+  ## appending/flushing the open record fails — the error is not raised.  The
+  ## open crossing is pushed onto the LIFO stack only after the open record is
+  ## committed, so a failed begin leaves no dangling pending entry.
   if w.closed:
     return 0'u64
   if w.nextSpanId == 0'u64:
     w.nextSpanId = 1'u64
   let spanId = w.nextSpanId
   w.nextSpanId += 1
-  w.pendingCrossings[spanId] = PendingCrossing(
-    spanType: spanType, startStep: w.stepCount)
+
+  let openSpan = SpanRecord(
+    spanId: spanId,
+    parentSpanId: 0'u64,
+    isOpen: true,
+    isExternal: false,
+    status: spanStatusUnknown,
+    startWallNs: 0'u64,
+    endWallNs: 0'u64,
+    processOrd: 0'u64,
+    threadId: 0'u64,
+    startStep: w.stepCount,
+    endStep: 0'u64,
+    spanType: spanType,
+    label: "",
+    contiguousOnOneThread: true,
+    sharesTimeline: true,
+    concurrentWithSiblings: false,
+  )
+  # Seal-immediately, exactly as `endCrossing` does for the settled record, so
+  # the open frame is visible mid-run.  On any error return the 0 sentinel
+  # rather than raising — the FFI contract callers rely on.
+  let regRes = w.registerSpan(openSpan)
+  if regRes.isErr:
+    return 0'u64
+  let flushRes = w.flushSpans()
+  if flushRes.isErr:
+    return 0'u64
+
+  w.pendingCrossings.add(PendingCrossing(
+    spanId: spanId, spanType: spanType, startStep: w.stepCount))
   spanId
 
 proc endCrossing*(w: var MultiStreamTraceWriter,
@@ -1195,15 +1241,25 @@ proc endCrossing*(w: var MultiStreamTraceWriter,
   ## Settle the crossing opened as `spanId`: build its `SpanRecord` with
   ## `end_step = stepCount - 1` (the last materialized step inside the frame,
   ## clamped to 0 when nothing was recorded — the same clamp `registerReturn`
-  ## uses for `exitStep`), append it via `registerSpan`, and `flushSpans` so it
-  ## is sealed into the container's span stream immediately (mid-run visibility
-  ## per §3).  An unknown `spanId` is an error, never a silent no-op.
+  ## uses for `exitStep`), append it via `registerSpan` with the SAME `span_id`
+  ## as the open record `beginCrossing` wrote (last-record-wins settles the
+  ## pair), and `flushSpans` so it is sealed into the container's span stream
+  ## immediately (mid-run visibility per §3).
+  ##
+  ## Crossings close strictly LIFO — a crossing is a call frame, so `spanId`
+  ## MUST be the innermost still-open crossing (the top of the stack).  Closing
+  ## anything else, or closing when nothing is open, is an error, never a silent
+  ## no-op: it catches genuine misuse (mismatched begin/end nesting).
   if w.closed:
     return err("writer is closed")
-  if not w.pendingCrossings.hasKey(spanId):
-    return err("endCrossing: no open crossing with span_id " & $spanId)
-  let pending = w.pendingCrossings.getOrDefault(spanId)
-  w.pendingCrossings.del(spanId)
+  if w.pendingCrossings.len == 0:
+    return err("endCrossing: span_id " & $spanId &
+      " is not the innermost open crossing (no open crossings)")
+  let top = w.pendingCrossings[^1]
+  if top.spanId != spanId:
+    return err("endCrossing: span_id " & $spanId &
+      " is not the innermost open crossing (" & $top.spanId & ")")
+  w.pendingCrossings.setLen(w.pendingCrossings.len - 1)
 
   let span = SpanRecord(
     spanId: spanId,
@@ -1215,9 +1271,9 @@ proc endCrossing*(w: var MultiStreamTraceWriter,
     endWallNs: 0'u64,
     processOrd: 0'u64,
     threadId: 0'u64,
-    startStep: pending.startStep,
+    startStep: top.startStep,
     endStep: (if w.stepCount > 0'u64: w.stepCount - 1'u64 else: 0'u64),
-    spanType: pending.spanType,
+    spanType: top.spanType,
     label: "",
     contiguousOnOneThread: true,
     sharesTimeline: true,

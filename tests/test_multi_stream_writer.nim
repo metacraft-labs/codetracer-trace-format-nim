@@ -6,6 +6,7 @@
 ## then reads it back with NewTraceReader and verifies all data.
 
 import results
+import codetracer_ctfs
 import codetracer_trace_writer/multi_stream_writer
 import codetracer_trace_writer/new_trace_reader
 import codetracer_trace_writer/step_encoding
@@ -366,7 +367,12 @@ proc test_crossing_spans() {.raises: [].} =
   ## beginCrossing/endCrossing mint a 1-based span_id, snapshot start_step at
   ## begin and settle end_step = stepCount-1 at end, and NEST correctly (a VM
   ## frame entering another VM frame before the first returns).
-  let writerRes = initMultiStreamWriter("test_crossing.ct", "test_crossing")
+  ##
+  ## IS-M5 (streaming): beginCrossing writes an OPEN span record immediately, so
+  ## the in-flight frame is visible on disk BEFORE endCrossing; endCrossing then
+  ## settles it with the SAME span_id (last-record-wins).
+  let ctPath = "test_crossing.ct"
+  let writerRes = initMultiStreamWriter(ctPath, "test_crossing")
   doAssert writerRes.isOk, "initMultiStreamWriter failed: " & writerRes.error
   var w = writerRes.get()
   let p0 = w.registerPath("/vm/prog.src")
@@ -377,6 +383,29 @@ proc test_crossing_spans() {.raises: [].} =
   # OUTER crossing opens at step idx 1
   let outer = w.beginCrossing("gdscript-frame")
   doAssert outer == 1'u64, "first crossing span_id must be 1, got " & $outer
+
+  # STREAMING PROOF: the OPEN record for the outer crossing is on disk NOW,
+  # before endCrossing runs — a reader re-opening the still-growing container
+  # sees the in-flight frame as an open span (isOpen, end_step 0) at its
+  # start_step.  This is the whole point of open-at-begin (§1.4).
+  block:
+    let diskRes = readCtfsFromFile(ctPath)
+    doAssert diskRes.isOk, "mid-run readCtfsFromFile failed: " & diskRes.error
+    let midR = initSpanStreamReader(diskRes.get())
+    doAssert midR.isOk, "mid-run initSpanStreamReader failed: " & midR.error
+    let midSpansRes = midR.get().settledSpans()
+    doAssert midSpansRes.isOk, "mid-run settledSpans failed: " & midSpansRes.error
+    let midSpans = midSpansRes.get()
+    doAssert midSpans.len == 1,
+      "expected 1 in-flight span mid-run, got " & $midSpans.len
+    doAssert midSpans[0].spanId == 1'u64
+    doAssert midSpans[0].isOpen, "in-flight crossing must be OPEN before end"
+    doAssert midSpans[0].startStep == 1'u64,
+      "in-flight start " & $midSpans[0].startStep
+    doAssert midSpans[0].endStep == 0'u64,
+      "open record end_step must be 0, got " & $midSpans[0].endStep
+    doAssert midSpans[0].spanType == "gdscript-frame", midSpans[0].spanType
+
   doAssert w.registerStep(0, 2, @[]).isOk       # idx 1 (inside outer)
   # INNER (nested) crossing opens at step idx 2
   let inner = w.beginCrossing("gdscript-call")
@@ -386,7 +415,7 @@ proc test_crossing_spans() {.raises: [].} =
   doAssert w.registerStep(0, 4, @[]).isOk       # idx 3 (still inside outer)
   doAssert w.endCrossing(outer).isOk       # outer: [1, 3]
 
-  # An unknown / already-settled span_id is an error, never a silent no-op.
+  # LIFO stack is now empty; ending anything is an error, never a silent no-op.
   doAssert w.endCrossing(inner).isErr, "re-ending a settled crossing must err"
   doAssert w.endCrossing(999'u64).isErr, "unknown span_id must err"
 
@@ -400,6 +429,8 @@ proc test_crossing_spans() {.raises: [].} =
   let settledRes = rRes.get().settledSpans()
   doAssert settledRes.isOk, "settledSpans failed: " & settledRes.error
   let spans = settledRes.get()
+  # Last-record-wins collapses each crossing's open+settled pair to ONE settled
+  # span, so the settled view is 2 spans even though 4 records were written.
   doAssert spans.len == 2, "expected 2 crossing spans, got " & $spans.len
 
   # settledSpans sorts ascending by span_id: outer (1) then inner (2).
@@ -407,15 +438,45 @@ proc test_crossing_spans() {.raises: [].} =
   doAssert spans[0].spanType == "gdscript-frame", spans[0].spanType
   doAssert spans[0].startStep == 1'u64, "outer start " & $spans[0].startStep
   doAssert spans[0].endStep == 3'u64, "outer end " & $spans[0].endStep
-  doAssert not spans[0].isOpen
+  doAssert not spans[0].isOpen, "settled outer must not be open"
 
   doAssert spans[1].spanId == 2'u64
   doAssert spans[1].spanType == "gdscript-call", spans[1].spanType
   doAssert spans[1].startStep == 2'u64, "inner start " & $spans[1].startStep
   doAssert spans[1].endStep == 2'u64, "inner end " & $spans[1].endStep
-  doAssert not spans[1].isOpen
+  doAssert not spans[1].isOpen, "settled inner must not be open"
 
   echo "PASS: test_crossing_spans"
+
+proc test_crossing_lifo_order() {.raises: [].} =
+  ## Crossings close strictly LIFO (they are call frames).  Closing an OUTER
+  ## crossing while an inner one is still open is a nesting error, caught rather
+  ## than silently accepted.
+  let writerRes = initMultiStreamWriter("test_crossing_lifo.ct", "test_lifo")
+  doAssert writerRes.isOk, "initMultiStreamWriter failed: " & writerRes.error
+  var w = writerRes.get()
+  let p0 = w.registerPath("/vm/prog.src")
+  doAssert p0.isOk
+
+  doAssert w.registerStep(0, 1, @[]).isOk
+  let a = w.beginCrossing("frame-a")
+  doAssert a == 1'u64
+  let b = w.beginCrossing("frame-b")
+  doAssert b == 2'u64
+
+  # b is the innermost open crossing; closing a (the outer) out of order errs.
+  let outOfOrder = w.endCrossing(a)
+  doAssert outOfOrder.isErr, "closing the outer crossing first must err"
+
+  # Closing in the correct LIFO order succeeds: inner b, then outer a.
+  doAssert w.endCrossing(b).isOk, "innermost close must succeed"
+  doAssert w.endCrossing(a).isOk, "outer close after inner must succeed"
+
+  let closeRes = w.close()
+  doAssert closeRes.isOk, "close failed: " & closeRes.error
+  w.closeCtfs()
+
+  echo "PASS: test_crossing_lifo_order"
 
 # ---------------------------------------------------------------------------
 # Run
@@ -425,4 +486,5 @@ test_basic_round_trip()
 test_calls_and_returns()
 test_raise_catch()
 test_crossing_spans()
+test_crossing_lifo_order()
 echo "ALL PASS: test_multi_stream_writer"

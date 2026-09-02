@@ -252,22 +252,29 @@ int trace_writer_flush_spans(trace_writer_t handle);
  * start_step the call gets as its entryStep.  span_type names the crossing kind
  * (e.g. "gdscript-frame"), discriminated like "web-request" / "process".
  *
+ * Streaming correctness (nested-trace-correlation.md §1.4): this call emits an
+ * OPEN span record (flags.open, end_step = 0) and flushes it immediately, so the
+ * in-flight crossing is visible to a reader before trace_writer_end_crossing
+ * settles it with the same span_id (last-record-wins).
+ *
  * Crossings index the materialized step space, so ONLY the multi-stream backend
  * supports them.  Returns 0 (never a valid 1-based span id) on any error — NULL
- * handle, a non-multi-stream backend, a not-ready or closed writer — with
- * trace_writer_last_error set.
+ * handle, a non-multi-stream backend, a not-ready or closed writer, or a failure
+ * to write the open record — with trace_writer_last_error set.
  */
 uint64_t trace_writer_begin_crossing(trace_writer_t handle,
     const char* span_type);
 
 /*
- * Settle the crossing opened as span_id: its SpanRecord is written with
- * end_step = the last materialized step inside the frame, then the span stream
- * is flushed so the record is committed to the container immediately (mid-run
- * visibility, §3).  The pending step is flushed first (as
- * trace_writer_register_return does).  Returns 0 on success, non-zero (with
- * trace_writer_last_error set) on a NULL handle, a non-multi-stream backend, a
- * not-ready writer, or an unknown span_id.
+ * Settle the crossing opened as span_id: its SpanRecord is written (same span_id
+ * as the open record begin emitted, last-record-wins) with end_step = the last
+ * materialized step inside the frame, then the span stream is flushed so the
+ * record is committed to the container immediately (mid-run visibility, §3).  The
+ * pending step is flushed first (as trace_writer_register_return does).
+ * Crossings close strictly LIFO: span_id must be the innermost still-open
+ * crossing.  Returns 0 on success, non-zero (with trace_writer_last_error set) on
+ * a NULL handle, a non-multi-stream backend, a not-ready writer, or a span_id
+ * that is not the innermost open crossing.
  */
 int trace_writer_end_crossing(trace_writer_t handle, uint64_t span_id);
 

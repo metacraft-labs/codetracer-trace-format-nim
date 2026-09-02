@@ -1926,10 +1926,16 @@ proc trace_writer_begin_crossing(
   ## as `trace_writer_register_call` does, so a crossing wrapping a call gets the
   ## same `start_step` the call gets as its `entryStep`.
   ##
+  ## Streaming correctness (nested-trace-correlation.md §1.4): this call now
+  ## EMITS AN OPEN span record (`flags.open`, `end_step = 0`) and flushes it
+  ## immediately, so the in-flight crossing is visible to a reader before
+  ## `trace_writer_end_crossing` settles it with the same `span_id`.
+  ##
   ## Crossings index the materialized step space, so ONLY the multi-stream
   ## backend supports them.  Returns 0 (never a valid 1-based span id) on any
   ## error — NULL handle, a non-multi-stream backend, a not-ready or closed
-  ## writer — with `trace_writer_last_error` set.
+  ## writer, or a failure to append/flush the open record — with
+  ## `trace_writer_last_error` set.
   if handle.isNil:
     setError("trace_writer_begin_crossing: NULL handle")
     return 0'u64
@@ -1947,7 +1953,8 @@ proc trace_writer_begin_crossing(
     discard flushPendingStep(handle)
   let spanId = handle.msWriter.beginCrossing(toNimStr(span_type))
   if spanId == 0'u64:
-    setError("trace_writer_begin_crossing: writer is closed")
+    setError("trace_writer_begin_crossing: writer is closed or the open " &
+      "span record could not be written")
   spanId
 
 proc trace_writer_end_crossing(
@@ -1959,11 +1966,13 @@ proc trace_writer_end_crossing(
   ## stream is flushed so the record is committed to the container immediately
   ## (mid-run visibility, §3).  The pending step is flushed FIRST (mirroring
   ## `trace_writer_register_return`) so a step recorded right before the frame
-  ## exit is counted in `end_step`.
+  ## exit is counted in `end_step`.  The settled record carries the SAME
+  ## `span_id` as the open record `begin` wrote (last-record-wins).  Crossings
+  ## close strictly LIFO: `span_id` must be the innermost still-open crossing.
   ##
   ## Returns 0 on success; non-zero with `trace_writer_last_error` set on a NULL
-  ## handle, a non-multi-stream backend, a not-ready writer, or an unknown
-  ## `span_id`.
+  ## handle, a non-multi-stream backend, a not-ready writer, or a `span_id` that
+  ## is not the innermost open crossing.
   if handle.isNil:
     setError("trace_writer_end_crossing: NULL handle")
     return 1.cint
