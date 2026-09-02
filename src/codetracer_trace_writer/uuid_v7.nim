@@ -51,7 +51,12 @@ when defined(nimPreviewSlimSystem):
 ## concern; if a future caller needs strict monotonicity, layer it on
 ## top.
 
-import std/times
+when defined(ctHostClock):
+  # Freestanding targets (`--os:any`) have no `struct tm`, so `std/times` does
+  # not compile there. The host supplies the wall clock instead.
+  proc ctHostUnixMs(): uint64 {.importc: "ct_host_unix_ms".}
+else:
+  import std/times
 when defined(ctLeanRecord):
   # Lean recorder: use libSystem's getentropy() instead of std/sysrand, whose
   # macOS backend is SecRandomCopyBytes -> links Security.framework (which drags
@@ -83,8 +88,12 @@ type
 
 proc unixMs(): uint64 =
   ## Return the current Unix epoch in whole milliseconds.  Uses
-  ## `std/times.epochTime()` so the value matches `date +%s%3N`.
-  uint64(epochTime() * 1000.0)
+  ## `std/times.epochTime()` so the value matches `date +%s%3N`, or the
+  ## host-supplied clock when `ctHostClock` is defined.
+  when defined(ctHostClock):
+    ctHostUnixMs()
+  else:
+    uint64(epochTime() * 1000.0)
 
 # ---------------------------------------------------------------------------
 # Generation
