@@ -15,6 +15,7 @@ import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
 import ../codetracer_ctfs/streaming
 import ../codetracer_ctfs/variable_record_table
+import ../codetracer_ctfs/crossing_state
 import ./meta_dat
 import ./interning_table
 import ./exec_stream
@@ -1234,6 +1235,15 @@ proc beginCrossing*(w: var MultiStreamTraceWriter, spanType: string): uint64 =
 
   w.pendingCrossings.add(PendingCrossing(
     spanId: spanId, spanType: spanType, startStep: w.stepCount))
+
+  # MT7-5a: mirror the just-opened crossing into the exported, C-ABI, per-thread
+  # crossing block so a replay-time reader can read the current crossing /
+  # altitude from RECREATED memory in O(1) (nested-trace-correlation.md §1.2).
+  # Pushed AFTER the open span record is committed and the heap seq is grown, so
+  # a failed begin (returns 0 above) never pushes and the block's stack depth
+  # equals `pendingCrossings.len` at all times.  Same (spanId, startStep) the
+  # heap entry carries.
+  ctCrossingPush(spanId, w.stepCount)
   spanId
 
 proc endCrossing*(w: var MultiStreamTraceWriter,
@@ -1260,6 +1270,12 @@ proc endCrossing*(w: var MultiStreamTraceWriter,
     return err("endCrossing: span_id " & $spanId &
       " is not the innermost open crossing (" & $top.spanId & ")")
   w.pendingCrossings.setLen(w.pendingCrossings.len - 1)
+
+  # MT7-5a: mirror the close into the exported crossing block (see beginCrossing).
+  # Popped only after the LIFO validation passed and the heap seq was shortened,
+  # so an out-of-order / no-op endCrossing (which returns err above) never pops,
+  # keeping the block balanced with what the writer actually closed.
+  ctCrossingPop()
 
   let span = SpanRecord(
     spanId: spanId,

@@ -91,6 +91,9 @@ task test, "Run all tests":
   exec "nim c -r -p:src tests/test_streaming_value_encoder.nim"
   exec "nim c -r -p:src tests/test_value_ref.nim"
   exec "nim c -r -d:release -p:src tests/test_multi_stream_writer.nim"
+  # MT7-5a: the exported, ABI-stable, per-thread crossing block that mirrors the
+  # writer's `pendingCrossings` seq (read back via the C symbols the reader uses).
+  exec "nim c -r -d:release -p:src tests/test_crossing_state.nim"
   exec "nim c -r -d:release -p:src tests/test_multi_stream_attach.nim"
   exec "nim c -r -d:release -p:src tests/test_linehits_builder.nim"
   exec "nim c -r -d:release -p:src tests/test_memwrites_builder.nim"
