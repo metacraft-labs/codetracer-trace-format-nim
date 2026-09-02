@@ -279,6 +279,26 @@ uint64_t trace_writer_begin_crossing(trace_writer_t handle,
 int trace_writer_end_crossing(trace_writer_t handle, uint64_t span_id);
 
 /*
+ * Buffer an alternate source view for `path_id` (deminification support; spec
+ * "Alternate Source Views", codetracer-trace-format-spec/internal-files.md).
+ * `path_id` must already be registered. `view_kind`: 0 = raw, 1 = prettier_format,
+ * 2 = black_format, 3-127 reserved, 128+ vendor-specific. `view_name` need not be
+ * NUL-terminated (pass `view_name_len`). `content` is the formatted source bytes;
+ * `sourcemap` is Sourcemap V3 JSON bytes (may be NULL/empty for "no sourcemap").
+ * Multi-stream backend only. Returns the new view's 0-based index, or -1 on error
+ * (with last_error set) — a signed return distinguishes index 0 from an error.
+ */
+int64_t trace_writer_register_source_view(trace_writer_t handle,
+                                          uint64_t path_id,
+                                          uint8_t view_kind,
+                                          const char* view_name,
+                                          size_t view_name_len,
+                                          const uint8_t* content,
+                                          size_t content_len,
+                                          const uint8_t* sourcemap,
+                                          size_t sourcemap_len);
+
+/*
  * The exec-stream index the NEXT event registered on this writer will occupy —
  * the `start_step` a span opened right now should carry.  A span that runs from
  * here to there is `start_step = trace_writer_next_step_index()` at entry and
