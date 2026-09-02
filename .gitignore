@@ -111,4 +111,5 @@ src/macro_sourcemap_*.json
 # WebAssembly build outputs (wasm/build-*.sh)
 wasm/build/
 wasm/build-standalone/
+wasm/build-trace-writer-standalone/
 wasm/build-emscripten/
