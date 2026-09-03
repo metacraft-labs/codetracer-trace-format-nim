@@ -97,6 +97,7 @@ proc buildSplitBundle(path: string): seq[byte] =
   doAssert w.registerReturn().isOk
   doAssert w.close().isOk
   let bytes = w.toBytes()
+  w.closeCtfs()
   writeFile(path, cast[string](bytes))
   bytes
 
@@ -178,18 +179,17 @@ proc graftEntryInto(srcPath, outPath, entryName: string) =
 # ---------------------------------------------------------------------------
 
 proc ensureCtPrint() =
-  ## Compile ct-print into `ctPrintBin` when missing or stale. The libzstd
-  ## flags mirror the documented build recipe; pkg-config resolves them.
-  if fileExists(ctPrintBin) and
-     getLastModificationTime(ctPrintBin) >= getLastModificationTime(ctPrintSrc):
-    return
+  ## Compile ct-print into `ctPrintBin`. Reusing it based only on the entry
+  ## point's timestamp misses changes in imported reader and binding modules.
   createDir(ctPrintBin.parentDir)
-  let (cflags, c1) = execCmdEx("pkg-config --cflags libzstd")
-  let (lflags, c2) = execCmdEx("pkg-config --libs libzstd")
-  doAssert c1 == 0 and c2 == 0, "pkg-config libzstd failed"
-  let cmd = "nim c -d:release --mm:arc -p:src " &
-    "--passC:" & quoteShell(cflags.strip()) & " " &
-    "--passL:" & quoteShell(lflags.strip()) & " " &
+  var zstdFlags = ""
+  when not defined(windows):
+    let (cflags, c1) = execCmdEx("pkg-config --cflags libzstd")
+    let (lflags, c2) = execCmdEx("pkg-config --libs libzstd")
+    doAssert c1 == 0 and c2 == 0, "pkg-config libzstd failed"
+    zstdFlags = "--passC:" & quoteShell(cflags.strip()) & " " &
+      "--passL:" & quoteShell(lflags.strip()) & " "
+  let cmd = "nim c -d:release --mm:arc -p:src " & zstdFlags &
     "--hints:off --warnings:off " &
     "-o:" & quoteShell(ctPrintBin) & " " & quoteShell(ctPrintSrc)
   let (output, code) = execCmdEx(cmd)

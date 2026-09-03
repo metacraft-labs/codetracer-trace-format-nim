@@ -35,11 +35,10 @@
 ## shell puts the toolchain floor on ``PATH`` and ``PKG_CONFIG_PATH``.
 ##
 ## **libzstd.** ``test_ct_print_events_log_fallback`` compiles ct-print at
-## runtime and links libzstd via ``pkg-config --cflags/--libs libzstd``;
-## the ct-print C output ``#include``s ``zstd.h``. The dev shell's
-## ``PKG_CONFIG_PATH`` (zstd's ``pkgconfig`` dir) satisfies both, so no
-## per-edge zstd plumbing is needed — the shared ``nim c`` back-end picks
-## up ``-lzstd`` from the ambient link flags.
+## runtime. On POSIX it supplies ``pkg-config --cflags/--libs libzstd``; the
+## dev shell's ``PKG_CONFIG_PATH`` satisfies both. On Windows the binding names
+## the zstd archive directly: adding MSYS2's whole library directory would let
+## it replace the selected MinGW toolchain's implicit CRT and pthread archives.
 ##
 ## **The three cross-read tests** (``test_nim_{step,value,io_event}_stream_crossread``)
 ## prove a Nim-written production ``.ct`` bundle is byte-compatible with the
