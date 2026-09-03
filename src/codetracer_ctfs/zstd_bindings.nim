@@ -3,7 +3,26 @@
 ## Minimal bindings for libzstd frame-level compression/decompression.
 ## Links against the system libzstd library.
 
-{.passL: "-lzstd".}
+when defined(windows) and defined(vcc):
+  {.passC: "/IC:\\zstd\\include".}
+  {.passL: "C:\\zstd\\lib\\zstd.lib".}
+elif defined(windows):
+  const
+    msys2MingwInc {.strdefine.} = ""
+    msys2MingwLib {.strdefine.} = ""
+  when msys2MingwInc.len > 0:
+    {.passC: "-I" & msys2MingwInc.}
+  else:
+    {.passC: "-ID:/metacraft-dev-deps/msys2/msys64/mingw64/include".}
+  # Use the exact archive instead of adding the MSYS2 library directory to
+  # the global search path. The latter can replace a standalone GCC install's
+  # implicit pthread/CRT archives with ABI-incompatible MSYS2 copies.
+  when msys2MingwLib.len > 0:
+    {.passL: msys2MingwLib & "/libzstd.a".}
+  else:
+    {.passL: "D:/metacraft-dev-deps/msys2/msys64/mingw64/lib/libzstd.a".}
+else:
+  {.passL: "-lzstd".}
 
 proc ZSTD_compress*(dst: pointer, dstCapacity: csize_t,
                     src: pointer, srcSize: csize_t,
