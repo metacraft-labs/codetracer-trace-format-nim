@@ -337,8 +337,10 @@ proc trace_writer_finish_metadata(handle: TraceWriterHandle): cint {.exportc, cd
 # just before main). We resolve it WEAKLY at runtime via dlsym(RTLD_DEFAULT) so
 # this library links + runs unchanged when MCR is absent (standalone recording).
 when defined(windows):
-  proc getModuleHandleA(name: cstring): pointer {.importc, stdcall, dynlib: "kernel32".}
-  proc getProcAddress(m: pointer, name: cstring): pointer {.importc, stdcall, dynlib: "kernel32".}
+  proc getModuleHandleA(name: cstring): pointer
+    {.importc: "GetModuleHandleA", stdcall, dynlib: "kernel32".}
+  proc getProcAddress(m: pointer, name: cstring): pointer
+    {.importc: "GetProcAddress", stdcall, dynlib: "kernel32".}
   proc resolveMcrSharedCtfsSym(): pointer {.raises: [].} =
     let m = getModuleHandleA(nil)  # this process's own image
     if m.isNil: return nil
