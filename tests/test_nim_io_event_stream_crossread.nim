@@ -69,11 +69,12 @@ proc main() =
   let genBin = tmp / "gen"
   var nimArgs = @["c", "-d:release", "-p:src", "--hints:off", "-o:" & genBin]
   let incRes = run("pkg-config", @["--variable=includedir", "libzstd"])
-  let libRes = run("pkg-config", @["--variable=libdir", "libzstd"])
   if incRes.code == 0 and incRes.output.strip().len > 0:
     nimArgs.add("--passC:-I" & incRes.output.strip())
-  if libRes.code == 0 and libRes.output.strip().len > 0:
-    nimArgs.add("--passL:-L" & libRes.output.strip())
+  when not defined(windows):
+    let libRes = run("pkg-config", @["--variable=libdir", "libzstd"])
+    if libRes.code == 0 and libRes.output.strip().len > 0:
+      nimArgs.add("--passL:-L" & libRes.output.strip())
   nimArgs.add(FixtureGen)
   let buildRes = run("nim", nimArgs, workdir = repoRoot)
   doAssert buildRes.code == 0,
