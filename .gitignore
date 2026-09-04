@@ -112,4 +112,5 @@ src/macro_sourcemap_*.json
 wasm/build/
 wasm/build-standalone/
 wasm/build-trace-writer-standalone/
+wasm/build-trace-reader-standalone/
 wasm/build-emscripten/
