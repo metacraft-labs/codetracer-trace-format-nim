@@ -68,6 +68,11 @@ task test, "Run all tests":
   exec "nim c -r -p:src tests/test_span_stream.nim"
   exec "nim c -r -d:release -p:src tests/test_multi_stream_integration.nim"
   exec "nim c -r -d:release -p:src tests/test_new_trace_reader.nim"
+  # The reader's `paths.json` fallback and the `["a","b"]` decoder underneath
+  # it, which replaced `std/json` there: `parseJson` reaches `parseFloat` and so
+  # libc's `strtod`, which no freestanding target defines, and the reader could
+  # not LINK for wasm32 over a float no container contains.
+  exec "nim c -r -d:release -p:src tests/test_paths_json_fallback.nim"
   exec "nim c -r -d:release -p:src tests/test_reader_calls_events.nim"
   exec "nim c -r -d:release -p:src tests/test_reader_integration.nim"
   # M24a-1: cross-read proof — a Nim-written production steps.dat is read by

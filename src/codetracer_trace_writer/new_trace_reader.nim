@@ -7,7 +7,7 @@
 ## and IO-event streams are initialized lazily on first access.
 
 import results
-import std/[json, options]
+import std/options
 import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
 import ../codetracer_ctfs/variable_record_table
@@ -119,6 +119,161 @@ type
     sourceViewsByPath: seq[seq[uint64]]
 
 # ---------------------------------------------------------------------------
+# paths.json
+# ---------------------------------------------------------------------------
+#
+# ``paths.json`` is the only JSON document this reader parses, and its schema
+# is fixed by the spec: an array of source-path strings. Reading it with
+# ``std/json`` costs far more than the schema does — ``parsejson`` reaches
+# ``parseFloat``, which reaches libc's ``strtod``, which a freestanding target
+# has no definition of. The module then fails to LINK for
+# ``wasm32-unknown-unknown`` over a float parser no ``.ct`` container ever
+# needs. The decoder below is the whole grammar the document can contain.
+
+proc appendUtf8(dest: var string, cp: uint32) =
+  ## Append one code point to ``dest`` in UTF-8, the encoding a Nim string
+  ## holding a path is already assumed to be in.
+  if cp < 0x80'u32:
+    dest.add(char(uint8(cp)))
+  elif cp < 0x800'u32:
+    dest.add(char(uint8(0xC0'u32 or (cp shr 6))))
+    dest.add(char(uint8(0x80'u32 or (cp and 0x3F'u32))))
+  elif cp < 0x10000'u32:
+    dest.add(char(uint8(0xE0'u32 or (cp shr 12))))
+    dest.add(char(uint8(0x80'u32 or ((cp shr 6) and 0x3F'u32))))
+    dest.add(char(uint8(0x80'u32 or (cp and 0x3F'u32))))
+  else:
+    dest.add(char(uint8(0xF0'u32 or (cp shr 18))))
+    dest.add(char(uint8(0x80'u32 or ((cp shr 12) and 0x3F'u32))))
+    dest.add(char(uint8(0x80'u32 or ((cp shr 6) and 0x3F'u32))))
+    dest.add(char(uint8(0x80'u32 or (cp and 0x3F'u32))))
+
+proc jsonSkipWs(text: string, i: var int) =
+  while i < text.len and (text[i] == ' ' or text[i] == '\t' or
+                          text[i] == '\n' or text[i] == '\r'):
+    i += 1
+
+proc jsonHex4(text: string, i: int, value: var uint32): bool =
+  ## Read the four hex digits of a ``\uXXXX`` escape starting at ``i``.
+  if i + 4 > text.len:
+    return false
+  value = 0
+  for k in 0 ..< 4:
+    let c = text[i + k]
+    var d: uint32
+    if c >= '0' and c <= '9': d = uint32(ord(c) - ord('0'))
+    elif c >= 'a' and c <= 'f': d = uint32(ord(c) - ord('a') + 10)
+    elif c >= 'A' and c <= 'F': d = uint32(ord(c) - ord('A') + 10)
+    else: return false
+    value = value * 16'u32 + d
+  true
+
+proc jsonParseString(text: string, i: var int, dest: var string): bool =
+  ## Decode one JSON string starting at the opening quote ``text[i]``, leaving
+  ## ``i`` just past the closing quote. Returns false on anything that is not
+  ## a well-formed string, which the caller treats as a malformed document.
+  if i >= text.len or text[i] != '"':
+    return false
+  i += 1
+  dest = ""
+  while i < text.len:
+    let c = text[i]
+    if c == '"':
+      i += 1
+      return true
+    if c == '\\':
+      i += 1
+      if i >= text.len:
+        return false
+      let e = text[i]
+      case e
+      of '"', '\\', '/':
+        dest.add(e)
+        i += 1
+      of 'b':
+        dest.add('\b')
+        i += 1
+      of 'f':
+        dest.add('\f')
+        i += 1
+      of 'n':
+        dest.add('\n')
+        i += 1
+      of 'r':
+        dest.add('\r')
+        i += 1
+      of 't':
+        dest.add('\t')
+        i += 1
+      of 'u':
+        i += 1
+        var cp: uint32 = 0
+        if not jsonHex4(text, i, cp):
+          return false
+        i += 4
+        if cp >= 0xD800'u32 and cp <= 0xDBFF'u32:
+          # A high surrogate carries only half a code point; the low half must
+          # follow as a second escape or the document is malformed.
+          if i + 1 >= text.len or text[i] != '\\' or text[i + 1] != 'u':
+            return false
+          i += 2
+          var lo: uint32 = 0
+          if not jsonHex4(text, i, lo):
+            return false
+          i += 4
+          if lo < 0xDC00'u32 or lo > 0xDFFF'u32:
+            return false
+          cp = 0x10000'u32 + ((cp - 0xD800'u32) shl 10) + (lo - 0xDC00'u32)
+        elif cp >= 0xDC00'u32 and cp <= 0xDFFF'u32:
+          return false  # a low surrogate with no high half before it
+        appendUtf8(dest, cp)
+      else:
+        return false
+    else:
+      if uint8(c) < 0x20'u8:
+        return false  # an unescaped control character
+      dest.add(c)
+      i += 1
+  false  # ran off the end before the closing quote
+
+proc decodeJsonStringArray*(text: string): Option[seq[string]] =
+  ## Decode ``["a", "b"]`` into its elements.
+  ##
+  ## Returns ``none`` for every document that is not an array of strings —
+  ## including an array holding a number or an object, which this reader has
+  ## no meaning for. ``none`` is the same outcome a malformed ``paths.json``
+  ## has always had at the call site: the fallback list stays empty and path
+  ## lookups fall through to the binary interning table's own error.
+  var i = 0
+  jsonSkipWs(text, i)
+  if i >= text.len or text[i] != '[':
+    return none(seq[string])
+  i += 1
+  var items: seq[string] = @[]
+  jsonSkipWs(text, i)
+  if i < text.len and text[i] == ']':
+    i += 1
+  else:
+    while true:
+      jsonSkipWs(text, i)
+      var s = ""
+      if not jsonParseString(text, i, s):
+        return none(seq[string])
+      items.add(s)
+      jsonSkipWs(text, i)
+      if i < text.len and text[i] == ',':
+        i += 1
+        continue
+      if i < text.len and text[i] == ']':
+        i += 1
+        break
+      return none(seq[string])
+  jsonSkipWs(text, i)
+  if i != text.len:
+    return none(seq[string])
+  some(items)
+
+# ---------------------------------------------------------------------------
 # Opening
 # ---------------------------------------------------------------------------
 
@@ -163,14 +318,9 @@ proc openNewTraceFromBytes*(data: seq[byte],
         var pathsTxt = newString(pathsBytes.len)
         for i, b in pathsBytes:
           pathsTxt[i] = char(b)
-        try:
-          let parsed = parseJson(pathsTxt)
-          if parsed.kind == JArray:
-            for item in parsed.elems:
-              if item.kind == JString:
-                reader.pathsJson.add(item.getStr(""))
-        except CatchableError:
-          discard  # malformed paths.json — leave the fallback empty
+        let parsed = decodeJsonStringArray(pathsTxt)
+        if parsed.isSome:
+          reader.pathsJson = parsed.get()
 
   # P6.5 / Layout A — when the trace is column-aware, parse each
   # paths.dat record as
