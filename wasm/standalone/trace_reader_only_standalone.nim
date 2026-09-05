@@ -6,15 +6,19 @@
 ## and never records one should not carry a writer, a Zstd compressor or a
 ## container allocator it will not call.
 ##
-## This module imports `new_trace_reader` and nothing that writes. Its size is
-## therefore the honest answer to "what does reading cost", and its link is the
-## honest answer to "does the READER surface stand on its own" — a module that
-## also links a writer could be linking the writer's copy of a symbol.
+## This module imports the reader surface and nothing that writes: the
+## multi-stream reader, the span-stream reader, and the reader for the
+## `linehits.tc` namespace. Its size is therefore the honest answer to "what
+## does reading cost", and its link is the honest answer to "does the READER
+## surface stand on its own" — a module that also links a writer could be
+## linking the writer's copy of a symbol.
 ##
 ## Build: see `wasm/build-trace-reader-standalone.sh`.
 
 import results
 import ../../src/codetracer_trace_writer/new_trace_reader
+import ../../src/codetracer_trace_writer/span_stream
+import ../../src/codetracer_trace_writer/linehits_reader
 import ./trace_reader_corpus
 
 include ./trace_reader_abi

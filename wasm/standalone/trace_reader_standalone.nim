@@ -18,14 +18,17 @@
 ## its header for why both exist.
 ##
 ## The query exports below exist so the adjudication is not "the module said
-## zero". The host reads step counts, decoded positions and interned strings
-## back out and compares them against expectations computed from the corpus
-## definition, so a reader that returned a plausible wrong answer is caught.
+## zero". The host reads step counts, decoded positions, interned strings,
+## source views, IO events, spans and line hits back out and compares them
+## against expectations computed from the corpus definition, so a reader that
+## returned a plausible wrong answer is caught.
 ##
 ## Build: see `wasm/build-trace-reader-standalone.sh`.
 
 import results
 import ../../src/codetracer_trace_writer/new_trace_reader
+import ../../src/codetracer_trace_writer/span_stream
+import ../../src/codetracer_trace_writer/linehits_reader
 import ./trace_reader_corpus
 import ./trace_reader_corpus_build
 
@@ -58,9 +61,18 @@ proc ctSelftest(): int32 {.exportc: "ct_selftest", cdecl.} =
   ##
   ## Runs `NimMain` itself so a wasm engine with no host glue at all can
   ## adjudicate it: `wasmtime run --invoke ct_selftest` prints the result.
-  ## 0 means the container was built and every field decoded as expected;
-  ## anything else is the failing check from `verifyCorpus`, or 1 if the
-  ## write failed.
+  ## 0 means both containers were built and every field decoded as expected;
+  ## anything else is the failing check from `verifyCorpus` /
+  ## `verifyLegacyCorpus`, or 1 if a write failed.
+  ##
+  ## The legacy container is built here rather than only host-side because the
+  ## legacy DECODERS are the ones with no other coverage on this target: they
+  ## are selected by three meta.dat bits that this repo's writer never clears,
+  ## so nothing else in the build path executes them.
   nimMain()
   if ctBuild() != 0: return 1
-  verifyCorpus(built)
+  let mainRc = verifyCorpus(built)
+  if mainRc != 0: return mainRc
+  let legacy = buildLegacyCorpus()
+  if legacy.isErr: return 1
+  verifyLegacyCorpus(legacy.get())
