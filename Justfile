@@ -71,6 +71,15 @@ lint-nim:
 lint-nix:
     nixfmt --check flake.nix
 
+# `--self-test` is hermetic; the bare run resolves against the network, and
+# skips rather than fails when the network is unreachable and $CI is unset.
+# Kept out of `lint` so `just lint` stays usable offline.
+
+# Check CI refs for branches that no longer exist
+check-ci-refs:
+    ci/check-ci-refs.sh --self-test
+    ci/check-ci-refs.sh
+
 # --- Format -----------------------------------------------------------
 
 # Nim ships `nimpretty`, but it is not safe to run unattended over this

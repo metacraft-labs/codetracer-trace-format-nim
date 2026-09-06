@@ -14,11 +14,15 @@ name: CI (reprobuild)
 # lands, this workflow exercises it end-to-end on every supported
 # host without any other repo-side change.
 
+# `main` was deleted from this remote; both filters listed it, which was
+# inert (an entry matching nothing never fires, and `dev`/`stable` are live)
+# but misleading. Dropping it changes no behaviour and removes cruft the
+# ref-rot gate would otherwise keep reporting.
 on:
   push:
-    branches: [main, dev, stable]
+    branches: [dev, stable]
   pull_request:
-    branches: [main, dev, stable]
+    branches: [dev, stable]
 
 jobs:
   reprobuild:
