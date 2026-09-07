@@ -80,6 +80,39 @@ jobs:
       - name: Install Nim dependencies
         run: nimble install -y stew results
 
+      - name: Clone the sibling codetracer-trace-format (shared test fixtures)
+        # tests/test_trace_storage_config.nim reads the CANONICAL trace-storage
+        # JSON fixtures from the sibling Rust repo, so that both
+        # implementations are pinned to one copy of the wire contract:
+        # `fixturePath` walks up from the cwd looking for
+        # <ancestor>/codetracer-trace-format/codetracer_ctfs/tests/fixtures/
+        # trace_storage/<name>. On a developer machine the sibling checkout
+        # happens to be there, so the test passes locally while depending on
+        # something the workstation supplies invisibly; on a clean runner the
+        # fixtures are absent and the test raises IOError. Supply the sibling
+        # rather than skip the test — it is a cross-implementation conformance
+        # check and skipping it would delete the coverage it exists for.
+        #
+        # `..` is outside $GITHUB_WORKSPACE, which actions/checkout refuses, so
+        # this is a plain clone. Cloning at that exact path also satisfies the
+        # `../codetracer-trace-format` that the three test_nim_*_crossread
+        # proofs look for.
+        #
+        # AUTHENTICATED even though the repo is public: an anonymous clone is
+        # what GitHub's "temporarily limiting some unauthenticated downloads"
+        # rate limit refuses, and that refusal (exit 128) is precisely what
+        # kills the eph-linux-x64 leg of ci-reprobuild.yml today.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer-trace-format.git" \
+            ../codetracer-trace-format
+          echo "sibling codetracer-trace-format at $(git -C ../codetracer-trace-format rev-parse HEAD)"
+          # Fail loudly HERE if the shared fixtures moved, rather than 60
+          # tests later as a bare IOError from a test that looks unrelated.
+          ls ../codetracer-trace-format/codetracer_ctfs/tests/fixtures/trace_storage/
+
       # ------------------------------------------------------------------
       # The suite itself.
       # ------------------------------------------------------------------
