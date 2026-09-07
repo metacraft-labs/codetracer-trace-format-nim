@@ -3216,16 +3216,26 @@ proc ct_reader_workdir(h: pointer, outLen: ptr csize_t): ptr uint8 {.exportc, cd
 # Global line index resolution helper
 # ---------------------------------------------------------------------------
 #
-# The multi-stream writer encodes steps as globalLineIndex values using a
-# prefix-sum over per-file line counts (DefaultLinesPerFile = 100_000 per
-# file). To convert back to (path_id, line), the reader must reconstruct
-# the same prefix-sum. We build it lazily from the path count.
+# A line-only step is one integer that addresses one line, and the container
+# says nothing about how the integers were apportioned between files. The
+# space rebuilt here is `codetracer_trace_format_nim`'s own writer's —
+# `prefixSum[path_id] + line` over `DefaultLinesPerFile` addresses per file
+# — which is an assumption about the producer, not a property of the trace.
+# The Rust `codetracer_trace_writer` writes the same container format with a
+# different packing, `(path_id shl 32) or line`.
+#
+# Every accessor below therefore resolves through `tryResolve`, which
+# refuses an index this space cannot address rather than clamping it into a
+# file that exists. A caller that gets the refusal is holding a trace whose
+# positions this reader cannot interpret; a caller that gets a location has
+# one whose positions are at least consistent with the assumption named
+# above.
 
 import codetracer_trace_writer/global_line_index
 
 proc getOrBuildGli(rh: TraceReaderHandle): GlobalLineIndex =
-  ## Build a GlobalLineIndex from the reader's path count, using the same
-  ## DefaultLinesPerFile constant the writer uses.
+  ## Rebuild the writer's line-only address space from the reader's path
+  ## count. See the note above on what the reconstruction assumes.
   let pathCount = rh[].pathCount()
   var counts = newSeq[uint64](int(pathCount))
   for i in 0 ..< int(pathCount):
@@ -3243,10 +3253,11 @@ proc ct_reader_step_location(
   ## Resolve step N to its source location (path_id, line).
   ## Returns 0 on success, non-zero on failure.
   ##
-  ## Internally, steps are stored as globalLineIndex values (a prefix-sum
-  ## encoding of path_id + line). This function resolves deltas within
-  ## the exec stream chunk and then maps the absolute GLI back to
-  ## (path_id, line) using the same DefaultLinesPerFile the writer used.
+  ## Resolves deltas within the exec stream chunk, then inverts the
+  ## absolute `global_position_index` through the writer's line-only
+  ## address space. When the index is not one that space can address the
+  ## call FAILS with the reason in `trace_writer_last_error` rather than
+  ## reporting a location — see the note above `getOrBuildGli`.
   if h.isNil or outPathId.isNil or outLine.isNil:
     setError("NULL parameter")
     return 1.cint
@@ -3259,9 +3270,12 @@ proc ct_reader_step_location(
     return 1.cint
   let globalIdx = gliRes.get()
 
-  # Resolve GLI to (path_id, line) using the same prefix-sum the writer used
   let gli = getOrBuildGli(rh)
-  let (pathId, line) = gli.resolve(globalIdx)
+  let resolved = gli.tryResolve(globalIdx)
+  if resolved.isErr:
+    setError("step " & $n & ": " & resolved.error)
+    return 1.cint
+  let (pathId, line) = resolved.get()
   outPathId[] = uint64(pathId)
   outLine[] = line
   0.cint
@@ -3314,7 +3328,11 @@ proc ct_reader_step_locations(
   let pidArr = cast[ptr UncheckedArray[uint64]](outPathIds)
   let lineArr = cast[ptr UncheckedArray[uint64]](outLines)
   for i in 0 ..< int(written):
-    let (pathId, line) = gli.resolve(glis[i])
+    let resolved = gli.tryResolve(glis[i])
+    if resolved.isErr:
+      setError("step " & $(startN + uint64(i)) & ": " & resolved.error)
+      return high(uint64)
+    let (pathId, line) = resolved.get()
     pidArr[i] = uint64(pathId)
     lineArr[i] = line
   written
@@ -3372,7 +3390,11 @@ proc ct_reader_step_locations_with_columns(
     # Legacy line-only trace: GLI resolves directly via prefix-sum.
     let gli = getOrBuildGli(rh)
     for i in 0 ..< int(written):
-      let (pathId, line) = gli.resolve(glis[i])
+      let resolved = gli.tryResolve(glis[i])
+      if resolved.isErr:
+        setError("step " & $(startN + uint64(i)) & ": " & resolved.error)
+        return high(uint64)
+      let (pathId, line) = resolved.get()
       pidArr[i] = uint64(pathId)
       lineArr[i] = line
       colArr[i] = 0
@@ -3405,7 +3427,11 @@ proc ct_reader_step_locations_with_columns(
     else:
       # Fall back to line-only resolution.  Column = 1 mirrors the
       # column-tracking cursor's default when per-line data is absent.
-      let (pathId, line) = gliFallback.resolve(glis[i])
+      let resolved = gliFallback.tryResolve(glis[i])
+      if resolved.isErr:
+        setError("step " & $(startN + uint64(i)) & ": " & resolved.error)
+        return high(uint64)
+      let (pathId, line) = resolved.get()
       pidArr[i] = uint64(pathId)
       lineArr[i] = line
       colArr[i] = 1

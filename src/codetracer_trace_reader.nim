@@ -375,15 +375,23 @@ proc readEventsV4(reader: var TraceReader): Result[void, string] =
     return err("failed to read step count: " & stepCountRes.error)
   let totalSteps = stepCountRes.get()
 
-  # Build a GLI matching the writer (DefaultLinesPerFile per file).
-  # IMPORTANT: this MUST stay in lock-step with
-  # `codetracer_trace_writer/multi_stream_writer.DefaultLinesPerFile`.
-  # If a future writer revision changes the assumed density (or starts
-  # writing per-file true line counts into the trace), this reader will
-  # silently misinterpret the (fileId, line) of every step. When that
-  # happens the writer should expose the counts via trace metadata and
-  # this code should read them back instead of assuming a constant.
-  const DefaultLinesPerFile: uint64 = 100_000
+  # The line-only address space this reader inverts steps through.
+  #
+  # A line-only `global_position_index` is an integer that addresses one
+  # line, and nothing in the container says how the integers were
+  # apportioned between files: no stride, no per-file line count, no
+  # producer identifier. Inverting one is therefore an assumption about the
+  # producer, and the assumption made here is `codetracer_trace_format_nim`'s
+  # own writer — `prefixSum[path_id] + line` over `DefaultLinesPerFile`
+  # addresses per file (`multi_stream_writer.toGlobalLineIndex`).
+  #
+  # It is not the only packing in circulation. The Rust
+  # `codetracer_trace_writer` produces the same container format and packs
+  # `(path_id shl 32) or line` (`step_stream.rs pack_global_line_index`),
+  # which `codetracer/src/db-backend` round-trips through for its own
+  # step streams. `tryResolve` is what keeps a trace from the other writer
+  # from being answered instead of reported: its positions land above the
+  # top of this space and the read fails by name.
   var lineCounts = newSeq[uint64](reader.paths.len)
   for i in 0 ..< reader.paths.len:
     lineCounts[i] = DefaultLinesPerFile
@@ -542,7 +550,10 @@ proc readEventsV4(reader: var TraceReader): Result[void, string] =
       else:
         let absGli = nr.stepAbsoluteGlobalLineIndex(n)
         if absGli.isOk and reader.paths.len > 0:
-          let (fileId, line) = gli.resolve(absGli.get())
+          let resolved = gli.tryResolve(absGli.get())
+          if resolved.isErr:
+            return err("step " & $n & ": " & resolved.error)
+          let (fileId, line) = resolved.get()
           var rec = StepRecord(pathId: PathId(uint64(fileId)),
                                line: Line(int64(line)))
           if cursorHasColumn:

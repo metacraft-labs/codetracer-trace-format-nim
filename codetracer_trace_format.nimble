@@ -79,6 +79,13 @@ task test, "Run all tests":
   # the bytes answers a line-only trace with a truncated path, a fabricated
   # per-file line table and the wrong step line — with no error.
   exec "nim c -r -d:release -p:src tests/test_paths_dat_layout_authority.nim"
+  # A line-only global_position_index says nothing about how its integers were
+  # apportioned between files, and the two writers of this container format
+  # disagree — prefixSum[path_id] + line here, (path_id shl 32) or line in the
+  # Rust codetracer_trace_writer. Inverting one is an assumption, so it has to
+  # be a falsifiable one: an address outside the space is refused by name
+  # rather than clamped into a file that exists.
+  exec "nim c -r -d:release -p:src tests/test_line_only_position_space.nim"
   # The column-aware step encoding end to end: the writer's opt-in, the
   # DeltaColumn round-trip, Layout A paths.dat, the position decoder, and the
   # meta.dat unknown-flag-bit rejection that keeps the extension clean.
@@ -133,6 +140,12 @@ task test, "Run all tests":
   # caller's opt-in recovery — which refuses by name rather than falling back.
   # Same FFI-`include` compile requirements as the tests above.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_reader_ffi_column_aware_paths.nim"
+  # The C ABI's step-location accessors — what codetracer's db-backend turns
+  # into DAP stackTrace frames — refuse a line-only position their address
+  # space cannot address instead of clamping it into a file that exists, and
+  # still answer every position this repository's writer produces.
+  # Same FFI-`include` compile requirements as the tests above.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_reader_ffi_line_only_position_space.nim"
   # The C ABI's in-memory constructors: an embedder with no filesystem gets a
   # container's BYTES rather than a file. Carries its own positive control (the
   # file arm, in the same directory) and its own mutation control (one extra

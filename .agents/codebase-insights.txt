@@ -94,6 +94,52 @@
   events.log-only bundle was opened by the v4 reader and produced an empty
   event array (lazy split readers found nothing).
 
+## The line-only global_position_index has TWO packings and no discriminator
+A pre-extension trace's step position is one varint that "addresses one line"
+(spec trace-events.md §"Back-Compatibility"). The spec does not say how the
+integers are apportioned between files, and a container records nothing about
+it — no stride, no per-file line count, no producer id. Two writers of this
+format disagree:
+
+- this repo — `prefixSum[path_id] + line`, DefaultLinesPerFile (100_000)
+  addresses per file. multi_stream_writer.toGlobalLineIndex + global_line_index.
+- the Rust codetracer_trace_writer — `(path_id shl 32) or line`.
+  step_stream.rs pack_global_line_index / unpack_global_line_index. Its own
+  module doc says the divergence "is *not* repaired here".
+
+So inverting one is an assumption about the producer. `global_line_index.
+tryResolve` states it and refuses addresses that contradict it (>= totalLines);
+`resolve` is the unchecked form that clamps to the last file and answers with a
+path id that exists. Every reader path here that handles a position from a
+container uses tryResolve. Re-derived: 2 paths, step at (path 1, line 7) is
+100007 under this repo's packing and 4294967303 under the Rust one; feeding
+4294967301 (Rust's (1,5)) to the unchecked resolve gives (path 1, line
+4294867301). See tests/test_line_only_position_space.nim.
+
+STILL OPEN, all outside this repo's fix:
+- step_map_builder.recordStep keys `step-map.ns` by unpackGlobalLineIndex of
+  the EXEC-STREAM gli, i.e. it applies the RUST inverse to a NIM-packed
+  integer, deliberately (see its module header) so the on-disk map matches
+  db-backend's derivation. Re-derived: a step written at (path 1, line 7) is
+  indexed at (path 0, line 100007).
+- codetracer/src/db-backend/src/ctfs_trace_reader inverts the same steps.dat
+  two ways: the LAZY path via unpack_global_line_index, the EAGER path via this
+  repo's FFI. mod.rs asserts they agree; they cannot both be right.
+- ct-print (src/codetracer_ct_print.nim resolveGli/resolveStepLocation,
+  src/codetracer_ct_print_lib.nim resolveGli) still uses the unchecked resolve.
+- new_trace_reader.ensurePositionTables gives a COLUMN-AWARE file with no
+  line-length table size 0, where multi_stream_writer.rebuildGli gives it
+  DefaultLinesPerFile. Re-derived on a mixed trace (file 0 lengths [10,10],
+  file 1 none): a step at (file 1, line 1) encodes to 21,
+  decodeGlobalPositionIndex refuses it, and the line-only fallback answers
+  (file 0, line 21).
+
+## test_path_filter needs libpcre on the loader path
+It uses std/re, which dlopens libpcre.so at runtime. The dev shell does not put
+pcre on LD_LIBRARY_PATH, so a bare `nimble test` fails there with "could not
+load: libpcre.so(.3|.1|)". repro.nim links pcre directly for its own edge; for
+`nimble test` prepend a pcre lib dir to LD_LIBRARY_PATH.
+
 ## Known PRE-EXISTING test failures on dev (NOT caused by M23e-1 work)
 - tests/test_column_aware_steps.nim test_strict_meta_flag_rejection: picks a
   bit that is supposed to be unallocated and asserts readMetaDat rejects it,

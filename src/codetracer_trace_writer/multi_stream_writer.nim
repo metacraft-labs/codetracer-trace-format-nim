@@ -32,11 +32,12 @@ import ../codetracer_trace_types
 export results, value_stream.VariableValue, io_event_stream.IOEventKind,
        codetracer_trace_types.FilterProvenance, uuid_v7
 
-const
-  DefaultLinesPerFile*: uint64 = 100_000
-    ## Default assumed line count per file for GlobalLineIndex.
-    ## The real line counts would come from source files, which we
-    ## don't have at this level.
+# The line-only address-space stride, re-exported for the consumers that
+# reach it through this module. It is defined beside the prefix-sum
+# arithmetic in `global_line_index` because encoding with one value and
+# inverting with another produces plausible wrong positions that no
+# container check can catch.
+export global_line_index.DefaultLinesPerFile
 
 type
   SourceViewRecord* = object

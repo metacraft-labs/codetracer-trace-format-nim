@@ -132,11 +132,15 @@ const
 # --nimMainPrefix:codetracerTraceWriter`` compile reason (``TestSpec`` has
 # no field for either flag) — but unlike the two above these DO run, in the
 # nimble ``test`` task and therefore in ``just test``:
-# ``tests/test_line_only_orphan_carry_forward.nim`` and
-# ``tests/test_orphan_call_args_step_location.nim``. Both drive the C FFI
-# entry points directly to pin ``flushPendingStep``'s orphan-values
-# branch. Teaching ``TestSpec`` about the two flags so reprobuild covers
-# them as well is worth doing and is tracked separately.
+# ``tests/test_line_only_orphan_carry_forward.nim``,
+# ``tests/test_orphan_call_args_step_location.nim``,
+# ``tests/test_reader_ffi_column_aware_paths.nim`` and
+# ``tests/test_reader_ffi_line_only_position_space.nim``. All four drive the
+# C FFI entry points directly — the first two to pin ``flushPendingStep``'s
+# orphan-values branch, the last two to pin what the ABI does with a
+# ``paths.dat`` layout and a step position it cannot resolve on its own.
+# Teaching ``TestSpec`` about the two flags so reprobuild covers them as
+# well is worth doing and is tracked separately.
 const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_base40.nim", binary: "build/test-bin/test_base40"),
   TestSpec(source: "tests/test_container.nim", binary: "build/test-bin/test_container"),
@@ -178,6 +182,7 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_multi_stream_integration.nim", binary: "build/test-bin/test_multi_stream_integration"),
   TestSpec(source: "tests/test_new_trace_reader.nim", binary: "build/test-bin/test_new_trace_reader"),
   TestSpec(source: "tests/test_paths_dat_layout_authority.nim", binary: "build/test-bin/test_paths_dat_layout_authority"),
+  TestSpec(source: "tests/test_line_only_position_space.nim", binary: "build/test-bin/test_line_only_position_space"),
   TestSpec(source: "tests/test_reader_calls_events.nim", binary: "build/test-bin/test_reader_calls_events"),
   TestSpec(source: "tests/test_reader_integration.nim", binary: "build/test-bin/test_reader_integration"),
   TestSpec(source: "tests/test_nim_step_stream_crossread.nim", binary: "build/test-bin/test_nim_step_stream_crossread", pooled: true),
