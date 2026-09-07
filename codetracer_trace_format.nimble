@@ -127,6 +127,24 @@ task test, "Run all tests":
   # and the flow view rendered program output one source line too high.
   # Same FFI-`include` compile requirements as the two tests above.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_io_event_pending_step_attribution.nim"
+  # Previously reachable ONLY through `repro.nim`'s collection, i.e. only via
+  # `.github/workflows/ci-reprobuild.yml` — a lane that has never once been
+  # green (0 successes in 39 runs), so in practice these ran in no CI at all.
+  # The four reader/network suites were covered by the deleted `test.yml`
+  # until 2026-07-11; the rest never were. `repro.nim` already documents that
+  # every one of them "compiles and runs to exit 0 with -d:release -p:src",
+  # which is the flag pair used here. Listing them in the canonical task is
+  # what stops the two collections drifting apart again.
+  exec "nim c -r -d:release -p:src tests/test_cross_format.nim"
+  exec "nim c -r -d:release -p:src tests/test_query_protocol.nim"
+  exec "nim c -r -d:release -p:src tests/test_network_reader.nim"
+  exec "nim c -r -d:release -p:src tests/test_replication.nim"
+  exec "nim c -r -d:release -p:src tests/test_column_aware_steps.nim"
+  exec "nim c -r -d:release -p:src tests/test_ct_print_full.nim"
+  exec "nim c -r -d:release -p:src tests/test_ct_print_native.nim"
+  exec "nim c -r -d:release -p:src tests/test_managed_sender.nim"
+  exec "nim c -r -d:release -p:src tests/test_reader_v4.nim"
+  exec "nim c -r -d:release -p:src tests/test_source_views.nim"
 
 task regenerateFixtures, "Regenerate .expected golden fixture files":
   exec "nim c -r tests/generate_golden_fixtures.nim"

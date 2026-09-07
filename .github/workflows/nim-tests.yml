@@ -1,0 +1,160 @@
+name: Nim tests
+
+# The repo's portable test lane: the canonical `nimble test` corpus plus the
+# C-FFI smoke test, on a GitHub-HOSTED runner.
+#
+# Why this exists separately from `ci-reprobuild.yml`:
+#
+#   * `ci-reprobuild.yml` is the full 5-platform matrix, but four of its five
+#     legs request self-hosted runner labels (`eph-linux-arm64`,
+#     `eph-macos-arm64`, `eph-win-x64`, `eph-win-arm64`) that no runner in the
+#     fleet currently offers, so those legs sit queued until the 24h
+#     "exceeded the maximum execution time while awaiting a runner" timeout.
+#     The one leg that does get a runner (`eph-linux-x64`) dies inside the
+#     `setup-dev-env` composite action before any project code is compiled.
+#     That workflow has never been green: 0 successes in 39 runs.
+#
+#   * This repo therefore had NO working CI. The lane that used to work
+#     (`.github/workflows/test.yml`, 16 green runs) was deleted in c2f3dfc on
+#     the stated grounds that it was "covered by ci-reprobuild.yml on all
+#     classes" — but ci-reprobuild.yml had already failed every run it had
+#     ever made, so the coverage it was retired in favour of did not exist.
+#
+# This lane depends on nothing but the runner: no self-hosted labels, no
+# GitHub App token, no sibling checkouts, no Nix. It is deliberately narrow in
+# PLATFORM (linux/x64 only) and complete in CORPUS — the opposite trade to
+# ci-reprobuild.yml, which is broad in platform and has never run a test.
+# Restoring the platform matrix is a runner-fleet task, not a repo task.
+
+on:
+  push:
+    branches: [main, dev, stable, 'ci/**']
+  pull_request:
+    branches: [main, dev, stable]
+  workflow_dispatch:
+
+concurrency:
+  group: nim-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: linux-x64 — nimble test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        # Explicit `shell: bash` runs steps under `bash --noprofile --norc
+        # -eo pipefail`. The DEFAULT shell has no `pipefail`, which would make
+        # `nimble test | tee ...` below report the exit status of `tee` (always
+        # 0) and turn every test failure into a green run.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        # libzstd  — the CTFS chunk codec (`zstd.h` is #included by the
+        #            seekable-zstd bindings, and test_ffi links -lzstd).
+        # libpcre3 — tests/test_path_filter.nim uses std/re, whose PCRE
+        #            binding dlopen()s libpcre at RUNTIME. Without it the
+        #            test compiles and then dies at startup.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libzstd-dev libpcre3-dev
+
+      - name: Install Nim 2.2.4
+        env:
+          # Pinned rather than "whatever choosenim serves today" so a Nim
+          # release cannot turn this lane red on its own. The .nimble
+          # declares `requires "nim >= 2.2.0"`.
+          CHOOSENIM_CHOOSE_VERSION: 2.2.4
+        run: |
+          curl https://nim-lang.org/choosenim/init.sh -sSf | sh -s -- -y
+          echo "$HOME/.nimble/bin" >> "$GITHUB_PATH"
+
+      - name: Report toolchain
+        run: |
+          nim --version | head -1
+          nimble --version | head -1
+
+      - name: Install Nim dependencies
+        run: nimble install -y stew results
+
+      # ------------------------------------------------------------------
+      # The suite itself.
+      # ------------------------------------------------------------------
+
+      - name: nimble test
+        # `just test-nim`. Every `exec` in the .nimble `test` task runs in
+        # sequence and a non-zero exit aborts the task, so reaching the end
+        # means every declared test compiled AND exited 0.
+        run: nimble test 2>&1 | tee nimble-test.log
+
+      - name: nimble testFfi
+        # `just test-ffi`: builds libcodetracer_trace_writer.a, checks the MT1
+        # replay-observation chokepoint symbols are exported, then compiles
+        # and runs tests/test_ffi.c against it.
+        run: nimble testFfi 2>&1 | tee nimble-testffi.log
+
+      - name: Verify the library still compiles GC-free as a static lib
+        # Carried over from the retired test.yml — it is the only check that
+        # the CTFS core stays usable from a --noMain staticlib embedding.
+        run: nim c --mm:arc --app:staticlib --noMain -p:src src/codetracer_ctfs.nim
+
+      # ------------------------------------------------------------------
+      # Make the green account for itself.
+      # ------------------------------------------------------------------
+
+      - name: Reconcile tests run against tests declared
+        # A green that ran nothing is the failure mode this lane exists to
+        # rule out. `nimble test` aborting on first failure proves the tests
+        # that RAN passed; it proves nothing about how many ran. So: parse the
+        # test sources the .nimble task declares and require that every one of
+        # them left a compiled binary behind. A silently shortened task, or a
+        # test dropped from the list, shows up here as a count mismatch rather
+        # than as a smaller green.
+        run: |
+          python3 - <<'PY'
+          import re, sys, os
+          src = open('codetracer_trace_format.nimble').read()
+          task = src.split('task test,')[1].split('task regenerateFixtures')[0]
+          sources = re.findall(r'exec "nim c[^"]*?(tests/\S+?\.nim)"', task)
+          missing = [s for s in sources if not os.path.exists(s[:-4])]
+          print(f"declared in the nimble `test` task : {len(sources)}")
+          print(f"compiled binaries present          : {len(sources) - len(missing)}")
+          if missing:
+              print("\nDECLARED BUT NEVER BUILT:")
+              for m in missing:
+                  print("  ", m)
+              sys.exit(1)
+          if len(sources) < 70:
+              print(f"\nThe task declares only {len(sources)} tests; it had 76 "
+                    "when this check was written. If that shrank on purpose, "
+                    "update this floor in the same commit.")
+              sys.exit(1)
+          print("\nOK: every declared test was compiled and run.")
+          PY
+
+      - name: Report what the suite SKIPPED
+        # Some tests short-circuit when an optional dependency is absent and
+        # still exit 0 — notably the three `test_nim_*_crossread` proofs, which
+        # need the sibling Rust checkout (`../codetracer-trace-format`) that a
+        # GitHub-hosted runner does not have. That is legitimate, but it must
+        # be VISIBLE: a skip that no one can see is indistinguishable from
+        # coverage. Printed, not failed.
+        if: always()
+        run: |
+          echo "Lines reporting a skipped test:"
+          grep -n -i -E '(^|[^a-z])(skip|skipped)' nimble-test.log nimble-testffi.log || \
+            echo "  (none — every test in the corpus executed its assertions)"
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nim-test-logs
+          path: |
+            nimble-test.log
+            nimble-testffi.log
+          retention-days: 14
+          if-no-files-found: warn

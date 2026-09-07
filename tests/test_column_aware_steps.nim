@@ -465,19 +465,33 @@ proc test_strict_meta_flag_rejection() {.raises: [].} =
   ## net that makes the column extension's bit-4 break clean for
   ## older readers (and gives every future bit allocation the same
   ## guarantee).
-  # Bit 13 (= 0x2000) is a still-reserved bit: bits 0-5 and 8-12 are
+  # Bit 14 (= 0x4000) is a still-reserved bit: bits 0-5 and 8-13 are
   # allocated in ``KnownFlags`` (MCR/replay/layout/filter/column/
   # source-views + the M17a/M23a-d call/step/value/io/interning stream
-  # flags — bit 8 is ``FlagHasCallStream``), and bits 6/7 predate them.
-  # Earlier iterations of this test used bit 5 (then 6, then 8) — keep
-  # the test in sync with the latest allocated range so it exercises a
-  # genuinely-unknown bit and keeps the unknown-bit rejection contract
-  # enforced.
-  const FirstReservedBit: uint16 = 0x2000
+  # flags — bit 8 is ``FlagHasCallStream`` — and the RS-M1 span-stream
+  # flag ``FlagHasSpanStream`` at bit 13), and bits 6/7 predate them.
+  # ``meta_dat.nim`` leaves bits 14 and 15 deliberately UNALLOCATED.
+  # Earlier iterations of this test used bit 5 (then 6, then 8, then
+  # 13) — keep the test in sync with the latest allocated range so it
+  # exercises a genuinely-unknown bit and keeps the unknown-bit
+  # rejection contract enforced.
+  const FirstReservedBit: uint16 = 0x4000
+  # Tripwire: allocating ``FirstReservedBit`` in ``KnownFlags`` turns the
+  # assertion below into a claim that a KNOWN bit is rejected, which is
+  # false by construction and used to surface only as a bare
+  # ``AssertionDefect`` 480 lines into the file. Fail at COMPILE time with
+  # the actual instruction instead: pick the next unallocated bit (and if
+  # none is left, the flag word is exhausted — see meta_dat.nim
+  # §"Flag-space exhaustion").
+  static:
+    doAssert (KnownFlags and FirstReservedBit) == 0'u16,
+      "test_strict_meta_flag_rejection: bit 0x" & toHex(FirstReservedBit) &
+      " is now allocated in KnownFlags (0x" & toHex(KnownFlags) & "). " &
+      "Bump FirstReservedBit to the next unallocated bit."
   let badBuf = handcraftMetaDatWithFlags(FirstReservedBit)
   let badRes = readMetaDat(badBuf)
   doAssert badRes.isErr,
-    "readMetaDat must reject meta.dat with unknown flag bit 8 set"
+    "readMetaDat must reject meta.dat with unknown flag bit 14 set"
 
   # Sanity check the error message mentions the unknown bits.
   doAssert "unknown flag" in badRes.error or
