@@ -20,8 +20,10 @@ name: Nim tests
 #     classes" — but ci-reprobuild.yml had already failed every run it had
 #     ever made, so the coverage it was retired in favour of did not exist.
 #
-# This lane depends on nothing but the runner: no self-hosted labels, no
-# GitHub App token, no sibling checkouts, no Nix. It is deliberately narrow in
+# This lane needs no self-hosted label, no GitHub App token and no Nix. Its
+# one cross-repo dependency is a public, token-authenticated shallow clone of
+# codetracer-trace-format for the shared trace-storage fixtures (see the step
+# for why the test cannot honestly run without it). It is deliberately narrow in
 # PLATFORM (linux/x64 only) and complete in CORPUS — the opposite trade to
 # ci-reprobuild.yml, which is broad in platform and has never run a test.
 # Restoring the platform matrix is a runner-fleet task, not a repo task.
@@ -93,10 +95,20 @@ jobs:
         # rather than skip the test — it is a cross-implementation conformance
         # check and skipping it would delete the coverage it exists for.
         #
-        # `..` is outside $GITHUB_WORKSPACE, which actions/checkout refuses, so
-        # this is a plain clone. Cloning at that exact path also satisfies the
-        # `../codetracer-trace-format` that the three test_nim_*_crossread
-        # proofs look for.
+        # Cloned INSIDE the workspace, deliberately. The walk starts at the cwd,
+        # so <workspace>/codetracer-trace-format is found on the first
+        # iteration. The three test_nim_*_crossread proofs resolve a different
+        # path — the literal `../codetracer-trace-format` — so they do NOT see
+        # this clone and keep skipping, which is correct for this lane: they
+        # shell out to `cargo test` in the Rust workspace, and providing a Rust
+        # toolchain + a crates.io build is a different CI capability from the
+        # Nim one this lane exists to supply. Cross-language proofs belong to
+        # ci-reprobuild.yml, whose setup-dev-env machinery is built to
+        # provision both sides; see the note at the top of this file for why
+        # that lane does not currently run. Placing the clone at `..` instead
+        # does un-skip them, and they then fail — tracked separately, see the
+        # report on run 34117554418: 37s of no output and a bare, EMPTY
+        # `AssertionDefect`, i.e. a check that cannot say why it failed.
         #
         # AUTHENTICATED even though the repo is public: an anonymous clone is
         # what GitHub's "temporarily limiting some unauthenticated downloads"
@@ -107,11 +119,11 @@ jobs:
         run: |
           git clone --depth 1 \
             "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer-trace-format.git" \
-            ../codetracer-trace-format
-          echo "sibling codetracer-trace-format at $(git -C ../codetracer-trace-format rev-parse HEAD)"
+            codetracer-trace-format
+          echo "sibling codetracer-trace-format at $(git -C codetracer-trace-format rev-parse HEAD)"
           # Fail loudly HERE if the shared fixtures moved, rather than 60
           # tests later as a bare IOError from a test that looks unrelated.
-          ls ../codetracer-trace-format/codetracer_ctfs/tests/fixtures/trace_storage/
+          ls codetracer-trace-format/codetracer_ctfs/tests/fixtures/trace_storage/
 
       # ------------------------------------------------------------------
       # The suite itself.
