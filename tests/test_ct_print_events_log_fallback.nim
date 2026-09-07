@@ -187,8 +187,20 @@ proc ensureCtPrint() =
     let (cflags, c1) = execCmdEx("pkg-config --cflags libzstd")
     let (lflags, c2) = execCmdEx("pkg-config --libs libzstd")
     doAssert c1 == 0 and c2 == 0, "pkg-config libzstd failed"
-    zstdFlags = "--passC:" & quoteShell(cflags.strip()) & " " &
-      "--passL:" & quoteShell(lflags.strip()) & " "
+    # Emit a flag ONLY when pkg-config gave it a value. `--cflags` is empty
+    # whenever libzstd's headers are already on the compiler's default include
+    # path — true on a stock Linux distro, false under macOS/homebrew, which is
+    # why this bug was invisible on a workstation and broke on every clean
+    # Linux runner. A bare `--passC:` does not mean "no C flags": Nim takes the
+    # NEXT token as its value, so `--passL:-lzstd` was swallowed as a C flag
+    # and forwarded to gcc, which rejects it with
+    #   gcc: error: unrecognized command-line option '--passL:-lzstd'
+    # and ct-print then fails to build for a reason that names neither zstd
+    # nor pkg-config.
+    if cflags.strip().len > 0:
+      zstdFlags.add("--passC:" & quoteShell(cflags.strip()) & " ")
+    if lflags.strip().len > 0:
+      zstdFlags.add("--passL:" & quoteShell(lflags.strip()) & " ")
   let cmd = "nim c -d:release --mm:arc -p:src " & zstdFlags &
     "--hints:off --warnings:off " &
     "-o:" & quoteShell(ctPrintBin) & " " & quoteShell(ctPrintSrc)
