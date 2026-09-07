@@ -95,12 +95,15 @@
   event array (lazy split readers found nothing).
 
 ## Known PRE-EXISTING test failures on dev (NOT caused by M23e-1 work)
-- tests/test_column_aware_steps.nim test_strict_meta_flag_rejection: asserts
-  readMetaDat rejects flag bit 8 (0x100) as "unknown/reserved", but bit 8 is
-  FlagHasCallStream (allocated in M17a) — stale test, fails on clean dev.
+- tests/test_column_aware_steps.nim test_strict_meta_flag_rejection: picks a
+  bit that is supposed to be unallocated and asserts readMetaDat rejects it,
+  so it goes stale every time a flag bit is allocated (bit 5, then 6, then 8,
+  then 13 = FlagHasSpanStream). It now uses bit 14 (0x4000). When the next bit
+  is allocated in KnownFlags, move this test up with it — and note that a
+  failure here ABORTS the whole file, hiding the five column-aware tests that
+  run after it.
 - tests/test_ram_cache.nim: hard-coded perf threshold (<1000 ns/read) fails on
   slower/loaded machines (~2200 ns/read observed on macOS arm64). Timing flake.
-- Neither is in the nimble `test` task's hard path in a way M23e-1 touched.
 
 ## M34b: the nimble `test` task is GREEN (was 48 pass / 3 fail)
 Running every `exec` line of the nimble `test` task independently on

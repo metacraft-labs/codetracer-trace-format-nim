@@ -73,6 +73,16 @@ task test, "Run all tests":
   # libc's `strtod`, which no freestanding target defines, and the reader could
   # not LINK for wasm32 over a float no container contains.
   exec "nim c -r -d:release -p:src tests/test_paths_json_fallback.nim"
+  # meta.dat bit 4 is the sole authority on the paths.dat record layout: the
+  # line-only and Layout A record spaces overlap (a 97-byte ASCII path decodes
+  # as a complete Layout A record), so a reader that infers the layout from
+  # the bytes answers a line-only trace with a truncated path, a fabricated
+  # per-file line table and the wrong step line — with no error.
+  exec "nim c -r -d:release -p:src tests/test_paths_dat_layout_authority.nim"
+  # The column-aware step encoding end to end: the writer's opt-in, the
+  # DeltaColumn round-trip, Layout A paths.dat, the position decoder, and the
+  # meta.dat unknown-flag-bit rejection that keeps the extension clean.
+  exec "nim c -r -d:release -p:src tests/test_column_aware_steps.nim"
   exec "nim c -r -d:release -p:src tests/test_reader_calls_events.nim"
   exec "nim c -r -d:release -p:src tests/test_reader_integration.nim"
   # M24a-1: cross-read proof — a Nim-written production steps.dat is read by
@@ -117,6 +127,12 @@ task test, "Run all tests":
   # and the flow view rendered program output one source line too high.
   # Same FFI-`include` compile requirements as the two tests above.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_io_event_pending_step_attribution.nim"
+  # The C ABI's view of the paths.dat layout question: meta.dat bit 4 decides,
+  # `ct_reader_column_aware_paths_suspected` reports a record set that also
+  # decodes as Layout A, and `ct_reader_open_assume_column_aware_paths` is the
+  # caller's opt-in recovery — which refuses by name rather than falling back.
+  # Same FFI-`include` compile requirements as the tests above.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_reader_ffi_column_aware_paths.nim"
   # The C ABI's in-memory constructors: an embedder with no filesystem gets a
   # container's BYTES rather than a file. Carries its own positive control (the
   # file arm, in the same directory) and its own mutation control (one extra

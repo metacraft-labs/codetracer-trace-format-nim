@@ -78,6 +78,13 @@ type
     # not column-aware, this stays empty and column queries return
     # ``none``.
     lineLengths: seq[seq[uint32]]
+    # Advisory: the trace declares line-only paths.dat records, yet every
+    # record also decodes as a complete Layout A record.  Surfaced by
+    # `columnAwarePathsSuspected`; never used to reinterpret data.
+    layoutASuspected: bool
+    # The `assumeColumnAwarePaths` override this handle was opened with,
+    # kept so `refresh` re-opens the container under the same reading.
+    assumedColumnAwarePaths: bool
     # Per-file cumulative line-base table (prefix sum of lineLengths).
     # Built lazily on first column resolution.  ``lineBase[fileId][l]``
     # is the in-file offset where line ``l`` starts in the file's
@@ -274,18 +281,123 @@ proc decodeJsonStringArray*(text: string): Option[seq[string]] =
   some(items)
 
 # ---------------------------------------------------------------------------
+# paths.dat Layout A
+# ---------------------------------------------------------------------------
+
+const MaxProbeLineCount = 1_000_000
+  ## Upper bound on the ``line_count`` a *probe* will accept before
+  ## declaring a record not-Layout-A.  Sized to the largest source file
+  ## we'd plausibly see (a few hundred thousand lines covers the Linux
+  ## kernel's biggest translation unit).  The authoritative decode does
+  ## not apply it: a trace that declares Layout A is trusted about its
+  ## own line counts, and a corrupt count there surfaces as a decode
+  ## error on the line-length varints that follow.
+
+proc parseLayoutAPathRecords(pathReader: InterningTableReader,
+    probe: bool): Result[seq[seq[uint32]], string] =
+  ## Decode every ``paths.dat`` record as Layout A —
+  ## ``path_len + path_bytes + line_count + line_lengths`` (spec
+  ## §"paths.dat per-line offset table") — and return the per-file
+  ## line-length tables.
+  ##
+  ## ``probe`` selects between the two callers:
+  ##
+  ##   * ``probe = false`` (authoritative): the trace has *declared*
+  ##     Layout A, so a record that does not decode is a corrupt trace
+  ##     and the error names the record and the field that failed.
+  ##   * ``probe = true`` (advisory): the caller is asking whether a
+  ##     record set *could* be Layout A.  Extra structural conditions
+  ##     apply — printable path bytes, a bounded line count, and a parse
+  ##     that consumes the record exactly — and any failure is reported
+  ##     as a plain "not Layout A" rather than as corruption.
+  ##
+  ## A ``probe`` that returns ``ok`` is NOT proof of Layout A.  The
+  ## record space of the two layouts overlaps: a legitimate line-only
+  ## record holding the 97-byte ASCII path
+  ## ``'/' & 'a'.repeat(46) & "/0" & 'b'.repeat(48)`` decodes cleanly as
+  ## Layout A (path_len 47 from the leading ``'/'``, line_count 48 from
+  ## the ``'0'``, 48 line lengths from the ``'b'``s) and consumes the
+  ## record exactly.  Treat the result as a hint about a suspected
+  ## recorder bug, never as a licence to reinterpret the record.
+  let pathTotal = pathReader.count()
+  var llsAll = newSeq[seq[uint32]](int(pathTotal))
+  for i in 0'u64 ..< pathTotal:
+    let rawRes = pathReader.readRawById(i)
+    if rawRes.isErr:
+      return err("paths.dat[" & $i & "]: " & rawRes.error)
+    let raw = rawRes.get()
+    var pos = 0
+    let pathLenRes = decodeVarint(raw, pos)
+    if pathLenRes.isErr:
+      return err("paths.dat[" & $i & "]: column-aware path_len varint: " &
+        pathLenRes.error)
+    let pathLen = int(pathLenRes.get())
+    if pos + pathLen > raw.len:
+      return err("paths.dat[" & $i & "]: path_bytes truncated")
+    if probe:
+      if pos + pathLen >= raw.len:
+        # No room left for the line_count varint after the path bytes.
+        # A legacy record ends right after the raw path string.
+        return err("paths.dat[" & $i & "]: not Layout A (no line_count)")
+      for k in pos ..< pos + pathLen:
+        let b = raw[k]
+        # Reject control characters except tab — paths are filesystem
+        # names which the spec keeps within printable UTF-8 / ASCII.
+        if b < 0x09'u8 or (b > 0x0D'u8 and b < 0x20'u8):
+          return err("paths.dat[" & $i & "]: not Layout A (control byte in path)")
+    pos += pathLen
+    let lineCountRes = decodeVarint(raw, pos)
+    if lineCountRes.isErr:
+      return err("paths.dat[" & $i & "]: column-aware line_count varint: " &
+        lineCountRes.error)
+    let lineCount = int(lineCountRes.get())
+    if probe and lineCount > MaxProbeLineCount:
+      return err("paths.dat[" & $i & "]: not Layout A (line_count " &
+        $lineCount & " exceeds probe bound)")
+    var lls = newSeq[uint32](lineCount)
+    var prev: int64 = 0
+    for l in 0 ..< lineCount:
+      let dRes = decodeSignedVarint(raw, pos)
+      if dRes.isErr:
+        return err("paths.dat[" & $i & "]: line_length[" & $l & "]: " &
+          dRes.error)
+      let d = dRes.get()
+      let current = if l == 0: d else: prev + d
+      if current < 0:
+        return err("paths.dat[" & $i & "]: line_length[" & $l &
+          "] negative: " & $current)
+      lls[l] = uint32(current)
+      prev = current
+    if probe and pos != raw.len:
+      return err("paths.dat[" & $i & "]: not Layout A (" &
+        $(raw.len - pos) & " trailing byte(s))")
+    llsAll[i] = lls
+  ok(llsAll)
+
+# ---------------------------------------------------------------------------
 # Opening
 # ---------------------------------------------------------------------------
 
 proc openNewTraceFromBytes*(data: seq[byte],
     blockSize: uint32 = DefaultBlockSize,
-    maxEntries: uint32 = DefaultMaxRootEntries): Result[NewTraceReader, string] =
+    maxEntries: uint32 = DefaultMaxRootEntries,
+    assumeColumnAwarePaths: bool = false): Result[NewTraceReader, string] =
   ## Open a trace from in-memory bytes. Used for testing.
+  ##
+  ## ``assumeColumnAwarePaths`` overrides the ``meta.dat`` bit 4
+  ## declaration for the ``paths.dat`` record layout only.  Pass it when
+  ## you know out of band that the trace was produced by a recorder that
+  ## emitted Layout A path records without setting the flag (see the
+  ## note at the Layout A block below).  It is an assertion by the
+  ## caller, not a guess by the reader: on a trace whose records are not
+  ## Layout A the open fails with a named ``paths.dat[N]: …`` error
+  ## instead of returning misdecoded positions.
 
   var reader: NewTraceReader
   reader.data = data
   reader.blockSize = blockSize
   reader.maxEntries = maxEntries
+  reader.assumedColumnAwarePaths = assumeColumnAwarePaths
 
   # Read meta.dat
   let metaDataRes = readInternalFile(data, "meta.dat", blockSize, maxEntries)
@@ -322,153 +434,51 @@ proc openNewTraceFromBytes*(data: seq[byte],
         if parsed.isSome:
           reader.pathsJson = parsed.get()
 
-  # P6.5 / Layout A — when the trace is column-aware, parse each
-  # paths.dat record as
-  # ``path_len + path_bytes + line_count + line_lengths`` and cache
-  # the per-file line-length table.
+  # P6.5 / Layout A — the shape of a ``paths.dat`` record is decided by
+  # ``meta.dat`` bit 4 (``FlagHasColumnAwareSteps``).  When it is set
+  # each record is ``path_len + path_bytes + line_count + line_lengths``
+  # and the per-file line-length table is cached here; when it is clear
+  # each record is the raw path bytes and there is no table to cache.
   #
-  # Defensive recovery: we ALSO speculatively try Layout A parsing when
-  # ``meta.hasColumnAwareSteps`` is false, to handle traces whose writer
-  # emitted Layout A ``paths.dat`` records (and uses column-aware
-  # byte-offset ``global_position_index`` encoding on the exec stream)
-  # but failed to flip the ``meta.dat`` bit 4 flag at close time.
-  # Surfacing such traces as line-only — which legacy ``gli.resolve()``
-  # would then interpret as ``(file_id, line)`` using
-  # ``DefaultLinesPerFile`` — produces wild "line" numbers (e.g. line 270
-  # for a 12-line source).
+  # The reader does not infer the layout from the record bytes, because
+  # the two layouts are not distinguishable by inspection: the 97-byte
+  # ASCII path ``'/' & 'a'.repeat(46) & "/0" & 'b'.repeat(48)`` is an
+  # ordinary line-only record that also decodes as a complete Layout A
+  # record (see ``parseLayoutAPathRecords``).  A reader that promoted on
+  # a successful decode returned a 47-character prefix of that path, a
+  # fabricated 48-line table for the file, and a plausible but wrong
+  # ``(file, line, column)`` for every step — wrong answers with no
+  # error, which is worse than any refusal.
   #
-  # History (2026-06): before ``708ee44`` ("P6.4: implement DeltaColumn")
-  # the writer's ``close()`` didn't forward ``columnAwareSteps`` to
-  # ``writeMetaDat`` at all, so any recorder that called
-  # ``enableColumnAwareSteps()`` would still produce a trace with bit 4
-  # CLEAR even though Layout A + DeltaColumn events had been emitted.
-  # The blockchain recorders that adopted column-aware mode in mid-June
-  # (cairo ``d594485``, evm/move/flow earlier) recorded fixtures during
-  # that window which then surfaced as ``has_column_aware_steps: false``
-  # in ``ct-print --meta-json`` even though the on-disk byte layout was
-  # column-aware throughout — see 2026-06-19 cross-repo CI debugging.
-  # ``708ee44`` fixed the writer side, but the read-side recovery here
-  # stays as belt-and-suspenders for any legacy fixture lingering in CI
-  # runner caches or developer workspaces; freshly-recorded traces from
-  # current recorders are bit-for-bit consistent (bit 4 SET) and the
-  # speculative parse is a no-op promotion in that case.
+  # The recorder-side bug that motivated the promotion was real: before
+  # ``708ee44`` ("P6.4: implement DeltaColumn") the writer's ``close()``
+  # did not forward ``columnAwareSteps`` to ``writeMetaDat``, so a
+  # recorder that called ``enableColumnAwareSteps()`` produced Layout A
+  # records under a CLEAR bit 4.  Blockchain recorders that adopted
+  # column-aware mode in mid-June 2026 recorded fixtures in that window.
+  # Recovering such a trace is now the CALLER's decision, taken by
+  # passing ``assumeColumnAwarePaths = true``: the parse then runs in
+  # authoritative mode, so a trace that is genuinely line-only fails the
+  # open with a named ``paths.dat[N]: …`` error rather than yielding
+  # misdecoded positions.
   #
-  # When the speculative Layout A parse succeeds across every paths.dat
-  # record, we promote ``meta.hasColumnAwareSteps = true`` in-memory so
-  # downstream decode paths see the trace as it was actually written.
-  # When any record fails to parse as Layout A we leave the flag clear
-  # and ``lineLengths`` empty — bit-for-bit identical to the pre-existing
-  # pre-extension code path.
+  # A trace opened without the override never has its meta flag
+  # promoted.  When its records nonetheless look like Layout A the
+  # reader names the condition through ``columnAwarePathsSuspected``
+  # (and ct-print's ``column_aware_paths_suspected`` flag) so an
+  # affected trace is reported rather than silently reinterpreted.
   if reader.pathReader.count() > 0:
-    let pathTotal = reader.pathReader.count()
-    var llsAll = newSeq[seq[uint32]](int(pathTotal))
-    var layoutAValid = true
-    for i in 0'u64 ..< pathTotal:
-      let rawRes = reader.pathReader.readRawById(i)
-      if rawRes.isErr:
-        if reader.meta.hasColumnAwareSteps:
-          return err("paths.dat[" & $i & "]: " & rawRes.error)
-        layoutAValid = false
-        break
-      let raw = rawRes.get()
-      var pos = 0
-      let pathLenRes = decodeVarint(raw, pos)
-      if pathLenRes.isErr:
-        if reader.meta.hasColumnAwareSteps:
-          return err("paths.dat[" & $i & "]: column-aware path_len varint: " &
-            pathLenRes.error)
-        layoutAValid = false
-        break
-      let pathLen = int(pathLenRes.get())
-      if pos + pathLen > raw.len:
-        if reader.meta.hasColumnAwareSteps:
-          return err("paths.dat[" & $i & "]: path_bytes truncated")
-        layoutAValid = false
-        break
-      # When meta says line-only, sanity-check the speculative parse:
-      # the path-length prefix must yield UTF-8-ish bytes (printable
-      # ASCII or common path characters) AND leave at least one trailing
-      # byte for the ``line_count`` varint.  This rejects legacy traces
-      # whose first record byte happens to coincide with a valid varint
-      # length but whose data isn't actually Layout A.
-      if not reader.meta.hasColumnAwareSteps:
-        if pos + pathLen >= raw.len:
-          # No room left for the line_count varint after the path bytes
-          # → not Layout A (legacy paths.dat ends right after the raw
-          # path string).
-          layoutAValid = false
-          break
-        var asciiOk = true
-        for k in pos ..< pos + pathLen:
-          let b = raw[k]
-          # Reject control characters except tab — paths are filesystem
-          # names which the spec keeps within printable UTF-8 / ASCII.
-          if b < 0x09'u8 or (b > 0x0D'u8 and b < 0x20'u8):
-            asciiOk = false
-            break
-        if not asciiOk:
-          layoutAValid = false
-          break
-      pos += pathLen
-      let lineCountRes = decodeVarint(raw, pos)
-      if lineCountRes.isErr:
-        if reader.meta.hasColumnAwareSteps:
-          return err("paths.dat[" & $i & "]: column-aware line_count varint: " &
-            lineCountRes.error)
-        layoutAValid = false
-        break
-      let lineCount = int(lineCountRes.get())
-      # Bound the speculative parse to avoid attempting to consume
-      # absurd amounts of memory on a malformed record that happens to
-      # decode a huge varint.  ``MaxSpeculativeLineCount`` is sized to
-      # the largest source file we'd plausibly see (a few hundred
-      # thousand lines covers the Linux kernel's biggest TU).
-      const MaxSpeculativeLineCount = 1_000_000
-      if not reader.meta.hasColumnAwareSteps and lineCount > MaxSpeculativeLineCount:
-        layoutAValid = false
-        break
-      var lls = newSeq[uint32](lineCount)
-      var prev: int64 = 0
-      var lineOk = true
-      for l in 0 ..< lineCount:
-        let dRes = decodeSignedVarint(raw, pos)
-        if dRes.isErr:
-          if reader.meta.hasColumnAwareSteps:
-            return err("paths.dat[" & $i & "]: line_length[" & $l & "]: " &
-              dRes.error)
-          lineOk = false
-          break
-        let d = dRes.get()
-        let current = if l == 0: d else: prev + d
-        if current < 0:
-          if reader.meta.hasColumnAwareSteps:
-            return err("paths.dat[" & $i & "]: line_length[" & $l &
-              "] negative: " & $current)
-          lineOk = false
-          break
-        lls[l] = uint32(current)
-        prev = current
-      if not lineOk:
-        layoutAValid = false
-        break
-      # In speculative mode, require the parse to consume the entire
-      # record — leftover bytes signal we're misinterpreting a legacy
-      # paths.dat entry.
-      if not reader.meta.hasColumnAwareSteps and pos != raw.len:
-        layoutAValid = false
-        break
-      llsAll[i] = lls
-    if layoutAValid:
-      reader.lineLengths = llsAll
-      if not reader.meta.hasColumnAwareSteps:
-        # Recover from the recorder-side meta-flag-not-flipped bug: the
-        # paths.dat records cleanly parse as Layout A, so the trace IS
-        # actually column-aware on the wire even though the meta header
-        # says otherwise.  Promote the in-memory flag so downstream
-        # ``decodeGlobalPositionIndex`` / ``ct_reader_step_locations_*``
-        # paths treat the trace as the column-aware container it really
-        # is.  The on-disk meta.dat is untouched.
-        reader.meta.hasColumnAwareSteps = true
+    if reader.meta.hasColumnAwareSteps or assumeColumnAwarePaths:
+      let parsed = parseLayoutAPathRecords(reader.pathReader, probe = false)
+      if parsed.isErr:
+        return err(parsed.error)
+      reader.lineLengths = parsed.get()
+      # Only reachable via the caller's explicit override; a trace that
+      # declared bit 4 already has the flag set.
+      reader.meta.hasColumnAwareSteps = true
+    else:
+      reader.layoutASuspected =
+        parseLayoutAPathRecords(reader.pathReader, probe = true).isOk
 
   # Alternate source views (spec §"Alternate Source Views
   # (Deminification Support)").  When the writer set bit 5 we eagerly
@@ -554,10 +564,13 @@ when ctHasFilesystem:
   # below them reads bytes that are already in memory, so this is the whole
   # filesystem surface of the reader.
 
-  proc openNewTrace*(path: string): Result[NewTraceReader, string] =
+  proc openNewTrace*(path: string,
+      assumeColumnAwarePaths: bool = false): Result[NewTraceReader, string] =
     ## Open a multi-stream trace file from disk.
     ## Loads meta.dat and interning tables at startup.
     ## All other streams are loaded lazily on first access.
+    ##
+    ## See `openNewTraceFromBytes` for ``assumeColumnAwarePaths``.
 
     if not fileExists(path):
       return err("file not found: " & path)
@@ -572,12 +585,15 @@ when ctHasFilesystem:
     except:
       return err("failed to read file: " & path)
 
-    openNewTraceFromBytes(data)
+    openNewTraceFromBytes(data, assumeColumnAwarePaths = assumeColumnAwarePaths)
 
   proc refresh*(r: var NewTraceReader, path: string): Result[void, string] =
     ## Re-read a growing CTFS container into this handle and invalidate every
     ## lazily-opened stream reader whose chunk table may have grown.
-    let reopened = openNewTrace(path)
+    ## Re-opens under the same ``assumeColumnAwarePaths`` reading this
+    ## handle was created with.
+    let reopened = openNewTrace(path,
+      assumeColumnAwarePaths = r.assumedColumnAwarePaths)
     if reopened.isErr:
       return err(reopened.error)
     r = reopened.get()
@@ -623,6 +639,25 @@ proc typeName*(r: NewTraceReader, id: uint64): Result[string, string] =
 
 proc varname*(r: NewTraceReader, id: uint64): Result[string, string] =
   r.varnameReader.readById(id)
+
+proc columnAwarePathsSuspected*(r: NewTraceReader): bool =
+  ## True when this trace's ``meta.dat`` declares line-only steps, yet
+  ## every ``paths.dat`` record also decodes as a complete Layout A
+  ## record.  It names the one condition a reader cannot resolve on its
+  ## own: either the trace really is line-only and the coincidence is
+  ## harmless, or its recorder emitted Layout A records without setting
+  ## ``FlagHasColumnAwareSteps`` (a writer bug fixed in ``708ee44``,
+  ## after several mid-June-2026 recorder fixtures were captured).
+  ##
+  ## This is a report, not a decision.  The reader keeps treating the
+  ## trace exactly as its ``meta.dat`` declares — path strings and step
+  ## positions are the line-only ones.  A caller that has independent
+  ## grounds to believe the recorder was affected reopens the trace with
+  ## ``assumeColumnAwarePaths = true``.
+  ##
+  ## Always false when the trace declares column-aware steps: there is
+  ## nothing to suspect, the layout is stated.
+  r.layoutASuspected
 
 proc pathCount*(r: NewTraceReader): uint64 =
   let binary = r.pathReader.count()
@@ -728,15 +763,13 @@ proc lineLength*(r: NewTraceReader, fileId: uint64,
 proc lineLengthRaw*(r: NewTraceReader, fileId: uint64,
     lineIndex0: uint32): Option[uint32] =
   ## Ungated sibling of [lineLength] — surfaces the addressable column
-  ## count for ``(fileId, lineIndex0)`` even when
-  ## ``meta.hasColumnAwareSteps`` is false.  This exists so the codetracer
-  ## DAP read path can recover Layout A ``paths.dat`` data on traces whose
-  ## writer emitted column-aware path records (per-line lengths) but
-  ## failed to set ``FlagHasColumnAwareSteps`` at close time — a known
-  ## recorder-side bug surfaced as raw GLI byte offsets being misreported
-  ## as source lines in DAP ``stackTrace`` responses.  Returns ``none``
-  ## when the file has no Layout A data, when ``fileId`` is out of range,
-  ## or when ``lineIndex0`` is past the file's known line table.
+  ## count for ``(fileId, lineIndex0)`` without consulting
+  ## ``meta.hasColumnAwareSteps``.  It reads the per-file table the open
+  ## call parsed, so it answers for a trace that declares column-aware
+  ## steps and for one opened with ``assumeColumnAwarePaths = true``;
+  ## on a trace opened normally that declares line-only steps there is
+  ## no table and every query is ``none``.  Also ``none`` when ``fileId``
+  ## is out of range or ``lineIndex0`` is past the file's line table.
   if fileId >= uint64(r.lineLengths.len):
     return none(uint32)
   let lls = r.lineLengths[fileId]
@@ -746,9 +779,11 @@ proc lineLengthRaw*(r: NewTraceReader, fileId: uint64,
 
 proc lineCountRaw*(r: NewTraceReader, fileId: uint64): uint64 =
   ## Ungated companion to [lineLengthRaw]: number of lines registered in
-  ## paths.dat Layout A for ``fileId``.  Returns ``0`` when no Layout A
-  ## data is available (legitimate "no per-line data" sentinel — see
-  ## spec §"paths.dat per-line offset table").
+  ## paths.dat Layout A for ``fileId``.  Returns ``0`` when this handle
+  ## parsed no Layout A table for the file — which includes every trace
+  ## that declares line-only steps and was opened without
+  ## ``assumeColumnAwarePaths`` (the legitimate "no per-line data"
+  ## sentinel — see spec §"paths.dat per-line offset table").
   if fileId >= uint64(r.lineLengths.len):
     return 0'u64
   uint64(r.lineLengths[fileId].len)

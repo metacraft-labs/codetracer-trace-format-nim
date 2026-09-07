@@ -1,10 +1,10 @@
 ## The writer half of the C ABI compiles for a target with no filesystem, and
-## the filesystem gate removes exactly the two entry points that name a file.
+## the filesystem gate removes exactly the entry points that name a file.
 ##
 ## `new_trace_reader.nim` reached `fileExists` and `open(path, fmRead)` from
 ## `openNewTrace`, and the FFI reached `openNewTrace` from `ct_reader_open`.
-## Nothing else in the module graph touches the filesystem, so those two entry
-## points were the whole reason the 129-function C ABI could not be built for
+## Nothing else in the module graph touches the filesystem, so those entry
+## points were the whole reason the C ABI could not be built for
 ## `--os:any` — the target a wasm32 embedding uses. `ctHasFilesystem` gates
 ## them on the TARGET (`posix`/`windows` versus the freestanding OSes) rather
 ## than on a define someone has to remember to pass.
@@ -17,8 +17,8 @@
 ##      being checked is that the Nim module graph is freestanding-clean, not
 ##      that a particular linker is installed.
 ##   2. **The gate DISCRIMINATES, in both directions.** Every one of the C ABI's
-##      `exportc` functions is looked for in the emitted C. Exactly
-##      `ct_reader_open` and `ct_reader_refresh` must be missing — a gate that
+##      `exportc` functions is looked for in the emitted C. Exactly the path
+##      openers and `ct_reader_refresh` must be missing — a gate that
 ##      removed nothing fails the first half of that, and a gate that removed
 ##      the reader wholesale (or the writer with it) fails the second. The
 ##      expected-missing set is spelled out, so widening the gate is a
@@ -37,9 +37,11 @@ import codetracer_trace_writer/new_trace_reader
 const
   RepoRoot = currentSourcePath.parentDir.parentDir
   FfiSource = RepoRoot / "src" / "codetracer_trace_writer_ffi.nim"
-  # The two entry points that name a file. Everything else on the ABI works on
+  # The entry points that name a file. Everything else on the ABI works on
   # bytes it was handed, so everything else must survive.
-  ExpectedMissing = ["ct_reader_open", "ct_reader_refresh"]
+  ExpectedMissing = ["ct_reader_open",
+                     "ct_reader_open_assume_column_aware_paths",
+                     "ct_reader_refresh"]
 
 proc exportcNames(): seq[string] =
   ## Every `exportc` function the FFI declares, read out of the source: the
@@ -68,7 +70,7 @@ suite "freestanding writer surface":
     let r = openNewTrace(RepoRoot / "no-such-container.ct")
     check r.isErr
 
-  test "the C ABI compiles for --os:any and loses exactly the two path openers":
+  test "the C ABI compiles for --os:any and loses exactly the path openers":
     let names = exportcNames()
     check names.len > 100          # the source really was parsed
     for m in ExpectedMissing:

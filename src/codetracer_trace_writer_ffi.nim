@@ -2926,7 +2926,7 @@ proc allocStringResult(s: string, outLen: ptr csize_t): ptr uint8 =
 # ---------------------------------------------------------------------------
 
 when ctHasFilesystem:
-  # The two reader entry points that name a file, and the only two in this
+  # The reader entry points that name a file, and the only ones in this
   # family that do. The handle-based accessors below are byte readers and
   # compile everywhere; on a target without a filesystem a handle comes from
   # `openNewTraceFromBytes` instead.
@@ -2939,6 +2939,35 @@ when ctHasFilesystem:
       return nil
     let p = $path
     let res = openNewTrace(p)
+    if res.isErr:
+      setError(res.error)
+      return nil
+    let h = cast[TraceReaderHandle](alloc0(sizeof(NewTraceReader)))
+    h[] = res.get()
+    return cast[pointer](h)
+
+  proc ct_reader_open_assume_column_aware_paths(
+      path: cstring): pointer {.exportc, cdecl, dynlib.} =
+    ## Open a .ct trace file, reading its ``paths.dat`` records as
+    ## column-aware Layout A even when ``meta.dat`` bit 4 is clear.
+    ##
+    ## This is the recovery path for traces produced by a recorder that hit
+    ## the pre-``708ee44`` writer bug (Layout A records emitted under a clear
+    ## bit 4).  It is an assertion the CALLER makes, because the two record
+    ## layouts overlap and no inspection of the bytes can distinguish them —
+    ## which is why ``ct_reader_open`` never guesses.  Use
+    ## ``ct_reader_column_aware_paths_suspected`` on a normally-opened handle
+    ## to find candidates, then decide from what you know about the recorder.
+    ##
+    ## The parse is authoritative: on a trace whose records are not Layout A
+    ## the open FAILS (nil, with ``paths.dat[N]: …`` in
+    ## ``trace_writer_last_error``) rather than falling back to the line-only
+    ## reading.
+    if path.isNil:
+      setError("NULL path")
+      return nil
+    let p = $path
+    let res = openNewTrace(p, assumeColumnAwarePaths = true)
     if res.isErr:
       setError(res.error)
       return nil
@@ -3492,6 +3521,30 @@ proc ct_reader_has_column_aware_steps(h: pointer): cint {.exportc, cdecl, dynlib
     return -1.cint
   let rh = cast[TraceReaderHandle](h)
   if rh[].meta.hasColumnAwareSteps: 1.cint else: 0.cint
+
+# ---------------------------------------------------------------------------
+# ct_reader_column_aware_paths_suspected — reader diagnostic
+# ---------------------------------------------------------------------------
+
+proc ct_reader_column_aware_paths_suspected(
+    h: pointer): cint {.exportc, cdecl, dynlib.} =
+  ## Return 1 when the trace declares line-only steps
+  ## (``ct_reader_has_column_aware_steps`` is 0) yet every ``paths.dat``
+  ## record also decodes as a complete column-aware Layout A record; 0
+  ## otherwise, -1 on a NULL handle.
+  ##
+  ## The two record layouts overlap, so this is a report and not a verdict:
+  ## an ordinary 97-byte ASCII path satisfies the Layout A grammar by
+  ## coincidence.  The reader keeps answering exactly as ``meta.dat``
+  ## declares — ``ct_reader_line_count_raw`` stays 0 and step locations stay
+  ## line-only.  A consumer that has independent grounds to believe the
+  ## recorder hit the pre-``708ee44`` meta-flag bug (which emitted Layout A
+  ## records under a clear bit 4) should surface this to its user rather
+  ## than reinterpret the trace on its own.
+  if h.isNil:
+    return -1.cint
+  let rh = cast[TraceReaderHandle](h)
+  if rh[].columnAwarePathsSuspected: 1.cint else: 0.cint
 
 proc ct_reader_supports_column_breakpoints(
     h: pointer): cint {.exportc, cdecl, dynlib.} =

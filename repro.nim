@@ -108,12 +108,12 @@ const
   CrossReadPool = "codetracer_trace_format_nim.crossread-serial"
 
 # The reproducible green corpus. It is the union of the nimble ``test``
-# task (51 files) and the four CI-only reader/network tests
+# task and the four CI-only reader/network tests
 # (``test_cross_format`` / ``test_query_protocol`` / ``test_network_reader``
 # / ``test_replication``), PLUS the additional in-tree unit tests that
 # compile + run clean on a headless Linux host under ``-d:release -p:src``
 # (``test_ct_print_full`` / ``test_ct_print_native`` / ``test_managed_sender``
-# / ``test_reader_v4`` / ``test_source_views`` / ``test_column_aware_steps``).
+# / ``test_reader_v4`` / ``test_source_views``).
 # Every listed file compiles and runs to exit 0 with ``-d:release -p:src``;
 # ``-d:release`` is a faithful superset of the per-file flags the nimble
 # task uses (the non-release files run identically under it).
@@ -177,6 +177,7 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_span_stream.nim", binary: "build/test-bin/test_span_stream"),
   TestSpec(source: "tests/test_multi_stream_integration.nim", binary: "build/test-bin/test_multi_stream_integration"),
   TestSpec(source: "tests/test_new_trace_reader.nim", binary: "build/test-bin/test_new_trace_reader"),
+  TestSpec(source: "tests/test_paths_dat_layout_authority.nim", binary: "build/test-bin/test_paths_dat_layout_authority"),
   TestSpec(source: "tests/test_reader_calls_events.nim", binary: "build/test-bin/test_reader_calls_events"),
   TestSpec(source: "tests/test_reader_integration.nim", binary: "build/test-bin/test_reader_integration"),
   TestSpec(source: "tests/test_nim_step_stream_crossread.nim", binary: "build/test-bin/test_nim_step_stream_crossread", pooled: true),

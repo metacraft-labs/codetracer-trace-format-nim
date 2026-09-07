@@ -417,6 +417,15 @@ proc printMetaJsonV4(reader: var NewTraceReader) =
   flagsObj["has_io_event_stream"] = newJBool(reader.meta.hasIoEventStream)
   flagsObj["has_interning_tables"] = newJBool(reader.meta.hasInterningTables)
   meta["flags"] = flagsObj
+  # Reader diagnostic, deliberately outside `flags` because it is not a
+  # meta.dat bit: true when the trace declares line-only steps yet every
+  # paths.dat record also decodes as a column-aware Layout A record. Either
+  # the resemblance is coincidental and harmless, or the recorder emitted
+  # Layout A records without setting bit 4 (a writer bug fixed in 708ee44).
+  # The reader keeps reading the trace as its meta.dat declares; this field
+  # is how an operator finds out there is a question to answer.
+  meta["column_aware_paths_suspected"] = newJBool(
+    reader.columnAwarePathsSuspected)
 
   if reader.meta.hasFilterProvenance:
     var filtersArr = newJArray()
@@ -828,6 +837,15 @@ proc buildFullDocument(reader: var NewTraceReader,
   flagsObj["has_io_event_stream"] = newJBool(reader.meta.hasIoEventStream)
   flagsObj["has_interning_tables"] = newJBool(reader.meta.hasInterningTables)
   meta["flags"] = flagsObj
+  # Reader diagnostic, deliberately outside `flags` because it is not a
+  # meta.dat bit: true when the trace declares line-only steps yet every
+  # paths.dat record also decodes as a column-aware Layout A record. Either
+  # the resemblance is coincidental and harmless, or the recorder emitted
+  # Layout A records without setting bit 4 (a writer bug fixed in 708ee44).
+  # The reader keeps reading the trace as its meta.dat declares; this field
+  # is how an operator finds out there is a question to answer.
+  meta["column_aware_paths_suspected"] = newJBool(
+    reader.columnAwarePathsSuspected)
 
   # ----- trace_filter provenance (TF-M7, spec §7) -----
   # Materialized as `metadata.trace_filter.filters[].{path,sha256}` per

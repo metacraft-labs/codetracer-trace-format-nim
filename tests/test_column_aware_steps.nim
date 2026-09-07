@@ -465,19 +465,19 @@ proc test_strict_meta_flag_rejection() {.raises: [].} =
   ## net that makes the column extension's bit-4 break clean for
   ## older readers (and gives every future bit allocation the same
   ## guarantee).
-  # Bit 13 (= 0x2000) is a still-reserved bit: bits 0-5 and 8-12 are
+  # Bit 14 (= 0x4000) is the lowest still-reserved bit: bits 0-13 are
   # allocated in ``KnownFlags`` (MCR/replay/layout/filter/column/
-  # source-views + the M17a/M23a-d call/step/value/io/interning stream
-  # flags — bit 8 is ``FlagHasCallStream``), and bits 6/7 predate them.
-  # Earlier iterations of this test used bit 5 (then 6, then 8) — keep
-  # the test in sync with the latest allocated range so it exercises a
-  # genuinely-unknown bit and keeps the unknown-bit rejection contract
-  # enforced.
-  const FirstReservedBit: uint16 = 0x2000
+  # source-views, the bit-6/7 capability flags, and the M17a/M23a-d/RS-M1
+  # call/step/value/io/interning/span stream flags — bit 13 is
+  # ``FlagHasSpanStream``).  Earlier iterations of this test used bit 5
+  # (then 6, then 8, then 13) — keep the test in sync with the latest
+  # allocated range so it exercises a genuinely-unknown bit and keeps the
+  # unknown-bit rejection contract enforced.
+  const FirstReservedBit: uint16 = 0x4000
   let badBuf = handcraftMetaDatWithFlags(FirstReservedBit)
   let badRes = readMetaDat(badBuf)
   doAssert badRes.isErr,
-    "readMetaDat must reject meta.dat with unknown flag bit 8 set"
+    "readMetaDat must reject meta.dat with unknown flag bit 14 set"
 
   # Sanity check the error message mentions the unknown bits.
   doAssert "unknown flag" in badRes.error or
