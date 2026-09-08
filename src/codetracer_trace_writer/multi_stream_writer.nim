@@ -131,11 +131,10 @@ type
     #
     # Enabled BY DEFAULT for line-only traces (the production write path every
     # non-column-aware recorder drives).  Gated OFF for column-aware traces:
-    # there the exec stream's `global_position_index` is a byte offset, not a
-    # `(path_id << 32) | line` packing, so the reader decodes step locations via
-    # the column-aware path rather than `unpack_global_line_index`, and a
-    # gli-derived `step-map.ns` would not agree with that derivation.  See
-    # `enableColumnAwareSteps` (which clears this) and `step_map_builder.nim`.
+    # there a step's position carries a column as well, and a line-keyed index
+    # would answer a per-column breakpoint request with every step on the line.
+    # See `enableColumnAwareSteps` (which clears this) and
+    # `step_map_builder.nim`.
     stepMapBuilder: StepMapBuilder
     emitStepMap: bool
 
@@ -582,11 +581,12 @@ proc registerStep*(w: var MultiStreamTraceWriter, pathId: uint64,
   if w.linehitsBuilder.isSome:
     w.linehitsBuilder.get().recordHit(gli, w.stepCount)
 
-  # M26b — record into the prepopulated breakpoint index, keyed by the SAME
-  # gli the exec stream encoded so the resulting `step-map.ns` matches the
-  # db-backend's `unpack_global_line_index`-derived whole-table build.
+  # M26b — record into the prepopulated breakpoint index, keyed by the
+  # coordinates registered here.  A breakpoint request arrives as
+  # `(path_id, line)`; the packed `gli` is a writer convention the container
+  # does not record, so it is not a key (see step_map_builder's header).
   if w.emitStepMap:
-    w.stepMapBuilder.recordStep(gli, w.stepCount)
+    w.stepMapBuilder.recordStep(pathId, line, w.stepCount)
 
   w.lastGlobalLineIndex = gli
   w.lastPathId = pathId
@@ -655,12 +655,12 @@ proc registerStepWithColumn*(w: var MultiStreamTraceWriter,
   if w.linehitsBuilder.isSome:
     w.linehitsBuilder.get().recordHit(combinedGli, w.stepCount)
 
-  # M26b — index into the breakpoint map.  In practice `emitStepMap` is only
-  # on for line-only writers (where `columnDelta == 0` and `combinedGli`
-  # packs `(path_id << 32) | line`), so the gli unpacks back to the recorded
-  # `(path_id, line)` exactly as the reader decodes it.
+  # M26b — index into the breakpoint map at the registered coordinates.
+  # `emitStepMap` is only on for line-only writers, where `columnDelta == 0`
+  # and this step is the line's first position, so the column the request
+  # cannot name is not lost by keying on the line alone.
   if w.emitStepMap:
-    w.stepMapBuilder.recordStep(combinedGli, w.stepCount)
+    w.stepMapBuilder.recordStep(pathId, line, w.stepCount)
 
   w.lastGlobalLineIndex = combinedGli
   w.lastPathId = pathId

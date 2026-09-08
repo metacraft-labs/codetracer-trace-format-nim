@@ -8,8 +8,8 @@
 ##    `StepMapNamespace::parse` expects.
 ## 2. A `.ct` produced by `MultiStreamTraceWriter` carries `step-map.ns` in the
 ##    CTFS container BY DEFAULT (line-only trace), and its `(path_id, line) ->
-##    [step_id]` content equals the data the db-backend whole-table build would
-##    derive (keyed by `unpack_global_line_index` of each step's gli).
+##    [step_id]` content is keyed by the coordinates the recorder registered,
+##    which is how a breakpoint request arrives.
 ##
 ## The authoritative write<->read loop (Nim writer -> Rust M26 consumer) lives in
 ## the db-backend's `m26_step_map_namespace_test.rs`; this file is the Nim-side
@@ -92,19 +92,17 @@ proc parseStepMap(buf: seq[byte]): ParsedStepMap =
 
 proc test_builder_round_trip() =
   var b = initStepMapBuilder()
-  # gli packs (path << 32) | line for line-only traces.  Record a non-trivial
-  # spread across two paths so sort order and the path table are exercised.
-  proc gli(path: uint64, line: uint64): uint64 = (path shl 32) or line
-
+  # A non-trivial spread across two paths so sort order and the path table
+  # are exercised.
   # path 0, line 10: steps 2, 52, 102 (ascending)
-  b.recordStep(gli(0, 10), 2)
-  b.recordStep(gli(0, 10), 52)
-  b.recordStep(gli(0, 10), 102)
+  b.recordStep(0, 10, 2)
+  b.recordStep(0, 10, 52)
+  b.recordStep(0, 10, 102)
   # path 0, line 11: step 3
-  b.recordStep(gli(0, 11), 3)
+  b.recordStep(0, 11, 3)
   # path 2, line 7: steps 9, 8 (out of order on purpose -> serializer sorts)
-  b.recordStep(gli(2, 7), 9)
-  b.recordStep(gli(2, 7), 8)
+  b.recordStep(2, 7, 9)
+  b.recordStep(2, 7, 8)
 
   doAssert b.entryCount == 3, "entryCount: " & $b.entryCount
 
@@ -133,7 +131,7 @@ proc test_empty_builder() =
 
 # ---------------------------------------------------------------------------
 # Test 3: writer emits step-map.ns by default (line-only trace), content
-# matches the gli-derived (path, line) -> [step_id] map.
+# matches the registered (path, line) -> [step_id] map.
 # ---------------------------------------------------------------------------
 
 proc test_writer_emits_step_map() =
@@ -146,8 +144,7 @@ proc test_writer_emits_step_map() =
 
   const NumSteps = 300
   const NumLines = 7
-  # Build the expected (line -> step_ids) map, with lines 1..7 (gli == line for
-  # path 0).
+  # Build the expected (line -> step_ids) map, with lines 1..7 on path 0.
   var expected: array[NumLines, seq[int64]]
   for i in 0 ..< NumSteps:
     let lineIdx = i mod NumLines
@@ -211,9 +208,72 @@ proc test_column_aware_suppresses_step_map() =
   w.closeCtfs()
   echo "PASS: test_column_aware_suppresses_step_map"
 
+# ---------------------------------------------------------------------------
+# Test 5: the index is keyed by the (path_id, line) a breakpoint request
+# carries, on a trace with more than one path.
+# ---------------------------------------------------------------------------
+
+proc test_writer_step_map_keys_second_path() =
+  ## A breakpoint on `/src/lib.py:7` reaches `step-map.ns` as the pair
+  ## `(path_id = 1, line = 7)`. Path 0 hides every keying error: its steps
+  ## are packed as `0 + line`, which every packing in circulation agrees
+  ## with. Path 1 does not.
+  let writerRes = initMultiStreamWriter("test_sm_p1.ct", "step_map_path1_test")
+  doAssert writerRes.isOk, "initMultiStreamWriter failed: " & writerRes.error
+  var w = writerRes.get()
+
+  let p0 = w.registerPath("/src/main.py")
+  doAssert p0.isOk and p0.get() == 0
+  let p1 = w.registerPath("/src/lib.py")
+  doAssert p1.isOk and p1.get() == 1
+
+  doAssert w.registerStep(0, 3, @[]).isOk   # step 0
+  doAssert w.registerStep(1, 7, @[]).isOk   # step 1
+  doAssert w.registerStep(1, 7, @[]).isOk   # step 2
+  doAssert w.registerStep(1, 9, @[]).isOk   # step 3
+
+  let closeRes = w.close()
+  doAssert closeRes.isOk, "close failed: " & closeRes.error
+  let bytes = w.toBytes()
+
+  let blobRes = readInternalFile(bytes, "step-map.ns")
+  doAssert blobRes.isOk, "reading step-map.ns failed: " & blobRes.error
+  let parsed = parseStepMap(blobRes.get())
+
+  doAssert parsed.byPath.hasKey(1'u64),
+    "step-map.ns registers no path 1; keys present: " &
+      $(block:
+        var ks: seq[uint64]
+        for k in parsed.byPath.keys: ks.add(k)
+        ks.sort()
+        ks)
+  doAssert parsed.byPath[1].hasKey(7'u32),
+    "path 1 carries no entry for line 7; lines present: " &
+      $(block:
+        var ls: seq[uint32]
+        for k in parsed.byPath[1].keys: ls.add(k)
+        ls.sort()
+        ls)
+  doAssert parsed.byPath[1][7'u32] == @[1'i64, 2],
+    "steps at (path 1, line 7): " & $parsed.byPath[1][7'u32]
+  doAssert parsed.byPath[1][9'u32] == @[3'i64],
+    "steps at (path 1, line 9): " & $parsed.byPath[1][9'u32]
+  doAssert parsed.byPath[0][3'u32] == @[0'i64],
+    "steps at (path 0, line 3): " & $parsed.byPath[0][3'u32]
+
+  # The writer packs (path 1, line 7) as prefixSum[1] + 7. Nothing may be
+  # filed under that integer read as a line number of path 0.
+  doAssert not parsed.byPath[0].hasKey(uint32(DefaultLinesPerFile) + 7'u32),
+    "path 0 carries an entry at line " & $(DefaultLinesPerFile + 7) &
+      " — the raw global_line_index of (path 1, line 7) filed as a line"
+
+  w.closeCtfs()
+  echo "PASS: test_writer_step_map_keys_second_path"
+
 when isMainModule:
   test_builder_round_trip()
   test_empty_builder()
   test_writer_emits_step_map()
   test_column_aware_suppresses_step_map()
+  test_writer_step_map_keys_second_path()
   echo "All step-map builder tests passed."

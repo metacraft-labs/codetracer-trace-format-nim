@@ -9,21 +9,24 @@
 ## `.ct` carries `step-map.ns`, BREAKPOINT line->step resolution is an
 ## O(unique-lines) index lookup that never materialises the whole step table.
 ##
-## ## Why this keys off `global_line_index`, not the raw `(pathId, line)` args
+## ## Why this keys off the recorded `(path_id, line)`
 ##
-## The db-backend's seekable reader recovers a step's `(path_id, line)` by
-## decoding the exec stream's `global_line_index` through
-## `unpack_global_line_index` — `(gli >> 32, gli & 0xFFFF_FFFF)` — and the M26
-## whole-table breakpoint build keys on exactly those decoded coordinates (see
-## `codetracer/src/db-backend/src/ctfs_trace_reader/step_value_stream_source.rs`
-## `reconstruct_db_step` / `step_line`).  To make a Nim-written `step-map.ns`
-## BYTE-FOR-BYTE agree with that whole-table derivation, this builder keys off
-## the SAME `global_line_index` the writer encoded into the exec stream and
-## unpacks it identically.  Keying off the raw `registerStep(pathId, line)`
-## arguments would silently disagree whenever the writer's
-## `toGlobalLineIndex` packing differs from the reader's `unpack` (e.g. the
-## column-aware byte-offset path), so we deliberately mirror the reader's
-## decode here.
+## The key side of this index is fixed by its query side. A BREAKPOINT request
+## names a source file and a line; the debugger interns the file to a
+## `path_id` and looks up `(path_id, line)`. So the index must be keyed by the
+## coordinates the recorder registered the step at — the arguments of
+## `registerStep(pathId, line, ...)` — and by nothing else.
+##
+## In particular it must not be keyed by inverting the `global_line_index` the
+## writer packed those coordinates into. That integer's apportionment between
+## files is a writer convention the container does not record, and the two
+## writers of this format disagree about it: this repo packs
+## `prefixSum[path_id] + line`, the Rust `codetracer_trace_writer` packs
+## `(path_id shl 32) or line` (`step_stream.rs pack_global_line_index`). See
+## `global_line_index.nim`'s module header. Inverting one packing's integer
+## with the other's formula files every step of every path above 0 under a
+## path and line that nothing executed, and a breakpoint set anywhere in such
+## a file then resolves against an empty entry.
 ##
 ## ## On-disk format — spec §4.1 `STMP` (matches `serialize_step_map`)
 ##
@@ -55,11 +58,6 @@ const
     ## The only format version the M26 reader understands.
   StepMapFileName*: string = "step-map.ns"
     ## The CTFS container-internal file name for the prepopulated index.
-  GliLineBits: uint32 = 32
-    ## Bits reserved for the `line` component of a packed `global_line_index`;
-    ## `path_id` occupies the bits above it.  Mirrors the db-backend's
-    ## `GLI_LINE_BITS` so the unpack here matches the reader exactly.
-  GliLineMask: uint64 = (1'u64 shl GliLineBits) - 1
 
 type
   StepMapBuilder* = object
@@ -74,22 +72,14 @@ proc initStepMapBuilder*(): StepMapBuilder =
   ## A fresh, empty step-map builder.
   StepMapBuilder(byPath: initTable[uint64, Table[uint32, seq[int64]]]())
 
-proc unpackGlobalLineIndex*(gli: uint64): (uint64, uint32) =
-  ## Recover `(path_id, line)` from a packed `global_line_index`, identically to
-  ## the db-backend's `unpack_global_line_index`.  Returned `line` is a u32
-  ## (the wire width of the step-map line field).
-  let pathId = gli shr GliLineBits
-  let line = uint32(gli and GliLineMask)
-  (pathId, line)
-
-proc recordStep*(b: var StepMapBuilder, globalLineIndex: uint64,
+proc recordStep*(b: var StepMapBuilder, pathId: uint64, line: uint64,
     stepId: uint64) =
-  ## Record that step `stepId` executed at `globalLineIndex`.  The
-  ## `(path_id, line)` key is derived by unpacking the gli exactly as the
-  ## reader does (see module docs), so the resulting table mirrors the
-  ## db-backend whole-table build byte-for-byte.
-  let (pathId, line) = unpackGlobalLineIndex(globalLineIndex)
+  ## Record that step `stepId` executed at `(pathId, line)` — the coordinates
+  ## the recorder registered, which are also the coordinates a breakpoint
+  ## request arrives as.  `line` is narrowed to the u32 wire width of the
+  ## `STMP` line field.
   var byLine = addr b.byPath.mgetOrPut(pathId, initTable[uint32, seq[int64]]())
+  let line = uint32(line)
   var ids = addr byLine[].mgetOrPut(line, newSeq[int64]())
   ids[].add(int64(stepId))
 
