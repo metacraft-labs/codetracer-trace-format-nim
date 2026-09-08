@@ -182,7 +182,7 @@ proc test_reader_ffi_lifecycle() =
 
   let step0 = ffiGetJson(h, 0, ct_reader_step)
   doAssert step0.contains("absolute_step"), "step 0: " & step0
-  doAssert step0.contains("\"global_line_index\":1"), "step 0 gli: " & step0
+  doAssert step0.contains("\"global_line_index\":0"), "step 0 gli: " & step0
 
   let step1 = ffiGetJson(h, 1, ct_reader_step)
   doAssert step1.contains("delta_step"), "step 1: " & step1

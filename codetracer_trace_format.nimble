@@ -81,10 +81,10 @@ task test, "Run all tests":
   exec "nim c -r -d:release -p:src tests/test_paths_dat_layout_authority.nim"
   # A line-only global_position_index says nothing about how its integers were
   # apportioned between files, and the two writers of this container format
-  # disagree — prefixSum[path_id] + line here, (path_id shl 32) or line in the
-  # Rust codetracer_trace_writer. Inverting one is an assumption, so it has to
-  # be a falsifiable one: an address outside the space is refused by name
-  # rather than clamped into a file that exists.
+  # disagree — prefixSum[path_id] + (line - 1) here, (path_id shl 32) or line
+  # in the Rust codetracer_trace_writer. Inverting one is an assumption, so
+  # it has to be a falsifiable one: an address outside the space is refused
+  # by name rather than clamped into a file that exists.
   exec "nim c -r -d:release -p:src tests/test_line_only_position_space.nim"
   # The file boundary in that space. An address is prefixSum[file_id] +
   # (line - 1), so a file's slot holds exactly the lines it has. Encoding

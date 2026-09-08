@@ -49,6 +49,17 @@
 ## the producer. `tryResolve` states that assumption and refuses the
 ## addresses that contradict it, rather than answering with a plausible
 ## `(file, line)` pair for a position that was never in the trace.
+##
+## **A third packing is already on disk.** This writer encoded
+## ``prefixSum[file_id] + line`` — the same address space, shifted one up —
+## until 2026-09, and no field in the container distinguishes a bundle
+## written then from one written now: `meta.dat` carries a schema version
+## and a `recorder_id`, neither of which names the writer's address
+## packing. A line-only trace recorded before the change therefore reads
+## back one line high, everywhere and silently: the address is inside the
+## space, so `tryResolve` has nothing to refuse. The refusal above catches
+## the Rust writer's packing only because that one lands outside the space.
+## Re-recording is the only remedy a reader has.
 
 import results
 export results

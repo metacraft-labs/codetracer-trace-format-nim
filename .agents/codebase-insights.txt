@@ -101,8 +101,10 @@ integers are apportioned between files, and a container records nothing about
 it — no stride, no per-file line count, no producer id. Two writers of this
 format disagree:
 
-- this repo — `prefixSum[path_id] + line`, DefaultLinesPerFile (100_000)
+- this repo — `prefixSum[path_id] + (line - 1)`, DefaultLinesPerFile (100_000)
   addresses per file. multi_stream_writer.toGlobalLineIndex + global_line_index.
+  The in-file offset is 0-based, so a file's first line sits at the file's own
+  base and its last at base + count - 1.
 - the Rust codetracer_trace_writer — `(path_id shl 32) or line`.
   step_stream.rs pack_global_line_index / unpack_global_line_index. Its own
   module doc says the divergence "is *not* repaired here".
@@ -112,16 +114,16 @@ tryResolve` states it and refuses addresses that contradict it (>= totalLines);
 `resolve` is the unchecked form that clamps to the last file and answers with a
 path id that exists. Every reader path here that handles a position from a
 container uses tryResolve. Re-derived: 2 paths, step at (path 1, line 7) is
-100007 under this repo's packing and 4294967303 under the Rust one; feeding
+100006 under this repo's packing and 4294967303 under the Rust one; feeding
 4294967301 (Rust's (1,5)) to the unchecked resolve gives (path 1, line
-4294867301). See tests/test_line_only_position_space.nim.
+4294867302). See tests/test_line_only_position_space.nim.
 
 Three consequences of the divergence were fixed after that, in this repo:
 
 - step_map_builder.recordStep used to key `step-map.ns` by unpackGlobalLineIndex
   of the EXEC-STREAM gli — the RUST inverse applied to a NIM-packed integer.
   Re-derived: a step written at (path 1, line 7) was indexed at
-  (path 0, line 100007), so a breakpoint anywhere in a path above 0 resolved
+  (path 0, line 100006), so a breakpoint anywhere in a path above 0 resolved
   against an empty entry. It now keys on the (pathId, line) registerStep was
   called with, which is also what a breakpoint request arrives as; the gli is
   not a key. tests/test_step_map_builder.nim
@@ -129,7 +131,7 @@ Three consequences of the divergence were fixed after that, in this repo:
 - new_trace_reader.ensurePositionTables gave a COLUMN-AWARE file with no
   line-length table size 0, where multi_stream_writer.rebuildGli gives it
   DefaultLinesPerFile. Re-derived on a mixed trace (file 0 lengths [10,10],
-  file 1 none): a step at (file 1, line 1) encodes to 21,
+  file 1 none): a step at (file 1, line 1) encodes to 20,
   decodeGlobalPositionIndex refused it, and the line-only fallback answered
   (file 0, line 21) — INSIDE the valid space, so tryResolve could not catch it.
   The sizing rule is now global_line_index.fileAddressCount /
