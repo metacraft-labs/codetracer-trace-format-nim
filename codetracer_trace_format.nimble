@@ -92,6 +92,16 @@ task test, "Run all tests":
   # into the next file's range — invisible behind an oversized stride,
   # a wrong answer at every boundary once slots are sized to real counts.
   exec "nim c -r -d:release -p:src tests/test_global_line_index_boundary.nim"
+  # The schema break that carries the corrected encode. A container written
+  # under the superseded prefixSum[path_id] + line reads one line high under
+  # the current decode -- silently, because the address is INSIDE the space
+  # and tryResolve has nothing to refuse. meta.dat's version is the only
+  # field that can tell the two apart, so v3 and below are refused by name.
+  # Carries its own mutation control: resolving the same container's
+  # addresses without the gate is what puts every step one line high.
+  # `include`s codetracer_trace_writer_ffi to drive ct_reader_open, so it
+  # needs --mm:arc and the --nimMainPrefix the FFI's NimMain importc expects.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_meta_dat_v3_global_index_refusal.nim"
   # The column-aware step encoding end to end: the writer's opt-in, the
   # DeltaColumn round-trip, Layout A paths.dat, the position decoder, and the
   # meta.dat unknown-flag-bit rejection that keeps the extension clean.

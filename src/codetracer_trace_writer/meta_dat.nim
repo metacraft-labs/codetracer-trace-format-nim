@@ -5,7 +5,7 @@ when defined(nimPreviewSlimSystem):
 
 ## Binary meta.dat writer for CTFS trace metadata.
 ##
-## Layout (version 3):
+## Layout (version 4):
 ##   [4] magic "CTMD"
 ##   [2] version u16 LE
 ##   [2] flags u16 LE (bit 0: has_mcr_fields,
@@ -79,6 +79,33 @@ when defined(nimPreviewSlimSystem):
 ##        would break the in-flight trace fixtures from those
 ##        milestones.  The spec was updated in the same TF-M7 commit
 ##        series to match.
+##   v4 — (2026-09-08): the line-only ``global_position_index`` encode
+##        changed from ``prefixSum[path_id] + line`` to
+##        ``prefixSum[path_id] + (line - 1)``, making it the exact
+##        inverse of the decode the spec states.  Spec:
+##        ``codetracer-trace-format-spec`` branch ``zk/gli-off-by-one``
+##        (commit ``becd9e1``), ``internal-files.md`` §"Global Line
+##        Index" and ``trace-events.md`` §"Decoding
+##        ``global_position_index``".
+##
+##        The bump exists because the two encodes are INDISTINGUISHABLE
+##        in the bytes.  Both put every step at an address the space can
+##        address, so a v3 container read under the v4 decode yields a
+##        ``(path, line)`` pair for every step and reports each one
+##        exactly one line high — silently, with nothing for
+##        ``tryResolve`` to refuse.  (The Rust writer's rival
+##        ``(path_id shl 32) or line`` is catchable only because it
+##        lands OUTSIDE the space.)  The schema version is the sole
+##        discriminator: ``recorder_id`` names the producer, not its
+##        address packing.
+##
+##        Pre-1.0: no backcompat shim — v3 fixtures must be regenerated.
+##        A shim is not possible in principle here, only in practice:
+##        subtracting one from every address would fix the steps of a
+##        trace the writer of which used this packing, but the version
+##        is what says it did, and that is exactly what a v3 container
+##        does not record.  ``readMetaDat`` therefore refuses v3 and
+##        below by name rather than decoding them one line high.
 
 import std/options
 import std/strutils
@@ -91,7 +118,19 @@ import ./uuid_v7
 
 const
   MetaDatMagic*: array[4, byte] = [0x43'u8, 0x54, 0x4D, 0x44]  # "CTMD"
-  MetaDatVersion*: uint16 = 3
+  MetaDatVersion*: uint16 = 4
+  LastShiftedGlobalIndexVersion*: uint16 = 3
+    ## The highest schema version whose writer packed a line-only
+    ## ``global_position_index`` as ``prefixSum[path_id] + line``.
+    ##
+    ## Containers at or below it are refused by ``readMetaDat``: their
+    ## addresses are one above what the current decode inverts, and
+    ## nothing else in the container says so.  It is named rather than
+    ## written as a literal `3` at the refusal because the refusal and
+    ## this definition have to move together — a later version that
+    ## changed the packing again would raise the bound, and a reader
+    ## comparing against a stale literal would answer such a container
+    ## instead of refusing it.
   FlagHasMcrFields*: uint16 = 1                  # bit 0
   FlagHasReplayLaunchFields*: uint16 = 2         # bit 1 — M-RLP-1 (spec §6A.5)
   FlagHasLayoutSnapshot*: uint16 = 4             # bit 2 — M-RLP-2 (spec §6B.7)
@@ -587,6 +626,25 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
     return err("meta.dat: bad magic bytes")
 
   let version = readU16LE(data, 4)
+  if version <= LastShiftedGlobalIndexVersion:
+    # Refused by name, not by the generic version mismatch below, because
+    # the consequence of reading one anyway is not a parse failure — it is
+    # a plausible wrong answer at every step.  See the v4 note in the
+    # version history above.
+    # Phrased about the WRITER, not about this container's contents: the
+    # gate is on the schema version, so it also refuses a v3 container that
+    # holds no steps at all (a ct-mcr recording, say). Saying "its steps
+    # were packed as" would be a claim about such a trace that is not true.
+    return err("meta.dat: schema version " & $version &
+      " predates the global line index correction, and this trace cannot " &
+      "be read. Writers at that version packed a line-only step position " &
+      "as prefixSum[path_id] + line; version " & $MetaDatVersion &
+      " packs prefixSum[path_id] + (line - 1). Both land inside the " &
+      "trace's address space, so a step read under the current decode " &
+      "would come back one line high rather than fail, and the container " &
+      "records nothing else that tells the two apart. Re-record the trace " &
+      "with a current recorder. Spec: " &
+      "codetracer-trace-format-spec/internal-files.md \"Global Line Index\"")
   if version != MetaDatVersion:
     return err("meta.dat: unsupported version " & $version & ", expected " & $MetaDatVersion)
 

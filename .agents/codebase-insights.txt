@@ -167,6 +167,29 @@ STILL OPEN, outside this repo:
   separates them. That needs a discriminator at the FORMAT level — a producer
   id or an explicit stride in meta.dat — not more reader-side defence.
 
+## meta.dat v4 is the discriminator for THIS repo's own encode change
+This repo encoded `prefixSum[path_id] + line` until 2026-09. That address is
+INSIDE the space, so tryResolve cannot refuse it and such a bundle reads back
+one line high, silently — unlike the Rust packing, which is only catchable
+because it lands outside. Re-derived on real fixtures: steps recorded at
+(0,3) (1,7) (0,12) come back as lines 4, 8, 13, and the committed
+codetracer request-panel `ruby_sinatra/ruby.ct` walks its `/api/users`
+handler one line late, ending on a BLANK line.
+
+So MetaDatVersion is 4 and readMetaDat refuses <= LastShiftedGlobalIndexVersion
+(3) by name. This does NOT discriminate this repo from the Rust writer — that
+one also stamps 3, and the bullet above still stands for it. It discriminates
+this repo's own before/after, which is all a version can do.
+
+Two gates, not one: bumping the version alone was NOT enough, because
+new_trace_reader.openNewTraceFromBytes parsed meta.dat and DISCARDED the
+error, opening the container with a zeroed `meta` instead. Every meta.dat
+check — the version, and the P6.5 unknown-flag-bit rejection that predates it
+— was unreachable from the container entry points until that error was
+propagated. Anything else that parses meta.dat best-effort is worth the same
+look; the Rust `read_meta_dat_flags` has a documented "invalid meta.dat =>
+false, never an error" caller (has_call_stream) with the same shape.
+
 ## test_path_filter needs libpcre on the loader path
 It uses std/re, which dlopens libpcre.so at runtime. The dev shell does not put
 pcre on LD_LIBRARY_PATH, so a bare `nimble test` fails there with "could not

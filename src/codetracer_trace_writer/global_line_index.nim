@@ -52,14 +52,19 @@
 ##
 ## **A third packing is already on disk.** This writer encoded
 ## ``prefixSum[file_id] + line`` — the same address space, shifted one up —
-## until 2026-09, and no field in the container distinguishes a bundle
-## written then from one written now: `meta.dat` carries a schema version
-## and a `recorder_id`, neither of which names the writer's address
-## packing. A line-only trace recorded before the change therefore reads
-## back one line high, everywhere and silently: the address is inside the
-## space, so `tryResolve` has nothing to refuse. The refusal above catches
-## the Rust writer's packing only because that one lands outside the space.
-## Re-recording is the only remedy a reader has.
+## until 2026-09. Such an address is INSIDE the space, so `tryResolve` has
+## nothing to refuse and the trace reads back one line high everywhere; the
+## refusal above catches the Rust writer's packing only because that one
+## lands outside the space.
+##
+## Nothing in the address distinguishes the two, so the discriminator is
+## the container's schema version rather than its arithmetic: `meta.dat` is
+## at `MetaDatVersion` 4 for the encode above, and `readMetaDat` refuses
+## version 3 and below by name (see its own version history for why a
+## shim is not available). `recorder_id` does not serve — it names the
+## producer, not the producer's address packing, and the same recorder
+## spans the change. Re-recording is the only remedy for a bundle already
+## written.
 
 import results
 export results

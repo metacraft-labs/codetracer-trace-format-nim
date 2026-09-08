@@ -400,12 +400,24 @@ proc openNewTraceFromBytes*(data: seq[byte],
   reader.maxEntries = maxEntries
   reader.assumedColumnAwarePaths = assumeColumnAwarePaths
 
-  # Read meta.dat
+  # Read meta.dat.  A container that HAS one and cannot parse it is refused,
+  # rather than opened with a zeroed `meta`.  Every flag this reader consults
+  # lives in meta.dat and every one of them defaults to false, so carrying on
+  # without it does not degrade to a partial answer — it silently picks the
+  # other reading: line-only paths.dat records for a Layout A trace, the
+  # line-count decode for a column-aware one, and the current global line
+  # index decode for a container written under the superseded one. Those are
+  # the misdecodes `readMetaDat`'s version and unknown-flag-bit checks exist
+  # to prevent, and discarding its error here is what let them through.
+  #
+  # A container with NO meta.dat is a different case and still opens: the
+  # legacy `paths.json` fallback below is the reading for those.
   let metaDataRes = readInternalFile(data, "meta.dat", blockSize, maxEntries)
   if metaDataRes.isOk:
     let metaRes = readMetaDat(metaDataRes.get())
-    if metaRes.isOk:
-      reader.meta = metaRes.get()
+    if metaRes.isErr:
+      return err("meta.dat present but not readable: " & metaRes.error)
+    reader.meta = metaRes.get()
 
   # Load interning tables (these are small, load at startup)
   let pathRes = initInterningTableReader(data, "paths", blockSize, maxEntries)

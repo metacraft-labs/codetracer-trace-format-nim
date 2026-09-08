@@ -177,11 +177,31 @@ proc graftEntryInto(srcPath, outPath, entryName: string) =
 # ct-print binary
 # ---------------------------------------------------------------------------
 
+proc newestSourceTime(): Time =
+  ## The modification time of the most recently changed file under `src/`.
+  ##
+  ## ct-print is a thin front end over the reader library: nearly everything
+  ## it can get wrong lives in a module OTHER than `codetracer_ct_print.nim`.
+  ## Dating the cached binary against that one file only therefore answers
+  ## "fresh" for a binary built before a reader change, and the test then
+  ## measures a ct-print that no longer exists in the tree — reporting a pass
+  ## or a failure that belongs to the previous build.
+  result = getLastModificationTime(ctPrintSrc)
+  for path in walkDirRec(repoRoot / "src"):
+    if path.endsWith(".nim"):
+      let t = getLastModificationTime(path)
+      if t > result:
+        result = t
+
 proc ensureCtPrint() =
   ## Compile ct-print into `ctPrintBin` when missing or stale. The libzstd
   ## flags mirror the documented build recipe; pkg-config resolves them.
+  ##
+  ## `ctPrintBin` is a fixed path outside the repository, so it survives
+  ## between runs and between branches; the staleness test is what keeps that
+  ## cache honest, and it has to cover everything the binary links.
   if fileExists(ctPrintBin) and
-     getLastModificationTime(ctPrintBin) >= getLastModificationTime(ctPrintSrc):
+     getLastModificationTime(ctPrintBin) >= newestSourceTime():
     return
   createDir(ctPrintBin.parentDir)
   let (cflags, c1) = execCmdEx("pkg-config --cflags libzstd")

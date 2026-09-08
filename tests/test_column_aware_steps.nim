@@ -431,15 +431,19 @@ proc test_step_record_column_none_for_legacy() {.raises: [].} =
 # ---------------------------------------------------------------------------
 
 proc handcraftMetaDatWithFlags(flags: uint16): seq[byte] {.raises: [].} =
-  ## Minimal v3 meta.dat with the given raw flags word.  Recording id
-  ## is the canonical UUIDv7 used in `test_meta_dat.nim`.
+  ## Minimal meta.dat at the current schema version with the given raw
+  ## flags word.  Recording id is the canonical UUIDv7 used in
+  ## `test_meta_dat.nim`.
   const TestRecordingId = "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb"
   var buf = newSeq[byte](0)
   # Magic
   for b in [0x43'u8, 0x54, 0x4D, 0x44]:
     buf.add(b)
-  # Version = 3
-  buf.add(3'u8); buf.add(0'u8)
+  # The CURRENT version, so the flags word is what the parse judges. A
+  # superseded number would be refused for its version first, leaving the
+  # flag-rejection contract untested behind a passing assertion.
+  buf.add(byte(MetaDatVersion and 0xFF))
+  buf.add(byte((MetaDatVersion shr 8) and 0xFF))
   # Flags
   buf.add(byte(flags and 0xFF))
   buf.add(byte((flags shr 8) and 0xFF))
