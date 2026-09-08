@@ -30,7 +30,7 @@ import codetracer_trace_writer/call_stream as v4calls
 import codetracer_trace_writer/io_event_stream
 import codetracer_trace_writer/value_stream
 import codetracer_trace_writer/global_line_index
-import codetracer_trace_writer/multi_stream_writer  # for DefaultLinesPerFile
+import codetracer_trace_writer/multi_stream_writer
 import codetracer_trace_writer/cbor
 import codetracer_trace_types
 import codetracer_ctfs/container as ctfs_container
@@ -77,31 +77,34 @@ proc addEventMetadata*(obj: JsonNode, metadata: seq[byte]) =
     # Not JSON, or not a marker — the raw string above is all we can say.
     discard
 
-proc buildGliFromMeta(meta: MetaDatContents): GlobalLineIndex =
-  ## Rebuild the global line index from the meta.dat paths list
-  ## using the same DefaultLinesPerFile the writer uses.
-  var counts = newSeq[uint64](meta.paths.len)
-  for i in 0 ..< meta.paths.len:
-    counts[i] = DefaultLinesPerFile
-  buildGlobalLineIndex(counts)
-
-proc resolveGli(gli: GlobalLineIndex, globalIdx: uint64): (int, uint64) =
-  ## Convert global line index to (pathId, line).
-  gli.resolve(globalIdx)
+proc resolveGli(gli: GlobalLineIndex,
+    globalIdx: uint64): Result[(int, uint64), string] =
+  ## Invert a line-only ``global_position_index`` to ``(pathId, line)``,
+  ## or say why it cannot be inverted.
+  ##
+  ## Through ``tryResolve``, not ``resolve``: the packing is a writer
+  ## convention the container does not record and the writers of this
+  ## format disagree about it, so an index the space cannot address is
+  ## reported rather than clamped into a file that exists (see
+  ## ``global_line_index``'s module header). ct-print's business is
+  ## saying what the container holds, and "this position is not one this
+  ## trace can hold" is part of that.
+  gli.tryResolve(globalIdx)
 
 proc resolveStepLocation(reader: var NewTraceReader,
-    gli: GlobalLineIndex, stepGli: uint64): (int, uint64) =
+    gli: GlobalLineIndex, stepGli: uint64): Result[(int, uint64), string] =
   ## Resolve a step's absolute ``global_position_index`` to ``(pathId,
   ## line)``.  Column-aware traces encode GLI as a byte-offset (cumulative
   ## sum of preceding line_lengths), so the legacy line-count-based
-  ## ``gli.resolve`` returns garbage on them.  Route through the spec-
-  ## canonical ``decodeGlobalPositionIndex`` when the column-aware flag is
-  ## set; fall back to the line-count resolver for legacy traces.
+  ## resolver returns garbage on them.  Route through the spec-canonical
+  ## ``decodeGlobalPositionIndex`` when the column-aware flag is set; fall
+  ## back to the line-only space for legacy traces and for the
+  ## column-aware files that carry no per-line table.
   if reader.meta.hasColumnAwareSteps:
     let posRes = reader.decodeGlobalPositionIndex(stepGli)
     if posRes.isOk:
-      return (int(posRes.get().file), uint64(posRes.get().line))
-  gli.resolve(stepGli)
+      return ok((int(posRes.get().file), uint64(posRes.get().line)))
+  gli.tryResolve(stepGli)
 
 proc precomputeStepGlis(reader: var NewTraceReader): seq[uint64] =
   ## Walk the exec stream once and return a seq mapping step_index →
@@ -468,7 +471,7 @@ proc printMetaJsonV4(reader: var NewTraceReader) =
 # ---------------------------------------------------------------------------
 
 proc printJsonV4(reader: var NewTraceReader) =
-  let gli = buildGliFromMeta(reader.meta)
+  let gli = reader.globalPositionSpace()
 
   var root = newJObject()
 
@@ -507,12 +510,19 @@ proc printJsonV4(reader: var NewTraceReader) =
     for i in 0'u64 ..< uint64(allGlis.len):
       var stepObj = newJObject()
       stepObj["index"] = newJInt(int64(i))
-      let (pathId, line) = resolveStepLocation(reader, gli, allGlis[int(i)])
-      stepObj["path_id"] = newJInt(int64(pathId))
-      stepObj["line"] = newJInt(int64(line))
-      let pathStr = reader.path(uint64(pathId))
-      if pathStr.isOk:
-        stepObj["path"] = newJString(pathStr.get())
+      let loc = resolveStepLocation(reader, gli, allGlis[int(i)])
+      if loc.isErr:
+        # No `path_id` / `line` / `path` key at all: a consumer that reads
+        # them gets a missing key rather than a position that was never
+        # in the trace.
+        stepObj["position_error"] = newJString(loc.error)
+      else:
+        let (pathId, line) = loc.get()
+        stepObj["path_id"] = newJInt(int64(pathId))
+        stepObj["line"] = newJInt(int64(line))
+        let pathStr = reader.path(uint64(pathId))
+        if pathStr.isOk:
+          stepObj["path"] = newJString(pathStr.get())
       let ev = reader.step(i)
       if ev.isOk:
         stepObj["kind"] = newJString($ev.get().kind)
@@ -602,7 +612,11 @@ proc stepEventToJson(reader: var NewTraceReader, gli: GlobalLineIndex,
   stepObj["step_index"] = newJInt(int64(stepIdx))
 
   block resolveStep:
-    let (pathId, line) = resolveStepLocation(reader, gli, stepGli)
+    let loc = resolveStepLocation(reader, gli, stepGli)
+    if loc.isErr:
+      stepObj["position_error"] = newJString(loc.error)
+      break resolveStep
+    let (pathId, line) = loc.get()
     stepObj["path_id"] = newJInt(int64(pathId))
     stepObj["line"] = newJInt(int64(line))
     let pathStr = reader.path(uint64(pathId))
@@ -676,7 +690,7 @@ proc stepEventToJson(reader: var NewTraceReader, gli: GlobalLineIndex,
   nodes
 
 proc printJsonEventsV4(reader: var NewTraceReader) =
-  let gli = buildGliFromMeta(reader.meta)
+  let gli = reader.globalPositionSpace()
 
   # Pre-load all IO events indexed by stepId for quick lookup
   var ioByStep: seq[(uint64, IOEvent, uint64)]  # (stepId, event, index)
@@ -798,7 +812,7 @@ proc buildFullDocument(reader: var NewTraceReader,
   ##     events: [ {kind: "...", ...}, ... ] }
   ## All variable values and call args/returns are decoded from CBOR into
   ## structured JSON objects matching the ValueRecord variant layout.
-  let gli = buildGliFromMeta(reader.meta)
+  let gli = reader.globalPositionSpace()
   var root = newJObject()
 
   # ----- metadata -----
@@ -1028,7 +1042,11 @@ proc buildFullDocument(reader: var NewTraceReader,
         stepObj["kind"] = newJString("step")
         stepObj["step_index"] = newJInt(int64(stepIdx))
         block emitStep:
-          let (pathId, line) = resolveStepLocation(reader, gli, stepGli)
+          let loc = resolveStepLocation(reader, gli, stepGli)
+          if loc.isErr:
+            stepObj["position_error"] = newJString(loc.error)
+            break emitStep
+          let (pathId, line) = loc.get()
           stepObj["path_id"] = newJInt(int64(pathId))
           stepObj["line"] = newJInt(int64(line))
           let pStr = reader.path(uint64(pathId))
@@ -1269,7 +1287,7 @@ proc printEventsJsonlV4(reader: var NewTraceReader, opts: FullOpts) =
 # ---------------------------------------------------------------------------
 
 proc printTextV4(reader: var NewTraceReader) =
-  let gli = buildGliFromMeta(reader.meta)
+  let gli = reader.globalPositionSpace()
 
   echo "=== Trace (v4 multi-stream) ==="
   echo "program: " & reader.meta.program
@@ -1299,8 +1317,13 @@ proc printTextV4(reader: var NewTraceReader) =
   for stepIdx in 0'u64 ..< totalSteps:
     var pathStr = "?"
     var lineNum: uint64 = 0
+    var posError = ""
     block resolveStep:
-      let (pathId, line) = resolveStepLocation(reader, gli, allGlis[int(stepIdx)])
+      let loc = resolveStepLocation(reader, gli, allGlis[int(stepIdx)])
+      if loc.isErr:
+        posError = loc.error
+        break resolveStep
+      let (pathId, line) = loc.get()
       lineNum = line
       let p = reader.path(uint64(pathId))
       if p.isOk:
@@ -1314,7 +1337,12 @@ proc printTextV4(reader: var NewTraceReader) =
       if fn.isOk:
         funcStr = fn.get()
 
-    echo "Step " & $stepIdx & ": " & pathStr & ":" & $lineNum & " (" & funcStr & ")"
+    if posError.len > 0:
+      echo "Step " & $stepIdx & ": <unresolved position> (" & funcStr & ")"
+      echo "  " & posError
+    else:
+      echo "Step " & $stepIdx & ": " & pathStr & ":" & $lineNum &
+        " (" & funcStr & ")"
 
     # Print values
     let vals = reader.values(stepIdx)
@@ -1374,7 +1402,7 @@ proc followV4(filePath: string, pollMs: int) =
       continue
 
     var reader = readerRes.get()
-    let gli = buildGliFromMeta(reader.meta)
+    let gli = reader.globalPositionSpace()
     var hadNewEvents = false
 
     let sc = reader.stepCount()
@@ -1392,13 +1420,16 @@ proc followV4(filePath: string, pollMs: int) =
         stepObj["type"] = newJString("step")
         stepObj["step_index"] = newJInt(int64(stepIdx))
         if usableGlis:
-          let (pathId, line) = resolveGli(
-            gli, newGlis[int(stepIdx - lastStepCount)])
-          stepObj["path_id"] = newJInt(int64(pathId))
-          stepObj["line"] = newJInt(int64(line))
-          let pathStr = reader.path(uint64(pathId))
-          if pathStr.isOk:
-            stepObj["path"] = newJString(pathStr.get())
+          let loc = resolveGli(gli, newGlis[int(stepIdx - lastStepCount)])
+          if loc.isErr:
+            stepObj["position_error"] = newJString(loc.error)
+          else:
+            let (pathId, line) = loc.get()
+            stepObj["path_id"] = newJInt(int64(pathId))
+            stepObj["line"] = newJInt(int64(line))
+            let pathStr = reader.path(uint64(pathId))
+            if pathStr.isOk:
+              stepObj["path"] = newJString(pathStr.get())
 
         let callRes = reader.callForStep(stepIdx)
         if callRes.isOk:

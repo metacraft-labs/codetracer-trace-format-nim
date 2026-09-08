@@ -116,23 +116,54 @@ container uses tryResolve. Re-derived: 2 paths, step at (path 1, line 7) is
 4294967301 (Rust's (1,5)) to the unchecked resolve gives (path 1, line
 4294867301). See tests/test_line_only_position_space.nim.
 
-STILL OPEN, all outside this repo's fix:
-- step_map_builder.recordStep keys `step-map.ns` by unpackGlobalLineIndex of
-  the EXEC-STREAM gli, i.e. it applies the RUST inverse to a NIM-packed
-  integer, deliberately (see its module header) so the on-disk map matches
-  db-backend's derivation. Re-derived: a step written at (path 1, line 7) is
-  indexed at (path 0, line 100007).
-- codetracer/src/db-backend/src/ctfs_trace_reader inverts the same steps.dat
-  two ways: the LAZY path via unpack_global_line_index, the EAGER path via this
-  repo's FFI. mod.rs asserts they agree; they cannot both be right.
-- ct-print (src/codetracer_ct_print.nim resolveGli/resolveStepLocation,
-  src/codetracer_ct_print_lib.nim resolveGli) still uses the unchecked resolve.
-- new_trace_reader.ensurePositionTables gives a COLUMN-AWARE file with no
+Three consequences of the divergence were fixed after that, in this repo:
+
+- step_map_builder.recordStep used to key `step-map.ns` by unpackGlobalLineIndex
+  of the EXEC-STREAM gli — the RUST inverse applied to a NIM-packed integer.
+  Re-derived: a step written at (path 1, line 7) was indexed at
+  (path 0, line 100007), so a breakpoint anywhere in a path above 0 resolved
+  against an empty entry. It now keys on the (pathId, line) registerStep was
+  called with, which is also what a breakpoint request arrives as; the gli is
+  not a key. tests/test_step_map_builder.nim
+  test_writer_step_map_keys_second_path.
+- new_trace_reader.ensurePositionTables gave a COLUMN-AWARE file with no
   line-length table size 0, where multi_stream_writer.rebuildGli gives it
   DefaultLinesPerFile. Re-derived on a mixed trace (file 0 lengths [10,10],
   file 1 none): a step at (file 1, line 1) encodes to 21,
-  decodeGlobalPositionIndex refuses it, and the line-only fallback answers
-  (file 0, line 21).
+  decodeGlobalPositionIndex refused it, and the line-only fallback answered
+  (file 0, line 21) — INSIDE the valid space, so tryResolve could not catch it.
+  The sizing rule is now global_line_index.fileAddressCount /
+  positionSpaceCounts and the writer, the reader's position tables and the
+  line-only fallback (new_trace_reader.globalPositionSpace, used by
+  readEventsV4 and the FFI accessors) all go through it.
+  tests/test_mixed_column_aware_position_space.nim.
+- ct-print (src/codetracer_ct_print.nim resolveGli/resolveStepLocation,
+  src/codetracer_ct_print_lib.nim resolveGli) used the unchecked resolve on six
+  JSON/text emission sites. They go through tryResolve now; an unresolvable
+  position emits `position_error` and NO path_id/line/path key, so a consumer
+  reading `line` gets a missing key rather than a fabricated number.
+  tests/test_ct_print_unresolvable_position.nim.
+
+STILL OPEN, outside this repo:
+- codetracer/src/db-backend/src/ctfs_trace_reader inverted the same steps.dat
+  two ways: the LAZY path via unpack_global_line_index, the EAGER path via this
+  repo's FFI, with mod.rs claiming in prose that they agree. The lazy path is
+  the live one (this writer always sets has_step_stream). Addressed on the
+  codetracer branch zk/db-backend-line-only-step-decode by handing the lazy
+  stream the container's own address space
+  (ctfs_trace_reader::line_only_position::LineOnlyPositionSpace), which reads
+  an address as prefix-sum when the space can hold it, as (path_id shl 32) or
+  line when it cannot and the resulting path exists, and refuses by name
+  otherwise. Not yet merged, and follow-mode
+  (follow_stream_source.decode_step_chunk) still applies the shifted inverse
+  unconditionally: it decodes committed chunks append-only, before the path
+  table is necessarily complete, so the space it would invert through is not
+  known at the time it decodes.
+- The divergence itself. Reader-side disambiguation works because the
+  prefix-sum space is falsifiable and the shifted one is not, but an address in
+  [DefaultLinesPerFile, top) is well-formed under both and no container field
+  separates them. That needs a discriminator at the FORMAT level — a producer
+  id or an explicit stride in meta.dat — not more reader-side defence.
 
 ## test_path_filter needs libpcre on the loader path
 It uses std/re, which dlopens libpcre.so at runtime. The dev shell does not put
