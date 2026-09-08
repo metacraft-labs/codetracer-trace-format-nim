@@ -2,25 +2,48 @@
 
 ## Global line index: collapses (file_id, line) into a single varint.
 ##
-## Each file contributes a range of global line numbers. A prefix-sum array
-## allows O(1) encode and O(log N) decode via binary search.
+## Files are concatenated in file-id order into one per-trace address
+## space. A prefix-sum array gives O(1) encode and O(log N) decode via
+## binary search:
 ##
-## **This packing is a writer convention, not a container format.** The
-## spec (``codetracer-trace-format-spec/trace-events.md`` §"Source Location
+## .. code-block::
+##
+##   globalIndex(file_id, line) = prefixSum[file_id] + (line - 1)
+##   resolve(p)                 = (f, p - prefixSum[f] + 1)
+##
+## ``line`` is 1-based, so the ``- 1`` puts a file's first line at its own
+## ``prefixSum[file_id]`` and its last at ``prefixSum[file_id] + count -
+## 1``: the range is exactly the addresses the file's lines occupy, none
+## left over and none spilling into the next file. That is what makes a
+## file's slot size equal to its line count, and it is the same 0-based
+## in-file offset the column-aware mode uses, where offset 0 is line 1
+## column 1. See ``codetracer-trace-format-spec/internal-files.md``
+## §"Global Line Index" for the encode and ``trace-events.md``
+## §"Decoding ``global_position_index``" for the decode.
+##
+## **The apportionment between files is a writer convention, not a
+## container format.** The spec (``trace-events.md`` §"Source Location
 ## Addressing", §"Back-Compatibility") says only that a line-only trace's
 ## ``global_position_index`` is a ``global_line_index`` in which "each
-## integer addresses one line". How the integers are apportioned between
-## files is left to the writer, and a container records nothing about the
-## choice — there is no stride field, no per-file line count, and no
-## producer identifier that would let a reader recover it.
+## integer addresses one line". How many integers each file gets is left
+## to the writer, and a container records nothing about the choice — there
+## is no stride field, no per-file line count, and no producer identifier
+## that would let a reader recover it.
 ##
 ## Two writers of the same container format disagree about it today:
 ##
-## * this one — ``prefixSum[file_id] + line``, with every file allocated
+## * this one — the prefix sum above, with every file allocated
 ##   `DefaultLinesPerFile` addresses, and
 ## * the Rust ``codetracer_trace_writer`` —
 ##   ``(path_id shl 32) or line``, its ``step_stream.rs``
 ##   ``pack_global_line_index`` / ``unpack_global_line_index``.
+##
+## The spec excludes the second (``trace-events.md`` §"The address is a
+## prefix sum, and nothing else"): a shift of 32 bounds the trace, costs
+## five varint bytes per address after the first against a 2-3 byte
+## budget, and — because a container carries no discriminator and both
+## inverses always return a plausible pair — leaves a reader handed the
+## wrong scheme answering a location that was never in the trace.
 ##
 ## So the inverse direction is only defined relative to an assumption about
 ## the producer. `tryResolve` states that assumption and refuses the
@@ -35,7 +58,10 @@ const DefaultLinesPerFile*: uint64 = 100_000
   ##
   ## Real line counts would come from the source files, which the writer
   ## does not have; the constant is a ceiling generous enough that a
-  ## file's lines never spill into the next file's range.
+  ## file's lines never spill into the next file's range. It is a count of
+  ## addressable lines, so a file of exactly this many lines fits: lines
+  ## `1 .. DefaultLinesPerFile` occupy the whole slot and line
+  ## `DefaultLinesPerFile + 1` is the first that spills.
   ##
   ## It lives here, next to the prefix-sum arithmetic it parameterises, so
   ## that the writer that encodes with it and any reader that inverts it
@@ -49,6 +75,11 @@ proc fileAddressCount*(lineLengths: openArray[uint32]): uint64 =
   ## capacity, so a `global_position_index` inside its range resolves to a
   ## `(line, column)`. A file without one occupies `DefaultLinesPerFile`
   ## addresses and its positions resolve to a line only.
+  ##
+  ## Either way the count is the number of positions the file has, not one
+  ## more: the in-file offset is 0-based, so the slot `[base, base +
+  ## count)` holds every position and no address is left unused at the
+  ## base.
   ##
   ## A trace may mix the two: `registerPath` takes the line lengths as an
   ## optional argument, so a column-aware recorder that has them for its
@@ -98,12 +129,25 @@ proc buildGlobalLineIndex*(lineCounts: openArray[uint64]): GlobalLineIndex =
   )
 
 proc globalIndex*(gli: GlobalLineIndex, fileId: int, line: uint64): uint64 =
-  ## Convert (file_id, line) to global line index.
-  gli.prefixSum[fileId] + line
+  ## Convert a 1-based `(file_id, line)` to a global line index:
+  ## `prefixSum[fileId] + (line - 1)`. Inverted by `resolve`.
+  ##
+  ## Line 0 is not a source line, and the offset is clamped at 0 for it.
+  ## Unclamped it would be `prefixSum[fileId] - 1`, which wraps to
+  ## `2^64 - 1` for file 0 — a ten-byte varint on the wire — and lands in
+  ## the previous file's last line for every other file. The clamp costs
+  ## injectivity for an input that is not a location anyway: line 0 gets
+  ## line 1's address, the file's own base. The column-aware encoder in
+  ## `multi_stream_writer.toGlobalLineIndex` clamps to the same address,
+  ## so the two modes agree on what a caller's 0 means.
+  let inFileOffset = if line == 0: 0'u64 else: line - 1
+  gli.prefixSum[fileId] + inFileOffset
 
 proc resolve*(gli: GlobalLineIndex, globalIdx: uint64): (int, uint64) =
-  ## Convert global line index back to (file_id, line).
-  ## Uses binary search on the prefix sum array.
+  ## Convert global line index back to (file_id, line): binary-search the
+  ## prefix sums for the file, then `line = globalIdx - prefixSum[f] + 1`
+  ## because the in-file offset is 0-based and lines are 1-based. Inverse
+  ## of `globalIndex` over every line a file has.
   ##
   ## Unchecked: `globalIdx` is assumed to be an address of this index, i.e.
   ## below `totalLines`. An index above the top of the space is answered by
@@ -120,7 +164,7 @@ proc resolve*(gli: GlobalLineIndex, globalIdx: uint64): (int, uint64) =
       lo = mid
     else:
       hi = mid - 1
-  (lo, globalIdx - gli.prefixSum[lo])
+  (lo, globalIdx - gli.prefixSum[lo] + 1)
 
 proc tryResolve*(gli: GlobalLineIndex,
     globalIdx: uint64): Result[(int, uint64), string] =
@@ -137,6 +181,10 @@ proc tryResolve*(gli: GlobalLineIndex,
   ## line` puts every step of every file above id 0 far beyond the top of a
   ## `DefaultLinesPerFile` space.
   ##
+  ## `totalLines` is the exact top: the last file's last line sits at
+  ## `totalLines - 1`, so nothing this space can encode is refused and
+  ## everything above it is.
+  ##
   ## What it cannot catch: a spill *within* the space. A file whose lines
   ## run past its slot addresses the next file's range, and the arithmetic
   ## there is indistinguishable from a legitimate address. That is a
@@ -150,8 +198,8 @@ proc tryResolve*(gli: GlobalLineIndex,
       " is outside this trace's address space of " & $gli.totalLines &
       " (" & $(gli.prefixSum.len - 1) & " path(s)). A line-only container " &
       "records no packing discriminator, and the writers disagree: " &
-      "codetracer_trace_format_nim packs prefixSum[path_id] + line, the " &
-      "Rust codetracer_trace_writer packs (path_id shl 32) or line " &
+      "codetracer_trace_format_nim packs prefixSum[path_id] + (line - 1), " &
+      "the Rust codetracer_trace_writer packs (path_id shl 32) or line " &
       "(step_stream.rs pack_global_line_index). Resolving this index would " &
       "require an assumption the container does not carry")
   ok(gli.resolve(globalIdx))

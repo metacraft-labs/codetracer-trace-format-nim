@@ -21,7 +21,7 @@
 ## writer packed those coordinates into. That integer's apportionment between
 ## files is a writer convention the container does not record, and the two
 ## writers of this format disagree about it: this repo packs
-## `prefixSum[path_id] + line`, the Rust `codetracer_trace_writer` packs
+## `prefixSum[path_id] + (line - 1)`, the Rust `codetracer_trace_writer` packs
 ## `(path_id shl 32) or line` (`step_stream.rs pack_global_line_index`). See
 ## `global_line_index.nim`'s module header. Inverting one packing's integer
 ## with the other's formula files every step of every path above 0 under a

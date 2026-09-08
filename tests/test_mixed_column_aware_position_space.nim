@@ -23,15 +23,17 @@
 ## everywhere — a third layout, agreeing with neither.
 ##
 ## What that produced, on the fixture below (file 0 lengths `[10, 10]`, file
-## 1 untabled): the writer encodes (file 1, line 1) as 21. The column decode
-## refuses it — file 1 has no line table — and the fallback answers
-## (file 0, line 21). 21 is INSIDE the fallback's space, so `tryResolve`
-## cannot catch it: the guard added for a foreign packing only refuses
-## addresses above the top, and this one is not.
+## 1 untabled): the writer encodes (file 1, line 1) as 20, file 1's own
+## base. The column decode refuses it — file 1 has no line table — and the
+## fallback, which sizes file 0 as `DefaultLinesPerFile`, reads 20 as an
+## offset into file 0 and answers (file 0, line 21). 20 is INSIDE the
+## fallback's space, so `tryResolve` cannot catch it: the guard added for a
+## foreign packing only refuses addresses above the top, and this one is
+## not.
 ##
 ## What is asserted here, and why each one can fail:
 ##
-##   1. The writer's own encoding of (file 1, line 1) is 21 — the arithmetic
+##   1. The writer's own encoding of (file 1, line 1) is 20 — the arithmetic
 ##      the rest of the test is about, read off the container's step stream.
 ##   2. `readEvents` reports the steps at the files and lines they were
 ##      registered at. A reader whose file sizing disagrees with the
@@ -94,8 +96,9 @@ proc writeFullyTabledTrace(file: string) =
 
 proc test_the_writer_puts_file_one_just_past_file_zeros_capacity() =
   ## THE ARITHMETIC. File 0 has 20 addressable columns, so file 1's base is
-  ## 20 and (file 1, line 1) is 21. Read off the container rather than
-  ## recomputed, so a change to the writer's sizing shows up here first.
+  ## 20, and its first line sits at that base: (file 1, line 1) is 20. Read
+  ## off the container rather than recomputed, so a change to the writer's
+  ## sizing shows up here first.
   let file = dir / "mixed_arithmetic.ct"
   writeMixedTrace(file)
 
@@ -110,14 +113,15 @@ proc test_the_writer_puts_file_one_just_past_file_zeros_capacity() =
 
   let g2 = reader.stepAbsoluteGlobalLineIndex(2)
   doAssert g2.isOk, "step 2 gli: " & g2.error
-  doAssert g2.get() == 21'u64,
+  doAssert g2.get() == 20'u64,
     "(file 1, line 1) must encode as file 0's capacity (" &
-    $expectedFileZeroCapacity & ") + 1; the container holds " & $g2.get()
+    $expectedFileZeroCapacity & "), which is file 1's own base; the " &
+    "container holds " & $g2.get()
 
   let g3 = reader.stepAbsoluteGlobalLineIndex(3)
   doAssert g3.isOk, "step 3 gli: " & g3.error
-  doAssert g3.get() == 23'u64,
-    "(file 1, line 3) must encode as 23; the container holds " & $g3.get()
+  doAssert g3.get() == 22'u64,
+    "(file 1, line 3) must encode as 22; the container holds " & $g3.get()
 
   echo "PASS: test_the_writer_puts_file_one_just_past_file_zeros_capacity"
 
@@ -164,9 +168,9 @@ proc test_untabled_file_refuses_a_column_by_name() =
   doAssert readerRes.isOk, "openNewTrace failed: " & readerRes.error
   var reader = readerRes.get()
 
-  let decoded = reader.decodeGlobalPositionIndex(21'u64)
+  let decoded = reader.decodeGlobalPositionIndex(20'u64)
   doAssert decoded.isErr,
-    "21 is in file 1, which has no line-length table; the decoder answered " &
+    "20 is in file 1, which has no line-length table; the decoder answered " &
     $decoded.get()
   doAssert "file 1" in decoded.error,
     "the refusal must name the file it landed in: " & decoded.error

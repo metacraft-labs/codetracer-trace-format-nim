@@ -593,11 +593,15 @@ const
   LegacyValueByte* = 0x5A'u8
 
 proc legacyStepGli*(i: int): uint64 =
-  ## Line-only addressing: `(path_id << 32) | line`, which is what
-  ## `DefaultLinesPerFile`-based `GlobalLineIndex` produces and what a
-  ## pre-column-aware bundle carries.  Kept inside one file's slot so the
-  ## deltas stay in the ±63 DeltaStep window for most steps and cross it for
-  ## some.
+  ## The `global_position_index` of step `i` in the legacy corpus.
+  ##
+  ## The corpus writes these integers into `steps.dat` directly and reads
+  ## them back as integers, so what matters is only that the sequence is
+  ## fixed and that its deltas straddle the ±63 DeltaStep window — some
+  ## steps inside it, some outside — which exercises both encodings. It is
+  ## not run through `globalIndex`, so it asserts nothing about how a file
+  ## id and a line are apportioned into an address; the whole sequence sits
+  ## inside path 0's slot in a `DefaultLinesPerFile` space.
   1000'u64 + uint64(i) * 3'u64
 
 proc legacyValueBytes*(i: int): seq[byte] =

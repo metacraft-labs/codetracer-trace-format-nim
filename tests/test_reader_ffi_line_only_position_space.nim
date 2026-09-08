@@ -5,7 +5,7 @@
 ## `codetracer/src/db-backend/src/ctfs_trace_reader` populates `Db.steps`,
 ## so whatever they answer becomes a DAP `stackTrace` frame. They invert a
 ## line-only `global_position_index` through the writer's own address space
-## — `prefixSum[path_id] + line`, `DefaultLinesPerFile` addresses per file —
+## — `prefixSum[path_id] + (line - 1)`, `DefaultLinesPerFile` addresses per file —
 ## which is an assumption about the producer, not a property of the trace.
 ## A line-only container states no packing: no stride, no per-file line
 ## count, no producer identifier.
@@ -21,7 +21,7 @@
 ##   1. All three accessors REFUSE such a position — non-zero / `UINT64_MAX`
 ##      with the index and the rival packing named in
 ##      `trace_writer_last_error`. Unchecked, they report path 1, line
-##      4294867301 and return success, which is what reaches the DAP wire.
+##      4294867302 and return success, which is what reaches the DAP wire.
 ##   2. They DISCRIMINATE: on an ordinary line-only container built by the
 ##      same helper, all three succeed and report exactly the `(path, line)`
 ##      pairs registered, with the column slot 0. A guard that refused
@@ -50,10 +50,18 @@ proc packGlobalLineIndexRust(pathId: uint64, line: uint64): uint64 =
   ## that the two packings are independent.
   (pathId shl 32) or (line and ((1'u64 shl 32) - 1))
 
+proc lineEncodingTo(address: uint64): uint64 =
+  ## The `line` to register on path 0 so that `address` itself is what lands
+  ## on the wire. Path 0's base is 0 and the encode is `base + (line - 1)`,
+  ## so the line is one more than the address it produces. Without the
+  ## `+ 1` the injected step carries `address - 1` and the test asserts
+  ## about an integer no writer emits.
+  address + 1
+
 proc writeTrace(file: string, steps: openArray[(uint64, uint64)]) =
   ## A line-only container over two paths. `registerStep` applies the Nim
-  ## packing, so a Rust-packed integer passed as `line` on path 0 — whose
-  ## base is 0 — lands on the wire unchanged, exactly as a Rust-written
+  ## packing, so a Rust-packed address routed through `lineEncodingTo` on
+  ## path 0 lands on the wire unchanged, exactly as a Rust-written
   ## container's `steps.dat` would hold it.
   var w = initMultiStreamWriter(file & ".build", "ffi_line_only_space").get()
   doAssert w.registerPath(PathA).isOk
@@ -74,7 +82,8 @@ removeDir(dir)
 createDir(dir)
 let foreign = dir / "foreign.ct"
 let ordinary = dir / "ordinary.ct"
-writeTrace(foreign, [(0'u64, packGlobalLineIndexRust(1'u64, 5'u64))])
+writeTrace(foreign,
+  [(0'u64, lineEncodingTo(packGlobalLineIndexRust(1'u64, 5'u64)))])
 writeTrace(ordinary, [(0'u64, 3'u64), (1'u64, 7'u64), (0'u64, 12'u64)])
 
 block single_accessor_refuses_by_name:

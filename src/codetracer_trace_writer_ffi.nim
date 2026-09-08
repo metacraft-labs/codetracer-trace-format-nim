@@ -3219,7 +3219,7 @@ proc ct_reader_workdir(h: pointer, outLen: ptr csize_t): ptr uint8 {.exportc, cd
 # A line-only step is one integer that addresses one line, and the container
 # says nothing about how the integers were apportioned between files. The
 # space rebuilt here is `codetracer_trace_format_nim`'s own writer's —
-# `prefixSum[path_id] + line`, each file's slot sized by
+# `prefixSum[path_id] + (line - 1)`, each file's slot sized by
 # `global_line_index.fileAddressCount` exactly as the writer sizes it —
 # which is an assumption about the producer, not a property of the trace.
 # The Rust `codetracer_trace_writer` writes the same container format with a

@@ -382,7 +382,7 @@ proc readEventsV4(reader: var TraceReader): Result[void, string] =
   # apportioned between files: no stride, no per-file line count, no
   # producer identifier. Inverting one is therefore an assumption about the
   # producer, and the assumption made here is `codetracer_trace_format_nim`'s
-  # own writer — `prefixSum[path_id] + line`, each file's slot sized by
+  # own writer — `prefixSum[path_id] + (line - 1)`, each file's slot sized by
   # `global_line_index.fileAddressCount` exactly as
   # `multi_stream_writer.rebuildGli` sizes it.
   #

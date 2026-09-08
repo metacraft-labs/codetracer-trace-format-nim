@@ -86,6 +86,12 @@ task test, "Run all tests":
   # be a falsifiable one: an address outside the space is refused by name
   # rather than clamped into a file that exists.
   exec "nim c -r -d:release -p:src tests/test_line_only_position_space.nim"
+  # The file boundary in that space. An address is prefixSum[file_id] +
+  # (line - 1), so a file's slot holds exactly the lines it has. Encoding
+  # + line instead leaves each base unused and pushes a file's last line
+  # into the next file's range — invisible behind an oversized stride,
+  # a wrong answer at every boundary once slots are sized to real counts.
+  exec "nim c -r -d:release -p:src tests/test_global_line_index_boundary.nim"
   # The column-aware step encoding end to end: the writer's opt-in, the
   # DeltaColumn round-trip, Layout A paths.dat, the position decoder, and the
   # meta.dat unknown-flag-bit rejection that keeps the extension clean.

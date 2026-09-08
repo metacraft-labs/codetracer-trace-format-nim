@@ -7,13 +7,17 @@ import codetracer_trace_writer/step_encoding
 
 proc test_global_line_index_roundtrip() {.raises: [].} =
   ## Create line index with 5 files, verify every (fileId, line) roundtrips.
+  ##
+  ## Lines are 1-based, so a file of N lines holds lines ``1 .. N`` — the
+  ## whole of its N-address slot, first line at its own base and last line
+  ## at ``base + N - 1``.
   let lineCounts = [100'u64, 200, 50, 300, 150]
   let gli = buildGlobalLineIndex(lineCounts)
 
   doAssert gli.totalLines == 800
 
   for fileId in 0 ..< lineCounts.len:
-    for line in 0'u64 ..< lineCounts[fileId]:
+    for line in 1'u64 .. lineCounts[fileId]:
       let gi = gli.globalIndex(fileId, line)
       let (resolvedFileId, resolvedLine) = gli.resolve(gi)
       doAssert resolvedFileId == fileId,

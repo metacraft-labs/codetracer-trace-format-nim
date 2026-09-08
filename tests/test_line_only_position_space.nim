@@ -11,7 +11,7 @@
 ##
 ## Two writers of this container format pack it differently:
 ##
-##   * `codetracer_trace_format_nim` — `prefixSum[path_id] + line`, every file
+##   * `codetracer_trace_format_nim` — `prefixSum[path_id] + (line - 1)`, every file
 ##     allocated `DefaultLinesPerFile` (100_000) addresses.
 ##     `multi_stream_writer.toGlobalLineIndex` / `global_line_index`.
 ##   * the Rust `codetracer_trace_writer` — `(path_id shl 32) or line`.
@@ -32,7 +32,7 @@
 ##      wrong pair. A `tryResolve` that forwarded to `resolve` fails this.
 ##   2. `readEvents` on a container holding such an address fails by name
 ##      rather than emitting a `StepRecord`. A reader that resolves it
-##      unchecked emits `(path 1, line 4294867301)` and returns `ok`.
+##      unchecked emits `(path 1, line 4294867302)` and returns `ok`.
 ##   3. `tryResolve` DISCRIMINATES: every address a Nim-written trace really
 ##      produces resolves, to exactly the `(path, line)` registered. A check
 ##      that refused unconditionally fails this half, and so does a
@@ -60,11 +60,19 @@ proc packGlobalLineIndexRust(pathId: uint64, line: uint64): uint64 =
   ## this test exists to pin.
   (pathId shl 32) or (line and ((1'u64 shl 32) - 1))
 
+proc lineEncodingTo(address: uint64): uint64 =
+  ## The `line` to register on path 0 so that `address` itself is what lands
+  ## on the wire. Path 0's base is 0 and the encode is `base + (line - 1)`,
+  ## so the line is one more than the address it produces. Without the
+  ## `+ 1` the injected step carries `address - 1` and the test asserts
+  ## about an integer no writer emits.
+  address + 1
+
 proc writeTrace(file: string, steps: openArray[(uint64, uint64)]) =
   ## A line-only container (no `enableColumnAwareSteps`) over two paths,
   ## carrying `steps` as `(pathId, line)` pairs. `registerStep` runs the
-  ## Nim packing, so passing a Rust-packed integer as `line` on path 0 —
-  ## whose base is 0 — puts that exact integer on the wire, which is what a
+  ## Nim packing, so a Rust-packed address routed through `lineEncodingTo`
+  ## on path 0 puts that exact integer on the wire, which is what a
   ## Rust-written container's `steps.dat` would hold.
   var w = initMultiStreamWriter(file & ".build", "line_only_position_space").get()
   doAssert w.registerPath(PathA).isOk
@@ -106,8 +114,8 @@ proc test_foreign_packing_is_refused_not_answered() =
   let (clampedPath, clampedLine) = gli.resolve(foreign)
   doAssert clampedPath == 1,
     "resolve clamps to the last file; got path " & $clampedPath
-  doAssert clampedLine == 4_294_867_301'u64,
-    "resolve reports 4294967301 - 100000; got line " & $clampedLine
+  doAssert clampedLine == 4_294_867_302'u64,
+    "resolve reports 4294967301 - 100000 + 1; got line " & $clampedLine
 
   let refused = gli.tryResolve(foreign)
   doAssert refused.isErr,
@@ -128,7 +136,8 @@ proc test_reader_fails_by_name_on_a_foreign_packed_step() =
   ## writer would have written for (path 1, line 5) must be reported, not
   ## reinterpreted.
   let file = dir / "foreign_packing.ct"
-  writeTrace(file, [(0'u64, packGlobalLineIndexRust(1'u64, 5'u64))])
+  writeTrace(file,
+    [(0'u64, lineEncodingTo(packGlobalLineIndexRust(1'u64, 5'u64)))])
 
   var readerRes = openTrace(file)
   doAssert readerRes.isOk, "openTrace failed (see trace reader Result)"
@@ -146,7 +155,7 @@ proc test_reader_fails_by_name_on_a_foreign_packed_step() =
     "the refusal must say what the container is missing: " & res.error
 
   # The wrong answer this replaces: the unchecked inverse emitted a step at
-  # path 1, line 4294867301, in a two-file trace whose sources have a few
+  # path 1, line 4294867302, in a two-file trace whose sources have a few
   # dozen lines between them.
   for ev in reader.events:
     doAssert ev.kind != tleStep,
@@ -162,7 +171,8 @@ proc test_native_packing_still_resolves_exactly() =
   ## that cannot fail.
   let gli = lineOnlySpace(2)
   for (path, line) in [(0'u64, 1'u64), (0'u64, 99_999'u64),
-                       (1'u64, 1'u64), (1'u64, 42'u64)]:
+                       (0'u64, DefaultLinesPerFile), (1'u64, 1'u64),
+                       (1'u64, 42'u64), (1'u64, DefaultLinesPerFile)]:
     let encoded = gli.globalIndex(int(path), line)
     let got = gli.tryResolve(encoded)
     doAssert got.isOk,

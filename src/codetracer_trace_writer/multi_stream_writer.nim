@@ -248,9 +248,10 @@ proc toGlobalLineIndex(w: var MultiStreamTraceWriter,
   ## column is 1, and subsequent ``DeltaColumn`` events advance it
   ## within the line).
   ##
-  ## In line-only mode, returns the legacy ``file_base + line`` value
-  ## so traces produced without column data are byte-for-byte identical
-  ## to pre-P6 output.
+  ## In line-only mode, returns ``file_base + (line - 1)`` — the same
+  ## 0-based in-file offset, with one address per line instead of one per
+  ## (line, column) position, so both modes put line 1 at the file's own
+  ## base. See ``global_line_index.globalIndex``.
   if w.gliDirty:
     w.rebuildGli()
   if w.columnAwareSteps and pathId < uint64(w.pathLineLengths.len) and

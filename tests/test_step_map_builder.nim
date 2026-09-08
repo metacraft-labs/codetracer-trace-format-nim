@@ -19,6 +19,7 @@ import std/[tables, algorithm]
 import results
 import codetracer_trace_writer/step_map_builder
 import codetracer_trace_writer/multi_stream_writer
+import codetracer_trace_writer/global_line_index
 import codetracer_ctfs/container
 
 # ---------------------------------------------------------------------------
@@ -215,9 +216,9 @@ proc test_column_aware_suppresses_step_map() =
 
 proc test_writer_step_map_keys_second_path() =
   ## A breakpoint on `/src/lib.py:7` reaches `step-map.ns` as the pair
-  ## `(path_id = 1, line = 7)`. Path 0 hides every keying error: its steps
-  ## are packed as `0 + line`, which every packing in circulation agrees
-  ## with. Path 1 does not.
+  ## `(path_id = 1, line = 7)`. Path 0 hides most keying errors: its base
+  ## is 0, so its addresses differ from its line numbers only by the
+  ## 1-based-to-0-based shift. Path 1 does not.
   let writerRes = initMultiStreamWriter("test_sm_p1.ct", "step_map_path1_test")
   doAssert writerRes.isOk, "initMultiStreamWriter failed: " & writerRes.error
   var w = writerRes.get()
@@ -261,10 +262,15 @@ proc test_writer_step_map_keys_second_path() =
   doAssert parsed.byPath[0][3'u32] == @[0'i64],
     "steps at (path 0, line 3): " & $parsed.byPath[0][3'u32]
 
-  # The writer packs (path 1, line 7) as prefixSum[1] + 7. Nothing may be
-  # filed under that integer read as a line number of path 0.
-  doAssert not parsed.byPath[0].hasKey(uint32(DefaultLinesPerFile) + 7'u32),
-    "path 0 carries an entry at line " & $(DefaultLinesPerFile + 7) &
+  # Nothing may be filed under the ADDRESS the writer packs (path 1,
+  # line 7) into, read as a line number of path 0. The address is taken
+  # from `global_line_index` rather than restated, so this stays the
+  # writer's own arithmetic if the packing or the sizing changes.
+  let space = buildGlobalLineIndex(
+    positionSpaceCounts([], 2, columnAware = false))
+  let packedPath1Line7 = space.globalIndex(1, 7)
+  doAssert not parsed.byPath[0].hasKey(uint32(packedPath1Line7)),
+    "path 0 carries an entry at line " & $packedPath1Line7 &
       " — the raw global_line_index of (path 1, line 7) filed as a line"
 
   w.closeCtfs()

@@ -21,7 +21,7 @@
 ##
 ##   1. The `--full` / `--events` document carries `position_error` for an
 ##      unresolvable step, and carries NO `path_id`, `line` or `path`. A
-##      ct-print that resolves unchecked emits `line: 4294867301` and no
+##      ct-print that resolves unchecked emits `line: 4294867302` and no
 ##      error key.
 ##   2. The message names the index, the space it is outside of, and the
 ##      rival packing — enough to act on without reading the source.
@@ -52,10 +52,18 @@ proc packGlobalLineIndexRust(pathId: uint64, line: uint64): uint64 =
   ## packings are independent.
   (pathId shl 32) or (line and ((1'u64 shl 32) - 1))
 
+proc lineEncodingTo(address: uint64): uint64 =
+  ## The `line` to register on path 0 so that `address` itself is what lands
+  ## on the wire. Path 0's base is 0 and the encode is `base + (line - 1)`,
+  ## so the line is one more than the address it produces. Without the
+  ## `+ 1` the injected step carries `address - 1` and the test asserts
+  ## about an integer no writer emits.
+  address + 1
+
 proc writeTrace(file: string, steps: openArray[(uint64, uint64)]) =
   ## A line-only container over two paths. `registerStep` runs the Nim
-  ## packing, so passing an already-packed integer as `line` on path 0 —
-  ## whose base is 0 — puts that exact integer on the wire, which is what a
+  ## packing, so an already-packed address routed through `lineEncodingTo`
+  ## on path 0 puts that exact integer on the wire, which is what a
   ## foreign writer's `steps.dat` would hold.
   var w = initMultiStreamWriter(file & ".build", "ct_print_position").get()
   doAssert w.registerPath(PathA).isOk
@@ -79,7 +87,7 @@ proc test_unresolvable_step_is_reported_not_located() =
   let file = dir / "foreign_packing.ct"
   let foreign = packGlobalLineIndexRust(1'u64, 5'u64)
   doAssert foreign == 4_294_967_301'u64, "packing changed: " & $foreign
-  writeTrace(file, [(0'u64, foreign)])
+  writeTrace(file, [(0'u64, lineEncodingTo(foreign))])
 
   var readerRes = openNewTrace(file)
   doAssert readerRes.isOk, "openNewTrace failed: " & readerRes.error
