@@ -1554,8 +1554,9 @@ type
     adkUnreadable    ## file does not exist / cannot be opened
     adkNotCtfs       ## file exists but lacks CTFS magic — let v2/v3 path try
     adkCtfsCorrupt   ## CTFS magic OK but root header looks broken — hard error
-    adkNative        ## CTFS + meta.json with recordingMode → native decoder
-    adkV4MultiStream ## CTFS without meta.json → existing v4 path
+    adkNative        ## CTFS with `tNNN` thread streams (or legacy meta.json
+                     ## + recordingMode) → native MCR decoder
+    adkV4MultiStream ## CTFS with the split per-kind streams → v4 path
 
 proc detectAutoKind(filePath: string): (AutoDetectKind, string) =
   ## Inspect the file once and decide which decode path should claim it.
@@ -1569,10 +1570,12 @@ proc detectAutoKind(filePath: string): (AutoDetectKind, string) =
     return (adkNotCtfs, "no CTFS magic — not a .ct bundle")
   let infoR = detectNativeBundle(data)
   if infoR.isErr:
-    # A v4 multi-stream bundle has `meta.dat` and no `meta.json`, so
-    # detectNativeBundle errs with "meta.json missing" — that's the normal
-    # signal to route to the v4 reader, not a corruption indicator.
-    if infoR.error.startsWith("meta.json missing"):
+    # A container with no metadata document at all is not something either
+    # decoder can read; anything else is a v4 bundle for the v4 reader.
+    # (Routing no longer keys off "meta.json missing": current MCR bundles
+    # carry only `meta.dat`, and `detectNativeBundle` now accepts either —
+    # `isNativeBundle` discriminates on the presence of `tNNN` streams.)
+    if infoR.error.startsWith("metadata missing"):
       return (adkV4MultiStream, "")
     return (adkCtfsCorrupt, infoR.error)
   if isNativeBundle(data):

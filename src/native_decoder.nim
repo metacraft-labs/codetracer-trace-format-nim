@@ -7,11 +7,17 @@
 ## internal layout from the regular v4 multi-stream traces this repo's
 ## `NewTraceReader` understands. Concretely, a native bundle contains:
 ##
-##   - `meta.json`             — JSON header (program / args / recordingMode /
-##                               platform / tickSource / hookProfile / ...)
+##   - `meta.dat`              — binary metadata (program / args / workdir /
+##                               MCR fields: platform / tickSource /
+##                               hookProfile / hookStrategies / paths).  Legacy
+##                               bundles carry a `meta.json` with the same
+##                               fields instead; both are accepted.
 ##   - `tNNNNNNNNNNN`          — one per-thread event stream, each a sequence
-##                               of `EventHeader (26 bytes)` + payload records;
-##                               may be zstd-compressed (auto-detected).
+##                               of `EventHeader (26 bytes)` + payload records,
+##                               stored as a concatenation of per-chunk zstd
+##                               frames (seekable-zstd; companion index
+##                               `iNNNNNNNNNNN`).  Uncompressed streams are
+##                               accepted too (auto-detected).
 ##   - `event_log.dat` + `.idx`— chunk-indexed OS-event log with structured
 ##                               (geid, tick, tid, kind, fd, returnValue,
 ##                               metadata, content) entries.
@@ -57,13 +63,14 @@
 ##   module returns `Result[..., string]` and the CLI treats `isErr` as a
 ##   user-visible error rather than a silent fallback.
 
-import std/[json, base64, strutils, algorithm]
+import std/[json, base64, strutils, algorithm, options]
 import results
 import stew/endians2
 import codetracer_ctfs/base40
 import codetracer_ctfs/container
 import codetracer_ctfs/types
 import codetracer_ctfs/zstd_bindings
+import codetracer_trace_writer/meta_dat
 
 # ---------------------------------------------------------------------------
 # Wire-format constants (must match the native recorder)
@@ -205,6 +212,13 @@ type
     blockSize*: uint32
     maxRoot*: uint32
     metaJson*: string
+      ## Legacy JSON metadata blob.  Empty on every recording made after the
+      ## recorder retired `meta.json` in favour of binary `meta.dat`
+      ## (`codetracer-native-recorder` a0ca32b; see
+      ## codetracer-specs/Planned-Work/Legacy-CTFS-Format-Cleanup.md).
+    metaDat*: seq[byte]
+      ## Binary `meta.dat` bytes when the bundle carries them.  Current MCR
+      ## containers have ONLY this; `metaJson` stays empty for them.
     threadStreams*: seq[(uint32, string)]  # (ctTid, encodedName-string)
     hasEventLog*: bool
     hasCheckpointIndex*: bool
@@ -245,14 +259,23 @@ proc detectNativeBundle*(data: openArray[byte]): Result[NativeBundleInfo, string
 
   var info = NativeBundleInfo(blockSize: blockSize, maxRoot: maxRoot)
 
-  # Pull meta.json — required for native bundles.
+  # Pull the metadata blob.  Legacy native bundles carry `meta.json`; every
+  # bundle written since the recorder retired that document carries binary
+  # `meta.dat` instead (both are accepted — a container with neither is not a
+  # decodable trace at all).
   let metaR = readInternalFile(data, "meta.json", blockSize, maxRoot)
-  if metaR.isErr:
-    return err("meta.json missing: " & metaR.error)
-  var metaStr = newString(metaR.get().len)
-  for i in 0 ..< metaR.get().len:
-    metaStr[i] = char(metaR.get()[i])
-  info.metaJson = metaStr
+  if metaR.isOk:
+    var metaStr = newString(metaR.get().len)
+    for i in 0 ..< metaR.get().len:
+      metaStr[i] = char(metaR.get()[i])
+    info.metaJson = metaStr
+  else:
+    let metaDatR = readInternalFile(data, "meta.dat", blockSize, maxRoot)
+    if metaDatR.isErr:
+      return err(
+        "metadata missing: neither meta.json (" & metaR.error &
+        ") nor meta.dat (" & metaDatR.error & ")")
+    info.metaDat = metaDatR.get()
 
   # Enumerate root-block entries to find tNNNN streams and event_log files.
   for i in 0 ..< int(maxRoot):
@@ -291,12 +314,18 @@ proc isNativeBundle*(data: openArray[byte]): bool =
   if infoR.isErr:
     return false
   let info = infoR.get()
-  # Has a non-empty meta.json AND has either a `recordingMode` field or
-  # at least one thread stream — both are unique to the native layout.
-  if info.metaJson.len == 0:
-    return false
+  # A `tNNN` per-thread stream is the discriminator that survives the
+  # meta.json → meta.dat migration: the v4 multi-stream layout never has one
+  # (it splits by kind: steps.dat / calls.dat / values.dat / events.dat), so a
+  # container carrying at least one `tNNN` is an MCR bundle regardless of
+  # which metadata document it uses.
   if info.threadStreams.len > 0:
     return true
+  # Legacy JSON-metadata bundles with no thread stream are still routed here
+  # so the native decoder's structured error surfaces instead of the v4
+  # reader's degenerate `{counts: {steps: -1, ...}}` document.
+  if info.metaJson.len == 0:
+    return false
   findJsonStringValue(info.metaJson, "recordingMode").len > 0
 
 # ---------------------------------------------------------------------------
@@ -315,29 +344,52 @@ type
     streamOffset*: int    ## byte offset into the per-thread stream
 
 proc decompressZstdFrame(raw: openArray[byte]): Result[seq[byte], string] =
-  ## Single-frame zstd decompression. We use `ZSTD_getFrameContentSize` to
-  ## learn the decoded length up front; if the frame doesn't carry a content
-  ## size we fall back to a 16x growth heuristic.
+  ## Decompress a per-thread stream that is a CONCATENATION of zstd frames.
+  ##
+  ## A `tNNN` stream is seekable-zstd: `[zstd(chunk_0)][zstd(chunk_1)]...`,
+  ## each chunk holding `ThreadStreamChunkSize` (256) whole event records
+  ## (`internal-files.md` §"Per-file thread streams (MCR recorder) are
+  ## seekable-zstd").  A single `ZSTD_decompress` over the whole buffer is not
+  ## enough: `ZSTD_getFrameContentSize` reports only the FIRST frame's decoded
+  ## size, so a multi-chunk stream would fail with `dstSize_tooSmall`.  We
+  ## therefore walk frame by frame with `ZSTD_findFrameCompressedSize` and
+  ## concatenate.  Records never straddle a chunk boundary, so the
+  ## concatenation is a valid `EventHeader.size`-walkable record stream.
   if raw.len == 0:
     var empty: seq[byte] = @[]
     return ok(empty)
-  let srcPtr = unsafeAddr raw[0]
-  let cs = ZSTD_getFrameContentSize(srcPtr, csize_t(raw.len))
-  var dstSize: int
-  if cs == ZSTD_CONTENTSIZE_ERROR:
-    return err("zstd: not a valid frame")
-  elif cs == ZSTD_CONTENTSIZE_UNKNOWN:
-    dstSize = raw.len * 16
-    if dstSize < 4096: dstSize = 4096
-  else:
-    dstSize = int(cs)
-  var dst = newSeq[byte](dstSize)
-  let n = ZSTD_decompress(addr dst[0], csize_t(dstSize),
-                          srcPtr, csize_t(raw.len))
-  if ZSTD_isError(n) != 0:
-    return err("zstd decompress failed: " & $ZSTD_getErrorName(n))
-  dst.setLen(int(n))
-  ok(dst)
+  var decoded: seq[byte] = @[]
+  var pos = 0
+  while pos < raw.len:
+    let srcPtr = unsafeAddr raw[pos]
+    let remaining = csize_t(raw.len - pos)
+    let frameSize = ZSTD_findFrameCompressedSize(srcPtr, remaining)
+    if ZSTD_isError(frameSize) != 0:
+      return err("zstd: frame at offset " & $pos & " is invalid: " &
+                 $ZSTD_getErrorName(frameSize))
+    if frameSize == 0.csize_t or int(frameSize) > raw.len - pos:
+      return err("zstd: nonsensical frame size " & $frameSize &
+                 " at offset " & $pos)
+    let cs = ZSTD_getFrameContentSize(srcPtr, csize_t(frameSize))
+    var dstSize: int
+    if cs == ZSTD_CONTENTSIZE_ERROR:
+      return err("zstd: not a valid frame at offset " & $pos)
+    elif cs == ZSTD_CONTENTSIZE_UNKNOWN:
+      dstSize = int(frameSize) * 16
+      if dstSize < 4096: dstSize = 4096
+    else:
+      dstSize = int(cs)
+    var dst = newSeq[byte](dstSize)
+    if dstSize > 0:
+      let n = ZSTD_decompress(addr dst[0], csize_t(dstSize),
+                              srcPtr, csize_t(frameSize))
+      if ZSTD_isError(n) != 0:
+        return err("zstd decompress failed at offset " & $pos & ": " &
+                   $ZSTD_getErrorName(n))
+      dst.setLen(int(n))
+      decoded.add(dst)
+    pos += int(frameSize)
+  ok(decoded)
 
 proc readThreadStream(data: openArray[byte], blockSize, maxRoot: uint32,
                       streamName: string): Result[seq[byte], string] =
@@ -644,15 +696,38 @@ proc buildNativeFullDocument*(data: openArray[byte], opts: NativeOpts):
 
   # ----- metadata -----
   var meta = newJObject()
-  let program = findJsonStringValue(info.metaJson, "program")
-  let args = findJsonStringArray(info.metaJson, "args")
-  let platform = findJsonStringValue(info.metaJson, "platform")
-  let recordingMode = findJsonStringValue(info.metaJson, "recordingMode")
-  let tickSource = findJsonStringValue(info.metaJson, "tickSource")
-  let tickDef = findJsonStringValue(info.metaJson, "tickDefinition")
-  let hookProfile = findJsonStringValue(info.metaJson, "hookProfile")
-  let metaVersion = findJsonStringValue(info.metaJson, "version")
-  let hookStrats = findJsonStringArray(info.metaJson, "hookStrategies")
+  var program = findJsonStringValue(info.metaJson, "program")
+  var args = findJsonStringArray(info.metaJson, "args")
+  var platform = findJsonStringValue(info.metaJson, "platform")
+  var recordingMode = findJsonStringValue(info.metaJson, "recordingMode")
+  var tickSource = findJsonStringValue(info.metaJson, "tickSource")
+  var tickDef = findJsonStringValue(info.metaJson, "tickDefinition")
+  var hookProfile = findJsonStringValue(info.metaJson, "hookProfile")
+  var metaVersion = findJsonStringValue(info.metaJson, "version")
+  var hookStrats = findJsonStringArray(info.metaJson, "hookStrategies")
+  var workdir = ""
+  var metaDatPaths: seq[string] = @[]
+
+  # Binary-metadata bundles (every recording made since `meta.json` was
+  # retired): source the same fields from `meta.dat`.
+  if info.metaJson.len == 0 and info.metaDat.len > 0:
+    let mdR = readMetaDat(info.metaDat)
+    if mdR.isErr:
+      return err("meta.dat parse failed: " & mdR.error)
+    let md = mdR.get()
+    program = md.program
+    args = md.args
+    workdir = md.workdir
+    metaVersion = $md.version
+    metaDatPaths = md.paths
+    if md.mcrFields.isSome:
+      let mcr = md.mcrFields.get()
+      recordingMode = "mcr"
+      platform = mcr.platform
+      tickSource = mcr.tickSourceStr
+      tickDef = mcr.tickGranularity
+      hookProfile = mcr.hookProfile
+      hookStrats = mcr.hookStrategies
   meta["program"] = newJString(
     if opts.stripPaths and program.len > 0: "<program>" else: program)
   var argsArr = newJArray()
@@ -664,7 +739,8 @@ proc buildNativeFullDocument*(data: openArray[byte], opts: NativeOpts):
         a
     argsArr.add(newJString(av))
   meta["args"] = argsArr
-  meta["workdir"] = newJString("")  # native bundle has no workdir field
+  meta["workdir"] = newJString(
+    if opts.stripPaths and workdir.len > 0: "<workdir>" else: workdir)
   meta["recorder"] = newJString("native-mcr")
   meta["recording_mode"] = newJString(recordingMode)
   meta["platform"] = newJString(platform)
@@ -703,6 +779,12 @@ proc buildNativeFullDocument*(data: openArray[byte], opts: NativeOpts):
               inc pathsCount
       except CatchableError:
         discard  # malformed paths.json — leave count at 0 / array empty
+  if pathsCount == 0 and metaDatPaths.len > 0:
+    # No paths.json (retired alongside meta.json): meta.dat carries the
+    # recorder's registered source paths.
+    for p in metaDatPaths:
+      pathsArr.add(newJString(p))
+      inc pathsCount
   root["paths"] = pathsArr
   root["functions"] = newJArray()
   root["varnames"] = newJArray()
