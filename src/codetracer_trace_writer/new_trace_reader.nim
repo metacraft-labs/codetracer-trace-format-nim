@@ -45,14 +45,6 @@ type
     typeReader: InterningTableReader
     varnameReader: InterningTableReader
 
-    # paths.json fallback for traces that don't carry a binary paths
-    # interning table yet (the M13 ct_recorder writer populates
-    # paths.json but the binary paths.dat / paths.off table is still
-    # an open TODO per the meta-json-retirement work tracked in
-    # codetracer-specs/Planned-Work/Legacy-CTFS-Format-Cleanup.md).
-    # When pathReader is empty we fall back to this list so callers
-    # get the source paths they actually recorded.
-    pathsJson: seq[string]
 
     # P6.5 / Layout A — per-file line-length tables, parsed from the
     # column-aware paths.dat records when `meta.hasColumnAwareSteps`
@@ -134,26 +126,6 @@ proc openNewTraceFromBytes*(data: seq[byte],
 
   let vnRes = initInterningTableReader(data, "varnames", blockSize, maxEntries)
   if vnRes.isOk: reader.varnameReader = vnRes.get()
-
-  # paths.json fallback: when no binary paths interning table is
-  # present, try the JSON form ct_recorder writes (M13).  The
-  # binary table is preferred when both exist — see pathCount / path.
-  if reader.pathReader.count() == 0:
-    let pathsJsonRes = readInternalFile(data, "paths.json", blockSize, maxEntries)
-    if pathsJsonRes.isOk:
-      let pathsBytes = pathsJsonRes.get()
-      if pathsBytes.len > 0:
-        var pathsTxt = newString(pathsBytes.len)
-        for i, b in pathsBytes:
-          pathsTxt[i] = char(b)
-        try:
-          let parsed = parseJson(pathsTxt)
-          if parsed.kind == JArray:
-            for item in parsed.elems:
-              if item.kind == JString:
-                reader.pathsJson.add(item.getStr(""))
-        except CatchableError:
-          discard  # malformed paths.json — leave the fallback empty
 
   # P6.5 / Layout A — when the trace is column-aware, parse each
   # paths.dat record as
@@ -438,8 +410,6 @@ proc path*(r: NewTraceReader, id: uint64): Result[string, string] =
       ok(s)
     else:
       r.pathReader.readById(id)
-  elif r.pathsJson.len > 0 and id < uint64(r.pathsJson.len):
-    ok(r.pathsJson[int(id)])
   else:
     r.pathReader.readById(id)  # error path — preserve the original error
 
@@ -453,9 +423,7 @@ proc varname*(r: NewTraceReader, id: uint64): Result[string, string] =
   r.varnameReader.readById(id)
 
 proc pathCount*(r: NewTraceReader): uint64 =
-  let binary = r.pathReader.count()
-  if binary > 0: binary
-  else: uint64(r.pathsJson.len)
+  r.pathReader.count()
 
 # ---------------------------------------------------------------------------
 # Alternate source views (Deminification Support).  See spec §

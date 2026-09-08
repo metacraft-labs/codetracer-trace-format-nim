@@ -344,7 +344,7 @@ type
 
   TraceMetadata* = object
     ## Per-trace metadata stamped into `meta.dat` (or, for the legacy
-    ## JSON fallback path, into `meta.json`).
+    ## metadata document `meta.dat`).
     ##
     ## ~recordingId~ is the canonical identifier for this recording — a
     ## UUIDv7 (RFC 9562) generated at record start by the recorder.

@@ -9,9 +9,12 @@
 ##
 ##   - `meta.dat`              — binary metadata (program / args / workdir /
 ##                               MCR fields: platform / tickSource /
-##                               hookProfile / hookStrategies / paths).  Legacy
-##                               bundles carry a `meta.json` with the same
-##                               fields instead; both are accepted.
+##                               hookProfile / hookStrategies / paths).  The
+##                               legacy `meta.json` sidecar is retired and is
+##                               not read: an MCR container may still carry a
+##                               `meta.json`, but it holds only the portable
+##                               trace format's `initial_state` field, which is
+##                               a different document with the same name.
 ##   - `tNNNNNNNNNNN`          — one per-thread event stream, each a sequence
 ##                               of `EventHeader (26 bytes)` + payload records,
 ##                               stored as a concatenation of per-chunk zstd
@@ -21,10 +24,6 @@
 ##   - `event_log.dat` + `.idx`— chunk-indexed OS-event log with structured
 ##                               (geid, tick, tid, kind, fd, returnValue,
 ##                               metadata, content) entries.
-##   - `paths.json`            — JSON string array of recorded source
-##                               paths (populated by ct_recorder/
-##                               trace_writer.nim from `--source` plus
-##                               DWARF-discovered companions).
 ##   - `cpidx.idx` + `cpdata.bin` (optional) — checkpoint records
 ##
 ## Without this decoder, `ct-print --full` on a native bundle silently produced
@@ -58,7 +57,7 @@
 ##   thread streams are emitted in ascending CtTid order, OS events in their
 ##   stored order, and counts are computed up front.
 ## * Mutation behaviour: any byte corruption that breaks CTFS magic, the
-##   meta.json blob, or an event-stream header is reported via a hard
+##   meta.dat document, or an event-stream header is reported via a hard
 ##   `quit("ct-print: native decode failed: ...")` from the caller — this
 ##   module returns `Result[..., string]` and the CLI treats `isErr` as a
 ##   user-visible error rather than a silent fallback.
@@ -113,97 +112,6 @@ proc readU64LE(data: openArray[byte], offset: int): uint64 =
   fromBytesLE(uint64, arr)
 
 # ---------------------------------------------------------------------------
-# Minimal JSON extraction — we don't use std/json on the meta blob because the
-# native writer hand-rolls a JSON string and `meta.json` is the *only* source
-# of metadata. The helpers mirror those in trace_loader.nim (the reference
-# reader) so behaviour stays consistent across implementations.
-# ---------------------------------------------------------------------------
-
-proc skipWhitespaceColon(s: string, i: int): int =
-  result = i
-  while result < s.len and (s[result] == ' ' or s[result] == ':' or
-                            s[result] == '\t' or s[result] == '\n' or
-                            s[result] == '\r'):
-    result += 1
-
-proc keyMatch(json: string, i: int, needle: string): bool =
-  if i + needle.len > json.len:
-    return false
-  for j in 0 ..< needle.len:
-    if json[i + j] != needle[j]:
-      return false
-  true
-
-proc findJsonStringValue(json: string, key: string): string =
-  let needle = "\"" & key & "\""
-  var i = 0
-  while i + needle.len <= json.len:
-    if keyMatch(json, i, needle):
-      var pos = skipWhitespaceColon(json, i + needle.len)
-      if pos < json.len and json[pos] == '"':
-        pos += 1
-        var val = ""
-        while pos < json.len and json[pos] != '"':
-          if json[pos] == '\\' and pos + 1 < json.len:
-            val.add(json[pos + 1])
-            pos += 2
-          else:
-            val.add(json[pos])
-            pos += 1
-        return val
-    i += 1
-  ""
-
-proc findJsonIntValue(json: string, key: string): int =
-  let needle = "\"" & key & "\""
-  var i = 0
-  while i + needle.len <= json.len:
-    if keyMatch(json, i, needle):
-      var pos = skipWhitespaceColon(json, i + needle.len)
-      if pos < json.len and json[pos] >= '0' and json[pos] <= '9':
-        var val = 0
-        while pos < json.len and json[pos] >= '0' and json[pos] <= '9':
-          val = val * 10 + (ord(json[pos]) - ord('0'))
-          pos += 1
-        return val
-    i += 1
-  0
-
-proc findJsonStringArray(json: string, key: string): seq[string] =
-  result = @[]
-  let needle = "\"" & key & "\""
-  var i = 0
-  while i + needle.len <= json.len:
-    if keyMatch(json, i, needle):
-      var pos = skipWhitespaceColon(json, i + needle.len)
-      if pos < json.len and json[pos] == '[':
-        pos += 1
-        while pos < json.len:
-          while pos < json.len and (json[pos] == ' ' or json[pos] == ',' or
-                                    json[pos] == '\t' or json[pos] == '\n' or
-                                    json[pos] == '\r'):
-            pos += 1
-          if pos >= json.len or json[pos] == ']':
-            return result
-          if json[pos] == '"':
-            pos += 1
-            var s = ""
-            while pos < json.len and json[pos] != '"':
-              if json[pos] == '\\' and pos + 1 < json.len:
-                s.add(json[pos + 1])
-                pos += 2
-              else:
-                s.add(json[pos])
-                pos += 1
-            if pos < json.len: pos += 1
-            result.add(s)
-          else:
-            while pos < json.len and json[pos] != ',' and json[pos] != ']':
-              pos += 1
-        return
-    i += 1
-
-# ---------------------------------------------------------------------------
 # Detection — is this a native MCR bundle?
 # ---------------------------------------------------------------------------
 
@@ -211,14 +119,8 @@ type
   NativeBundleInfo* = object
     blockSize*: uint32
     maxRoot*: uint32
-    metaJson*: string
-      ## Legacy JSON metadata blob.  Empty on every recording made after the
-      ## recorder retired `meta.json` in favour of binary `meta.dat`
-      ## (`codetracer-native-recorder` a0ca32b; see
-      ## codetracer-specs/Planned-Work/Legacy-CTFS-Format-Cleanup.md).
     metaDat*: seq[byte]
-      ## Binary `meta.dat` bytes when the bundle carries them.  Current MCR
-      ## containers have ONLY this; `metaJson` stays empty for them.
+      ## Binary `meta.dat` bytes — the bundle's metadata document.
     threadStreams*: seq[(uint32, string)]  # (ctTid, encodedName-string)
     hasEventLog*: bool
     hasCheckpointIndex*: bool
@@ -240,7 +142,7 @@ proc parseTidFromName(name: string): uint32 =
 
 proc detectNativeBundle*(data: openArray[byte]): Result[NativeBundleInfo, string] =
   ## Inspect a CTFS container's root block and decide whether it looks like a
-  ## native MCR shard (multi-thread streams + meta.json with `recordingMode`).
+  ## native MCR shard (per-thread `tNNN` streams + binary `meta.dat`).
   ## Returns the discovered structure on success, or an error message on
   ## inputs that aren't a valid CTFS file.
   if data.len < HeaderSize + ExtHeaderSize:
@@ -259,23 +161,14 @@ proc detectNativeBundle*(data: openArray[byte]): Result[NativeBundleInfo, string
 
   var info = NativeBundleInfo(blockSize: blockSize, maxRoot: maxRoot)
 
-  # Pull the metadata blob.  Legacy native bundles carry `meta.json`; every
-  # bundle written since the recorder retired that document carries binary
-  # `meta.dat` instead (both are accepted — a container with neither is not a
-  # decodable trace at all).
-  let metaR = readInternalFile(data, "meta.json", blockSize, maxRoot)
-  if metaR.isOk:
-    var metaStr = newString(metaR.get().len)
-    for i in 0 ..< metaR.get().len:
-      metaStr[i] = char(metaR.get()[i])
-    info.metaJson = metaStr
-  else:
-    let metaDatR = readInternalFile(data, "meta.dat", blockSize, maxRoot)
-    if metaDatR.isErr:
-      return err(
-        "metadata missing: neither meta.json (" & metaR.error &
-        ") nor meta.dat (" & metaDatR.error & ")")
-    info.metaDat = metaDatR.get()
+  # Pull the metadata document.  `meta.dat` is the only one read: a native
+  # bundle may also carry a `meta.json`, but that is the portable trace
+  # format's `initial_state` document, NOT metadata — reading it here would
+  # yield an empty program and no args.
+  let metaDatR = readInternalFile(data, "meta.dat", blockSize, maxRoot)
+  if metaDatR.isErr:
+    return err("meta.dat missing: " & metaDatR.error)
+  info.metaDat = metaDatR.get()
 
   # Enumerate root-block entries to find tNNNN streams and event_log files.
   for i in 0 ..< int(maxRoot):
@@ -303,30 +196,20 @@ proc detectNativeBundle*(data: openArray[byte]): Result[NativeBundleInfo, string
   ok(info)
 
 proc isNativeBundle*(data: openArray[byte]): bool =
-  ## True when the container looks like a native MCR shard. We accept any
-  ## CTFS container that has a `meta.json` file (the native writer's
-  ## metadata blob) — that's enough to distinguish from the v4 multi-stream
-  ## layout, which uses `meta.dat`. An empty native bundle (no `tNNNN`
-  ## streams) is still routed here so the native decoder's structured
-  ## error message surfaces, rather than the v4 reader silently emitting a
-  ## degenerate `{counts: {steps: -1, ...}}` document.
+  ## True when the container carries per-thread `tNNN` streams, which is
+  ## what distinguishes a native MCR shard from the v4 multi-stream layout
+  ## (that one splits by kind: steps.dat / calls.dat / values.dat /
+  ## events.dat).  Both carry `meta.dat`, so the metadata document does not
+  ## discriminate.
   let infoR = detectNativeBundle(data)
   if infoR.isErr:
     return false
   let info = infoR.get()
-  # A `tNNN` per-thread stream is the discriminator that survives the
-  # meta.json → meta.dat migration: the v4 multi-stream layout never has one
-  # (it splits by kind: steps.dat / calls.dat / values.dat / events.dat), so a
-  # container carrying at least one `tNNN` is an MCR bundle regardless of
-  # which metadata document it uses.
-  if info.threadStreams.len > 0:
-    return true
-  # Legacy JSON-metadata bundles with no thread stream are still routed here
-  # so the native decoder's structured error surfaces instead of the v4
-  # reader's degenerate `{counts: {steps: -1, ...}}` document.
-  if info.metaJson.len == 0:
-    return false
-  findJsonStringValue(info.metaJson, "recordingMode").len > 0
+  # A `tNNN` per-thread stream is the discriminator: the v4 multi-stream
+  # layout never has one (it splits by kind: steps.dat / calls.dat /
+  # values.dat / events.dat), so a container carrying at least one `tNNN` is
+  # an MCR bundle and nothing else is.
+  info.threadStreams.len > 0
 
 # ---------------------------------------------------------------------------
 # Per-thread event stream decoding
@@ -696,38 +579,36 @@ proc buildNativeFullDocument*(data: openArray[byte], opts: NativeOpts):
 
   # ----- metadata -----
   var meta = newJObject()
-  var program = findJsonStringValue(info.metaJson, "program")
-  var args = findJsonStringArray(info.metaJson, "args")
-  var platform = findJsonStringValue(info.metaJson, "platform")
-  var recordingMode = findJsonStringValue(info.metaJson, "recordingMode")
-  var tickSource = findJsonStringValue(info.metaJson, "tickSource")
-  var tickDef = findJsonStringValue(info.metaJson, "tickDefinition")
-  var hookProfile = findJsonStringValue(info.metaJson, "hookProfile")
-  var metaVersion = findJsonStringValue(info.metaJson, "version")
-  var hookStrats = findJsonStringArray(info.metaJson, "hookStrategies")
+  var program = ""
+  var args: seq[string] = @[]
+  var platform = ""
+  var recordingMode = ""
+  var tickSource = ""
+  var tickDef = ""
+  var hookProfile = ""
+  var metaVersion = ""
+  var hookStrats: seq[string] = @[]
   var workdir = ""
   var metaDatPaths: seq[string] = @[]
 
-  # Binary-metadata bundles (every recording made since `meta.json` was
-  # retired): source the same fields from `meta.dat`.
-  if info.metaJson.len == 0 and info.metaDat.len > 0:
-    let mdR = readMetaDat(info.metaDat)
-    if mdR.isErr:
-      return err("meta.dat parse failed: " & mdR.error)
-    let md = mdR.get()
-    program = md.program
-    args = md.args
-    workdir = md.workdir
-    metaVersion = $md.version
-    metaDatPaths = md.paths
-    if md.mcrFields.isSome:
-      let mcr = md.mcrFields.get()
-      recordingMode = "mcr"
-      platform = mcr.platform
-      tickSource = mcr.tickSourceStr
-      tickDef = mcr.tickGranularity
-      hookProfile = mcr.hookProfile
-      hookStrats = mcr.hookStrategies
+  # `meta.dat` is the metadata document.
+  let mdR = readMetaDat(info.metaDat)
+  if mdR.isErr:
+    return err("meta.dat parse failed: " & mdR.error)
+  let md = mdR.get()
+  program = md.program
+  args = md.args
+  workdir = md.workdir
+  metaVersion = $md.version
+  metaDatPaths = md.paths
+  if md.mcrFields.isSome:
+    let mcr = md.mcrFields.get()
+    recordingMode = "mcr"
+    platform = mcr.platform
+    tickSource = mcr.tickSourceStr
+    tickDef = mcr.tickGranularity
+    hookProfile = mcr.hookProfile
+    hookStrats = mcr.hookStrategies
   meta["program"] = newJString(
     if opts.stripPaths and program.len > 0: "<program>" else: program)
   var argsArr = newJArray()
@@ -753,38 +634,17 @@ proc buildNativeFullDocument*(data: openArray[byte], opts: NativeOpts):
   meta["hook_strategies"] = hsArr
   root["metadata"] = meta
 
-  # paths: ct_recorder/trace_writer.nim writes the registered --source
-  # paths (and DWARF-discovered companions) into the CTFS-internal
-  # paths.json as a JSON string array.  Surface them in the output so
-  # ct-print --summary / --full reflects what the recorder actually
-  # captured, matching the v4 `--full` schema.
+  # paths: `meta.dat` carries the recorder's registered --source paths (and
+  # DWARF-discovered companions).  The legacy CTFS-internal `paths.json` this
+  # used to read first is retired.
   #
   # functions/varnames/types are not interning-tabled by the native
   # bundle's M1 writer (it streams them inline in the per-thread event
   # payloads instead of building separate interning tables); surface
   # as empty arrays for schema parity.
   var pathsArr = newJArray()
-  var pathsCount = 0
-  let pathsR = readInternalFile(data, "paths.json", info.blockSize, info.maxRoot)
-  if pathsR.isOk:
-    let pathsBytes = pathsR.get()
-    if pathsBytes.len > 0:
-      let pathsTxt = bytesToUtf8(pathsBytes)
-      try:
-        let parsed = parseJson(pathsTxt)
-        if parsed.kind == JArray:
-          for item in parsed.elems:
-            if item.kind == JString:
-              pathsArr.add(item)
-              inc pathsCount
-      except CatchableError:
-        discard  # malformed paths.json — leave count at 0 / array empty
-  if pathsCount == 0 and metaDatPaths.len > 0:
-    # No paths.json (retired alongside meta.json): meta.dat carries the
-    # recorder's registered source paths.
-    for p in metaDatPaths:
-      pathsArr.add(newJString(p))
-      inc pathsCount
+  for p in metaDatPaths:
+    pathsArr.add(newJString(p))
   root["paths"] = pathsArr
   root["functions"] = newJArray()
   root["varnames"] = newJArray()
@@ -820,7 +680,7 @@ proc buildNativeFullDocument*(data: openArray[byte], opts: NativeOpts):
 
   # ----- counts -----
   var counts = newJObject()
-  counts["paths"] = newJInt(int64(pathsCount))
+  counts["paths"] = newJInt(int64(metaDatPaths.len))
   counts["functions"] = newJInt(0)
   counts["varnames"] = newJInt(0)
   counts["types"] = newJInt(0)

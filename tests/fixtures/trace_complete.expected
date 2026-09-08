@@ -9,8 +9,7 @@ max_root_entries: 31
 === File Entries ===
 [0] name: "events.log" size: 200 map_block: 1
 [1] name: "events.fmt" size: 12 map_block: 3
-[2] name: "meta.json" size: 141 map_block: 5
-[3] name: "paths.json" size: 32 map_block: 7
+[2] name: "meta.dat" size: 124 map_block: 5
 
 === Internal File: events.log ===
 [chunk 0] event_count: 5 first_geid: 0
@@ -32,8 +31,8 @@ max_root_entries: 31
 === Internal File: events.fmt ===
 split-binary
 
-=== Internal File: meta.json ===
-{"recording_id":"01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb","program":"test_program","args":["--flag","input.txt"],"workdir":"/home/user/project"}
-
-=== Internal File: paths.json ===
-["/src/main.nim","/src/lib.nim"]
+=== Internal File: meta.dat ===
+43544d44030000002430313934396663
+632d376439322d376539632d61616161
+2d6262626262626262626262620c7465
+73745f70726f6772616d02062d2d666c... (124 bytes total)
