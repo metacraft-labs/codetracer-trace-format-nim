@@ -90,6 +90,11 @@ task test, "Run all tests":
   # DeltaColumn round-trip, Layout A paths.dat, the position decoder, and the
   # meta.dat unknown-flag-bit rejection that keeps the extension clean.
   exec "nim c -r -d:release -p:src tests/test_column_aware_steps.nim"
+  # A column-aware trace may table some of its files and not others, and the
+  # two kinds of file take different amounts of the position space. Writer
+  # and reader size them by one rule; sizing an untabled file 0 in the reader
+  # put every later file's base too low and answered out of the file before.
+  exec "nim c -r -d:release -p:src tests/test_mixed_column_aware_position_space.nim"
   exec "nim c -r -d:release -p:src tests/test_reader_calls_events.nim"
   exec "nim c -r -d:release -p:src tests/test_reader_integration.nim"
   # M24a-1: cross-read proof — a Nim-written production steps.dat is read by

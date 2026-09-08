@@ -183,6 +183,7 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_new_trace_reader.nim", binary: "build/test-bin/test_new_trace_reader"),
   TestSpec(source: "tests/test_paths_dat_layout_authority.nim", binary: "build/test-bin/test_paths_dat_layout_authority"),
   TestSpec(source: "tests/test_line_only_position_space.nim", binary: "build/test-bin/test_line_only_position_space"),
+  TestSpec(source: "tests/test_mixed_column_aware_position_space.nim", binary: "build/test-bin/test_mixed_column_aware_position_space"),
   TestSpec(source: "tests/test_reader_calls_events.nim", binary: "build/test-bin/test_reader_calls_events"),
   TestSpec(source: "tests/test_reader_integration.nim", binary: "build/test-bin/test_reader_integration"),
   TestSpec(source: "tests/test_nim_step_stream_crossread.nim", binary: "build/test-bin/test_nim_step_stream_crossread", pooled: true),

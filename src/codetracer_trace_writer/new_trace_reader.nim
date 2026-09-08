@@ -19,6 +19,7 @@ import ./call_stream
 import ./io_event_stream
 import ./step_encoding
 import ./varint
+import ./global_line_index
 
 const ctHasFilesystem* = defined(posix) or defined(windows)
   ## Whether the target this reader is being compiled for has an
@@ -788,9 +789,39 @@ proc lineCountRaw*(r: NewTraceReader, fileId: uint64): uint64 =
     return 0'u64
   uint64(r.lineLengths[fileId].len)
 
+proc globalPositionSpace*(r: NewTraceReader): GlobalLineIndex =
+  ## The address space this trace's ``global_position_index`` values were
+  ## encoded in, laid out by the rule the writer used
+  ## (``global_line_index.positionSpaceCounts``).
+  ##
+  ## This is what a caller inverts a position through when
+  ## ``decodeGlobalPositionIndex`` has nothing to say about it — a
+  ## line-only trace, or a column-aware one whose file has no per-line
+  ## table. Rebuilding the space from the path count alone gives every
+  ## file ``DefaultLinesPerFile``, which is right for a line-only trace
+  ## and wrong for a column-aware one the moment any file carries a
+  ## table: that file is smaller than the default, so every file after it
+  ## sits too high, and a position resolves into the wrong file with a
+  ## line number that is in range.
+  ##
+  ## Inverting through it is still an assumption about the producer's
+  ## packing — see the ``global_line_index`` module header — so callers
+  ## must go through ``tryResolve``, not ``resolve``.
+  buildGlobalLineIndex(positionSpaceCounts(
+    r.lineLengths, int(r.pathCount()), r.meta.hasColumnAwareSteps))
+
 proc ensurePositionTables(r: var NewTraceReader) =
   ## Build per-file cumulative tables used by ``decodeGlobalPositionIndex``.
   ## Idempotent: callable from every per-step resolution.
+  ##
+  ## A file's slot is sized by ``global_line_index.fileAddressCount``, the
+  ## same rule the writer's ``rebuildGli`` lays the space out with. That
+  ## matters for the files with no line-length table: they occupy
+  ## ``DefaultLinesPerFile`` addresses in the space the positions were
+  ## encoded in, so sizing them ``0`` here would put every later file's
+  ## base that much too low and land the file search in the file before
+  ## the right one — which then answers with a line number that is the
+  ## next file's base, in range and indistinguishable from a real one.
   if r.posTablesBuilt:
     return
   let fileCount = r.lineLengths.len
@@ -807,8 +838,8 @@ proc ensurePositionTables(r: var NewTraceReader) =
       sum += uint64(lls[i])
     r.lineBase[fid] = lb
     r.fileBase[fid] = runningGlobal
-    r.fileSize[fid] = sum
-    runningGlobal += sum
+    r.fileSize[fid] = fileAddressCount(lls)
+    runningGlobal += r.fileSize[fid]
   r.posTablesBuilt = true
 
 proc decodeGlobalPositionIndex*(r: var NewTraceReader,

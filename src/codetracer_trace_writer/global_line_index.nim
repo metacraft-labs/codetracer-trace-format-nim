@@ -42,6 +42,45 @@ const DefaultLinesPerFile*: uint64 = 100_000
   ## cannot drift apart — the drift being undetectable in the container,
   ## which carries no record of the value used.
 
+proc fileAddressCount*(lineLengths: openArray[uint32]): uint64 =
+  ## Addresses the global position space allocates to one file.
+  ##
+  ## A file with a per-line length table occupies exactly its byte
+  ## capacity, so a `global_position_index` inside its range resolves to a
+  ## `(line, column)`. A file without one occupies `DefaultLinesPerFile`
+  ## addresses and its positions resolve to a line only.
+  ##
+  ## A trace may mix the two: `registerPath` takes the line lengths as an
+  ## optional argument, so a column-aware recorder that has them for its
+  ## own sources and not for a dependency's produces exactly that. The two
+  ## sizings are not interchangeable — a file sized 20 here and 100000
+  ## there shifts every later file's base — and the container records
+  ## neither the sizes nor the rule that produced them. So every party
+  ## that lays out the space must call this, not re-derive it: writer,
+  ## reader position tables, and the line-only fallback all size a file
+  ## the same way or they do not agree on which file a position is in.
+  if lineLengths.len == 0:
+    return DefaultLinesPerFile
+  var total: uint64 = 0
+  for L in lineLengths:
+    total += uint64(L)
+  max(total, 1'u64)
+
+proc positionSpaceCounts*(lineLengths: openArray[seq[uint32]],
+    fileCount: int, columnAware: bool): seq[uint64] =
+  ## Per-file address counts for a trace with `fileCount` registered
+  ## paths, in the order the paths were registered.
+  ##
+  ## Line-only traces give every file `DefaultLinesPerFile` regardless of
+  ## what line-length tables happen to be around, which is what keeps a
+  ## pre-column-aware trace byte-for-byte what it always was.
+  result = newSeq[uint64](fileCount)
+  for i in 0 ..< fileCount:
+    if columnAware and i < lineLengths.len:
+      result[i] = fileAddressCount(lineLengths[i])
+    else:
+      result[i] = DefaultLinesPerFile
+
 type
   GlobalLineIndex* = object
     prefixSum*: seq[uint64]  # prefixSum[file_id] = cumulative line count before this file

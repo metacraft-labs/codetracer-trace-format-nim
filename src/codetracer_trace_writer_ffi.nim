@@ -3219,8 +3219,9 @@ proc ct_reader_workdir(h: pointer, outLen: ptr csize_t): ptr uint8 {.exportc, cd
 # A line-only step is one integer that addresses one line, and the container
 # says nothing about how the integers were apportioned between files. The
 # space rebuilt here is `codetracer_trace_format_nim`'s own writer's —
-# `prefixSum[path_id] + line` over `DefaultLinesPerFile` addresses per file
-# — which is an assumption about the producer, not a property of the trace.
+# `prefixSum[path_id] + line`, each file's slot sized by
+# `global_line_index.fileAddressCount` exactly as the writer sizes it —
+# which is an assumption about the producer, not a property of the trace.
 # The Rust `codetracer_trace_writer` writes the same container format with a
 # different packing, `(path_id shl 32) or line`.
 #
@@ -3234,13 +3235,11 @@ proc ct_reader_workdir(h: pointer, outLen: ptr csize_t): ptr uint8 {.exportc, cd
 import codetracer_trace_writer/global_line_index
 
 proc getOrBuildGli(rh: TraceReaderHandle): GlobalLineIndex =
-  ## Rebuild the writer's line-only address space from the reader's path
-  ## count. See the note above on what the reconstruction assumes.
-  let pathCount = rh[].pathCount()
-  var counts = newSeq[uint64](int(pathCount))
-  for i in 0 ..< int(pathCount):
-    counts[i] = DefaultLinesPerFile
-  buildGlobalLineIndex(counts)
+  ## Rebuild the writer's address space from the trace's paths and their
+  ## per-file line tables. See the note above on what the reconstruction
+  ## assumes, and `globalPositionSpace` for why the line tables are part
+  ## of the layout and not just of the column decode.
+  rh[].globalPositionSpace()
 
 # ---------------------------------------------------------------------------
 # ct_reader_step_location — resolve step N to (path_id, line)

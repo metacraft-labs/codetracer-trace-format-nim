@@ -382,8 +382,9 @@ proc readEventsV4(reader: var TraceReader): Result[void, string] =
   # apportioned between files: no stride, no per-file line count, no
   # producer identifier. Inverting one is therefore an assumption about the
   # producer, and the assumption made here is `codetracer_trace_format_nim`'s
-  # own writer — `prefixSum[path_id] + line` over `DefaultLinesPerFile`
-  # addresses per file (`multi_stream_writer.toGlobalLineIndex`).
+  # own writer — `prefixSum[path_id] + line`, each file's slot sized by
+  # `global_line_index.fileAddressCount` exactly as
+  # `multi_stream_writer.rebuildGli` sizes it.
   #
   # It is not the only packing in circulation. The Rust
   # `codetracer_trace_writer` produces the same container format and packs
@@ -392,10 +393,14 @@ proc readEventsV4(reader: var TraceReader): Result[void, string] =
   # step streams. `tryResolve` is what keeps a trace from the other writer
   # from being answered instead of reported: its positions land above the
   # top of this space and the read fails by name.
-  var lineCounts = newSeq[uint64](reader.paths.len)
-  for i in 0 ..< reader.paths.len:
-    lineCounts[i] = DefaultLinesPerFile
-  let gli = buildGlobalLineIndex(lineCounts)
+  #
+  # The space is laid out from the trace's own per-file line tables rather
+  # than from its path count, so a column-aware file that carries one is
+  # the size the writer gave it. Sizing every file `DefaultLinesPerFile`
+  # regardless puts the files that follow a tabled one too high, and the
+  # resulting position lands in the wrong file at a line that is in range —
+  # which `tryResolve` cannot refuse, because it is not outside anything.
+  let gli = nr.globalPositionSpace()
 
   # P6.5 / Piece B — column-tracking cursor.
   #

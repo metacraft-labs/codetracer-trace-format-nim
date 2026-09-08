@@ -131,10 +131,11 @@ type
     #
     # Enabled BY DEFAULT for line-only traces (the production write path every
     # non-column-aware recorder drives).  Gated OFF for column-aware traces:
-    # there a step's position carries a column as well, and a line-keyed index
-    # would answer a per-column breakpoint request with every step on the line.
-    # See `enableColumnAwareSteps` (which clears this) and
-    # `step_map_builder.nim`.
+    # there the exec stream's `global_position_index` is a byte offset, not a
+    # `(path_id << 32) | line` packing, so the reader decodes step locations via
+    # the column-aware path rather than `unpack_global_line_index`, and a
+    # gli-derived `step-map.ns` would not agree with that derivation.  See
+    # `enableColumnAwareSteps` (which clears this) and `step_map_builder.nim`.
     stepMapBuilder: StepMapBuilder
     emitStepMap: bool
 
@@ -230,17 +231,13 @@ proc rebuildGli(w: var MultiStreamTraceWriter) =
   ##
   ## In line-only mode every file gets the legacy ``DefaultLinesPerFile``
   ## allocation, preserving byte-for-byte output of pre-P6 traces.
-  var counts = newSeq[uint64](w.paths.len)
-  for i in 0 ..< w.paths.len:
-    if w.columnAwareSteps and i < w.pathLineLengths.len and
-       w.pathLineLengths[i].len > 0:
-      var total: uint64 = 0
-      for L in w.pathLineLengths[i]:
-        total += uint64(L)
-      counts[i] = max(total, 1'u64)
-    else:
-      counts[i] = DefaultLinesPerFile
-  w.gli = buildGlobalLineIndex(counts)
+  ##
+  ## The sizing rule lives in ``global_line_index.positionSpaceCounts``
+  ## because the reader has to apply the same one — a file sized
+  ## differently there shifts the base of every file after it, and the
+  ## container records neither the sizes nor the rule.
+  w.gli = buildGlobalLineIndex(
+    positionSpaceCounts(w.pathLineLengths, w.paths.len, w.columnAwareSteps))
   w.gliDirty = false
 
 proc toGlobalLineIndex(w: var MultiStreamTraceWriter,
