@@ -178,6 +178,25 @@ type
       ## Program argv recorded in meta.dat (CTFS spec §7).  Set via
       ## trace_writer_set_args; stored here and propagated to the
       ## multi-stream writer's metadata when/if it becomes ready.
+    recordingId: string
+      ## The canonical UUIDv7 recording identity (M-REC-1), when the CALLER
+      ## pins it.  Empty means "let the writer mint one", which is the
+      ## default and what every existing caller gets.
+      ##
+      ## It lives on the handle rather than being a `begin` argument because
+      ## identity is decided at CONSTRUCTION: the four constructors below all
+      ## take `recordingId` and validate it there, and a setter that ran after
+      ## one of them had already minted an id would have to rewrite a
+      ## container's identity rather than choose it.  So
+      ## ``trace_writer_set_recording_id`` refuses once a writer is ready,
+      ## instead of accepting a value it could not honour.
+      ##
+      ## An embedder with no entropy source is the case this exists for.  On
+      ## `wasm32-unknown-unknown` there is no CSPRNG and no wall clock, so
+      ## ``newUuidV7`` mints from whatever the host stubs answer — which is a
+      ## constant, and a constant recording id collides with every other
+      ## recording in a trace store.  Such a host has an id already (its page,
+      ## its transaction) and needs a way to say so.
     started: bool
     # Function registry: name+path+line -> id
     functions: seq[FunctionEntry]
@@ -308,6 +327,7 @@ proc trace_writer_new(
     programName: prog,
     workdir: "",
     metaArgs: @[],
+    recordingId: "",
     started: false,
     functions: @[],
     functionIndex: initTable[string, csize_t](),
@@ -460,6 +480,11 @@ proc trace_writer_begin_events(
       # dup-name guard would then reject a --source MCR, which is exactly the
       # latent collision IC-M2 removes.
       let sharedInterning = ctMcrSharedInterning()
+      # `handle.recordingId` is deliberately NOT passed here. An attached writer
+      # does not own `meta.dat` — MCR does, and MCR has already written the
+      # recording identity into the container this writer is joining. Handing a
+      # second id to the attach would either be ignored or would contradict the
+      # owner's, and neither is something a caller could act on.
       let ares = initMultiStreamWriterAttached(sharedCtfs, handle.programName,
         sharedInterning = sharedInterning, qualifier = handle.interningQualifier)
       if ares.isErr:
@@ -475,7 +500,8 @@ proc trace_writer_begin_events(
 
     # Standalone: the multi-stream writer always streams to disk as chunks seal
     # (createCtfsStreaming). ctPath == handle.ctFilePath.
-    let res = initMultiStreamWriter(ctPath, handle.programName)
+    let res = initMultiStreamWriter(ctPath, handle.programName,
+      recordingId = handle.recordingId)
     if res.isErr:
       setError(res.error)
       return 1.cint
@@ -500,7 +526,8 @@ proc trace_writer_begin_events(
   let (_, progBase, _) = splitFile(handle.programName)
   let ctPath = outDir / (progBase & ".ct")
 
-  let res = newTraceWriter(ctPath, handle.programName, @[], handle.workdir)
+  let res = newTraceWriter(ctPath, handle.programName, @[], handle.workdir,
+    recordingId = handle.recordingId)
   if res.isErr:
     setError(res.error)
     return 1.cint
@@ -544,7 +571,8 @@ proc trace_writer_begin_in_memory(
     # The empty path is deliberate and is not a placeholder for a real one:
     # `filePath` is metadata the container never reads back, and an in-memory
     # writer has no file to name. `trace_writer_close` refuses to write one.
-    let res = initMultiStreamWriter("", handle.programName)
+    let res = initMultiStreamWriter("", handle.programName,
+      recordingId = handle.recordingId)
     if res.isErr:
       setError(res.error)
       return 1.cint
@@ -563,7 +591,8 @@ proc trace_writer_begin_in_memory(
       return 1.cint
     return 0.cint
 
-  let res = newTraceWriterInMemory(handle.programName, @[], handle.workdir)
+  let res = newTraceWriterInMemory(handle.programName, @[], handle.workdir,
+    recordingId = handle.recordingId)
   if res.isErr:
     setError(res.error)
     return 1.cint
@@ -828,6 +857,44 @@ proc trace_writer_set_workdir(
       handle.msWriter.metadata.workdir = handle.workdir
   elif handle.writerReady:
     handle.writer.metadata.workdir = handle.workdir
+
+proc trace_writer_set_recording_id(
+    handle: TraceWriterHandle,
+    recording_id: cstring,
+): cint {.exportc, cdecl, dynlib.} =
+  ## Pin the recording's canonical UUIDv7 identity (M-REC-1, spec §3).
+  ## Returns 0 on success; on refusal returns 1 and names the reason in
+  ## ``trace_writer_last_error``.
+  ##
+  ## MUST be called before ``trace_writer_begin_in_memory`` /
+  ## ``trace_writer_begin_events``.  The four constructors resolve the identity
+  ## themselves — caller-provided when non-empty, freshly minted otherwise — so
+  ## after one of them has run there is an id in the metadata already, and
+  ## accepting a second one here would mean silently rewriting it.  A writer
+  ## that is already ready is therefore REFUSED rather than mutated.
+  ##
+  ## The id is validated by the same ``validateRecordingIdStr`` that
+  ## ``ct_write_meta_dat`` applies to the same field, so a caller cannot put a
+  ## string in ``meta.dat`` through this door that it could not put there
+  ## through that one.  An empty string is refused rather than treated as
+  ## "mint one": a caller that passes an empty id is a caller whose own id is
+  ## missing, and answering that with a fresh UUID hides it.
+  if handle.isNil:
+    setError("NULL handle")
+    return 1.cint
+  if handle.writerReady or handle.msWriterReady:
+    setError("the recording id must be set before the writer is begun; this writer is already open")
+    return 1.cint
+  let id = toNimStr(recording_id)
+  if id.len == 0:
+    setError("recording_id is empty; pass a canonical UUIDv7, or do not call this at all to have one minted")
+    return 1.cint
+  let valRes = validateRecordingIdStr(id)
+  if valRes.isErr:
+    setError("recording_id is not a canonical UUIDv7: " & valRes.error)
+    return 1.cint
+  handle.recordingId = id
+  0.cint
 
 proc trace_writer_set_interning_qualifier(
     handle: TraceWriterHandle,

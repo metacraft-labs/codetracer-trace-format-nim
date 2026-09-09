@@ -200,6 +200,12 @@ task test, "Run all tests":
   # step), which is what showed that a container's LENGTH cannot tell two
   # traces apart. Same FFI-`include` compile requirements as the tests above.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_in_memory.nim"
+  # The C ABI lets a caller PIN the recording identity instead of having one
+  # minted. Carries its own control — a writer that does not call the setter
+  # gets a different, valid id — without which the positive assertion cannot
+  # tell a working setter from a no-op. Same FFI-`include` compile requirements
+  # as the tests above.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_recording_id.nim"
   # The C ABI builds for a target with no filesystem, and `ctHasFilesystem`
   # removes EXACTLY the two entry points that name a file. Re-runs the compiler
   # over src/ with `--os:any --cpu:wasm32 --compileOnly` and reads the emitted
