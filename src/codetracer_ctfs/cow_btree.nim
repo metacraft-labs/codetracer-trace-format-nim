@@ -845,10 +845,21 @@ proc loadCowBTree*(image: openArray[byte],
     commit0: rU64(image, OffCommit0),
     commit1: rU64(image, OffCommit1),
     lastCommit: max(rU64(image, OffCommit0), rU64(image, OffCommit1)),
-    count: 0,  # recomputed lazily if needed; not part of the wire format
+    count: 0,  # recomputed below; the live-key total is not on the wire
     pendingFree: @[],
     readers: @[],
   )
+  # The NamespaceHeader carries the roots and the allocation cursors but not
+  # the live-key total, so it is recounted here by walking the committed tree.
+  # It has to happen at load: `count` is read through a non-`var` accessor, so
+  # there is no later point at which a lazy recount could run, and leaving the
+  # field at its zero value makes `count()` report an EMPTY namespace for a
+  # loaded image whose `keys()` returns every key — a wrong answer that reads
+  # as a plausible one. O(live keys), against an open that already copies the
+  # whole page image.
+  var loadedKeys: seq[uint64]
+  t.collectKeysFrom(t.committedRoot(), loadedKeys)
+  t.count = uint64(loadedKeys.len)
   ok(t)
 
 # ---------------------------------------------------------------------------

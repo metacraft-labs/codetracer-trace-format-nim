@@ -17,7 +17,8 @@
       "has_value_stream": true,
       "has_io_event_stream": true,
       "has_interning_tables": false
-    }
+    },
+    "column_aware_paths_suspected": false
   },
   "paths": [
     "<workdir>/main.py",

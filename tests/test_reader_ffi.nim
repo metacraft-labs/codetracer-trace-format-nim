@@ -96,8 +96,9 @@ proc writeTestTrace(path: string) =
   doAssert ioRes.isOk
   var ioW = ioRes.get()
 
-  # Step 0: absolute step at line 1
-  doAssert ctfs.writeEvent(execW, StepEvent(kind: sekAbsoluteStep, globalLineIndex: 1)).isOk
+  # Step 0: absolute step at path 0, line 1. Line 1 of the first file is
+  # address 0 — the in-file offset is 0-based (`global_line_index`).
+  doAssert ctfs.writeEvent(execW, StepEvent(kind: sekAbsoluteStep, globalLineIndex: 0)).isOk
   doAssert ctfs.writeStepValues(valW, @[
     VariableValue(varnameId: 0, typeId: 0, data: "42".toBytes),
     VariableValue(varnameId: 1, typeId: 1, data: "hello".toBytes)]).isOk
@@ -181,7 +182,7 @@ proc test_reader_ffi_lifecycle() =
 
   let step0 = ffiGetJson(h, 0, ct_reader_step)
   doAssert step0.contains("absolute_step"), "step 0: " & step0
-  doAssert step0.contains("\"global_line_index\":1"), "step 0 gli: " & step0
+  doAssert step0.contains("\"global_line_index\":0"), "step 0 gli: " & step0
 
   let step1 = ffiGetJson(h, 1, ct_reader_step)
   doAssert step1.contains("delta_step"), "step 1: " & step1
@@ -249,10 +250,11 @@ proc test_reader_ffi_structured_accessors() =
 
   # -- Step locations --
   # The test trace writes:
-  #   step 0: AbsoluteStep(globalLineIndex=1) -> path 0, line 1
-  #   step 1: DeltaStep(+1) -> GLI=2 -> path 0, line 2
-  #   step 2: DeltaStep(+2) -> GLI=4 -> path 0, line 4
-  # With 2 paths and DefaultLinesPerFile=100_000, path 0 covers GLI [0, 99999].
+  #   step 0: AbsoluteStep(globalLineIndex=0) -> path 0, line 1
+  #   step 1: DeltaStep(+1) -> GLI=1 -> path 0, line 2
+  #   step 2: DeltaStep(+2) -> GLI=3 -> path 0, line 4
+  # With 2 paths and DefaultLinesPerFile=100_000, path 0 covers GLI
+  # [0, 99999], holding its lines 1..100000.
   var pathId, line: uint64
 
   doAssert ct_reader_step_location(h, 0, addr pathId, addr line) == 0

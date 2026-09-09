@@ -93,7 +93,8 @@ proc test_meta_dat_write_layout() {.raises: [].} =
   pos = 4
 
   # Version
-  doAssert readU16LEAt(raw, pos) == 3, "version mismatch (expected v3, M-REC-1)"
+  doAssert readU16LEAt(raw, pos) == MetaDatVersion,
+    "version mismatch: the writer must stamp the current schema version"
   pos += 2
 
   # Flags
@@ -175,7 +176,8 @@ proc test_meta_dat_with_mcr_fields() {.raises: [].} =
   pos = 4
 
   # Version
-  doAssert readU16LEAt(raw, pos) == 3, "version mismatch (v3 from M-REC-1)"
+  doAssert readU16LEAt(raw, pos) == MetaDatVersion,
+    "version mismatch: the writer must stamp the current schema version"
   pos += 2
 
   # Flags — bit 0 should be set
@@ -286,7 +288,8 @@ proc test_meta_dat_empty_fields() {.raises: [].} =
   # Magic + version + flags = 8 bytes
   doAssert raw[0] == 0x43 and raw[1] == 0x54 and raw[2] == 0x4D and raw[3] == 0x44
   pos = 4
-  doAssert readU16LEAt(raw, pos) == 3
+  doAssert readU16LEAt(raw, pos) == MetaDatVersion,
+    "version mismatch: the writer must stamp the current schema version"
   pos += 2
   doAssert readU16LEAt(raw, pos) == 0
   pos += 2
@@ -319,7 +322,7 @@ proc test_meta_dat_empty_fields() {.raises: [].} =
   # zeros (each 1 byte) = 50 bytes total.
   doAssert pos == raw.len, "trailing bytes: consumed " & $pos & " of " & $raw.len
   doAssert raw.len == 50,
-    "expected 50 bytes for minimal v3 meta.dat, got " & $raw.len
+    "expected 50 bytes for a minimal meta.dat, got " & $raw.len
 
   c.closeCtfs()
   echo "PASS: test_meta_dat_empty_fields"
@@ -349,7 +352,7 @@ proc test_meta_dat_roundtrip() {.raises: [].} =
   doAssert parsed.isOk, "readMetaDat failed: " & parsed.unsafeError
 
   let contents = parsed.get()
-  doAssert contents.version == 3, "version mismatch (expected v3)"
+  doAssert contents.version == MetaDatVersion, "version mismatch"
   doAssert contents.recordingId == TestRecordingId,
     "recording_id round-trip failed: got " & contents.recordingId
   doAssert contents.program == "/usr/bin/myapp", "program mismatch: " & contents.program
@@ -830,8 +833,12 @@ proc test_meta_dat_reader_rejects_missing_recording_id() {.raises: [].} =
   # Magic
   for b in [0x43'u8, 0x54, 0x4D, 0x44]:
     buf.add(b)
-  # Version = 3
-  buf.add(3'u8); buf.add(0'u8)
+  # Version — the CURRENT one, so the empty recording_id below is what the
+  # parse refuses. Stamped from the constant rather than a literal: pinned to
+  # a superseded number this buffer would be refused for its VERSION and the
+  # recording_id rule would go untested while the test still passed.
+  buf.add(byte(MetaDatVersion and 0xFF))
+  buf.add(byte((MetaDatVersion shr 8) and 0xFF))
   # Flags = 0
   buf.add(0'u8); buf.add(0'u8)
   # Empty recording_id (varint 0 — zero-length string)
@@ -920,7 +927,11 @@ proc test_meta_dat_strict_unknown_flag_rejection() {.raises: [].} =
     var buf = newSeq[byte](0)
     for b in [0x43'u8, 0x54, 0x4D, 0x44]:
       buf.add(b)
-    buf.add(3'u8); buf.add(0'u8)               # version 3
+    # The CURRENT version, so an unknown flag bit is what the parse refuses.
+    # A superseded number here would be refused for its version instead, and
+    # the flag-rejection contract would go untested.
+    buf.add(byte(MetaDatVersion and 0xFF))
+    buf.add(byte((MetaDatVersion shr 8) and 0xFF))
     buf.add(byte(flags and 0xFF))
     buf.add(byte((flags shr 8) and 0xFF))
     # recording_id (canonical UUIDv7)

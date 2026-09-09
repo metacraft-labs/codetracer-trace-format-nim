@@ -431,15 +431,19 @@ proc test_step_record_column_none_for_legacy() {.raises: [].} =
 # ---------------------------------------------------------------------------
 
 proc handcraftMetaDatWithFlags(flags: uint16): seq[byte] {.raises: [].} =
-  ## Minimal v3 meta.dat with the given raw flags word.  Recording id
-  ## is the canonical UUIDv7 used in `test_meta_dat.nim`.
+  ## Minimal meta.dat at the current schema version with the given raw
+  ## flags word.  Recording id is the canonical UUIDv7 used in
+  ## `test_meta_dat.nim`.
   const TestRecordingId = "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb"
   var buf = newSeq[byte](0)
   # Magic
   for b in [0x43'u8, 0x54, 0x4D, 0x44]:
     buf.add(b)
-  # Version = 3
-  buf.add(3'u8); buf.add(0'u8)
+  # The CURRENT version, so the flags word is what the parse judges. A
+  # superseded number would be refused for its version first, leaving the
+  # flag-rejection contract untested behind a passing assertion.
+  buf.add(byte(MetaDatVersion and 0xFF))
+  buf.add(byte((MetaDatVersion shr 8) and 0xFF))
   # Flags
   buf.add(byte(flags and 0xFF))
   buf.add(byte((flags shr 8) and 0xFF))
@@ -465,19 +469,19 @@ proc test_strict_meta_flag_rejection() {.raises: [].} =
   ## net that makes the column extension's bit-4 break clean for
   ## older readers (and gives every future bit allocation the same
   ## guarantee).
-  # Bit 13 (= 0x2000) is a still-reserved bit: bits 0-5 and 8-12 are
+  # Bit 14 (= 0x4000) is the lowest still-reserved bit: bits 0-13 are
   # allocated in ``KnownFlags`` (MCR/replay/layout/filter/column/
-  # source-views + the M17a/M23a-d call/step/value/io/interning stream
-  # flags — bit 8 is ``FlagHasCallStream``), and bits 6/7 predate them.
-  # Earlier iterations of this test used bit 5 (then 6, then 8) — keep
-  # the test in sync with the latest allocated range so it exercises a
-  # genuinely-unknown bit and keeps the unknown-bit rejection contract
-  # enforced.
-  const FirstReservedBit: uint16 = 0x2000
+  # source-views, the bit-6/7 capability flags, and the M17a/M23a-d/RS-M1
+  # call/step/value/io/interning/span stream flags — bit 13 is
+  # ``FlagHasSpanStream``).  Earlier iterations of this test used bit 5
+  # (then 6, then 8, then 13) — keep the test in sync with the latest
+  # allocated range so it exercises a genuinely-unknown bit and keeps the
+  # unknown-bit rejection contract enforced.
+  const FirstReservedBit: uint16 = 0x4000
   let badBuf = handcraftMetaDatWithFlags(FirstReservedBit)
   let badRes = readMetaDat(badBuf)
   doAssert badRes.isErr,
-    "readMetaDat must reject meta.dat with unknown flag bit 8 set"
+    "readMetaDat must reject meta.dat with unknown flag bit 14 set"
 
   # Sanity check the error message mentions the unknown bits.
   doAssert "unknown flag" in badRes.error or

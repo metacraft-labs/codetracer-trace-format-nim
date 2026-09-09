@@ -34,11 +34,12 @@ import ../codetracer_trace_types
 export results, value_stream.VariableValue, io_event_stream.IOEventKind,
        codetracer_trace_types.FilterProvenance, uuid_v7
 
-const
-  DefaultLinesPerFile*: uint64 = 100_000
-    ## Default assumed line count per file for GlobalLineIndex.
-    ## The real line counts would come from source files, which we
-    ## don't have at this level.
+# The line-only address-space stride, re-exported for the consumers that
+# reach it through this module. It is defined beside the prefix-sum
+# arithmetic in `global_line_index` because encoding with one value and
+# inverting with another produces plausible wrong positions that no
+# container check can catch.
+export global_line_index.DefaultLinesPerFile
 
 type
   SourceViewRecord* = object
@@ -331,17 +332,13 @@ proc rebuildGli(w: var MultiStreamTraceWriter) =
   ##
   ## In line-only mode every file gets the legacy ``DefaultLinesPerFile``
   ## allocation, preserving byte-for-byte output of pre-P6 traces.
-  var counts = newSeq[uint64](w.paths.len)
-  for i in 0 ..< w.paths.len:
-    if w.columnAwareSteps and i < w.pathLineLengths.len and
-       w.pathLineLengths[i].len > 0:
-      var total: uint64 = 0
-      for L in w.pathLineLengths[i]:
-        total += uint64(L)
-      counts[i] = max(total, 1'u64)
-    else:
-      counts[i] = DefaultLinesPerFile
-  w.gli = buildGlobalLineIndex(counts)
+  ##
+  ## The sizing rule lives in ``global_line_index.positionSpaceCounts``
+  ## because the reader has to apply the same one — a file sized
+  ## differently there shifts the base of every file after it, and the
+  ## container records neither the sizes nor the rule.
+  w.gli = buildGlobalLineIndex(
+    positionSpaceCounts(w.pathLineLengths, w.paths.len, w.columnAwareSteps))
   w.gliDirty = false
 
 proc toGlobalLineIndex(w: var MultiStreamTraceWriter,
@@ -352,9 +349,10 @@ proc toGlobalLineIndex(w: var MultiStreamTraceWriter,
   ## column is 1, and subsequent ``DeltaColumn`` events advance it
   ## within the line).
   ##
-  ## In line-only mode, returns the legacy ``file_base + line`` value
-  ## so traces produced without column data are byte-for-byte identical
-  ## to pre-P6 output.
+  ## In line-only mode, returns ``file_base + (line - 1)`` — the same
+  ## 0-based in-file offset, with one address per line instead of one per
+  ## (line, column) position, so both modes put line 1 at the file's own
+  ## base. See ``global_line_index.globalIndex``.
   if w.gliDirty:
     w.rebuildGli()
   if w.columnAwareSteps and pathId < uint64(w.pathLineLengths.len) and
@@ -382,16 +380,21 @@ proc initMultiStreamWriter*(path: string, program: string,
     recordingId: string = ""): Result[MultiStreamTraceWriter, string] =
   ## Create a new multi-stream trace writer.
   ##
-  ## The container is ALWAYS built on ``createCtfsStreaming(path)``: the
-  ## exec/value/call/io/span stream chunks flush to ``path`` on disk as they are
-  ## written, so a producer does not have to hold the whole trace in RAM until
-  ## close, and the container is durable/observable mid-run.  ``closeCtfs``
-  ## finalizes the on-disk image.
+  ## A writer with a ``path`` builds its container on
+  ## ``createCtfsStreaming(path)``: the exec/value/call/io/span stream chunks
+  ## flush to ``path`` on disk as they are written, so a producer does not have
+  ## to hold the whole trace in RAM until close, and the container is
+  ## durable/observable mid-run.  ``closeCtfs`` finalizes the on-disk image.
+  ## Streaming is not a mode a file-backed producer may opt out of: buffering
+  ## the trace and dumping it at close balloons RAM and loses everything if a
+  ## long-running producer is killed first.
   ##
-  ## The old buffer-in-memory-then-dump mode (``createCtfs`` + ``toBytes`` at
-  ## close) has been removed: every CTFS producer streams.  ``toBytes`` still
-  ## returns the full container image for in-memory consumers, and the streamed
-  ## container is byte-identical to what the buffered mode produced.
+  ## An EMPTY ``path`` selects the in-memory container instead.  That is not
+  ## the retired opt-out — it is the case where there is nothing to stream to:
+  ## the freestanding WebAssembly writer has no filesystem, so its host reads
+  ## the finished image out of ``toBytes`` (see ``trace_writer_begin_in_memory``
+  ## on the C ABI).  ``toBytes`` returns the same bytes either way; a streamed
+  ## container is byte-identical to a buffered one.
   ##
   ## ~recordingId~ defaults to a freshly-minted UUIDv7 (M-REC-1).  Pass
   ## an explicit canonical-form id to pin the recording's identity
@@ -409,10 +412,13 @@ proc initMultiStreamWriter*(path: string, program: string,
       return err("recordingId is not a canonical UUIDv7: " & valRes.error)
 
   var w: MultiStreamTraceWriter
-  let sres = createCtfsStreaming(path)
-  if sres.isErr:
-    return err("failed to create streaming CTFS container at " & path & ": " & sres.error)
-  w.ownedCtfs = sres.get()
+  if path.len == 0:
+    w.ownedCtfs = createCtfs()
+  else:
+    let sres = createCtfsStreaming(path)
+    if sres.isErr:
+      return err("failed to create streaming CTFS container at " & path & ": " & sres.error)
+    w.ownedCtfs = sres.get()
   w.metadata = TraceMetadata(
     recordingId: resolvedId, program: program, args: @[], workdir: "")
   w.paths = @[]
@@ -794,11 +800,12 @@ proc registerStep*(w: var MultiStreamTraceWriter, pathId: uint64,
   if w.linehitsBuilder.isSome:
     w.linehitsBuilder.get().recordHit(gli, w.stepCount)
 
-  # M26b — record into the prepopulated breakpoint index, keyed by the SAME
-  # gli the exec stream encoded so the resulting `step-map.ns` matches the
-  # db-backend's `unpack_global_line_index`-derived whole-table build.
+  # M26b — record into the prepopulated breakpoint index, keyed by the
+  # coordinates registered here.  A breakpoint request arrives as
+  # `(path_id, line)`; the packed `gli` is a writer convention the container
+  # does not record, so it is not a key (see step_map_builder's header).
   if w.emitStepMap:
-    w.stepMapBuilder.recordStep(gli, w.stepCount)
+    w.stepMapBuilder.recordStep(pathId, line, w.stepCount)
 
   w.lastGlobalLineIndex = gli
   w.lastPathId = pathId
@@ -867,12 +874,12 @@ proc registerStepWithColumn*(w: var MultiStreamTraceWriter,
   if w.linehitsBuilder.isSome:
     w.linehitsBuilder.get().recordHit(combinedGli, w.stepCount)
 
-  # M26b — index into the breakpoint map.  In practice `emitStepMap` is only
-  # on for line-only writers (where `columnDelta == 0` and `combinedGli`
-  # packs `(path_id << 32) | line`), so the gli unpacks back to the recorded
-  # `(path_id, line)` exactly as the reader decodes it.
+  # M26b — index into the breakpoint map at the registered coordinates.
+  # `emitStepMap` is only on for line-only writers, where `columnDelta == 0`
+  # and this step is the line's first position, so the column the request
+  # cannot name is not lost by keying on the line alone.
   if w.emitStepMap:
-    w.stepMapBuilder.recordStep(combinedGli, w.stepCount)
+    w.stepMapBuilder.recordStep(pathId, line, w.stepCount)
 
   w.lastGlobalLineIndex = combinedGli
   w.lastPathId = pathId
@@ -1130,19 +1137,17 @@ proc flushSpans*(w: var MultiStreamTraceWriter): Result[void, string] =
   ## the writer's record buffer.  `close()` calls it anyway, so a batch
   ## recorder never needs to.  A no-op when no span has been registered.
   ##
-  ## **This does NOT yet make anything visible to a concurrent reader.**
-  ## `initMultiStreamWriter` builds the container with `createCtfs()`, i.e.
-  ## entirely in memory; the bytes reach the filesystem only when the caller
-  ## serialises them (`toBytes`, which the FFI does at
-  ## `trace_writer_close`).  Sealing a chunk therefore changes what an
-  ## already-materialised image would contain, not what is on disk right now.
+  ## On an IN-MEMORY writer (an empty `path`) this makes nothing visible to a
+  ## concurrent reader: there is no file, and the bytes exist only once the
+  ## caller serialises them (`toBytes`, which the FFI does at
+  ## `trace_writer_close`).  Sealing a chunk there changes what an
+  ## already-materialised image would contain, not what is on disk.
   ##
-  ## Live visibility needs one more change, not made here: the writer would
-  ## have to be built on `createCtfsStreaming(path)` so `syncEntry` lands the
-  ## chunk and its index entry on disk as they are sealed.  The span stream
-  ## itself is already ready for that — `flushChunk` writes the chunk body
-  ## before the index entry and syncs both, and `initSpanStreamReader` /
-  ## `readSpansSince` read a growing container (see
+  ## On a file-backed writer the container is `createCtfsStreaming(path)`, so
+  ## `syncEntry` lands the chunk and its index entry on disk as they are
+  ## sealed and a concurrent reader does see them.  `flushChunk` writes the
+  ## chunk body before the index entry and syncs both, and
+  ## `initSpanStreamReader` / `readSpansSince` read a growing container (see
   ## `span_stream_tail_during_active_write`, which drives exactly that path
   ## against a streaming container).
   if not w.hasSpans:
