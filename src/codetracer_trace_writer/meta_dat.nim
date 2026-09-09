@@ -724,6 +724,23 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
     return err("meta.dat: unknown flag bits set: 0x" &
       toHex(unknownBits.BiggestInt, 4))
 
+  # Two KNOWN bits that cannot both be honoured. Each selects a paths.dat
+  # record layout and a record is in one or the other; a column-aware
+  # record already carries the file's line_count as the length of its
+  # per-line table. Refused rather than resolved by preference, because
+  # the wrong choice is not a parse failure downstream — it is a path
+  # string with its own framing inside it and a per-file size that was
+  # never written. `writeMetaDat` refuses to produce such a header, so
+  # this catches one from another producer.
+  if (flags and FlagHasColumnAwareSteps) != 0 and
+     (flags and FlagHasLineCountTable) != 0:
+    return err("meta.dat: flags 0x" & toHex(flags.BiggestInt, 4) &
+      " set both FlagHasColumnAwareSteps (bit 4) and FlagHasLineCountTable " &
+      "(bit 14). Each selects a paths.dat record layout and a record is in " &
+      "one or the other; a column-aware record already carries the file's " &
+      "line_count as the length of its per-line table. Re-record the trace " &
+      "with a current recorder")
+
   var pos = 8
 
   var contents = MetaDatContents(version: version)

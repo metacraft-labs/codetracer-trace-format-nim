@@ -345,6 +345,34 @@ proc test_registerPath_refuses_a_path_with_no_count() =
     "the refusal must say why; got: " & bothClose.error
   both.closeCtfs()
 
+  # And the READER refuses such a header too, so a container from another
+  # producer that states both is reported rather than read under whichever
+  # layout the reader happens to test for first.
+  let sized = buildTrace("both-read", withTable = true,
+    counts = [CountA, CountB], steps = [(0'u64, 1'u64)])
+  var mutated = sized
+  var patched = 0
+  for i in 0 .. mutated.len - 8:
+    if mutated[i] == MetaDatMagic[0] and mutated[i + 1] == MetaDatMagic[1] and
+       mutated[i + 2] == MetaDatMagic[2] and mutated[i + 3] == MetaDatMagic[3]:
+      let flags = uint16(mutated[i + 6]) or (uint16(mutated[i + 7]) shl 8)
+      if (flags and FlagHasLineCountTable) != 0:
+        let both = flags or FlagHasColumnAwareSteps
+        mutated[i + 6] = byte(both and 0xFF)
+        mutated[i + 7] = byte((both shr 8) and 0xFF)
+        patched += 1
+  doAssert patched == 1,
+    "the control needs exactly one meta.dat header carrying bit 14; " &
+    "patched " & $patched
+  doAssert openNewTraceFromBytes(sized).isOk,
+    "the unpatched container must open, or the patch proves nothing"
+  let bothRead = openNewTraceFromBytes(mutated)
+  doAssert bothRead.isErr,
+    "a header declaring bit 4 AND bit 14 must fail the open — the reader " &
+    "cannot know which layout its paths.dat records are in"
+  doAssert "bit 14" in bothRead.error,
+    "the refusal must name the bits; got: " & bothRead.error
+
   echo "PASS: test_registerPath_refuses_a_path_with_no_count"
 
 proc test_a_writer_that_cannot_count_records_the_ceiling_it_used() =
