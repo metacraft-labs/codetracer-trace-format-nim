@@ -53,6 +53,10 @@ task test, "Run all tests":
   exec "nim c -r tests/test_trace_reader_null_mapping_root.nim"
   exec "nim c -r tests/test_golden_fixtures.nim"
   exec "nim c -r tests/test_cross_compat.nim"
+  exec "nim c -r tests/test_xxh64.nim"
+  # -d:release: the scale ladder builds a 100k-key index; a debug build
+  # turns that measurement into a multi-minute wait for no extra coverage.
+  exec "nim c -r -d:release tests/test_corrmark_builder.nim"
   exec "nim c -r tests/test_meta_dat.nim"
   exec "nim c -r tests/test_namespace_descriptor.nim"
   exec "nim c -d:release -r tests/test_sub_block_pool.nim"
