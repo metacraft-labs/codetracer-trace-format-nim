@@ -288,7 +288,7 @@ proc lookup*(idx: var CorrmarkIndex,
   let key = correlationKey(traceIdBe, spanIdBe)
   let descRes = idx.tree.lookup(key)
   if descRes.isErr:
-    return ok(@[])  # no such key — a legitimate miss
+    return ok(newSeq[CorrelationMarker]())  # no such key — a legitimate miss
   let desc = descRes.get()
   if desc.len < 16:
     return err("corrmark.ns: short descriptor")
@@ -325,7 +325,7 @@ proc lookupBoundary*(idx: var CorrmarkIndex, markerId: uint64, keyValue: string)
   let wantFp = keyFingerprint(keyValue)
   let descRes = idx.tree.lookup(key)
   if descRes.isErr:
-    return ok(@[])
+    return ok(newSeq[CorrelationMarker]())
   let desc = descRes.get()
   if desc.len < 16:
     return err("corrmark.ns: short descriptor")

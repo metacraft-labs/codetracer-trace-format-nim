@@ -780,8 +780,8 @@ proc test_meta_dat_writer_mints_when_blank() {.raises: [].} =
   doAssert id1 != id2,
     "two freshly-minted ids should differ; both were '" & id1 & "'"
 
-  discard w1.close()
-  discard w2.close()
+  doAssert w1.close().isOk
+  doAssert w2.close().isOk
 
   try:
     removeFile(path1)

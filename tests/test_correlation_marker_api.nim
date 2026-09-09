@@ -9,27 +9,38 @@
 ## 2. An entry in `corrmark.ns` — so a consumer can find it by lookup rather
 ##    than by decoding the event stream.
 ##
-## The intended check for the payload half is `ct print --json-events`, the
-## CANONICAL decoder: `addEventMetadata` already hoists `correlation_marker` /
-## `boundary_id` / `direction` / `key_value` to the top level, which would make
-## it the conformance target for every future binding too.
+## The payload half is checked through `ct print`'s OWN decoder — the same
+## `buildFullDocument` / `addEventMetadata` pair the `--full` and `--events`
+## modes run — so this is the conformance target every future binding can
+## reuse: a marker that decodes here decodes in the tool users run. It is
+## reached in-process via `codetracer_ct_print_lib` rather than by shelling
+## out, because the `ct-print` binary at the repo root is a build artifact
+## that can be older than the checkout (that stale artifact has already
+## produced one false finding in this area).
 ##
-## THAT ROUTE IS BLOCKED BY A PRE-EXISTING DEFECT, not by the marker work, so
-## this asserts the payload reached `events.dat` structurally instead.
-## Measured: a `MultiStreamTraceWriter` container closes with `meta.dat` at
-## **size 0** — with or without any marker — so `ct print` reads an empty
-## program, every capability flag false, and gates all four stream counts to
-## "(unavailable)" even though `events.dat`, `steps.dat` and `values.dat` all
-## carry bytes. Reproduce with `ct-print --full` on any container this writer
-## produces. Until that is fixed, no `ct print`-based conformance test can see
-## a marker, which is worth knowing before someone writes one and concludes
-## the recorder is at fault.
+## An earlier revision of this header recorded that the `ct print` route was
+## "blocked by a pre-existing defect": a container whose `meta.dat` read back
+## at size 0, making the whole recording decode as an empty program. That was
+## real, and it is now fixed and pinned by
+## `tests/test_close_publishes_entry_sizes.nim`. The diagnosis in that note
+## was wrong, though, and the correction is worth keeping: the meta bytes WERE
+## written. What was missing was the publication of block 0's entry-size
+## array, which `writeToFile` only updates in memory — so the file written
+## LAST always read back empty, and `meta.dat` is always written last. The
+## trigger was reading the container after `close()` without `closeCtfs()`,
+## which this test used to do.
 
 import std/os
 import results
 import ../src/codetracer_ctfs/container
 import ../src/codetracer_trace_writer/multi_stream_writer
 import ../src/codetracer_trace_writer/corrmark_builder
+import ../src/codetracer_trace_writer/new_trace_reader
+
+# ct-print's own JSON rendering, so the assertion below is made against the
+# canonical decoder rather than a second one written for the test.  Same
+# mechanism `tests/test_ct_print_full.nim` uses.
+include ../src/codetracer_ct_print_lib
 
 proc u32le(data: openArray[byte], off: int): uint32 =
   for i in 0 ..< 4:
@@ -61,26 +72,76 @@ proc recordTrace(path: string) =
   doAssert w.registerCorrelationMarker(
     "receive", "order-processing", "order-42").isOk
   doAssert w.close().isOk
+  doAssert w.closeCtfs().isOk
 
-proc test_marker_payload_reaches_the_event_stream() =
-  ## The payload half: a declared marker must land in `events.dat`, which is
-  ## where `ct print` and the db-backend's origin walk read it from.
+proc test_marker_payload_decodes_through_ct_print() =
+  ## The payload half, through the CANONICAL decoder.
   ##
-  ## Asserted structurally (the stream exists and grew) rather than by
-  ## decoding, because the canonical decoder cannot currently be reached — see
-  ## the module header. A stronger assertion belongs here the moment it can be.
+  ## A declared marker must come back out of `ct print` with
+  ## `correlation_marker` / `boundary_id` / `direction` / `key_value` hoisted
+  ## to the top level of the event — that hoisting is what the debugger's
+  ## cross-process origin walk and every consumer downstream key on. Asserting
+  ## the bytes merely reached `events.dat` would pass on a payload whose field
+  ## names had drifted, which is precisely the failure this shared API exists
+  ## to prevent: such a marker is invisible, not broken, and nothing reports an
+  ## error.
   let path = getTempDir() / "test_corrmark_api.ct"
   removeFile(path)
   recordTrace(path)
 
-  let data = readCtfsFromFile(path).get()
-  let events = readInternalFile(data, "events.dat", u32le(data, 8), u32le(data, 12))
-  doAssert events.isOk, "events.dat missing: " & events.error
-  doAssert events.get().len > 0,
-    "a declared marker must reach events.dat, which is empty"
+  var readerRes = openNewTrace(path)
+  doAssert readerRes.isOk, "ct print could not open the recording: " &
+    readerRes.error
+  var reader = readerRes.get()
+  let doc = buildFullDocument(reader, FullOpts(stripPaths: false))
+
+  doAssert doc["metadata"]["program"].getStr() == "marker_demo",
+    "the recording decoded with an empty program: " & $doc["metadata"]
+
+  var markers: seq[JsonNode] = @[]
+  for ev in doc["events"]:
+    if isCorrelationMarker(ev):
+      markers.add(ev)
+
+  doAssert markers.len == 2,
+    "expected both declared markers in ct print's output, got " &
+    $markers.len
+
+  doAssert markers[0]["boundary_id"].getStr() == "order-processing"
+  doAssert markers[0]["direction"].getStr() == "send"
+  doAssert markers[0]["key_value"].getStr() == "order-42"
+  doAssert markers[0]["correlation_marker"]["show_value"].getStr() ==
+    "the order body"
+  doAssert markers[0]["correlation_marker"]["description"].getStr() ==
+    "Outbound order"
+  doAssert markers[0]["correlation_marker"]["marker_id"].getInt() == 0
+
+  # "receive" normalises to "recv" — an unrecognised spelling would produce an
+  # unpairable marker, so the API picks a side rather than erroring.
+  doAssert markers[1]["direction"].getStr() == "recv",
+    "'receive' must normalise to 'recv', got " &
+    markers[1]["direction"].getStr()
 
   removeFile(path)
-  echo "PASS: test_marker_payload_reaches_the_event_stream"
+  echo "PASS: test_marker_payload_decodes_through_ct_print"
+
+proc test_marker_mints_no_step() =
+  ## Contract §11a.6: a marker attaches to the enclosing step and mints none
+  ## of its own. Minting one would insert an exec-stream event no user code
+  ## executed and shift every later step index — the indices spans'
+  ## `start_step` / `end_step` are measured in.
+  let path = getTempDir() / "test_corrmark_api_steps.ct"
+  removeFile(path)
+  recordTrace(path)
+
+  var reader = openNewTrace(path).get()
+  let doc = buildFullDocument(reader, FullOpts(stripPaths: false))
+  doAssert doc["counts"]["steps"].getInt() == 2,
+    "recordTrace registers exactly 2 steps around 2 markers; ct print sees " &
+    $doc["counts"]["steps"].getInt() & " — a marker minted a step"
+
+  removeFile(path)
+  echo "PASS: test_marker_mints_no_step"
 
 proc test_marker_is_indexed_in_corrmark_ns() =
   let path = getTempDir() / "test_corrmark_api_idx.ct"
@@ -127,6 +188,7 @@ proc test_absence_is_distinguishable() =
   doAssert w.registerPath("/src/app.rb").isOk
   doAssert w.registerStep(0, 1, []).isOk
   doAssert w.close().isOk
+  doAssert w.closeCtfs().isOk
 
   let data = readCtfsFromFile(path).get()
   let ns = readNamespace(data)
@@ -137,7 +199,8 @@ proc test_absence_is_distinguishable() =
   echo "PASS: test_absence_is_distinguishable"
 
 when isMainModule:
-  test_marker_payload_reaches_the_event_stream()
+  test_marker_payload_decodes_through_ct_print()
+  test_marker_mints_no_step()
   test_marker_is_indexed_in_corrmark_ns()
   test_absence_is_distinguishable()
   echo "=== correlation marker API tests passed ==="

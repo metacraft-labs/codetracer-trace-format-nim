@@ -58,6 +58,7 @@ task test, "Run all tests":
   # turns that measurement into a multi-minute wait for no extra coverage.
   exec "nim c -r -d:release tests/test_corrmark_builder.nim"
   exec "nim c -r tests/test_correlation_marker_api.nim"
+  exec "nim c -r tests/test_close_publishes_entry_sizes.nim"
   exec "nim c -r tests/test_meta_dat.nim"
   exec "nim c -r tests/test_namespace_descriptor.nim"
   exec "nim c -d:release -r tests/test_sub_block_pool.nim"

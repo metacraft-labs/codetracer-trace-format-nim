@@ -1787,6 +1787,9 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   # lifetime is the owner's too, so an attached `close` must not write meta.dat
   # or `closeCtfs` — it just marks itself closed and returns.
   if w.attached:
+    # Publish this writer's entry sizes before handing the container back to
+    # its owner: `writeToFile` only updates them in block 0's in-memory image.
+    w.container.syncRootBlock()
     w.closed = true
     return ok()
 
@@ -1854,19 +1857,39 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   if metaRes.isErr:
     return err("failed to write meta.dat: " & metaRes.error)
 
+  # Publish block 0 — the root entry array, which carries every internal
+  # file's size.  `writeToFile` maintains those sizes in the in-memory image
+  # and flushes only the data block it filled, so without this the container
+  # on disk reports each member's size as of the last `addFile`: `meta.dat`,
+  # written last, reads back as 0 bytes and the whole recording decodes as an
+  # empty program.  One 4 KiB write per recording.
+  w.container.syncRootBlock()
+
   w.closed = true
   ok()
+
+proc isClosed*(w: MultiStreamTraceWriter): bool =
+  ## True once `close` has run.  Exposed so a caller that finalizes on a
+  ## teardown path (the C ABI's `trace_writer_free`) can tell "already closed,
+  ## nothing to flush" from "still open", instead of driving buffered writes
+  ## into a closed writer and reporting the resulting error as a real one.
+  w.closed
 
 proc toBytes*(w: var MultiStreamTraceWriter): seq[byte] =
   ## Get the serialized CTFS bytes. Must call close() first.
   w.container.toBytes()
 
-proc closeCtfs*(w: var MultiStreamTraceWriter) =
+proc closeCtfs*(w: var MultiStreamTraceWriter): Result[void, string]
+    {.discardable.} =
   ## Release any resources held by the underlying CTFS container.
   ##
   ## No-op for an ATTACHED writer: the container is owned by another writer,
   ## which is responsible for finalizing and closing it.  Only the owner's
   ## `closeCtfs` may write the final root block and close the stream file.
+  ##
+  ## Returns the container's finalization error instead of dropping it: this
+  ## is the write that makes the recording durable, so a failure here means
+  ## the trace on disk is incomplete.
   if w.attached:
-    return
+    return ok()
   w.container.closeCtfs()

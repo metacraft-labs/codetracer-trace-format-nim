@@ -291,19 +291,44 @@ proc trace_writer_new(
   )
   return state
 
+proc flushPendingStep(handle: TraceWriterHandle,
+    orphanPathId: uint64 = high(uint64),
+    orphanLine: uint64 = 0'u64): cint
+  ## Forward-declared: `trace_writer_free` finalizes through the same path
+  ## `trace_writer_close` does, and it is defined above it.
+
 proc trace_writer_free(handle: TraceWriterHandle) {.exportc, cdecl, dynlib.} =
   ## Free a trace writer handle. Passing NULL is a no-op.
   if handle.isNil:
     return
-  # Close if writer was actually created and not already closed
+  # Close if writer was actually created and not already closed.
+  #
+  # A recorder that frees without an explicit `trace_writer_close` still gets
+  # a COMPLETE recording: the buffered step is flushed first, and both the
+  # writer's close and the container's finalization are checked.  This path
+  # used to `discard` all three, so a close that failed produced a finalized
+  # container the caller was told nothing about.  `free` has no return channel,
+  # so the failure is recorded in the FFI's last-error slot, which
+  # `trace_writer_last_error` reports.
   if handle.useMultiStream:
     if handle.msWriterReady:
+      if not handle.msWriter.isClosed():
+        let flushRc = flushPendingStep(handle)
+        if flushRc != 0:
+          setError("trace_writer_free: failed to flush the pending step: " &
+            lastError)
       # close() is idempotent — safe to call even if already closed
-      discard handle.msWriter.close()
-      handle.msWriter.closeCtfs()
+      let closeRes = handle.msWriter.close()
+      if closeRes.isErr:
+        setError("trace_writer_free: close failed: " & closeRes.error)
+      let ctfsRes = handle.msWriter.closeCtfs()
+      if ctfsRes.isErr:
+        setError("trace_writer_free: closeCtfs failed: " & ctfsRes.error)
   else:
     if handle.writerReady and not handle.writer.closed:
-      discard handle.writer.close()
+      let closeRes = handle.writer.close()
+      if closeRes.isErr:
+        setError("trace_writer_free: close failed: " & closeRes.error)
   try:
     `=destroy`(handle[])
   except:
@@ -2292,7 +2317,14 @@ proc trace_writer_close(handle: TraceWriterHandle): cint {.exportc, cdecl, dynli
     # block and closes the file). No separate toBytes()/open(fmWrite) dump —
     # that was the buffered mode, which balloons RAM and loses the trace if a
     # long-running producer is killed before close.
-    handle.msWriter.closeCtfs()
+    let ctfsRes = handle.msWriter.closeCtfs()
+    if ctfsRes.isErr:
+      # The final write is what publishes block 0's entry-size array; losing
+      # it leaves a container whose members read back empty.  Reporting
+      # success here would hand the recorder a corrupt trace it believes is
+      # complete.
+      setError(ctfsRes.error)
+      return 1.cint
     return 0.cint
 
   if not handle.writerReady:

@@ -114,8 +114,8 @@ proc test_column_step_requires_opt_in() {.raises: [].} =
   doAssert colRes.isErr,
     "registerColumnStep without enableColumnAwareSteps must error"
 
-  discard w.close()
-  w.closeCtfs()
+  doAssert w.close().isOk
+  doAssert w.closeCtfs().isOk
   echo "PASS: test_column_step_requires_opt_in"
 
 proc test_column_step_first_is_rejected() {.raises: [].} =
@@ -132,8 +132,8 @@ proc test_column_step_first_is_rejected() {.raises: [].} =
   doAssert colRes.isErr,
     "first step must be an AbsoluteStep, registerColumnStep should error"
 
-  discard w.close()
-  w.closeCtfs()
+  doAssert w.close().isOk
+  doAssert w.closeCtfs().isOk
   echo "PASS: test_column_step_first_is_rejected"
 
 proc test_no_column_flag_for_legacy_writer() {.raises: [].} =
