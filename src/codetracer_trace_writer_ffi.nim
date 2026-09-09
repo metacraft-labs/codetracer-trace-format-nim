@@ -1254,6 +1254,8 @@ proc trace_writer_mark_correlation_by_id(
     key_value: ptr UncheckedArray[byte], key_value_len: csize_t,
     show_value: ptr UncheckedArray[byte], show_value_len: csize_t,
     description: ptr UncheckedArray[byte], description_len: csize_t,
+    key_text: ptr UncheckedArray[byte], key_text_len: csize_t,
+    show_text: ptr UncheckedArray[byte], show_text_len: csize_t,
 ): cint {.exportc, cdecl, dynlib.} =
   ## Declare a correlation marker against an interned label id.
   ##
@@ -1272,7 +1274,9 @@ proc trace_writer_mark_correlation_by_id(
     ptrLenToString(boundary_label, boundary_label_len),
     ptrLenToString(key_value, key_value_len),
     ptrLenToString(show_value, show_value_len),
-    ptrLenToString(description, description_len))
+    ptrLenToString(description, description_len),
+    ptrLenToString(key_text, key_text_len),
+    ptrLenToString(show_text, show_text_len))
   (if res.isOk: 0.cint else: 1.cint)
 
 proc trace_writer_mark_correlation(
@@ -1282,6 +1286,8 @@ proc trace_writer_mark_correlation(
     key_value: ptr UncheckedArray[byte], key_value_len: csize_t,
     show_value: ptr UncheckedArray[byte], show_value_len: csize_t,
     description: ptr UncheckedArray[byte], description_len: csize_t,
+    key_text: ptr UncheckedArray[byte], key_text_len: csize_t,
+    show_text: ptr UncheckedArray[byte], show_text_len: csize_t,
 ): cint {.exportc, cdecl, dynlib.} =
   ## Declare a correlation marker (`Correlation-Markers.md` §2.4).
   ##
@@ -1320,9 +1326,90 @@ proc trace_writer_mark_correlation(
     if not handle.msWriterReady:
       return 1
     let res = handle.msWriter.registerCorrelationMarker(
-      dir, boundary, key, show, desc)
+      dir, boundary, key, show, desc,
+      ptrLenToString(key_text, key_text_len),
+      ptrLenToString(show_text, show_text_len))
     return (if res.isOk: 0.cint else: 1.cint)
   1.cint
+
+proc trace_writer_mark_span_coverage(
+    handle: TraceWriterHandle,
+    trace_id: ptr UncheckedArray[byte], trace_id_len: csize_t,
+    span_id: ptr UncheckedArray[byte], span_id_len: csize_t,
+    wall_time_unix_ns: uint64,
+    monotonic_time_ns: uint64,
+): cint {.exportc, cdecl, dynlib.} =
+  ## Declare that this recording covers a distributed-trace span.
+  ##
+  ## THE ENTRY POINT AN OBSERVABILITY RECORDER BINDS TO, called once per
+  ## served request.  It is what lets a consumer holding an OTel
+  ## `(trace_id, span_id)` decide whether this recording covers that span with
+  ## a single index lookup, instead of downloading and decoding the recording.
+  ##
+  ## `trace_id` is the 16 WIRE bytes and `span_id` the 8 WIRE bytes — not a
+  ## hex rendering.  The index keys on the wire bytes, so hex here would build
+  ## an index keyed on something no consumer ever computes: present, correct
+  ## looking, and permanently unqueryable.  Use
+  ## `trace_writer_mark_span_coverage_hex` when the host hands you hex; it is
+  ## a wrapper over this, so the conversion has one implementation.
+  ##
+  ## Returns 0 on success, 1 on failure (see `trace_writer_last_error`).  A
+  ## binding is responsible for the no-op-when-not-recording behaviour: user
+  ## code calls this unconditionally and "no active recording" is not an error.
+  if handle.isNil:
+    setError("NULL handle")
+    return 1.cint
+  if not handle.useMultiStream or not handle.msWriterReady:
+    setError("no active CTFS recording")
+    return 1.cint
+  if trace_id.isNil or span_id.isNil:
+    setError("NULL trace_id or span_id")
+    return 1.cint
+
+  var traceBytes = newSeq[byte](int(trace_id_len))
+  for i in 0 ..< int(trace_id_len): traceBytes[i] = trace_id[i]
+  var spanBytes = newSeq[byte](int(span_id_len))
+  for i in 0 ..< int(span_id_len): spanBytes[i] = span_id[i]
+
+  let res = handle.msWriter.registerSpanCoverage(
+    traceBytes, spanBytes, wall_time_unix_ns, monotonic_time_ns)
+  if res.isErr:
+    setError(res.error)
+    return 1.cint
+  0.cint
+
+proc trace_writer_mark_span_coverage_hex(
+    handle: TraceWriterHandle,
+    trace_id_hex: ptr UncheckedArray[byte], trace_id_hex_len: csize_t,
+    span_id_hex: ptr UncheckedArray[byte], span_id_hex_len: csize_t,
+    wall_time_unix_ns: uint64,
+    monotonic_time_ns: uint64,
+): cint {.exportc, cdecl, dynlib.} =
+  ## Hex convenience over `trace_writer_mark_span_coverage`, for the common
+  ## case where the host's OTel API hands the ids out as the canonical 32- and
+  ## 16-character lowercase hex strings.
+  ##
+  ## The conversion lives in the shared library rather than in each binding
+  ## for the reason the whole marker API does: ~20 recorders each writing a
+  ## hex parser is ~20 chances to key the index on the wrong bytes, and that
+  ## mistake reports no error anywhere.
+  ##
+  ## (ptr, len), never NUL-terminated — see `ptrLenToString`.
+  if handle.isNil:
+    setError("NULL handle")
+    return 1.cint
+  if not handle.useMultiStream or not handle.msWriterReady:
+    setError("no active CTFS recording")
+    return 1.cint
+
+  let res = handle.msWriter.registerSpanCoverageHex(
+    ptrLenToString(trace_id_hex, trace_id_hex_len),
+    ptrLenToString(span_id_hex, span_id_hex_len),
+    wall_time_unix_ns, monotonic_time_ns)
+  if res.isErr:
+    setError(res.error)
+    return 1.cint
+  0.cint
 
 proc trace_writer_register_special_event(
     handle: TraceWriterHandle,

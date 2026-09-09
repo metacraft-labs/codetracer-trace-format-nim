@@ -142,6 +142,70 @@ proc initBoundaryMarker*(markerId: uint64, keyValue: string, isRecv: bool,
     result.traceId[8 + i] = byte((fp shr ((7 - i) * 8)) and 0xFF)
     result.spanId[i] = byte((idx shr ((7 - i) * 8)) and 0xFF)
 
+proc initSpanMarker*(traceIdBe: openArray[byte], spanIdBe: openArray[byte],
+                     wallTimeUnixNs: uint64, monotonicTimeNs: uint64,
+                     geid: uint64 = 0, threadId: uint64 = 0,
+                     isExit: bool = false):
+    Result[CorrelationMarker, string] =
+  ## Build a kind-0 entry: "this recording covers this distributed-trace span".
+  ##
+  ## The identity block is the full `(trace_id, span_id)` in WIRE ORDER, so a
+  ## lookup confirms it exactly and a hash collision costs one comparison
+  ## rather than returning another span's recording.
+  ##
+  ## The widths are CHECKED rather than truncated or zero-padded.  A short
+  ## `trace_id` silently padded to 16 bytes hashes to a key no consumer will
+  ## ever compute, so the marker would be written, reported as written, and be
+  ## permanently unfindable — the invisible-not-broken failure this whole
+  ## contract exists to remove.
+  if traceIdBe.len != 16:
+    return err("correlation trace_id must be 16 bytes (wire order), got " &
+      $traceIdBe.len)
+  if spanIdBe.len != 8:
+    return err("correlation span_id must be 8 bytes (wire order), got " &
+      $spanIdBe.len)
+  var m = CorrelationMarker(
+    kind: MarkerKindSpan,
+    flags: (if isExit: MarkerFlagExit else: 0'u16),
+    wallTimeUnixNs: wallTimeUnixNs,
+    monotonicTimeNs: monotonicTimeNs,
+    geid: geid,
+    threadId: threadId)
+  for i in 0 ..< 16: m.traceId[i] = traceIdBe[i]
+  for i in 0 ..< 8: m.spanId[i] = spanIdBe[i]
+  ok(m)
+
+proc decodeHexId*(hex: string, expectedBytes: int): Result[seq[byte], string] =
+  ## Parse a hex-rendered OTel identifier into its WIRE bytes.
+  ##
+  ## Lives here, in the shared library, on purpose.  §7 of the contract keys
+  ## the index on the wire bytes, and hashing the hex rendering instead yields
+  ## a different key — a mistake that produces an index nobody can query and
+  ## no error anywhere.  Every binding receives its ids as hex from the host's
+  ## OTel API, so ~20 recorders would otherwise each write this conversion and
+  ## some fraction would get it wrong in exactly that undetectable way.
+  ##
+  ## Accepts either case.  Rejects odd length, wrong length and non-hex.
+  if hex.len != expectedBytes * 2:
+    return err("expected " & $(expectedBytes * 2) &
+      " hex characters (" & $expectedBytes & " bytes), got " & $hex.len)
+  var outBytes = newSeq[byte](expectedBytes)
+  for i in 0 ..< expectedBytes:
+    var v = 0
+    for half in 0 .. 1:
+      let c = hex[i * 2 + half]
+      let d =
+        case c
+        of '0' .. '9': int(c) - int('0')
+        of 'a' .. 'f': int(c) - int('a') + 10
+        of 'A' .. 'F': int(c) - int('A') + 10
+        else: -1
+      if d < 0:
+        return err("'" & $c & "' is not a hex digit")
+      v = (v shl 4) or d
+    outBytes[i] = byte(v)
+  ok(outBytes)
+
 proc markerIdOf*(m: CorrelationMarker): uint64 =
   ## The interned boundary label id of a kind-1 entry.
   for i in 0 ..< 8:

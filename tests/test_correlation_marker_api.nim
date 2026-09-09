@@ -30,7 +30,7 @@
 ## trigger was reading the container after `close()` without `closeCtfs()`,
 ## which this test used to do.
 
-import std/os
+import std/[os, strutils]
 import results
 import ../src/codetracer_ctfs/container
 import ../src/codetracer_trace_writer/multi_stream_writer
@@ -198,9 +198,107 @@ proc test_absence_is_distinguishable() =
   removeFile(path)
   echo "PASS: test_absence_is_distinguishable"
 
+const
+  # The M25 observability corpus's own ids, so the shape this asserts is the
+  # shape the cross-repo consumer queries with.
+  DemoTraceIdHex = "6f92f3577b34da6a3ce929d0e0e4ab14"
+  DemoSpanIdHex = "51000000000025aa"
+  DemoWallNs = 1788897919650415375'u64
+  DemoMonotonicNs = 2052008038067771'u64
+
+proc recordSpanCoverage(path: string) =
+  var w = initMultiStreamWriter(path, "span_demo", chunkSize = 4,
+    recordingId = "01949fcc-7d92-7e9c-aaaa-111111111111").get()
+  doAssert w.registerPath("/src/app.py").isOk
+  doAssert w.registerStep(0, 1, []).isOk
+  doAssert w.registerStep(0, 2, []).isOk
+  doAssert w.registerSpanCoverageHex(
+    DemoTraceIdHex, DemoSpanIdHex, DemoWallNs, DemoMonotonicNs).isOk
+  doAssert w.close().isOk
+  doAssert w.closeCtfs().isOk
+
+proc test_span_coverage_is_indexed_and_confirmable() =
+  ## The kind-0 half: an observability recorder declares "this recording
+  ## covers this span", and a consumer resolves it by `(trace_id, span_id)`
+  ## alone, getting back the coordinates it needs to open a replay.
+  let path = getTempDir() / "test_corrmark_span.ct"
+  removeFile(path)
+  recordSpanCoverage(path)
+
+  let data = readCtfsFromFile(path).get()
+  var idx = openCorrmarkIndex(readNamespace(data).get()).get()
+
+  let traceId = decodeHexId(DemoTraceIdHex, 16).get()
+  let spanId = decodeHexId(DemoSpanIdHex, 8).get()
+  let hits = idx.lookup(traceId, spanId)
+  doAssert hits.isOk, "lookup failed: " & hits.error
+  doAssert hits.get().len == 1,
+    "expected exactly one covering entry, got " & $hits.get().len
+  let hit = hits.get()[0]
+  doAssert hit.kind == MarkerKindSpan
+  doAssert hit.wallTimeUnixNs == DemoWallNs,
+    "wall_time_unix_ns must round-trip exactly — the consumer asserts it"
+  doAssert hit.monotonicTimeNs == DemoMonotonicNs
+  doAssert hit.geid == 2'u64,
+    "geid must be the step count at declaration time, got " & $hit.geid
+
+  # A span this recording does NOT cover is a clean miss, not an error, and
+  # not the same answer as the namespace being absent (contract §9).
+  var otherSpan = spanId
+  otherSpan[7] = otherSpan[7] xor 0xFF'u8
+  let miss = idx.lookup(traceId, otherSpan)
+  doAssert miss.isOk and miss.get().len == 0,
+    "an uncovered span must be a clean miss"
+
+  removeFile(path)
+  echo "PASS: test_span_coverage_is_indexed_and_confirmable"
+
+proc test_span_ids_are_wire_bytes_not_hex() =
+  ## §7 keys the index on the WIRE bytes. Hashing the hex rendering instead
+  ## produces a different key — an index that is present, correct-looking and
+  ## permanently unqueryable, with no error anywhere. This pins the two forms
+  ## to the same key, and pins that a malformed id is REJECTED rather than
+  ## truncated or padded into an entry nobody can find.
+  let path = getTempDir() / "test_corrmark_span_bytes.ct"
+  removeFile(path)
+
+  var w = initMultiStreamWriter(path, "span_bytes", chunkSize = 4,
+    recordingId = "01949fcc-7d92-7e9c-aaaa-222222222222").get()
+  doAssert w.registerStep(0, 1, []).isOk
+
+  let traceId = decodeHexId(DemoTraceIdHex, 16).get()
+  let spanId = decodeHexId(DemoSpanIdHex, 8).get()
+  doAssert w.registerSpanCoverage(traceId, spanId, 1, 2).isOk
+
+  # Wrong widths must fail loudly.
+  doAssert w.registerSpanCoverage(traceId[0 ..< 8], spanId, 1, 2).isErr,
+    "a 8-byte trace_id must be rejected, not zero-padded"
+  doAssert w.registerSpanCoverage(traceId, spanId[0 ..< 4], 1, 2).isErr,
+    "a 4-byte span_id must be rejected"
+  doAssert w.registerSpanCoverageHex("nothex", DemoSpanIdHex, 1, 2).isErr,
+    "a non-hex trace_id must be rejected"
+  doAssert w.registerSpanCoverageHex(
+      DemoTraceIdHex & "00", DemoSpanIdHex, 1, 2).isErr,
+    "an over-long hex trace_id must be rejected"
+  # Upper case is the same identifier.
+  doAssert decodeHexId(DemoSpanIdHex.toUpperAscii(), 8).get() == spanId
+
+  doAssert w.close().isOk
+  doAssert w.closeCtfs().isOk
+
+  let data = readCtfsFromFile(path).get()
+  var idx = openCorrmarkIndex(readNamespace(data).get()).get()
+  doAssert idx.lookup(traceId, spanId).get().len == 1,
+    "the byte form and the hex form must resolve to the same key"
+
+  removeFile(path)
+  echo "PASS: test_span_ids_are_wire_bytes_not_hex"
+
 when isMainModule:
   test_marker_payload_decodes_through_ct_print()
   test_marker_mints_no_step()
   test_marker_is_indexed_in_corrmark_ns()
+  test_span_coverage_is_indexed_and_confirmable()
+  test_span_ids_are_wire_bytes_not_hex()
   test_absence_is_distinguishable()
   echo "=== correlation marker API tests passed ==="

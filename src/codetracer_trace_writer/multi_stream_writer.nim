@@ -1408,7 +1408,8 @@ proc ensureMarkerId*(w: var MultiStreamTraceWriter, label: string):
 
 proc registerCorrelationMarkerById*(w: var MultiStreamTraceWriter,
     direction: string, markerId: uint64, boundaryLabel: string,
-    keyValue: string, showValue: string = "", description: string = ""):
+    keyValue: string, showValue: string = "", description: string = "",
+    keyText: string = "key", showText: string = ""):
     Result[void, string] =
   ## Declare a correlation marker against an already-interned label id.
   ##
@@ -1435,6 +1436,17 @@ proc registerCorrelationMarkerById*(w: var MultiStreamTraceWriter,
   ## code executed and shift every later step index, which is what spans'
   ## `start_step`/`end_step` are measured in.
   ##
+  ## `keyText` and `showText` are the NAMES the two values were read under —
+  ## `key_text` is the textual form of the `key=<expr>` declaration, and
+  ## `showText` is the binding the shown value came from. `showText` is
+  ## load-bearing rather than cosmetic: a cross-process origin chain resumes
+  ## its walk on that name in the sending recording, so a marker that drops it
+  ## is visible with its history unreachable. They were hard-coded to "key" and
+  ## "show" here until the JavaScript recorder — the only end-to-end
+  ## implementation that predates this shared API — turned out to pass a real
+  ## binding name, which is exactly the kind of signal contract §11a.2 says to
+  ## treat as the API's shape being wrong rather than to work around.
+  ##
   ## `keyValue` / `showValue` are ALREADY-STRINGIFIED UTF-8: this library never
   ## calls back into the host to render a value, because a conversion that can
   ## raise must not run under the writer lock — a Ruby exception `longjmp`s
@@ -1450,10 +1462,12 @@ proc registerCorrelationMarkerById*(w: var MultiStreamTraceWriter,
   var payload = "{\"marker_id\":" & $markerId
   payload.add(",\"boundary_id\":\"" & jsonEscape(boundaryLabel) & "\"")
   payload.add(",\"direction\":\"" & dir & "\"")
-  payload.add(",\"key_text\":\"key\"")
+  payload.add(",\"key_text\":\"" &
+    jsonEscape(if keyText.len > 0: keyText else: "key") & "\"")
   payload.add(",\"key_value\":\"" & jsonEscape(keyValue) & "\"")
-  if showValue.len > 0:
-    payload.add(",\"show_text\":\"show\"")
+  if showValue.len > 0 or showText.len > 0:
+    payload.add(",\"show_text\":\"" &
+      jsonEscape(if showText.len > 0: showText else: "show") & "\"")
     payload.add(",\"show_value\":\"" & jsonEscape(showValue) & "\"")
   if description.len > 0:
     payload.add(",\"description\":\"" & jsonEscape(description) & "\"")
@@ -1470,7 +1484,8 @@ proc registerCorrelationMarkerById*(w: var MultiStreamTraceWriter,
 
 proc registerCorrelationMarker*(w: var MultiStreamTraceWriter,
     direction: string, boundaryId: string, keyValue: string,
-    showValue: string = "", description: string = ""):
+    showValue: string = "", description: string = "",
+    keyText: string = "key", showText: string = ""):
     Result[void, string] =
   ## String-label convenience: interns `boundaryId`, then forwards.
   ##
@@ -1479,7 +1494,51 @@ proc registerCorrelationMarker*(w: var MultiStreamTraceWriter,
   ## drift — which is the reason this moved into the shared writer at all.
   let id = ?w.ensureMarkerId(boundaryId)
   w.registerCorrelationMarkerById(
-    direction, id, boundaryId, keyValue, showValue, description)
+    direction, id, boundaryId, keyValue, showValue, description,
+    keyText, showText)
+
+proc registerSpanCoverage*(w: var MultiStreamTraceWriter,
+    traceIdBe: openArray[byte], spanIdBe: openArray[byte],
+    wallTimeUnixNs: uint64, monotonicTimeNs: uint64,
+    threadId: uint64 = 0, isExit: bool = false): Result[void, string] =
+  ## Declare that this recording covers a distributed-trace span
+  ## (`corrmark.ns` kind 0).
+  ##
+  ## THE ENTRY POINT AN OBSERVABILITY RECORDER CALLS per served request, so a
+  ## consumer holding an OTel `(trace_id, span_id)` can decide whether this
+  ## recording covers it with one B-tree lookup instead of decoding the event
+  ## stream.
+  ##
+  ## Ids are the WIRE bytes — 16 and 8 — not a hex rendering.  Hashing the hex
+  ## would key the index on something no consumer computes; `decodeHexId` is
+  ## provided for bindings whose host hands them hex.
+  ##
+  ## **This mints no `MarkerPayload` and no IO event**, unlike
+  ## `registerCorrelationMarkerById`.  A span-coverage marker has no send/recv
+  ## sense and no pairing domain, so forcing it into a `MarkerPayload` would
+  ## make the pairing index try to pair spans with each other (contract
+  ## §10.2).  One index, two kinds; two payload shapes.
+  ##
+  ## `geid` is the current step count — the coordinate a consumer resumes
+  ## replay from.  No step is minted, for the reason in §11a.6.
+  if w.closed:
+    return err("writer is closed")
+  let m = ?initSpanMarker(traceIdBe, spanIdBe, wallTimeUnixNs,
+    monotonicTimeNs, geid = w.stepCount, threadId = threadId, isExit = isExit)
+  w.correlationMarkers.add(m)
+  ok()
+
+proc registerSpanCoverageHex*(w: var MultiStreamTraceWriter,
+    traceIdHex: string, spanIdHex: string,
+    wallTimeUnixNs: uint64, monotonicTimeNs: uint64,
+    threadId: uint64 = 0, isExit: bool = false): Result[void, string] =
+  ## Hex convenience over `registerSpanCoverage`, for callers whose OTel API
+  ## hands them the canonical 32/16-character hex ids.  A WRAPPER: the byte
+  ## form stays primary so the conversion has exactly one implementation.
+  let traceId = ?decodeHexId(traceIdHex, 16)
+  let spanId = ?decodeHexId(spanIdHex, 8)
+  w.registerSpanCoverage(traceId, spanId, wallTimeUnixNs, monotonicTimeNs,
+    threadId, isExit)
 
 proc registerRaise*(w: var MultiStreamTraceWriter, exceptionTypeId: uint64,
     message: openArray[byte]): Result[void, string] =
