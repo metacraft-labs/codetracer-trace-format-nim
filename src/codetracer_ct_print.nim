@@ -31,9 +31,11 @@ import codetracer_trace_writer/io_event_stream
 import codetracer_trace_writer/value_stream
 import codetracer_trace_writer/global_line_index
 import codetracer_trace_writer/multi_stream_writer
+import codetracer_trace_writer/span_stream          # for --spans
 import codetracer_trace_writer/cbor
 import codetracer_trace_types
 import codetracer_ctfs/container as ctfs_container
+import codetracer_ctfs/types as ctfs_types  # header geometry for --spans
 import native_decoder
 
 # ---------------------------------------------------------------------------
@@ -1265,6 +1267,118 @@ proc printMarkersV4(reader: var NewTraceReader, opts: FullOpts) =
       alignLeft(boundary, 24) & "  " & alignLeft(key, 19) & "  " &
       align($stepId, 4) & "  " & showValue
 
+proc printSpans(filePath: string, jsonOut: bool) =
+  ## List the container's SPAN STREAM — the intervals `spans.dat` / `spans.idx`
+  ## hold, with `spantype.ns`'s type name resolved onto each record.
+  ##
+  ## The span stream is the only stream ct-print could not show. It is not an
+  ## event kind, so it never appears in `--full` / `--events`, and the two
+  ## consumers that need to see it — the request-span panel and the mixed-trace
+  ## native<->VM crossings — had no way to inspect a container from a shell.
+  ## Without this, "the recording carries N crossing spans" could only be
+  ## asserted from inside a Rust or Nim test, which is precisely the kind of
+  ## claim that ends up unverified.
+  ##
+  ## Reads the raw container rather than going through a trace reader: the span
+  ## stream is self-describing (`initSpanStreamReader` parses `spans.idx` and
+  ## decompresses only the chunks it is asked for), so this works on a
+  ## still-growing container and on bundles either reader flavour would reject.
+  ##
+  ## Records are shown SETTLED (last-record-wins per `span_id`), so a crossing
+  ## that was opened and later completed is one row carrying its final
+  ## `end_step`, not two.
+  let dataR = ctfs_container.readCtfsFromFile(filePath)
+  if dataR.isErr:
+    quit("ct-print: cannot read container: " & dataR.error)
+  let bytes = dataR.get()
+
+  # The container's OWN root geometry, from its extended header (block size at
+  # byte 8, root-entry count at byte 12), exactly as `native_decoder.nim` reads
+  # it. Taking `initSpanStreamReader`'s defaults instead is a silent-wrong-answer
+  # bug, and it was one: `DefaultMaxRootEntries` is 31, while a real MCR
+  # recording of a 30-thread process declares 128 and parks `spans.dat` in root
+  # slot 67 (past the per-thread `tNNN`/`iNNN` pairs). Scanning 31 slots misses
+  # it, `readInternalFile` says "internal file not found", and the tool that
+  # exists so a span count need not be taken on trust prints `spans: 0` for a
+  # container that has 450 bytes of them.
+  if bytes.len < HeaderSize + ExtHeaderSize:
+    quit("ct-print: file too small to be a CTFS container: " & filePath)
+  let blockSize = readU32LE(bytes, 8)
+  let maxRoot = readU32LE(bytes, 12)
+  if blockSize == 0'u32 or maxRoot == 0'u32 or int(maxRoot) > 4096:
+    quit("ct-print: nonsensical CTFS root header (blockSize=" & $blockSize &
+      " maxRootEntries=" & $maxRoot & ") in " & filePath)
+
+  # "No span stream" and "the span stream is there but would not open" are
+  # different answers and must not share an exit. Decide which one it is from
+  # the ROOT DIRECTORY — the presence of the member — before attributing an
+  # open failure to absence.
+  let hasSpanMember = ctfs_container.hasInternalFile(bytes, "spans.dat", maxRoot)
+
+  let rRes = initSpanStreamReader(bytes, blockSize, maxRoot)
+  if rRes.isErr:
+    if hasSpanMember:
+      # The member exists and the reader still refused it: that is damage or a
+      # format mismatch, never "zero spans". Fail loudly.
+      quit("ct-print: container carries a spans.dat member but its span " &
+        "stream would not open: " & rRes.error)
+    # A container without `spans.dat` is ordinary — most recordings have no
+    # spans. Say so, with the reason, and report zero rather than pretending
+    # to have looked.
+    if jsonOut:
+      echo "[]"
+    else:
+      echo "spans: 0"
+      echo "  (no span stream in this container: " & rRes.error & ")"
+    return
+  let reader = rRes.get()
+
+  let settledRes = reader.settledSpans()
+  if settledRes.isErr:
+    quit("ct-print: failed to read the span stream: " & settledRes.error)
+  let spans = settledRes.get()
+
+  if jsonOut:
+    var arr = newJArray()
+    for s in spans:
+      var o = newJObject()
+      o["span_id"] = %(s.spanId)
+      o["parent_span_id"] = %(s.parentSpanId)
+      o["span_type"] = %(s.spanType)
+      o["label"] = %(s.label)
+      o["open"] = %(s.isOpen)
+      o["external"] = %(s.isExternal)
+      o["status"] = %($s.status)
+      o["thread_id"] = %(s.threadId)
+      o["process_ord"] = %(s.processOrd)
+      o["start_step"] = %(s.startStep)
+      o["end_step"] = %(s.endStep)
+      o["start_wall_ns"] = %(s.startWallNs)
+      o["end_wall_ns"] = %(s.endWallNs)
+      var meta = newJObject()
+      for (k, v) in s.metadata:
+        meta[k] = %v
+      o["metadata"] = meta
+      arr.add(o)
+    try:
+      echo pretty(arr, indent = 2)
+    except ValueError:
+      echo $arr
+    return
+
+  echo "spans: " & $spans.len & " settled (" & $reader.count() &
+    " records in " & $reader.chunkCount() & " chunk(s))"
+  if spans.len == 0:
+    return
+  echo ""
+  echo "  #  span_id  parent  type                 open  start_step  end_step  label"
+  echo "-".repeat(94)
+  for i, s in spans:
+    echo align($(i + 1), 3) & "  " & align($s.spanId, 7) & "  " &
+      align($s.parentSpanId, 6) & "  " & alignLeft(s.spanType, 19) & "  " &
+      alignLeft((if s.isOpen: "yes" else: "no"), 4) & "  " &
+      align($s.startStep, 10) & "  " & align($s.endStep, 8) & "  " & s.label
+
 proc printEventsJsonlV4(reader: var NewTraceReader, opts: FullOpts) =
   ## Emit one JSON object per line. The first line is the header
   ## (metadata + interning tables). Subsequent lines are one event each.
@@ -1537,6 +1651,13 @@ Usage:
                                           chain enter or leave this
                                           recording. Add --json-out for
                                           machine-readable output.
+  ct-print --spans <file.ct>             List the container's span stream
+                                          (spans.dat/spans.idx), settled
+                                          last-record-wins: request spans,
+                                          process spans, and the native<->VM
+                                          crossing spans a mixed trace
+                                          carries. Add --json-out for
+                                          machine-readable output.
   ct-print --follow <file.ct>            Tail the trace as it is written
                                           (NDJSON output).
   ct-print --strip-paths --full <f.ct>   Replace absolute workdir/tmp prefixes
@@ -1649,6 +1770,7 @@ proc main() =
       of "full": format = "full"
       of "events": format = "events"
       of "markers": format = "markers"
+      of "spans": format = "spans"
       of "follow": follow = true
       of "strip-paths": stripPaths = true
       of "json-out": jsonOut = true
@@ -1675,6 +1797,14 @@ proc main() =
     quit(1)
 
   let opts = FullOpts(stripPaths: stripPaths, jsonOut: jsonOut)
+
+  # ----- Span stream -----
+  # Handled before the reader selection below because the span stream is read
+  # straight off the container and is therefore independent of which event
+  # reader (v4 split / legacy events.log / native shard) the bundle needs.
+  if format == "spans":
+    printSpans(filePath, jsonOut)
+    return
 
   # ----- Native MCR shard path (auto-detect or --native) -----
   # The native recorder writes a CTFS shard with per-thread `tNNNN` streams
