@@ -662,6 +662,15 @@ proc stepEventToJson(reader: var NewTraceReader, gli: GlobalLineIndex,
     ioObj["kind"] = newJString($io.kind)
     ioObj["step_id"] = newJInt(int64(io.stepId))
     ioObj["data"] = newJString(bytesToUtf8(io.data))
+    # The metadata slot, and a correlation marker hoisted out of it when the
+    # slot holds one.  `--json-events` used to drop the slot entirely, which
+    # made every correlation marker INVISIBLE in this mode while `--full`
+    # showed it — so a recorder's own test written against `--json-events`
+    # would report a perfectly good marker as missing and send the reader
+    # looking for a recorder bug that was not there.  A marker's whole failure
+    # mode is being invisible rather than broken; a decoder that hides one is
+    # the same defect one level up.
+    addEventMetadata(ioObj, io.metadata)
     nodes.add(ioObj)
 
   nodes
