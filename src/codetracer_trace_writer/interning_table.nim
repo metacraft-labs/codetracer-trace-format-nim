@@ -218,6 +218,18 @@ proc initTraceInterningTables*(ctfs: var Ctfs): Result[TraceInterningTables, str
   t.varnames = ?(initInterningTableWriter(ctfs, "varnames"))
   ok(t)
 
+proc ensureMarkerLabelId*(ctfs: var Ctfs, it: var InterningTableWriter,
+                          label: string): Result[uint64, string] =
+  ## Intern a correlation-marker label, returning its numeric id.
+  ##
+  ## Deliberately NOT part of `TraceInterningTables`: those four tables are
+  ## created eagerly for every trace, and adding a fifth there would put
+  ## `markers.dat` / `markers.off` into every container ever written, whether
+  ## or not it declares a marker.  The writer creates this table lazily on the
+  ## first `ensureMarkerId`, so a recording with no markers is byte-identical
+  ## to one written before markers existed.
+  ctfs.ensureId(it, label)
+
 proc ensurePathId*(ctfs: var Ctfs, t: var TraceInterningTables, path: string): Result[uint64, string] =
   ctfs.ensureId(t.paths, path)
 

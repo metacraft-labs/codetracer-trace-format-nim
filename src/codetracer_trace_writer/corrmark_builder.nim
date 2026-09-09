@@ -83,49 +83,73 @@ proc descriptor(offset, size: uint64): seq[byte] =
   result.putU64LE(offset)
   result.putU64LE(size)
 
-const BoundaryFingerprintSeed* = 2654435761'u64
-  ## Second, independently-seeded hash used to CONFIRM a kind-1 hit.
+const KeyFingerprintSeed* = 2654435761'u64
+  ## Seed for the `key_value` fingerprint.  Different from the index key's
+  ## seed 0 so the two hashes over the same bytes are independent.
 
-proc boundaryKeyBytes(boundaryId, keyValue: string): seq[byte] =
-  ## `boundary_id || 0x00 || key_value`.  The NUL separator matters: without
-  ## it ("ab","c") and ("a","bc") hash identically, and two unrelated
-  ## boundaries would share an index key.
-  result = newSeqOfCap[byte](boundaryId.len + 1 + keyValue.len)
-  for c in boundaryId: result.add(byte(c))
-  result.add(0'u8)
-  for c in keyValue: result.add(byte(c))
-
-proc boundaryIndexKey*(boundaryId, keyValue: string): uint64 =
-  ## The `corrmark.ns` B-tree key for a kind-1 (boundary-crossing) marker.
-  xxh64(boundaryKeyBytes(boundaryId, keyValue), 0)
-
-proc boundaryFingerprint*(boundaryId, keyValue: string): uint64 =
-  ## The confirmation fingerprint stored in a kind-1 entry.
+proc boundaryKeyBytes(markerId: uint64, keyValue: string): seq[byte] =
+  ## `marker_id` (8 bytes big-endian) followed by the raw `key_value` bytes.
   ##
-  ## A kind-0 entry carries its full 24-byte `(trace_id, span_id)` so a lookup
-  ## can confirm a B-tree hit exactly (§7).  A kind-1 key is a
-  ## VARIABLE-LENGTH string pair, which does not fit the fixed 60-byte entry,
-  ## so exact confirmation is not available.  Storing a SECOND hash under a
-  ## different seed is the honest substitute: confirmation then rests on 128
-  ## independent bits rather than the 64 the index key already used, so a
-  ## wrong answer needs both hashes to collide on the same input pair.
-  xxh64(boundaryKeyBytes(boundaryId, keyValue), BoundaryFingerprintSeed)
+  ## NO SEPARATOR IS NEEDED, and that is a property of interning rather than an
+  ## omission.  The earlier design hashed `boundary_id || NUL || key_value` and
+  ## needed the NUL because two variable-length strings are ambiguous —
+  ## ("ab","c") and ("a","bc") concatenate identically.  A `marker_id` is
+  ## FIXED WIDTH, so the split point is always byte 8 and no two distinct
+  ## `(marker_id, key_value)` pairs can produce the same buffer.
+  result = newSeqOfCap[byte](8 + keyValue.len)
+  for i in 0 ..< 8:
+    result.add(byte((markerId shr ((7 - i) * 8)) and 0xFF))
+  for c in keyValue:
+    result.add(byte(c))
 
-proc initBoundaryMarker*(boundaryId, keyValue: string, isRecv: bool,
+proc boundaryIndexKey*(markerId: uint64, keyValue: string): uint64 =
+  ## The `corrmark.ns` B-tree key for a kind-1 (boundary-crossing) marker.
+  xxh64(boundaryKeyBytes(markerId, keyValue), 0)
+
+proc keyFingerprint*(keyValue: string): uint64 =
+  ## Confirmation fingerprint for the per-event match key.
+  ##
+  ## WHY A FINGERPRINT IS STILL NEEDED, AND ONLY HERE.  Interning makes the
+  ## boundary label a fixed-width id that the entry stores and a lookup
+  ## compares EXACTLY.  `key_value` cannot follow it: it is the per-event match
+  ## value, so it is different on essentially every marker, and interning a
+  ## value that is unique per event is a leak rather than a saving — the table
+  ## would grow one record per marker and buy nothing.  It stays
+  ## variable-length, so a fixed-width entry can only carry a digest of it.
+  ##
+  ## The result is strictly stronger than the pre-interning design, where BOTH
+  ## components were probabilistic: a false positive now needs an exact match
+  ## on the interned boundary AND a 64-bit collision on the key.
+  var buf = newSeqOfCap[byte](keyValue.len)
+  for c in keyValue:
+    buf.add(byte(c))
+  xxh64(buf, KeyFingerprintSeed)
+
+proc initBoundaryMarker*(markerId: uint64, keyValue: string, isRecv: bool,
                          geid: uint64 = 0, threadId: uint64 = 0):
     CorrelationMarker =
-  ## Build a kind-1 entry: the index key rides in `spanId`, the confirmation
-  ## fingerprint in the first 8 bytes of `traceId`.  Both are stored
-  ## big-endian so an entry is byte-comparable across implementations.
-  let idx = boundaryIndexKey(boundaryId, keyValue)
-  let fp = boundaryFingerprint(boundaryId, keyValue)
+  ## Build a kind-1 entry.  The 24-byte identity block holds
+  ## `marker_id` (exact) then `key_fingerprint`, both big-endian; the
+  ## remaining 8 bytes are reserved and zero.
+  let idx = boundaryIndexKey(markerId, keyValue)
+  let fp = keyFingerprint(keyValue)
   result.kind = MarkerKindBoundary
   result.flags = (if isRecv: MarkerFlagExit else: 0'u16)
   result.geid = geid
   result.threadId = threadId
   for i in 0 ..< 8:
-    result.traceId[i] = byte((fp shr ((7 - i) * 8)) and 0xFF)
+    result.traceId[i] = byte((markerId shr ((7 - i) * 8)) and 0xFF)
+    result.traceId[8 + i] = byte((fp shr ((7 - i) * 8)) and 0xFF)
     result.spanId[i] = byte((idx shr ((7 - i) * 8)) and 0xFF)
+
+proc markerIdOf*(m: CorrelationMarker): uint64 =
+  ## The interned boundary label id of a kind-1 entry.
+  for i in 0 ..< 8:
+    result = (result shl 8) or uint64(m.traceId[i])
+
+proc keyFingerprintOf*(m: CorrelationMarker): uint64 =
+  for i in 0 ..< 8:
+    result = (result shl 8) or uint64(m.traceId[8 + i])
 
 proc markerKey*(m: CorrelationMarker): uint64 =
   ## The `corrmark.ns` B-tree key for `m`, derived PER KIND.
@@ -289,16 +313,16 @@ proc lookup*(idx: var CorrmarkIndex,
       hits.add(m)
   ok(hits)
 
-proc lookupBoundary*(idx: var CorrmarkIndex, boundaryId, keyValue: string):
+proc lookupBoundary*(idx: var CorrmarkIndex, markerId: uint64, keyValue: string):
     Result[seq[CorrelationMarker], string] =
   ## Resolve a kind-1 (boundary-crossing) marker.
   ##
-  ## Confirms the hit against the entry's fingerprint — the kind-1 substitute
-  ## for kind-0's exact full-key comparison (see `boundaryFingerprint`). A
-  ## bucket entry whose fingerprint differs is a different boundary/key pair
-  ## that merely shares an index key, and is skipped.
-  let key = boundaryIndexKey(boundaryId, keyValue)
-  let want = boundaryFingerprint(boundaryId, keyValue)
+  ## Confirmation is now HALF EXACT: the interned `marker_id` is compared
+  ## byte-for-byte, and only the variable-length `key_value` rests on a
+  ## fingerprint.  A bucket entry that fails either check belongs to a
+  ## different boundary or key that merely shares an index key.
+  let key = boundaryIndexKey(markerId, keyValue)
+  let wantFp = keyFingerprint(keyValue)
   let descRes = idx.tree.lookup(key)
   if descRes.isErr:
     return ok(@[])
@@ -317,10 +341,7 @@ proc lookupBoundary*(idx: var CorrmarkIndex, boundaryId, keyValue: string):
     let m = decodeEntry(idx.image, off + 4 + i * CorrmarkEntrySize)
     if m.kind != MarkerKindBoundary:
       continue
-    var fp: uint64 = 0
-    for j in 0 ..< 8:
-      fp = (fp shl 8) or uint64(m.traceId[j])
-    if fp == want:
+    if m.markerIdOf() == markerId and m.keyFingerprintOf() == wantFp:
       hits.add(m)
   ok(hits)
 

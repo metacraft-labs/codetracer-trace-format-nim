@@ -130,6 +130,12 @@ type
     spanWriter: SpanStreamWriter
       ## RS-M1 span stream.  Created LAZILY on the first `registerSpan` call —
       ## see `hasSpans`.
+    markerLabels: InterningTableWriter
+      ## `markers.dat` + `markers.off` — the correlation-marker label table,
+      ## the same Variable-Size Record Table shape as paths/funcs/types/
+      ## varnames.  Created LAZILY on the first `ensureMarkerId`, so a
+      ## recording that declares no marker gains no files.
+    hasMarkerLabels: bool
     correlationMarkers: seq[CorrelationMarker]
       ## Correlation markers declared during this recording
       ## (`Correlation-Markers.md` §2.4).  Accumulated here and bulk-loaded
@@ -1378,35 +1384,61 @@ proc jsonEscape(s: string): string =
       else:
         result.add(c)
 
-proc registerCorrelationMarker*(w: var MultiStreamTraceWriter,
-    direction: string, boundaryId: string, keyValue: string,
-    showValue: string = "", description: string = ""):
+proc ensureMarkerId*(w: var MultiStreamTraceWriter, label: string):
+    Result[uint64, string] =
+  ## Intern a correlation-marker label and return its numeric id.
+  ##
+  ## THE PRIMARY OPERATION, mirroring `ensure_path_id`.  A caller hoists this
+  ## out of its hot path — once per boundary, not once per crossing — and then
+  ## passes the integer to `registerCorrelationMarkerById`, so the per-marker
+  ## call does no string lookup.  Interning is the only part that touches a
+  ## hash map, which is the same reason a binding must keep it off the hot
+  ## path as it keeps host-language conversion off it.
+  ##
+  ## `markers.dat` / `markers.off` are created LAZILY here, not in
+  ## `initTraceInterningTables`: the four standard tables are made for every
+  ## trace, and a fifth there would put marker files into every container ever
+  ## written.  A recording that declares no marker gains no files.
+  if w.closed:
+    return err("writer is closed")
+  if not w.hasMarkerLabels:
+    w.markerLabels = ?initInterningTableWriter(w.container, "markers")
+    w.hasMarkerLabels = true
+  ensureMarkerLabelId(w.container, w.markerLabels, label)
+
+proc registerCorrelationMarkerById*(w: var MultiStreamTraceWriter,
+    direction: string, markerId: uint64, boundaryLabel: string,
+    keyValue: string, showValue: string = "", description: string = ""):
     Result[void, string] =
-  ## Declare a correlation marker — the record-time half of
-  ## `Correlation-Markers.md` §2.4, implemented ONCE here so the ~20 CTFS
-  ## recorders bind to it rather than each building the payload.
+  ## Declare a correlation marker against an already-interned label id.
+  ##
+  ## THE PRIMARY HOT-PATH ENTRY POINT (`Correlation-Markers.md` §2.4),
+  ## implemented once here so the ~20 CTFS recorders bind to it rather than
+  ## each building the payload — a recorder whose field names drifted would
+  ## write markers that are INVISIBLE rather than broken.
+  ##
+  ## `boundaryLabel` is passed alongside the id because the on-disk
+  ## `MarkerPayload` carries `boundary_id` as TEXT for the debugger, while the
+  ## index keys on the id.  A caller that has hoisted `ensureMarkerId` already
+  ## holds the label, so this costs it nothing.
   ##
   ## Two things happen, and both matter:
   ##
-  ## 1. The `MarkerPayload` is written into an IO event's metadata slot, which
-  ##    is where every existing consumer looks (`ct print` hoists it into
-  ##    `--json-events`, and the db-backend's cross-process origin walk reads
-  ##    it).  Field names must match `MarkerPayload` in
-  ##    `codetracer/src/db-backend/src/correlation_markers.rs`: a marker with
-  ##    differently-named fields is not degraded, it is INVISIBLE.
-  ## 2. It is accumulated for `corrmark.ns`, so a consumer can find it by
-  ##    lookup instead of decoding the event stream.
+  ## 1. The `MarkerPayload` goes into an IO event's metadata slot, where every
+  ##    existing consumer looks.  Field names must match `MarkerPayload` in
+  ##    `db-backend/src/correlation_markers.rs`.
+  ## 2. It is indexed into `corrmark.ns` for lookup without decoding the
+  ##    event stream.
   ##
   ## NO STEP IS MINTED.  The marker attaches to the enclosing step — the line
-  ## the user wrote the call on — matching the JavaScript recorder.  Minting a
-  ## step here would insert an event into the exec stream that no user code
-  ## executed, shifting every subsequent step index and with it every
-  ## step-addressed coordinate (spans' `start_step`/`end_step` among them).
+  ## the call sits on.  Minting one would insert an exec-stream event no user
+  ## code executed and shift every later step index, which is what spans'
+  ## `start_step`/`end_step` are measured in.
   ##
-  ## `keyValue` / `showValue` are ALREADY-STRINGIFIED UTF-8: a binding must not
-  ## hand back an opaque host value for this library to render.  Ruby exceptions
-  ## `longjmp` past Rust destructors, so a conversion that can raise must happen
-  ## before the writer lock is taken, never under it.
+  ## `keyValue` / `showValue` are ALREADY-STRINGIFIED UTF-8: this library never
+  ## calls back into the host to render a value, because a conversion that can
+  ## raise must not run under the writer lock — a Ruby exception `longjmp`s
+  ## past Rust destructors and strands the guard.
   if w.closed:
     return err("writer is closed")
 
@@ -1415,8 +1447,8 @@ proc registerCorrelationMarker*(w: var MultiStreamTraceWriter,
     ## the JS recorder: a marker with no side is unpairable, and an unpairable
     ## marker is worse than one that picked a side.
 
-  var payload = "{\"marker_id\":0"
-  payload.add(",\"boundary_id\":\"" & jsonEscape(boundaryId) & "\"")
+  var payload = "{\"marker_id\":" & $markerId
+  payload.add(",\"boundary_id\":\"" & jsonEscape(boundaryLabel) & "\"")
   payload.add(",\"direction\":\"" & dir & "\"")
   payload.add(",\"key_text\":\"key\"")
   payload.add(",\"key_value\":\"" & jsonEscape(keyValue) & "\"")
@@ -1428,15 +1460,26 @@ proc registerCorrelationMarker*(w: var MultiStreamTraceWriter,
   payload.add("}")
 
   var metaBytes = newSeq[byte](payload.len)
-  for i, c in payload:
-    metaBytes[i] = byte(c)
+  for k, c in payload:
+    metaBytes[k] = byte(c)
   ?w.registerIOEvent(ioStdout, [], metaBytes)
 
-  # kind 1 keys on `(boundary_id, key_value)`, not on a trace/span id: see the
-  # contract §10.2 for why an OTel pair does not ride in this payload.
   w.correlationMarkers.add(initBoundaryMarker(
-    boundaryId, keyValue, isRecv = dir == "recv", geid = w.stepCount))
+    markerId, keyValue, isRecv = dir == "recv", geid = w.stepCount))
   ok()
+
+proc registerCorrelationMarker*(w: var MultiStreamTraceWriter,
+    direction: string, boundaryId: string, keyValue: string,
+    showValue: string = "", description: string = ""):
+    Result[void, string] =
+  ## String-label convenience: interns `boundaryId`, then forwards.
+  ##
+  ## A WRAPPER OVER THE NUMERIC PATH, never the reverse.  If the string form
+  ## were primary, every binding would grow its own label cache and they would
+  ## drift — which is the reason this moved into the shared writer at all.
+  let id = ?w.ensureMarkerId(boundaryId)
+  w.registerCorrelationMarkerById(
+    direction, id, boundaryId, keyValue, showValue, description)
 
 proc registerRaise*(w: var MultiStreamTraceWriter, exceptionTypeId: uint64,
     message: openArray[byte]): Result[void, string] =

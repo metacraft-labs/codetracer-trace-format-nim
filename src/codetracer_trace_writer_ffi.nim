@@ -1197,6 +1197,59 @@ proc ptrLenToString(p: ptr UncheckedArray[byte], n: csize_t): string =
   for i in 0 ..< int(n):
     result[i] = char(p[i])
 
+proc trace_writer_ensure_marker_id(
+    handle: TraceWriterHandle,
+    label: ptr UncheckedArray[byte], label_len: csize_t,
+    out_id: ptr uint64,
+): cint {.exportc, cdecl, dynlib.} =
+  ## Intern a correlation-marker label; writes its numeric id to `out_id`.
+  ##
+  ## THE PRIMARY OPERATION, mirroring `ensure_path_id`.  A binding calls this
+  ## ONCE per boundary, outside its hot path, and then passes the integer to
+  ## `trace_writer_mark_correlation_by_id` — so the per-crossing call does no
+  ## string lookup, no interning, and no allocation on the binding side.
+  ##
+  ## Returns 0 on success, 1 on failure.
+  if handle.isNil or out_id.isNil:
+    return 1
+  if not handle.useMultiStream or not handle.msWriterReady:
+    return 1
+  let res = handle.msWriter.ensureMarkerId(
+    ptrLenToString(label, label_len))
+  if res.isErr:
+    return 1
+  out_id[] = res.get()
+  0.cint
+
+proc trace_writer_mark_correlation_by_id(
+    handle: TraceWriterHandle,
+    marker_id: uint64,
+    boundary_label: ptr UncheckedArray[byte], boundary_label_len: csize_t,
+    direction: ptr UncheckedArray[byte], direction_len: csize_t,
+    key_value: ptr UncheckedArray[byte], key_value_len: csize_t,
+    show_value: ptr UncheckedArray[byte], show_value_len: csize_t,
+    description: ptr UncheckedArray[byte], description_len: csize_t,
+): cint {.exportc, cdecl, dynlib.} =
+  ## Declare a correlation marker against an interned label id.
+  ##
+  ## THE PRIMARY HOT-PATH ENTRY POINT.  `trace_writer_mark_correlation` below
+  ## is a convenience wrapper over this one, not the other way round: if the
+  ## string form were primary every binding would grow its own label cache and
+  ## they would drift, which is what putting this in the shared writer exists
+  ## to prevent.
+  if handle.isNil:
+    return 1
+  if not handle.useMultiStream or not handle.msWriterReady:
+    return 1
+  let res = handle.msWriter.registerCorrelationMarkerById(
+    ptrLenToString(direction, direction_len),
+    marker_id,
+    ptrLenToString(boundary_label, boundary_label_len),
+    ptrLenToString(key_value, key_value_len),
+    ptrLenToString(show_value, show_value_len),
+    ptrLenToString(description, description_len))
+  (if res.isOk: 0.cint else: 1.cint)
+
 proc trace_writer_mark_correlation(
     handle: TraceWriterHandle,
     direction: ptr UncheckedArray[byte], direction_len: csize_t,

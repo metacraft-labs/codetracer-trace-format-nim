@@ -45,10 +45,17 @@ proc recordTrace(path: string) =
     recordingId = "01949fcc-7d92-7e9c-aaaa-cccccccccccc").get()
   doAssert w.registerPath("/src/app.rb").isOk
   doAssert w.registerStep(0, 1, []).isOk
-  doAssert w.registerCorrelationMarker(
-    "send", "order-processing", "order-42", "the order body",
+  # The NUMERIC path is primary: intern once, then pass the id. This is the
+  # shape a binding uses on a hot path, so it is the shape the test exercises.
+  let mid = w.ensureMarkerId("order-processing").get()
+  doAssert w.registerCorrelationMarkerById(
+    "send", mid, "order-processing", "order-42", "the order body",
     "Outbound order").isOk
   doAssert w.registerStep(0, 2, []).isOk
+  # The string form is a WRAPPER over the numeric one and must intern to the
+  # same id — if it did not, the two APIs would index into different buckets.
+  doAssert w.ensureMarkerId("order-processing").get() == mid,
+    "interning must be idempotent"
   # "receive" must normalise to "recv": an unrecognised spelling would be an
   # unpairable marker, so the API picks a side rather than erroring.
   doAssert w.registerCorrelationMarker(
@@ -85,21 +92,25 @@ proc test_marker_is_indexed_in_corrmark_ns() =
   doAssert ns.isOk, "corrmark.ns missing from the container: " & ns.error
 
   var idx = openCorrmarkIndex(ns.get()).get()
-  let hits = idx.lookupBoundary("order-processing", "order-42")
+  # Label id 0 is the first interned label, "order-processing".
+  let hits = idx.lookupBoundary(0'u64, "order-42")
   doAssert hits.isOk, "lookup failed: " & hits.error
   doAssert hits.get().len == 2,
     "expected both sides of the crossing, got " & $hits.get().len
+  doAssert hits.get()[0].markerIdOf() == 0'u64, "marker id must round-trip"
 
   # A key that was never declared is a clean miss, not an error — and NOT the
   # same answer as the namespace being absent (contract §9).
-  let miss = idx.lookupBoundary("order-processing", "order-999")
+  let miss = idx.lookupBoundary(0'u64, "order-999")
   doAssert miss.isOk and miss.get().len == 0, "expected a clean miss"
 
-  # A different boundary with the same key must not collide: the index key is
-  # built over `boundary_id || NUL || key_value` precisely so it cannot.
-  let other = idx.lookupBoundary("shipping", "order-42")
+  # A different boundary must not resolve to this one's markers.  Under
+  # interning the index key is `marker_id (8 bytes) || key_value`, so the
+  # ambiguity the old `boundary || NUL || key` separator guarded against is
+  # gone by construction: the split point is always byte 8.
+  let other = idx.lookupBoundary(7'u64, "order-42")
   doAssert other.isOk and other.get().len == 0,
-    "a different boundary must not resolve to this one's markers"
+    "a different boundary id must not resolve to this one's markers"
 
   removeFile(path)
   echo "PASS: test_marker_is_indexed_in_corrmark_ns"
