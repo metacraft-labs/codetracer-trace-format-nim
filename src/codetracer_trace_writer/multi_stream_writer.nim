@@ -17,6 +17,7 @@ import ../codetracer_ctfs/streaming
 import ../codetracer_ctfs/variable_record_table
 import ../codetracer_ctfs/crossing_state
 import ./meta_dat
+import ./corrmark_builder
 import ./interning_table
 import ./exec_stream
 import ./value_stream
@@ -129,6 +130,15 @@ type
     spanWriter: SpanStreamWriter
       ## RS-M1 span stream.  Created LAZILY on the first `registerSpan` call —
       ## see `hasSpans`.
+    correlationMarkers: seq[CorrelationMarker]
+      ## Correlation markers declared during this recording
+      ## (`Correlation-Markers.md` §2.4).  Accumulated here and bulk-loaded
+      ## into `corrmark.ns` at close, because the index is a constructor over a
+      ## known set rather than something inserted into per marker.
+      ##
+      ## A recording with no markers writes no namespace at all: its ABSENCE is
+      ## a distinct, meaningful answer ("never indexed") from an empty index
+      ## ("indexed, covers nothing").  See the contract §9.
     nextSpanId: uint64
       ## Monotonic span-id generator for spans this writer MINTS itself — i.e.
       ## native↔VM crossing spans (`beginCrossing`/`endCrossing`,
@@ -1349,6 +1359,85 @@ proc registerIOEvent*(w: var MultiStreamTraceWriter, kind: IOEventKind,
 # Exception events
 # ---------------------------------------------------------------------------
 
+proc jsonEscape(s: string): string =
+  ## Minimal JSON string escaping for the MarkerPayload document.
+  result = newStringOfCap(s.len + 8)
+  for c in s:
+    case c
+    of '"': result.add("\\\"")
+    of '\\': result.add("\\\\")
+    of '\n': result.add("\\n")
+    of '\r': result.add("\\r")
+    of '\t': result.add("\\t")
+    else:
+      if c < ' ':
+        const hex = "0123456789abcdef"
+        result.add("\\u00")
+        result.add(hex[(int(c) shr 4) and 0xF])
+        result.add(hex[int(c) and 0xF])
+      else:
+        result.add(c)
+
+proc registerCorrelationMarker*(w: var MultiStreamTraceWriter,
+    direction: string, boundaryId: string, keyValue: string,
+    showValue: string = "", description: string = ""):
+    Result[void, string] =
+  ## Declare a correlation marker — the record-time half of
+  ## `Correlation-Markers.md` §2.4, implemented ONCE here so the ~20 CTFS
+  ## recorders bind to it rather than each building the payload.
+  ##
+  ## Two things happen, and both matter:
+  ##
+  ## 1. The `MarkerPayload` is written into an IO event's metadata slot, which
+  ##    is where every existing consumer looks (`ct print` hoists it into
+  ##    `--json-events`, and the db-backend's cross-process origin walk reads
+  ##    it).  Field names must match `MarkerPayload` in
+  ##    `codetracer/src/db-backend/src/correlation_markers.rs`: a marker with
+  ##    differently-named fields is not degraded, it is INVISIBLE.
+  ## 2. It is accumulated for `corrmark.ns`, so a consumer can find it by
+  ##    lookup instead of decoding the event stream.
+  ##
+  ## NO STEP IS MINTED.  The marker attaches to the enclosing step — the line
+  ## the user wrote the call on — matching the JavaScript recorder.  Minting a
+  ## step here would insert an event into the exec stream that no user code
+  ## executed, shifting every subsequent step index and with it every
+  ## step-addressed coordinate (spans' `start_step`/`end_step` among them).
+  ##
+  ## `keyValue` / `showValue` are ALREADY-STRINGIFIED UTF-8: a binding must not
+  ## hand back an opaque host value for this library to render.  Ruby exceptions
+  ## `longjmp` past Rust destructors, so a conversion that can raise must happen
+  ## before the writer lock is taken, never under it.
+  if w.closed:
+    return err("writer is closed")
+
+  let dir = if direction == "recv" or direction == "receive": "recv" else: "send"
+    ## An unrecognised direction becomes "send" rather than an error, matching
+    ## the JS recorder: a marker with no side is unpairable, and an unpairable
+    ## marker is worse than one that picked a side.
+
+  var payload = "{\"marker_id\":0"
+  payload.add(",\"boundary_id\":\"" & jsonEscape(boundaryId) & "\"")
+  payload.add(",\"direction\":\"" & dir & "\"")
+  payload.add(",\"key_text\":\"key\"")
+  payload.add(",\"key_value\":\"" & jsonEscape(keyValue) & "\"")
+  if showValue.len > 0:
+    payload.add(",\"show_text\":\"show\"")
+    payload.add(",\"show_value\":\"" & jsonEscape(showValue) & "\"")
+  if description.len > 0:
+    payload.add(",\"description\":\"" & jsonEscape(description) & "\"")
+  payload.add("}")
+
+  var metaBytes = newSeq[byte](payload.len)
+  for i, c in payload:
+    metaBytes[i] = byte(c)
+  ?w.registerIOEvent(ioStdout, [], metaBytes)
+
+  # kind 1 keys on `(boundary_id, key_value)`, not on a trace/span id: see the
+  # contract §10.2 for why an OTel pair does not ride in this payload.
+  w.correlationMarkers.add(initBoundaryMarker(
+    boundaryId, keyValue, isRecv = dir == "recv", geid = w.stepCount))
+  ok()
+
 proc registerRaise*(w: var MultiStreamTraceWriter, exceptionTypeId: uint64,
     message: openArray[byte]): Result[void, string] =
   ## Register a raise event in the execution stream.
@@ -1657,6 +1746,24 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   if w.attached:
     w.closed = true
     return ok()
+
+  # Write corrmark.ns — the correlation index — when this recording declared
+  # any markers.  A recording with none writes NO namespace: its absence says
+  # "never indexed", which a consumer must not report as "does not cover that
+  # span" (contract §9).  That is why this is conditional rather than always
+  # emitting an empty index.
+  if w.correlationMarkers.len > 0:
+    let imageRes = serializeCorrmarkNamespace(w.correlationMarkers)
+    if imageRes.isErr:
+      return err("failed to build corrmark.ns: " & imageRes.error)
+    let image = imageRes.get()
+    let nsFileRes = w.container.addFile(CorrmarkNamespaceName)
+    if nsFileRes.isErr:
+      return err("failed to add corrmark.ns: " & nsFileRes.error)
+    var nsFile = nsFileRes.get()
+    let writeRes = w.container.writeToFile(nsFile, image)
+    if writeRes.isErr:
+      return err("failed to write corrmark.ns: " & writeRes.error)
 
   # Write meta.dat
   let metaFileRes = w.container.addFile("meta.dat")

@@ -163,6 +163,7 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_cross_compat.nim", binary: "build/test-bin/test_cross_compat"),
   TestSpec(source: "tests/test_xxh64.nim", binary: "build/test-bin/test_xxh64"),
   TestSpec(source: "tests/test_corrmark_builder.nim", binary: "build/test-bin/test_corrmark_builder"),
+  TestSpec(source: "tests/test_correlation_marker_api.nim", binary: "build/test-bin/test_correlation_marker_api"),
   TestSpec(source: "tests/test_meta_dat.nim", binary: "build/test-bin/test_meta_dat"),
   TestSpec(source: "tests/test_namespace_descriptor.nim", binary: "build/test-bin/test_namespace_descriptor"),
   TestSpec(source: "tests/test_sub_block_pool.nim", binary: "build/test-bin/test_sub_block_pool"),

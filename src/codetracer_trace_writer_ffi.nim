@@ -1186,6 +1186,66 @@ proc toIOEventKind(k: FfiEventLogKind): IOEventKind =
   of ffiElkTraceLogEvent, ffiElkEvmEvent:
     ioStderr
 
+proc ptrLenToString(p: ptr UncheckedArray[byte], n: csize_t): string =
+  ## Materialise a (ptr, len) pair.  NOT `$cstring`: a caller's string may
+  ## legally contain NUL — Ruby's can — and NUL-terminated marshalling both
+  ## truncates it and, on the Ruby side, raises from `rb_string_value_cstr`,
+  ## which is one of the recorder's known process-wedge regressions.
+  if p.isNil or n == 0:
+    return ""
+  result = newString(int(n))
+  for i in 0 ..< int(n):
+    result[i] = char(p[i])
+
+proc trace_writer_mark_correlation(
+    handle: TraceWriterHandle,
+    direction: ptr UncheckedArray[byte], direction_len: csize_t,
+    boundary_id: ptr UncheckedArray[byte], boundary_id_len: csize_t,
+    key_value: ptr UncheckedArray[byte], key_value_len: csize_t,
+    show_value: ptr UncheckedArray[byte], show_value_len: csize_t,
+    description: ptr UncheckedArray[byte], description_len: csize_t,
+): cint {.exportc, cdecl, dynlib.} =
+  ## Declare a correlation marker (`Correlation-Markers.md` §2.4).
+  ##
+  ## THE ENTRY POINT EVERY RECORDER BINDS TO.  Implemented once here, as
+  ## `trace_writer_register_span` already is for spans, so the ~20 CTFS
+  ## recorders do not each construct a `MarkerPayload` and drift — a recorder
+  ## whose field names fall out of step writes markers that are invisible
+  ## rather than broken, and nothing reports an error.
+  ##
+  ## Every string is (ptr, len), never NUL-terminated: see `ptrLenToString`.
+  ##
+  ## `key_value` and `show_value` must ALREADY BE STRINGIFIED UTF-8.  This
+  ## library never calls back into the host language to render a value: a
+  ## conversion that can raise must run before the binding takes the writer
+  ## lock, because a Ruby exception `longjmp`s past Rust destructors and
+  ## strands the guard, wedging the process permanently.
+  ##
+  ## Returns 0 on success, 1 on failure.  A binding is responsible for the
+  ## no-op-when-not-recording behaviour: user code calls this unconditionally,
+  ## and "no active recording" is not an error.
+  if handle.isNil:
+    return 1
+
+  let dir = ptrLenToString(direction, direction_len)
+  let boundary = ptrLenToString(boundary_id, boundary_id_len)
+  let key = ptrLenToString(key_value, key_value_len)
+  let show = ptrLenToString(show_value, show_value_len)
+  let desc = ptrLenToString(description, description_len)
+
+  if handle.useMultiStream:
+    # Same guard every other multi-stream entry point uses: a marker that
+    # arrives before `trace_writer_begin_events` created the writer is dropped
+    # rather than indexing an empty stream table, because an unhandled defect
+    # cannot be caught across the C boundary and would kill the RECORDED
+    # process.
+    if not handle.msWriterReady:
+      return 1
+    let res = handle.msWriter.registerCorrelationMarker(
+      dir, boundary, key, show, desc)
+    return (if res.isOk: 0.cint else: 1.cint)
+  1.cint
+
 proc trace_writer_register_special_event(
     handle: TraceWriterHandle,
     kind: FfiEventLogKind,

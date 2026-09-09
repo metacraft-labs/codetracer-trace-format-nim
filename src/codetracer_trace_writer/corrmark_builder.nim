@@ -83,9 +83,63 @@ proc descriptor(offset, size: uint64): seq[byte] =
   result.putU64LE(offset)
   result.putU64LE(size)
 
+const BoundaryFingerprintSeed* = 2654435761'u64
+  ## Second, independently-seeded hash used to CONFIRM a kind-1 hit.
+
+proc boundaryKeyBytes(boundaryId, keyValue: string): seq[byte] =
+  ## `boundary_id || 0x00 || key_value`.  The NUL separator matters: without
+  ## it ("ab","c") and ("a","bc") hash identically, and two unrelated
+  ## boundaries would share an index key.
+  result = newSeqOfCap[byte](boundaryId.len + 1 + keyValue.len)
+  for c in boundaryId: result.add(byte(c))
+  result.add(0'u8)
+  for c in keyValue: result.add(byte(c))
+
+proc boundaryIndexKey*(boundaryId, keyValue: string): uint64 =
+  ## The `corrmark.ns` B-tree key for a kind-1 (boundary-crossing) marker.
+  xxh64(boundaryKeyBytes(boundaryId, keyValue), 0)
+
+proc boundaryFingerprint*(boundaryId, keyValue: string): uint64 =
+  ## The confirmation fingerprint stored in a kind-1 entry.
+  ##
+  ## A kind-0 entry carries its full 24-byte `(trace_id, span_id)` so a lookup
+  ## can confirm a B-tree hit exactly (§7).  A kind-1 key is a
+  ## VARIABLE-LENGTH string pair, which does not fit the fixed 60-byte entry,
+  ## so exact confirmation is not available.  Storing a SECOND hash under a
+  ## different seed is the honest substitute: confirmation then rests on 128
+  ## independent bits rather than the 64 the index key already used, so a
+  ## wrong answer needs both hashes to collide on the same input pair.
+  xxh64(boundaryKeyBytes(boundaryId, keyValue), BoundaryFingerprintSeed)
+
+proc initBoundaryMarker*(boundaryId, keyValue: string, isRecv: bool,
+                         geid: uint64 = 0, threadId: uint64 = 0):
+    CorrelationMarker =
+  ## Build a kind-1 entry: the index key rides in `spanId`, the confirmation
+  ## fingerprint in the first 8 bytes of `traceId`.  Both are stored
+  ## big-endian so an entry is byte-comparable across implementations.
+  let idx = boundaryIndexKey(boundaryId, keyValue)
+  let fp = boundaryFingerprint(boundaryId, keyValue)
+  result.kind = MarkerKindBoundary
+  result.flags = (if isRecv: MarkerFlagExit else: 0'u16)
+  result.geid = geid
+  result.threadId = threadId
+  for i in 0 ..< 8:
+    result.traceId[i] = byte((fp shr ((7 - i) * 8)) and 0xFF)
+    result.spanId[i] = byte((idx shr ((7 - i) * 8)) and 0xFF)
+
 proc markerKey*(m: CorrelationMarker): uint64 =
-  ## The `corrmark.ns` B-tree key for `m`.
-  correlationKey(m.traceId, m.spanId)
+  ## The `corrmark.ns` B-tree key for `m`, derived PER KIND.
+  ##
+  ## kind 0 hashes the wire-order `(trace_id, span_id)`; kind 1 has already
+  ## had its index key computed from `(boundary_id, key_value)` and carries it
+  ## in `spanId`, because those strings are not retained in the entry.
+  if m.kind == MarkerKindBoundary:
+    var k: uint64 = 0
+    for i in 0 ..< 8:
+      k = (k shl 8) or uint64(m.spanId[i])
+    k
+  else:
+    correlationKey(m.traceId, m.spanId)
 
 proc encodeEntry(m: CorrelationMarker, dst: var seq[byte]) =
   for b in m.traceId: dst.add(b)
@@ -232,6 +286,41 @@ proc lookup*(idx: var CorrmarkIndex,
   for i in 0 ..< count:
     let m = decodeEntry(idx.image, off + 4 + i * CorrmarkEntrySize)
     if sameKey(m, probe):
+      hits.add(m)
+  ok(hits)
+
+proc lookupBoundary*(idx: var CorrmarkIndex, boundaryId, keyValue: string):
+    Result[seq[CorrelationMarker], string] =
+  ## Resolve a kind-1 (boundary-crossing) marker.
+  ##
+  ## Confirms the hit against the entry's fingerprint — the kind-1 substitute
+  ## for kind-0's exact full-key comparison (see `boundaryFingerprint`). A
+  ## bucket entry whose fingerprint differs is a different boundary/key pair
+  ## that merely shares an index key, and is skipped.
+  let key = boundaryIndexKey(boundaryId, keyValue)
+  let want = boundaryFingerprint(boundaryId, keyValue)
+  let descRes = idx.tree.lookup(key)
+  if descRes.isErr:
+    return ok(@[])
+  let desc = descRes.get()
+  if desc.len < 16:
+    return err("corrmark.ns: short descriptor")
+  let off = int(readU64LE(desc, 0))
+  let size = int(readU64LE(desc, 8))
+  if size < 4 or off + size > idx.image.len:
+    return err("corrmark.ns: descriptor out of range")
+  let count = int(readU32LE(idx.image, off))
+  if 4 + count * CorrmarkEntrySize > size:
+    return err("corrmark.ns: bucket overruns its descriptor")
+  var hits: seq[CorrelationMarker] = @[]
+  for i in 0 ..< count:
+    let m = decodeEntry(idx.image, off + 4 + i * CorrmarkEntrySize)
+    if m.kind != MarkerKindBoundary:
+      continue
+    var fp: uint64 = 0
+    for j in 0 ..< 8:
+      fp = (fp shl 8) or uint64(m.traceId[j])
+    if fp == want:
       hits.add(m)
   ok(hits)
 
