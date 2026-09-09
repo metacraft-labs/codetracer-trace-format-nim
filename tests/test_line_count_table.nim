@@ -54,7 +54,7 @@
 ## and read back through `openNewTraceFromBytes` / `openTrace`, the paths
 ## a debugger takes.
 
-import std/[os, assertions, strutils]
+import std/[os, assertions, strutils, json]
 import results
 import codetracer_trace_types
 import codetracer_trace_reader
@@ -63,6 +63,7 @@ import codetracer_trace_writer/new_trace_reader
 import codetracer_trace_writer/meta_dat
 import codetracer_trace_writer/global_line_index
 import codetracer_trace_writer/varint
+import codetracer_ct_print_lib
 
 const
   PathA = "/src/alpha.py"
@@ -71,6 +72,12 @@ const
   CountB = 7'u64
 
 let dir = getTempDir() / "ctfnim-line-count-table"
+
+proc ctPrintJson(bytes: seq[byte]): JsonNode =
+  ## The `ct-print --full` view of a container, which is how an operator
+  ## inspects one.
+  var r = openNewTraceFromBytes(bytes).get()
+  buildFullDocument(r, FullOpts(stripPaths: false))
 
 proc buildTrace(name: string, withTable: bool,
     counts: openArray[uint64],
@@ -173,6 +180,13 @@ proc test_the_container_states_the_counts_and_the_paths() =
       "path(" & $i & ") must be exactly " & want & " (" & $want.len &
       " bytes); got " & $got.get().len & " bytes, " &
       escape(got.get()) & " — the record's framing leaked into the path"
+
+  # And an operator can see it: `ct print --json` surfaces the bit under
+  # `metadata.flags`, which is the difference between a reported line the
+  # container vouches for and one the reader assumed.
+  let reported = ctPrintJson(bytes)
+  doAssert reported["metadata"]["flags"]["has_line_count_table"].getBool(),
+    "ct-print must report that this trace states its file sizes"
 
   echo "PASS: test_the_container_states_the_counts_and_the_paths"
 
@@ -460,6 +474,9 @@ proc test_a_writer_that_does_not_opt_in_is_unchanged() =
   var r = openNewTraceFromBytes(plain).get()
   doAssert not r.meta.hasLineCountTable,
     "a writer that did not opt in must leave bit 14 clear"
+  doAssert not ctPrintJson(plain)["metadata"]["flags"]["has_line_count_table"].getBool(),
+    "ct-print must report an opted-out trace as stating no file sizes — the " &
+    "field has to DISCRIMINATE, or it tells an operator nothing"
   doAssert r.recordedLineCount(0) == 0'u64,
     "an opted-out trace records no per-file size"
   doAssert r.path(0).get() == PathA,
