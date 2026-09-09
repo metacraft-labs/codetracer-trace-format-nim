@@ -260,15 +260,51 @@ const
     ## opt in explicitly and containers without spans are byte-identical to
     ## what the writer produced before this bit existed.
     ##
-    ## Bits 14 and 15 are deliberately left UNALLOCATED.  With bits 0-13
-    ## taken, two remain in the `u16` and there are more queued consumers
-    ## than bits; whether the last bit becomes an "extended flag word
-    ## follows" escape (or the field is widened by a meta.dat version bump)
-    ## is a format decision that needs its own milestone, with reader support
-    ## landed first.  See CTFS-Binary-Format.md §"Flag-space exhaustion".
-    ##
     ## Must match ``codetracer_trace_writer::meta_dat::FLAG_HAS_SPAN_STREAM``
     ## (Rust) and the db-backend ``FLAG_HAS_SPAN_STREAM`` bit 13 (RS-M2).
+  FlagHasLineCountTable*: uint16 = 0x4000        # bit 14 — per-file line counts
+    ## When set, every ``paths.dat`` record carries the file's line count
+    ## after the path bytes, and the line-only global position space is
+    ## laid out from those counts rather than from the
+    ## ``DefaultLinesPerFile`` convention.  The record layout is
+    ## ``path_len + path_bytes + line_count`` — the first three fields of
+    ## the column-aware Layout A record, without its trailing per-line
+    ## table.  See ``codetracer-trace-format-spec/internal-files.md``
+    ## §"``paths.dat`` line-count table".
+    ##
+    ## **The counts are mandatory under this bit**, not per-file
+    ## optional.  A file that omitted its count would put the reader back
+    ## to assuming a size for it, which is the defect the table exists to
+    ## remove; ``registerPath`` therefore refuses a path with no count
+    ## once the table is enabled, and a writer that cannot determine a
+    ## file's real line count records the ``DefaultLinesPerFile`` ceiling
+    ## it used.  Every file's size is then a number the container states.
+    ##
+    ## Mutually exclusive with ``FlagHasColumnAwareSteps``: a
+    ## column-aware record already carries ``line_count`` as the length of
+    ## its per-line table, so setting both would declare the same field
+    ## twice under two layouts.  ``writeMetaDat`` refuses the combination.
+    ##
+    ## **This bit is NOT additive at the reader**, for the same reason
+    ## bit 13 is not: ``KnownFlags`` + ``readMetaDat`` reject any
+    ## container carrying a bit outside the known mask, so a reader built
+    ## before this constant existed refuses a count-bearing container
+    ## outright.  The rollout consequence is the one recorded on bit 13 —
+    ## reader support (this constant, in ``KnownFlags``) must ship
+    ## everywhere BEFORE any writer sets the bit.  Accordingly no
+    ## recorder sets it by default: ``enableLineCountTable`` is an
+    ## explicit opt-in and a container without it is byte-identical to
+    ## what the writer produced before this bit existed.
+    ##
+    ## Bit 15 is the last unallocated bit of the ``u16``, and there are
+    ## more queued consumers than that.  Whether it becomes an "extended
+    ## flag word follows" escape or the field is widened by a meta.dat
+    ## version bump is a format decision that needs its own milestone,
+    ## with reader support landed first.  See CTFS-Binary-Format.md
+    ## §"Flag-space exhaustion".
+    ##
+    ## Must match ``codetracer_trace_writer::meta_dat::FLAG_HAS_LINE_COUNT_TABLE``
+    ## (Rust) and the db-backend ``FLAG_HAS_LINE_COUNT_TABLE`` bit 14.
   FlagHasCallStream*: uint16 = 0x100             # bit 8 — M17a
     ## When set, the materialized `.ct` carries a dedicated call stream
     ## (`calls.dat` + its companion seekable index `calls.idx`) in
@@ -296,7 +332,8 @@ const
     FlagHasValueStream or
     FlagHasIoEventStream or
     FlagHasInterningTables or
-    FlagHasSpanStream)
+    FlagHasSpanStream or
+    FlagHasLineCountTable)
     ## P6.5 (column-extension back-compat): every flag bit this reader
     ## understands.  ``readMetaDat`` rejects any meta.dat whose flag
     ## word has bits outside this mask set, per
@@ -410,6 +447,14 @@ type
       ## span streams and a span reader must report zero spans (it must not go
       ## looking for the files).  NOTE: unlike bits 8-12, this bit is not
       ## additive for readers that predate it — see `FlagHasSpanStream`.
+    hasLineCountTable*: bool
+      ## True iff FlagHasLineCountTable was set on the meta.dat header.
+      ## When set, every `paths.dat` record carries the file's line count
+      ## after the path bytes and the line-only global position space is
+      ## laid out from those counts.  Clear means the container states no
+      ## per-file size and every file occupies `DefaultLinesPerFile`
+      ## addresses by convention.  Like bit 13 this bit is not additive
+      ## for readers that predate it — see `FlagHasLineCountTable`.
 
 proc writeRawBytes(
     c: var Ctfs, f: var CtfsInternalFile,
@@ -460,6 +505,7 @@ proc writeMetaDat*(
     hasIoEventStream: bool = false,
     hasInterningTables: bool = false,
     hasSpanStream: bool = false,
+    hasLineCountTable: bool = false,
 ): Result[void, string] =
   ## Write binary meta.dat to a CTFS internal file.
   ##
@@ -522,6 +568,18 @@ proc writeMetaDat*(
     flags = flags or FlagHasInterningTables
   if hasSpanStream:
     flags = flags or FlagHasSpanStream
+  # A column-aware paths.dat record already carries `line_count` as the
+  # length of its per-line table, so bit 14 on top of bit 4 would declare
+  # the same field twice under two incompatible record layouts and leave
+  # the reader to pick one.  Refuse rather than write a header no reader
+  # can interpret unambiguously.
+  if hasLineCountTable and columnAwareSteps:
+    return err(
+      "meta.dat: hasLineCountTable and columnAwareSteps are mutually " &
+      "exclusive — a Layout A record already carries the file's " &
+      "line_count as the length of its per-line table")
+  if hasLineCountTable:
+    flags = flags or FlagHasLineCountTable
   ? c.writeU16LE(f, flags)
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.
@@ -682,6 +740,7 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
   contents.hasIoEventStream = (flags and FlagHasIoEventStream) != 0
   contents.hasInterningTables = (flags and FlagHasInterningTables) != 0
   contents.hasSpanStream = (flags and FlagHasSpanStream) != 0
+  contents.hasLineCountTable = (flags and FlagHasLineCountTable) != 0
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1, required
   # in v3+: a malformed or missing id rejects the trace at parse time.
@@ -828,6 +887,7 @@ proc writeMetaDatToBuffer*(
     hasIoEventStream: bool = false,
     hasInterningTables: bool = false,
     hasSpanStream: bool = false,
+    hasLineCountTable: bool = false,
 ): seq[byte] =
   ## Serialize meta.dat to an in-memory byte buffer.
   ## This is the same format as writeMetaDat but without needing a CTFS container.
@@ -887,6 +947,13 @@ proc writeMetaDatToBuffer*(
     flags = flags or FlagHasInterningTables
   if hasSpanStream:
     flags = flags or FlagHasSpanStream
+  # See writeMetaDat for why the two bits are mutually exclusive.  This
+  # entry point has no Result return, so the contract is a doAssert.
+  doAssert not (hasLineCountTable and columnAwareSteps),
+    "writeMetaDatToBuffer: hasLineCountTable and columnAwareSteps are " &
+    "mutually exclusive"
+  if hasLineCountTable:
+    flags = flags or FlagHasLineCountTable
   result.appendU16LE(flags)
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.

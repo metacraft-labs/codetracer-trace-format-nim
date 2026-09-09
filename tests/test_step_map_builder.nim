@@ -267,7 +267,7 @@ proc test_writer_step_map_keys_second_path() =
   # from `global_line_index` rather than restated, so this stays the
   # writer's own arithmetic if the packing or the sizing changes.
   let space = buildGlobalLineIndex(
-    positionSpaceCounts([], 2, columnAware = false))
+    positionSpaceCounts([], [], 2, columnAware = false))
   let packedPath1Line7 = space.globalIndex(1, 7)
   doAssert not parsed.byPath[0].hasKey(uint32(packedPath1Line7)),
     "path 0 carries an entry at line " & $packedPath1Line7 &

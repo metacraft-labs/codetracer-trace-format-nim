@@ -469,19 +469,24 @@ proc test_strict_meta_flag_rejection() {.raises: [].} =
   ## net that makes the column extension's bit-4 break clean for
   ## older readers (and gives every future bit allocation the same
   ## guarantee).
-  # Bit 14 (= 0x4000) is the lowest still-reserved bit: bits 0-13 are
-  # allocated in ``KnownFlags`` (MCR/replay/layout/filter/column/
-  # source-views, the bit-6/7 capability flags, and the M17a/M23a-d/RS-M1
-  # call/step/value/io/interning/span stream flags — bit 13 is
-  # ``FlagHasSpanStream``).  Earlier iterations of this test used bit 5
-  # (then 6, then 8, then 13) — keep the test in sync with the latest
-  # allocated range so it exercises a genuinely-unknown bit and keeps the
-  # unknown-bit rejection contract enforced.
-  const FirstReservedBit: uint16 = 0x4000
+  # Bit 15 (= 0x8000) is the lowest — and now the only — still-reserved
+  # bit: bits 0-14 are allocated in ``KnownFlags`` (MCR/replay/layout/
+  # filter/column/source-views, the bit-6/7 capability flags, the
+  # M17a/M23a-d/RS-M1 call/step/value/io/interning/span stream flags, and
+  # bit 14 ``FlagHasLineCountTable``).  Earlier iterations of this test
+  # used bit 5 (then 6, 8, 13, 14) — keep the test in sync with the
+  # latest allocated range so it exercises a genuinely-unknown bit and
+  # keeps the unknown-bit rejection contract enforced.  When bit 15 is
+  # allocated the flag word itself has to grow, and this probe has to be
+  # rewritten against whatever that growth defines as unknown.
+  const FirstReservedBit: uint16 = 0x8000
+  doAssert (FirstReservedBit and KnownFlags) == 0,
+    "the probe must name a bit this reader does NOT know, or it proves " &
+    "nothing about the rejection contract"
   let badBuf = handcraftMetaDatWithFlags(FirstReservedBit)
   let badRes = readMetaDat(badBuf)
   doAssert badRes.isErr,
-    "readMetaDat must reject meta.dat with unknown flag bit 14 set"
+    "readMetaDat must reject meta.dat with unknown flag bit 15 set"
 
   # Sanity check the error message mentions the unknown bits.
   doAssert "unknown flag" in badRes.error or

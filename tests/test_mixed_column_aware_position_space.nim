@@ -209,25 +209,49 @@ proc test_fully_tabled_trace_still_resolves_line_and_column() =
   echo "PASS: test_fully_tabled_trace_still_resolves_line_and_column"
 
 proc test_one_sizing_rule_serves_writer_and_reader() =
-  ## The rule itself, stated once. A file with a table occupies its byte
-  ## capacity; a file without one occupies `DefaultLinesPerFile`. Both
-  ## parties call this, so a change to either has to change this line.
+  ## The rule itself, stated once: a file's slot is the number of
+  ## positions it has. What a position is differs by mode — an
+  ## addressable column where the file has a per-line table, a line where
+  ## it has a recorded line count — and a file the trace sizes neither
+  ## way occupies `DefaultLinesPerFile`. Both parties call this, so a
+  ## change to either has to change this line.
   doAssert fileAddressCount(TabledLineLengths) == 20'u64,
     "a tabled file occupies sum(line_lengths); got " &
     $fileAddressCount(TabledLineLengths)
+  doAssert fileAddressCount([], lineCount = 12'u64) == 12'u64,
+    "a file with a recorded line count occupies that many addresses; got " &
+    $fileAddressCount([], lineCount = 12'u64)
   doAssert fileAddressCount([]) == DefaultLinesPerFile,
-    "an untabled file occupies DefaultLinesPerFile; got " &
+    "a file the trace sizes neither way occupies DefaultLinesPerFile; got " &
     $fileAddressCount([])
 
-  let mixed = positionSpaceCounts([@TabledLineLengths, newSeq[uint32]()], 2,
-    columnAware = true)
+  # The per-line table wins where both are present: a column-aware file
+  # is addressed in columns, and its line count is the table's length
+  # rather than its size.
+  doAssert fileAddressCount(TabledLineLengths, lineCount = 12'u64) == 20'u64,
+    "a tabled file is sized in columns even when a line count is also " &
+    "supplied; got " & $fileAddressCount(TabledLineLengths, lineCount = 12'u64)
+
+  let mixed = positionSpaceCounts([@TabledLineLengths, newSeq[uint32]()],
+    [], 2, columnAware = true)
   doAssert mixed == @[20'u64, DefaultLinesPerFile],
     "mixed column-aware space: " & $mixed
 
-  let lineOnly = positionSpaceCounts([@TabledLineLengths, newSeq[uint32]()], 2,
-    columnAware = false)
+  let lineOnly = positionSpaceCounts([@TabledLineLengths, newSeq[uint32]()],
+    [], 2, columnAware = false)
   doAssert lineOnly == @[DefaultLinesPerFile, DefaultLinesPerFile],
-    "a line-only trace ignores any line tables lying around: " & $lineOnly
+    "a line-only trace with no recorded counts ignores any line tables " &
+    "lying around: " & $lineOnly
+
+  let counted = positionSpaceCounts([], [12'u64, 30'u64], 2,
+    columnAware = false)
+  doAssert counted == @[12'u64, 30'u64],
+    "a line-only trace with recorded counts is sized by them: " & $counted
+
+  let shortCounts = positionSpaceCounts([], [12'u64], 2, columnAware = false)
+  doAssert shortCounts == @[12'u64, DefaultLinesPerFile],
+    "a file the counts do not cover falls back to the default: " &
+    $shortCounts
 
   echo "PASS: test_one_sizing_rule_serves_writer_and_reader"
 

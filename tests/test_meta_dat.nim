@@ -1084,13 +1084,31 @@ proc test_meta_dat_strict_unknown_flag_rejection() {.raises: [].} =
     doAssert resAll6.get().hasSpanStream
 
   block:
-    # Bit 14 (0x4000) is still unallocated — retarget the strict-rejection
-    # probe to it now that bit 13 is known.  (Bits 14 and 15 are the last two
-    # free bits and are deliberately left unallocated by RS-M1; see
-    # `FlagHasSpanStream`'s note on flag-space exhaustion.)
-    let res = readMetaDat(craft(FlagHasColumnAwareSteps or 0x4000'u16))
+    # Bit 14 is allocated to FlagHasLineCountTable, so it must ROUND-TRIP
+    # rather than reject — the same positive assertion every allocated bit
+    # gets above.  It is checked ALONE: a header setting it together with
+    # bit 4 declares the same paths.dat field under two record layouts, and
+    # `writeMetaDat` refuses to produce one.
+    let res = readMetaDat(craft(FlagHasLineCountTable))
+    doAssert res.isOk,
+      "bit 14 (FlagHasLineCountTable) must round-trip: " &
+      (if res.isErr: res.error else: "ok")
+    doAssert res.get().hasLineCountTable
+    doAssert not res.get().hasSpanStream
+    doAssert not res.get().hasColumnAwareSteps
+
+  block:
+    # Bit 15 (0x8000) is the last unallocated bit — retarget the
+    # strict-rejection probe to it now that bit 14 is known.  When bit 15 is
+    # allocated the flag word has to grow, and this probe has to be
+    # rewritten against whatever that growth defines as unknown.
+    const LastReservedBit: uint16 = 0x8000
+    doAssert (LastReservedBit and KnownFlags) == 0,
+      "the probe must name a bit this reader does NOT know, or it proves " &
+      "nothing about the rejection contract"
+    let res = readMetaDat(craft(FlagHasColumnAwareSteps or LastReservedBit))
     doAssert res.isErr,
-      "bit 4 + bit 14 must reject because bit 14 is unknown"
+      "bit 4 + bit 15 must reject because bit 15 is unknown"
     doAssert "unknown" in res.error,
       "rejection error must mention 'unknown'; got: " & res.error
 

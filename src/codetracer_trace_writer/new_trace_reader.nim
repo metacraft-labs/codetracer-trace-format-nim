@@ -79,6 +79,17 @@ type
     # not column-aware, this stays empty and column queries return
     # ``none``.
     lineLengths: seq[seq[uint32]]
+    # Per-file line counts, parsed from the line-count-table paths.dat
+    # records when `meta.hasLineCountTable` is set.  ``lineCounts[fileId]``
+    # is the number of lines in file ``fileId``, and it is what that
+    # file's slot in the line-only global position space is sized to.
+    # Empty on a trace that records no counts, in which case
+    # ``positionSpaceCounts`` falls back to the pre-table convention.
+    lineCounts: seq[uint64]
+    # The interning payloads decoded out of those same records, kept so
+    # `path` answers from the parse the open already did rather than
+    # re-deriving the framing per call.  Parallel to `lineCounts`.
+    lineCountPayloads: seq[string]
     # Advisory: the trace declares line-only paths.dat records, yet every
     # record also decodes as a complete Layout A record.  Surfaced by
     # `columnAwarePathsSuspected`; never used to reinterpret data.
@@ -375,6 +386,64 @@ proc parseLayoutAPathRecords(pathReader: InterningTableReader,
     llsAll[i] = lls
   ok(llsAll)
 
+proc parseLineCountPathRecords(pathReader: InterningTableReader):
+    Result[tuple[payloads: seq[string], counts: seq[uint64]], string] =
+  ## Decode every ``paths.dat`` record as the line-count-table layout —
+  ## ``payload_len + payload + line_count`` — and return the interning
+  ## payloads alongside the per-file line counts.
+  ##
+  ## Authoritative only: this runs when the trace has DECLARED the layout
+  ## through ``meta.dat`` bit 14, so a record that does not decode is a
+  ## corrupt trace and the error names the record and the field. There is
+  ## no probing counterpart, and there must not be: the record space
+  ## overlaps the bare layout's (a path whose first byte happens to be
+  ## its own remaining length decodes cleanly), so inferring the layout
+  ## from the bytes would answer with a truncated path and a fabricated
+  ## line count — the same defect the Layout A probe exists to avoid
+  ## acting on.
+  ##
+  ## A zero ``line_count`` is refused rather than defaulted. Under this
+  ## layout every file's size is a number the container states, and a
+  ## file sized zero would share its base with the next one; silently
+  ## substituting a stride there is exactly the assumption the table was
+  ## added to remove.
+  let pathTotal = pathReader.count()
+  var payloads = newSeq[string](int(pathTotal))
+  var counts = newSeq[uint64](int(pathTotal))
+  for i in 0'u64 ..< pathTotal:
+    let rawRes = pathReader.readRawById(i)
+    if rawRes.isErr:
+      return err("paths.dat[" & $i & "]: " & rawRes.error)
+    let raw = rawRes.get()
+    var pos = 0
+    let payloadLenRes = decodeVarint(raw, pos)
+    if payloadLenRes.isErr:
+      return err("paths.dat[" & $i & "]: line-count payload_len varint: " &
+        payloadLenRes.error)
+    let payloadLen = int(payloadLenRes.get())
+    if pos + payloadLen > raw.len:
+      return err("paths.dat[" & $i & "]: payload truncated (payload_len " &
+        $payloadLen & ", " & $(raw.len - pos) & " byte(s) left)")
+    var s = newString(payloadLen)
+    for k in 0 ..< payloadLen:
+      s[k] = char(raw[pos + k])
+    pos += payloadLen
+    let countRes = decodeVarint(raw, pos)
+    if countRes.isErr:
+      return err("paths.dat[" & $i & "]: line_count varint: " & countRes.error)
+    let count = countRes.get()
+    if count == 0:
+      return err("paths.dat[" & $i & "]: line_count is 0 for " & s &
+        ". A trace that sets FLAG_HAS_LINE_COUNT_TABLE states every " &
+        "file's size, and a file sized 0 shares its base with the next " &
+        "one — the two would be indistinguishable at decode")
+    if pos != raw.len:
+      return err("paths.dat[" & $i & "]: " & $(raw.len - pos) &
+        " trailing byte(s) after line_count")
+    payloads[i] = s
+    counts[i] = count
+  ok((payloads, counts))
+
 # ---------------------------------------------------------------------------
 # Opening
 # ---------------------------------------------------------------------------
@@ -489,6 +558,18 @@ proc openNewTraceFromBytes*(data: seq[byte],
       # Only reachable via the caller's explicit override; a trace that
       # declared bit 4 already has the flag set.
       reader.meta.hasColumnAwareSteps = true
+    elif reader.meta.hasLineCountTable:
+      # Bit 14 — every record carries the file's line count after the
+      # path bytes.  Like bit 4 this is a DECLARATION, so the parse is
+      # authoritative and a record that does not decode fails the open
+      # rather than falling back to the bare layout: falling back would
+      # hand the caller a path with a length prefix glued to its front
+      # and put every file back on the assumed stride.
+      let parsed = parseLineCountPathRecords(reader.pathReader)
+      if parsed.isErr:
+        return err(parsed.error)
+      reader.lineCountPayloads = parsed.get().payloads
+      reader.lineCounts = parsed.get().counts
     else:
       reader.layoutASuspected =
         parseLayoutAPathRecords(reader.pathReader, probe = true).isOk
@@ -637,6 +718,15 @@ proc path*(r: NewTraceReader, id: uint64): Result[string, string] =
       for k in 0 ..< pathLen:
         s[k] = char(raw[pos + k])
       ok(s)
+    elif r.meta.hasLineCountTable:
+      # Bit 14: the record is ``payload_len + payload + line_count``, and
+      # the payload was decoded at open.  Reading it back raw here would
+      # surface the length prefix and the trailing count as part of the
+      # path string.
+      if id >= uint64(r.lineCountPayloads.len):
+        return err("paths.dat[" & $id & "]: out of range (" &
+          $r.lineCountPayloads.len & " record(s))")
+      ok(r.lineCountPayloads[int(id)])
     else:
       r.pathReader.readById(id)
   elif r.pathsJson.len > 0 and id < uint64(r.pathsJson.len):
@@ -810,17 +900,34 @@ proc globalPositionSpace*(r: NewTraceReader): GlobalLineIndex =
   ## ``decodeGlobalPositionIndex`` has nothing to say about it — a
   ## line-only trace, or a column-aware one whose file has no per-line
   ## table. Rebuilding the space from the path count alone gives every
-  ## file ``DefaultLinesPerFile``, which is right for a line-only trace
-  ## and wrong for a column-aware one the moment any file carries a
-  ## table: that file is smaller than the default, so every file after it
-  ## sits too high, and a position resolves into the wrong file with a
-  ## line number that is in range.
+  ## file ``DefaultLinesPerFile``, which is wrong for any trace that
+  ## states its own per-file sizes: such a file is smaller than the
+  ## default, so every file after it sits too high, and a position
+  ## resolves into the wrong file with a line number that is in range.
+  ## The sizes come from the trace itself — the per-line tables of a
+  ## column-aware container, the line counts of one that sets bit 14 —
+  ## and only a container that states neither falls back to the default.
   ##
   ## Inverting through it is still an assumption about the producer's
   ## packing — see the ``global_line_index`` module header — so callers
   ## must go through ``tryResolve``, not ``resolve``.
   buildGlobalLineIndex(positionSpaceCounts(
-    r.lineLengths, int(r.pathCount()), r.meta.hasColumnAwareSteps))
+    r.lineLengths, r.lineCounts, int(r.pathCount()),
+    r.meta.hasColumnAwareSteps))
+
+proc recordedLineCount*(r: NewTraceReader, fileId: uint64): uint64 =
+  ## The line count this trace RECORDS for ``fileId``, or 0 when it
+  ## records none.
+  ##
+  ## Zero is not "the file has no lines" — the writer refuses to record
+  ## that and the reader refuses to parse it. It is "this container does
+  ## not state the file's size", which is every trace without
+  ## ``meta.dat`` bit 14, and it is why the answer is deliberately not a
+  ## fallback stride: a caller asking what the trace records must be able
+  ## to tell a recorded size from an assumed one.
+  if fileId >= uint64(r.lineCounts.len):
+    return 0'u64
+  r.lineCounts[int(fileId)]
 
 proc ensurePositionTables(r: var NewTraceReader) =
   ## Build per-file cumulative tables used by ``decodeGlobalPositionIndex``.

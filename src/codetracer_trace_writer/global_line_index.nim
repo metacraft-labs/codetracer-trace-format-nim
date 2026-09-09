@@ -21,14 +21,22 @@
 ## §"Global Line Index" for the encode and ``trace-events.md``
 ## §"Decoding ``global_position_index``" for the decode.
 ##
-## **The apportionment between files is a writer convention, not a
-## container format.** The spec (``trace-events.md`` §"Source Location
-## Addressing", §"Back-Compatibility") says only that a line-only trace's
-## ``global_position_index`` is a ``global_line_index`` in which "each
-## integer addresses one line". How many integers each file gets is left
-## to the writer, and a container records nothing about the choice — there
-## is no stride field, no per-file line count, and no producer identifier
-## that would let a reader recover it.
+## **How many addresses each file gets is recorded, when the container
+## says it is.** The spec (``trace-events.md`` §"Per-File Contiguous
+## Integer Ranges") sizes a line-only file at ``file_size = line_count``.
+## A container that sets ``meta.dat`` ``FlagHasLineCountTable`` (bit 14)
+## carries that count per file in its ``paths.dat`` records, so a reader
+## rebuilds the exact space the writer laid out rather than assuming one.
+## The counts are mandatory under that bit: every record carries one, and
+## a writer that cannot determine a file's real line count records the
+## ``DefaultLinesPerFile`` ceiling it used instead of leaving the reader
+## to guess it.
+##
+## A container WITHOUT that bit records nothing about the apportionment —
+## no stride field, no per-file line count, no producer identifier — and
+## every file is ``DefaultLinesPerFile`` addresses by convention alone.
+## That is the pre-table format, still written by every recorder that has
+## not opted in, and still read here on exactly those terms.
 ##
 ## Two writers of the same container format disagree about it today:
 ##
@@ -70,63 +78,86 @@ import results
 export results
 
 const DefaultLinesPerFile*: uint64 = 100_000
-  ## Addresses allocated to a file with no per-line length table.
+  ## The line count a writer records for a file whose real line count it
+  ## cannot determine.
   ##
-  ## Real line counts would come from the source files, which the writer
-  ## does not have; the constant is a ceiling generous enough that a
-  ## file's lines never spill into the next file's range. It is a count of
-  ## addressable lines, so a file of exactly this many lines fits: lines
-  ## `1 .. DefaultLinesPerFile` occupy the whole slot and line
-  ## `DefaultLinesPerFile + 1` is the first that spills.
+  ## It is a count of addressable lines, so a file of exactly this many
+  ## lines fits: lines `1 .. DefaultLinesPerFile` occupy the whole slot
+  ## and line `DefaultLinesPerFile + 1` is the first that would spill.
   ##
-  ## It lives here, next to the prefix-sum arithmetic it parameterises, so
-  ## that the writer that encodes with it and any reader that inverts it
-  ## cannot drift apart — the drift being undetectable in the container,
-  ## which carries no record of the value used.
+  ## Whether that ceiling is safe is not a property a reader can check,
+  ## so it is not left to be inferred. A writer that emits the per-file
+  ## line-count table (`meta.dat` `FlagHasLineCountTable`) writes this
+  ## number into `paths.dat` like any other count, and the reader lays
+  ## the file's slot out from what it read. A writer that does not emit
+  ## the table produces a container in which every file's size is this
+  ## constant by convention and by nothing else — the pre-table format,
+  ## kept readable, and the reason the constant still lives here next to
+  ## the prefix-sum arithmetic it parameterises.
 
-proc fileAddressCount*(lineLengths: openArray[uint32]): uint64 =
-  ## Addresses the global position space allocates to one file.
+proc fileAddressCount*(lineLengths: openArray[uint32],
+    lineCount: uint64 = 0): uint64 =
+  ## Addresses the global position space allocates to one file: **the
+  ## number of positions the file has.**
   ##
-  ## A file with a per-line length table occupies exactly its byte
-  ## capacity, so a `global_position_index` inside its range resolves to a
-  ## `(line, column)`. A file without one occupies `DefaultLinesPerFile`
-  ## addresses and its positions resolve to a line only.
+  ## That is the whole rule. The two addressing modes differ only in what
+  ## a *position* is, and each supplies the corresponding count:
   ##
-  ## Either way the count is the number of positions the file has, not one
-  ## more: the in-file offset is 0-based, so the slot `[base, base +
-  ## count)` holds every position and no address is left unused at the
-  ## base.
+  ## * column-aware — a position is an addressable column, so the file
+  ##   has `sum(lineLengths)` of them and `lineLengths` is its per-line
+  ##   table;
+  ## * line-only — a position is a line, so the file has `lineCount` of
+  ##   them and `lineLengths` is empty.
   ##
-  ## A trace may mix the two: `registerPath` takes the line lengths as an
-  ## optional argument, so a column-aware recorder that has them for its
-  ## own sources and not for a dependency's produces exactly that. The two
-  ## sizings are not interchangeable — a file sized 20 here and 100000
-  ## there shifts every later file's base — and the container records
-  ## neither the sizes nor the rule that produced them. So every party
-  ## that lays out the space must call this, not re-derive it: writer,
-  ## reader position tables, and the line-only fallback all size a file
-  ## the same way or they do not agree on which file a position is in.
-  if lineLengths.len == 0:
-    return DefaultLinesPerFile
-  var total: uint64 = 0
-  for L in lineLengths:
-    total += uint64(L)
-  max(total, 1'u64)
+  ## The units differ (bytes on one axis, lines on the other) because the
+  ## address means a different thing in each mode; the sizing does not.
+  ## Keeping it in one proc is what stops the two from drifting: a file
+  ## sized one way here and another way there shifts the base of every
+  ## file after it, and a position then resolves into the wrong file at a
+  ## line number that is in range.
+  ##
+  ## The count is the number of positions, not one more: the in-file
+  ## offset is 0-based, so the slot `[base, base + count)` holds every
+  ## position and no address is left unused at the base. It is never
+  ## zero — a file with no positions would share its base with the next
+  ## file, and the two would be indistinguishable at decode.
+  ##
+  ## Neither input given means the trace records no size for the file:
+  ## it occupies `DefaultLinesPerFile` addresses, the pre-table
+  ## convention. A trace may mix that with sized files — `registerPath`
+  ## takes both the line lengths and the line count as optional
+  ## arguments — so every party that lays the space out must call this
+  ## rather than re-derive it.
+  if lineLengths.len > 0:
+    var total: uint64 = 0
+    for L in lineLengths:
+      total += uint64(L)
+    return max(total, 1'u64)
+  if lineCount > 0:
+    return lineCount
+  DefaultLinesPerFile
 
 proc positionSpaceCounts*(lineLengths: openArray[seq[uint32]],
+    lineCounts: openArray[uint64],
     fileCount: int, columnAware: bool): seq[uint64] =
   ## Per-file address counts for a trace with `fileCount` registered
   ## paths, in the order the paths were registered.
   ##
-  ## Line-only traces give every file `DefaultLinesPerFile` regardless of
-  ## what line-length tables happen to be around, which is what keeps a
-  ## pre-column-aware trace byte-for-byte what it always was.
+  ## `lineLengths` carries the column-aware per-line tables and
+  ## `lineCounts` the line-only per-file line counts; a trace supplies
+  ## whichever its mode addresses in, and either may be short of
+  ## `fileCount` (or empty) for the files it says nothing about. Those
+  ## fall back to `DefaultLinesPerFile`, which is what a container
+  ## without a size table has always meant.
   result = newSeq[uint64](fileCount)
   for i in 0 ..< fileCount:
-    if columnAware and i < lineLengths.len:
-      result[i] = fileAddressCount(lineLengths[i])
-    else:
-      result[i] = DefaultLinesPerFile
+    let lls =
+      if columnAware and i < lineLengths.len: lineLengths[i]
+      else: @[]
+    let count =
+      if i < lineCounts.len: lineCounts[i]
+      else: 0'u64
+    result[i] = fileAddressCount(lls, count)
 
 type
   GlobalLineIndex* = object
@@ -205,7 +236,10 @@ proc tryResolve*(gli: GlobalLineIndex,
   ## run past its slot addresses the next file's range, and the arithmetic
   ## there is indistinguishable from a legitimate address. That is a
   ## property of a packing with no delimiters, not something a reader can
-  ## check; `DefaultLinesPerFile` is sized so it does not arise in practice.
+  ## check, so it is caught where the file's size is known — at the
+  ## writer, which refuses a step past a file's recorded line count
+  ## (`multi_stream_writer.registerStep`) rather than emitting an address
+  ## that lands in the next file.
   if gli.prefixSum.len < 2:
     return err("line-only global_position_index " & $globalIdx &
       " cannot be resolved to (file, line): the trace registers no paths")

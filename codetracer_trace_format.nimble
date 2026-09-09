@@ -103,6 +103,12 @@ task test, "Run all tests":
   # into the next file's range — invisible behind an oversized stride,
   # a wrong answer at every boundary once slots are sized to real counts.
   exec "nim c -r -d:release -p:src tests/test_global_line_index_boundary.nim"
+  # The per-file line-count table (meta.dat bit 14): a line-only container
+  # that STATES how large each of its files is instead of leaving a reader
+  # to assume DefaultLinesPerFile. With the sizes recorded, a step past a
+  # file's count addresses the next file and nothing downstream can tell
+  # that apart from a real location — so the writer refuses it.
+  exec "nim c -r -d:release -p:src tests/test_line_count_table.nim"
   # The schema break that carries the corrected encode. A container written
   # under the superseded prefixSum[path_id] + line reads one line high under
   # the current decode -- silently, because the address is INSIDE the space
@@ -194,6 +200,13 @@ task test, "Run all tests":
   # still answer every position this repository's writer produces.
   # Same FFI-`include` compile requirements as the tests above.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_reader_ffi_line_only_position_space.nim"
+  # The C ABI's door to the per-file line-count table. Every non-Nim recorder
+  # drives this writer through the C entry points, so a mandatory-count
+  # contract that only the Nim API enforces is not enforced at all: the
+  # implicit path registration `trace_writer_register_step` performs has no
+  # count, and must be refused by name rather than silently dropping the step.
+  # Same FFI-`include` compile requirements as the tests above.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_line_count_table.nim"
   # The C ABI's in-memory constructors: an embedder with no filesystem gets a
   # container's BYTES rather than a file. Carries its own positive control (the
   # file arm, in the same directory) and its own mutation control (one extra

@@ -112,7 +112,7 @@ proc test_linehits_via_multi_stream_writer() =
   # apportionment of addresses between files is the writer's convention,
   # and a test that recomputes it by hand is one more copy to drift.
   let space = buildGlobalLineIndex(
-    positionSpaceCounts([], 1, columnAware = false))
+    positionSpaceCounts([], [], 1, columnAware = false))
   var expected: array[NumLines, seq[uint64]]  # index 0..4 maps to lines 1..5
   for i in 0 ..< NumSteps:
     let line = uint64((i mod NumLines) + 1)

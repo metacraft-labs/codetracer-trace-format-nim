@@ -826,6 +826,14 @@ proc trace_writer_start(
       return
     let pathIdRes = handle.msWriter.registerPath(p)
     if pathIdRes.isErr:
+      # These entry points return void, so `last_error` is the only signal
+      # a C caller has. Returning silently makes a refused registration
+      # indistinguishable from a successful one, and the step that would
+      # have followed simply never appears in the trace. That matters most
+      # under the line-count table, where interning a path the caller
+      # never gave a count for is REFUSED — the caller has to be able to
+      # see why its steps went missing.
+      setError(pathIdRes.error)
       return
     let pathId = pathIdRes.get()
     # Buffer this as the first pending step
@@ -992,6 +1000,14 @@ proc trace_writer_register_step(
 
     let pathIdRes = handle.msWriter.registerPath(p)
     if pathIdRes.isErr:
+      # These entry points return void, so `last_error` is the only signal
+      # a C caller has. Returning silently makes a refused registration
+      # indistinguishable from a successful one, and the step that would
+      # have followed simply never appears in the trace. That matters most
+      # under the line-count table, where interning a path the caller
+      # never gave a count for is REFUSED — the caller has to be able to
+      # see why its steps went missing.
+      setError(pathIdRes.error)
       return
     let pathId = pathIdRes.get()
     # Buffer this as the new pending step
@@ -1612,6 +1628,14 @@ proc ct_assignment_with_column(
     discard flushPendingStep(handle)
     let pathIdRes = handle.msWriter.registerPath(p)
     if pathIdRes.isErr:
+      # These entry points return void, so `last_error` is the only signal
+      # a C caller has. Returning silently makes a refused registration
+      # indistinguishable from a successful one, and the step that would
+      # have followed simply never appears in the trace. That matters most
+      # under the line-count table, where interning a path the caller
+      # never gave a count for is REFUSED — the caller has to be able to
+      # see why its steps went missing.
+      setError(pathIdRes.error)
       return
     let pathId = pathIdRes.get()
     if has_column != 0:
@@ -1915,6 +1939,79 @@ proc trace_writer_register_path_with_line_lengths(
       "ready (call trace_writer_begin_events first)")
     return 1.cint
   discard handle.writer.writePath(p)
+  0.cint
+
+proc trace_writer_enable_line_count_table(
+    handle: TraceWriterHandle,
+): cint {.exportc, cdecl, dynlib.} =
+  ## Opt this writer into recording a per-file line count in every
+  ## ``paths.dat`` record (``meta.dat`` bit 14).  Mirrors the Nim
+  ## ``enableLineCountTable``.
+  ##
+  ## After this call every path MUST be registered through
+  ## ``trace_writer_register_path_with_line_count``: the implicit
+  ## registration ``trace_writer_register_step`` performs for an unseen
+  ## path has no count to record and is refused by name.  A recorder
+  ## that cannot count a file's lines passes the ceiling it wants the
+  ## file laid out with (conventionally 100000) so the size the space
+  ## uses is the size the container states.
+  ##
+  ## Must be called before the first path is registered, and is refused
+  ## on a column-aware writer.  Returns 0 on success, non-zero on
+  ## failure (with ``last_error`` set).
+  if handle.isNil:
+    setError("trace_writer_enable_line_count_table: NULL handle")
+    return 1.cint
+  if not handle.useMultiStream:
+    setError("trace_writer_enable_line_count_table: the legacy " &
+      "single-stream backend has no paths.dat to record line counts in")
+    return 1.cint
+  if not handle.msWriterReady:
+    setError("trace_writer_enable_line_count_table: writer not ready " &
+      "(call trace_writer_begin_events first)")
+    return 1.cint
+  let res = handle.msWriter.enableLineCountTable()
+  if res.isErr:
+    setError(res.error)
+    return 1.cint
+  0.cint
+
+proc trace_writer_register_path_with_line_count(
+    handle: TraceWriterHandle,
+    path: cstring,
+    line_count: uint64,
+): cint {.exportc, cdecl, dynlib.} =
+  ## Register a source path together with the number of lines the file
+  ## has, which sizes the file's slot in the line-only global position
+  ## space (``paths.dat`` line-count table — see
+  ## ~codetracer-trace-format-spec/internal-files.md~ §"``paths.dat``
+  ## line-count table").
+  ##
+  ## Only meaningful on a writer that called
+  ## ``trace_writer_enable_line_count_table``; without it the bare
+  ## ``paths.dat`` record has nowhere to put the count and this behaves
+  ## exactly like registering the path alone.
+  ##
+  ## ``line_count`` of 0 is refused rather than defaulted: a file sized
+  ## 0 would share its base with the next file.
+  ##
+  ## Returns 0 on success, non-zero on failure (with ``last_error`` set).
+  if handle.isNil:
+    setError("trace_writer_register_path_with_line_count: NULL handle")
+    return 1.cint
+  if not handle.useMultiStream:
+    setError("trace_writer_register_path_with_line_count: the legacy " &
+      "single-stream backend has no paths.dat to record line counts in")
+    return 1.cint
+  if not handle.msWriterReady:
+    setError("trace_writer_register_path_with_line_count: writer not " &
+      "ready (call trace_writer_begin_events first)")
+    return 1.cint
+  let pathIdRes = handle.msWriter.registerPath(
+    toNimStr(path), lineCount = line_count)
+  if pathIdRes.isErr:
+    setError(pathIdRes.error)
+    return 1.cint
   0.cint
 
 proc trace_writer_register_source_view(
