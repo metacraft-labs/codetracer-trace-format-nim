@@ -239,8 +239,9 @@ proc test_span_coverage_is_indexed_and_confirmable() =
   doAssert hit.wallTimeUnixNs == DemoWallNs,
     "wall_time_unix_ns must round-trip exactly — the consumer asserts it"
   doAssert hit.monotonicTimeNs == DemoMonotonicNs
-  doAssert hit.geid == 2'u64,
-    "geid must be the step count at declaration time, got " & $hit.geid
+  doAssert hit.geid == 1'u64,
+    "geid must be the ENCLOSING step — two steps were registered, so index 1 — " &
+    "and must equal the coordinate the payload half reports; got " & $hit.geid
 
   # A span this recording does NOT cover is a clean miss, not an error, and
   # not the same answer as the namespace being absent (contract §9).
@@ -324,6 +325,56 @@ proc test_index_is_enumerable_for_inspection() =
   removeFile(path)
   echo "PASS: test_index_is_enumerable_for_inspection"
 
+proc test_payload_step_and_index_geid_are_one_number() =
+  ## A marker has ONE coordinate, and both halves must report it.
+  ##
+  ## They did not: the `MarkerPayload` event defaulted to `stepCount - 1` while
+  ## the index entry recorded `stepCount`, so a consumer that resumed from the
+  ## index landed one step away from where `ct print` showed the marker. Found
+  ## by the JavaScript recorder while becoming a thin binding on this API —
+  ## which is the review contract §11a.2 asks a binding to perform, and the
+  ## reason this test exists rather than the disagreement being papered over.
+  let path = getTempDir() / "test_corrmark_step_agree.ct"
+  removeFile(path)
+
+  var w = initMultiStreamWriter(path, "step_agree", chunkSize = 4,
+    recordingId = "01949fcc-7d92-7e9c-aaaa-333333333333").get()
+  doAssert w.registerPath("/src/app.py").isOk
+  for line in 1'u64 .. 5'u64:
+    doAssert w.registerStep(0, line, []).isOk
+  doAssert w.registerCorrelationMarker(
+    "send", "order-processing", "order-42").isOk
+  doAssert w.registerSpanCoverageHex(
+    DemoTraceIdHex, DemoSpanIdHex, DemoWallNs, DemoMonotonicNs).isOk
+  doAssert w.close().isOk
+  doAssert w.closeCtfs().isOk
+
+  var reader = openNewTrace(path).get()
+  let doc = buildFullDocument(reader, FullOpts(stripPaths: false))
+
+  var markerStep = -1
+  for ev in doc["events"]:
+    if isCorrelationMarker(ev):
+      markerStep = ev["step_id"].getInt()
+  doAssert markerStep >= 0, "the declared marker must reach the event stream"
+
+  let data = readCtfsFromFile(path).get()
+  var idx = openCorrmarkIndex(readNamespace(data).get()).get()
+  let entries = idx.allEntries().get()
+  doAssert entries.len == 2, "expected the boundary and the span coverage"
+  for e in entries:
+    doAssert int(e.geid) == markerStep,
+      "the index coordinate and the payload's step must be the SAME number; " &
+      "payload step_id=" & $markerStep & " index geid=" & $e.geid
+
+  # And that number is the ENCLOSING step — the last one emitted — not one past
+  # it. Five steps were registered, so the enclosing step is index 4.
+  doAssert markerStep == 4,
+    "a marker attaches to the enclosing step; got " & $markerStep
+
+  removeFile(path)
+  echo "PASS: test_payload_step_and_index_geid_are_one_number"
+
 when isMainModule:
   test_marker_payload_decodes_through_ct_print()
   test_marker_mints_no_step()
@@ -331,5 +382,6 @@ when isMainModule:
   test_span_coverage_is_indexed_and_confirmable()
   test_span_ids_are_wire_bytes_not_hex()
   test_index_is_enumerable_for_inspection()
+  test_payload_step_and_index_geid_are_one_number()
   test_absence_is_distinguishable()
   echo "=== correlation marker API tests passed ==="

@@ -1222,6 +1222,19 @@ proc ptrLenToString(p: ptr UncheckedArray[byte], n: csize_t): string =
   for i in 0 ..< int(n):
     result[i] = char(p[i])
 
+proc enclosingStepId(handle: TraceWriterHandle): uint64 =
+  ## The step a marker or an I/O event declared right now belongs to.
+  ##
+  ## NOT `stepCount - 1`. `trace_writer_register_step` only BUFFERS its step, so
+  ## that values registered afterwards still attach to it, and a marker is
+  ## declared while that step is still pending — so the buffered step will take
+  ## index `stepCount`, and `stepCount - 1` names the PREVIOUS one. Attributing
+  ## output to the previous step is issue #601, and the same accounting
+  ## `trace_writer_next_step_index` documents.
+  if handle.hasPendingStep: handle.msWriter.stepCount
+  elif handle.msWriter.stepCount > 0: handle.msWriter.stepCount - 1
+  else: 0'u64
+
 proc trace_writer_ensure_marker_id(
     handle: TraceWriterHandle,
     label: ptr UncheckedArray[byte], label_len: csize_t,
@@ -1276,7 +1289,8 @@ proc trace_writer_mark_correlation_by_id(
     ptrLenToString(show_value, show_value_len),
     ptrLenToString(description, description_len),
     ptrLenToString(key_text, key_text_len),
-    ptrLenToString(show_text, show_text_len))
+    ptrLenToString(show_text, show_text_len),
+    stepId = some(enclosingStepId(handle)))
   (if res.isOk: 0.cint else: 1.cint)
 
 proc trace_writer_mark_correlation(
@@ -1328,7 +1342,8 @@ proc trace_writer_mark_correlation(
     let res = handle.msWriter.registerCorrelationMarker(
       dir, boundary, key, show, desc,
       ptrLenToString(key_text, key_text_len),
-      ptrLenToString(show_text, show_text_len))
+      ptrLenToString(show_text, show_text_len),
+      stepId = some(enclosingStepId(handle)))
     return (if res.isOk: 0.cint else: 1.cint)
   1.cint
 
@@ -1372,7 +1387,8 @@ proc trace_writer_mark_span_coverage(
   for i in 0 ..< int(span_id_len): spanBytes[i] = span_id[i]
 
   let res = handle.msWriter.registerSpanCoverage(
-    traceBytes, spanBytes, wall_time_unix_ns, monotonic_time_ns)
+    traceBytes, spanBytes, wall_time_unix_ns, monotonic_time_ns,
+    stepId = some(enclosingStepId(handle)))
   if res.isErr:
     setError(res.error)
     return 1.cint
@@ -1405,7 +1421,8 @@ proc trace_writer_mark_span_coverage_hex(
   let res = handle.msWriter.registerSpanCoverageHex(
     ptrLenToString(trace_id_hex, trace_id_hex_len),
     ptrLenToString(span_id_hex, span_id_hex_len),
-    wall_time_unix_ns, monotonic_time_ns)
+    wall_time_unix_ns, monotonic_time_ns,
+    stepId = some(enclosingStepId(handle)))
   if res.isErr:
     setError(res.error)
     return 1.cint

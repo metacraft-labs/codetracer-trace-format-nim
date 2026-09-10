@@ -1409,7 +1409,8 @@ proc ensureMarkerId*(w: var MultiStreamTraceWriter, label: string):
 proc registerCorrelationMarkerById*(w: var MultiStreamTraceWriter,
     direction: string, markerId: uint64, boundaryLabel: string,
     keyValue: string, showValue: string = "", description: string = "",
-    keyText: string = "key", showText: string = ""):
+    keyText: string = "key", showText: string = "",
+    stepId: Option[uint64] = none(uint64)):
     Result[void, string] =
   ## Declare a correlation marker against an already-interned label id.
   ##
@@ -1435,6 +1436,23 @@ proc registerCorrelationMarkerById*(w: var MultiStreamTraceWriter,
   ## the call sits on.  Minting one would insert an exec-stream event no user
   ## code executed and shift every later step index, which is what spans'
   ## `start_step`/`end_step` are measured in.
+  ##
+  ## `stepId` names that enclosing step, and **one value serves both halves**:
+  ## the `MarkerPayload` event's `step_id` and the index entry's `geid`. They
+  ## MUST be the same number. They were not: the event defaulted to
+  ## `stepCount - 1` while the index recorded `stepCount`, so a single marker
+  ## carried two different coordinates and a consumer that resumed from the
+  ## index landed one step away from where `ct print` showed the marker. Found
+  ## by the JavaScript recorder while becoming a thin binding, which is
+  ## precisely the review §11a.2 asks a binding to perform on this API.
+  ##
+  ## `none` means "the last step this writer emitted", which is right for a
+  ## caller that writes its steps eagerly. A caller that BUFFERS a step — the
+  ## C ABI does, so values registered after `trace_writer_register_step` still
+  ## attach to it — must pass the id explicitly, because at marker time the
+  ## step for the marker's own line has not been emitted yet and
+  ## `stepCount - 1` names the previous one (issue #601, the same accounting
+  ## `trace_writer_register_special_event` documents).
   ##
   ## `keyText` and `showText` are the NAMES the two values were read under —
   ## `key_text` is the textual form of the `key=<expr>` declaration, and
@@ -1476,16 +1494,22 @@ proc registerCorrelationMarkerById*(w: var MultiStreamTraceWriter,
   var metaBytes = newSeq[byte](payload.len)
   for k, c in payload:
     metaBytes[k] = byte(c)
-  ?w.registerIOEvent(ioStdout, [], metaBytes)
+  let enclosingStep =
+    if stepId.isSome: stepId.get()
+    elif w.stepCount > 0: w.stepCount - 1
+    else: 0'u64
+
+  ?w.registerIOEvent(ioStdout, [], metaBytes, stepId = some(enclosingStep))
 
   w.correlationMarkers.add(initBoundaryMarker(
-    markerId, keyValue, isRecv = dir == "recv", geid = w.stepCount))
+    markerId, keyValue, isRecv = dir == "recv", geid = enclosingStep))
   ok()
 
 proc registerCorrelationMarker*(w: var MultiStreamTraceWriter,
     direction: string, boundaryId: string, keyValue: string,
     showValue: string = "", description: string = "",
-    keyText: string = "key", showText: string = ""):
+    keyText: string = "key", showText: string = "",
+    stepId: Option[uint64] = none(uint64)):
     Result[void, string] =
   ## String-label convenience: interns `boundaryId`, then forwards.
   ##
@@ -1495,12 +1519,13 @@ proc registerCorrelationMarker*(w: var MultiStreamTraceWriter,
   let id = ?w.ensureMarkerId(boundaryId)
   w.registerCorrelationMarkerById(
     direction, id, boundaryId, keyValue, showValue, description,
-    keyText, showText)
+    keyText, showText, stepId)
 
 proc registerSpanCoverage*(w: var MultiStreamTraceWriter,
     traceIdBe: openArray[byte], spanIdBe: openArray[byte],
     wallTimeUnixNs: uint64, monotonicTimeNs: uint64,
-    threadId: uint64 = 0, isExit: bool = false): Result[void, string] =
+    threadId: uint64 = 0, isExit: bool = false,
+    stepId: Option[uint64] = none(uint64)): Result[void, string] =
   ## Declare that this recording covers a distributed-trace span
   ## (`corrmark.ns` kind 0).
   ##
@@ -1519,26 +1544,35 @@ proc registerSpanCoverage*(w: var MultiStreamTraceWriter,
   ## make the pairing index try to pair spans with each other (contract
   ## §10.2).  One index, two kinds; two payload shapes.
   ##
-  ## `geid` is the current step count — the coordinate a consumer resumes
-  ## replay from.  No step is minted, for the reason in §11a.6.
+  ## `geid` is the ENCLOSING step — the coordinate a consumer resumes replay
+  ## from — and follows the same rule as a boundary marker's: `none` means the
+  ## last step this writer emitted, and a caller that buffers its steps (the C
+  ## ABI) passes the id explicitly. No step is minted, for the reason in
+  ## §11a.6.
   if w.closed:
     return err("writer is closed")
+  let enclosingStep =
+    if stepId.isSome: stepId.get()
+    elif w.stepCount > 0: w.stepCount - 1
+    else: 0'u64
   let m = ?initSpanMarker(traceIdBe, spanIdBe, wallTimeUnixNs,
-    monotonicTimeNs, geid = w.stepCount, threadId = threadId, isExit = isExit)
+    monotonicTimeNs, geid = enclosingStep, threadId = threadId,
+    isExit = isExit)
   w.correlationMarkers.add(m)
   ok()
 
 proc registerSpanCoverageHex*(w: var MultiStreamTraceWriter,
     traceIdHex: string, spanIdHex: string,
     wallTimeUnixNs: uint64, monotonicTimeNs: uint64,
-    threadId: uint64 = 0, isExit: bool = false): Result[void, string] =
+    threadId: uint64 = 0, isExit: bool = false,
+    stepId: Option[uint64] = none(uint64)): Result[void, string] =
   ## Hex convenience over `registerSpanCoverage`, for callers whose OTel API
   ## hands them the canonical 32/16-character hex ids.  A WRAPPER: the byte
   ## form stays primary so the conversion has exactly one implementation.
   let traceId = ?decodeHexId(traceIdHex, 16)
   let spanId = ?decodeHexId(spanIdHex, 8)
   w.registerSpanCoverage(traceId, spanId, wallTimeUnixNs, monotonicTimeNs,
-    threadId, isExit)
+    threadId, isExit, stepId)
 
 proc registerRaise*(w: var MultiStreamTraceWriter, exceptionTypeId: uint64,
     message: openArray[byte]): Result[void, string] =
