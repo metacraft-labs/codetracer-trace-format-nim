@@ -849,7 +849,10 @@ proc trace_writer_start(
   if handle.useMultiStream:
     if not handle.msWriterReady:
       return
-    let pathIdRes = handle.msWriter.registerPath(p)
+    # GDH-M1 §6.1: the string-taking step path resolves to the path’s
+    # CURRENT version. Identical to `registerPath(p)` for every recorder
+    # that never registers a second version of a file.
+    let pathIdRes = handle.msWriter.pathIdForStep(p)
     if pathIdRes.isErr:
       # These entry points return void, so `last_error` is the only signal
       # a C caller has. Returning silently makes a refused registration
@@ -1023,7 +1026,10 @@ proc trace_writer_register_step(
     # Flush the previous pending step (with its accumulated values)
     discard flushPendingStep(handle)
 
-    let pathIdRes = handle.msWriter.registerPath(p)
+    # GDH-M1 §6.1: the string-taking step path resolves to the path’s
+    # CURRENT version. Identical to `registerPath(p)` for every recorder
+    # that never registers a second version of a file.
+    let pathIdRes = handle.msWriter.pathIdForStep(p)
     if pathIdRes.isErr:
       # These entry points return void, so `last_error` is the only signal
       # a C caller has. Returning silently makes a refused registration
@@ -1868,7 +1874,10 @@ proc ct_assignment_with_column(
     if not handle.msWriterReady:
       return
     discard flushPendingStep(handle)
-    let pathIdRes = handle.msWriter.registerPath(p)
+    # GDH-M1 §6.1: the string-taking step path resolves to the path’s
+    # CURRENT version. Identical to `registerPath(p)` for every recorder
+    # that never registers a second version of a file.
+    let pathIdRes = handle.msWriter.pathIdForStep(p)
     if pathIdRes.isErr:
       # These entry points return void, so `last_error` is the only signal
       # a C caller has. Returning silently makes a refused registration

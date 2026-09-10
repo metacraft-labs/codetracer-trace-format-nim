@@ -8,6 +8,7 @@
 
 import results
 import std/options
+import std/tables
 import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
 import ../codetracer_ctfs/variable_record_table
@@ -82,6 +83,30 @@ type
     # `path` answers from the parse the open already did rather than
     # re-deriving the framing per call.  Parallel to `lineCounts`.
     lineCountPayloads: seq[string]
+    # GDH-M1 / design §7.0 — the VERSION ORDINAL of every path entry,
+    # 0-based and in path-id order: 0 for the first entry carrying a
+    # given interning payload, 1 for the second, and so on.  Parallel to
+    # the paths.dat records, one entry per id, computed once at open.
+    #
+    # `paths.dat` needs no new layout for this: a second version of a
+    # file is a second record with the SAME payload and its own line
+    # count, so the ordinal is a property the container already states
+    # and this is where it is recovered.  A legacy trace, whose payloads
+    # are all distinct, yields 0 everywhere — which is exactly what
+    # `Location.source_generation` already promises for such traces, so
+    # no existing trace changes behaviour.
+    #
+    # Keyed on the interning PAYLOAD rather than on the split path
+    # (`splitInterningPayload`): the qualifier is a producer namespace
+    # (Interning-Table-Coexistence §2), so "gdscript\x1ffoo.gd" and
+    # "mcr\x1ffoo.gd" are two producers' files and not two versions of
+    # one.  Collapsing them would attribute a native recorder's file to
+    # a VM reload.
+    pathVersionOrdinals: seq[uint64]
+    # Total number of entries sharing each id's payload.  `1` for every
+    # id in a trace with no versioned paths.  Parallel to
+    # `pathVersionOrdinals`.
+    pathVersionTotals: seq[uint64]
     # Advisory: the trace declares line-only paths.dat records, yet every
     # record also decodes as a complete Layout A record.  Surfaced by
     # `columnAwarePathsSuspected`; never used to reinterpret data.
@@ -441,6 +466,39 @@ proc parseLineCountPathRecords(pathReader: InterningTableReader):
     counts[i] = count
   ok((payloads, counts))
 
+proc path*(r: NewTraceReader, id: uint64): Result[string, string]
+  ## Forward declaration — the ordinal pass below reads every record's
+  ## payload through the SAME accessor a consumer does, so the two can
+  ## never disagree about what a record's string is.
+
+proc computePathVersionOrdinals(r: var NewTraceReader): Result[void, string] =
+  ## GDH-M1 — assign every ``paths.dat`` entry its 0-based version
+  ## ordinal, in path-id order, and count how many entries share each
+  ## payload.
+  ##
+  ## Linear in the number of paths and run once at open, so
+  ## ``pathVersionOrdinal`` is O(1). It is computed EAGERLY rather than
+  ## lazily because a lazy answer would have to be recomputed after a
+  ## ``refresh``, and a stale ordinal is the kind of wrong answer that
+  ## reads as a legitimate one.
+  let total = r.pathReader.count()
+  r.pathVersionOrdinals = newSeq[uint64](int(total))
+  r.pathVersionTotals = newSeq[uint64](int(total))
+  var seen = initTable[string, seq[uint64]]()
+  for id in 0'u64 ..< total:
+    let payloadRes = r.path(id)
+    if payloadRes.isErr:
+      return err("paths.dat[" & $id & "]: " & payloadRes.error)
+    let payload = payloadRes.get()
+    var ids = seen.getOrDefault(payload, @[])
+    r.pathVersionOrdinals[int(id)] = uint64(ids.len)
+    ids.add(id)
+    seen[payload] = ids
+  for _, ids in seen:
+    for id in ids:
+      r.pathVersionTotals[int(id)] = uint64(ids.len)
+  ok()
+
 # ---------------------------------------------------------------------------
 # Opening
 # ---------------------------------------------------------------------------
@@ -635,6 +693,13 @@ proc openNewTraceFromBytes*(data: seq[byte],
       if pathId < pathCount:
         reader.sourceViewsByPath[int(pathId)].add(i)
 
+  # GDH-M1 — the version ordinals, computed after every layout decision
+  # above has been made, so the payload each ordinal is keyed on is the
+  # one `path()` answers with.
+  let ordRes = reader.computePathVersionOrdinals()
+  if ordRes.isErr:
+    return err(ordRes.error)
+
   ok(reader)
 
 when ctHasFilesystem:
@@ -746,6 +811,58 @@ proc columnAwarePathsSuspected*(r: NewTraceReader): bool =
 
 proc pathCount*(r: NewTraceReader): uint64 =
   r.pathReader.count()
+
+# ---------------------------------------------------------------------------
+# Versioned paths (GDH-M1 — design §6.1 / §7.0)
+# ---------------------------------------------------------------------------
+
+proc pathVersionOrdinal*(r: NewTraceReader,
+    id: uint64): Result[uint64, string] =
+  ## The 0-based VERSION ORDINAL of path ``id``: 0 for the first entry in
+  ## ``paths.dat`` carrying this entry's string, 1 for the second, and so
+  ## on in path-id order.
+  ##
+  ## This is what design §7.0 requires ``Location.source_generation`` to
+  ## be populated from. It is 0 for every id of a trace whose paths are
+  ## all distinct — every trace written before versioned paths existed —
+  ## which is what that field's own documentation already promises.
+  ##
+  ## It is deliberately NOT "how many reloads happened": a reload that
+  ## touched a file never executed again adds no entry, and the wire
+  ## generation the observer sent starts at 1 rather than 0. The two are
+  ## off by one by construction and the reload marker records the mapping
+  ## rather than leaving it to be inferred.
+  if id >= uint64(r.pathVersionOrdinals.len):
+    return err("pathVersionOrdinal: path id " & $id & " is out of range (" &
+      $r.pathVersionOrdinals.len & " path(s) in paths.dat)")
+  ok(r.pathVersionOrdinals[int(id)])
+
+proc pathVersionCount*(r: NewTraceReader,
+    id: uint64): Result[uint64, string] =
+  ## How many ``paths.dat`` entries — including ``id`` itself — carry
+  ## ``id``'s string. ``1`` for an unversioned path.
+  if id >= uint64(r.pathVersionTotals.len):
+    return err("pathVersionCount: path id " & $id & " is out of range (" &
+      $r.pathVersionTotals.len & " path(s) in paths.dat)")
+  ok(r.pathVersionTotals[int(id)])
+
+proc pathIdsForString*(r: NewTraceReader, payload: string): seq[uint64] =
+  ## Every path id whose ``paths.dat`` string equals ``payload``, in
+  ## path-id order — so index 0 is the earliest version.
+  ##
+  ## This is the shape design §7.1 requires of a reader's path map: a
+  ## string maps to an ORDERED LIST of ids, never to one id. A last-wins
+  ## map answers a pre-reload lookup with the post-reload file, which is
+  ## a wrong answer that looks like a right one.
+  ##
+  ## An empty result means the string is not in this trace; it never
+  ## means "ambiguous". A caller that must pick one version picks it by
+  ## version, not by the size of the candidate set.
+  result = @[]
+  for id in 0'u64 ..< r.pathCount():
+    let p = r.path(id)
+    if p.isOk and p.get() == payload:
+      result.add(id)
 
 # ---------------------------------------------------------------------------
 # Alternate source views (Deminification Support).  See spec §

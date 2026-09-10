@@ -115,6 +115,13 @@ task test, "Run all tests":
   # file's count addresses the next file and nothing downstream can tell
   # that apart from a real location — so the writer refuses it.
   exec "nim c -r -d:release -p:src tests/test_line_count_table.nim"
+  # GDH-M1 — a path may be registered more than once (`registerPathVersion`),
+  # each version gets its own correctly sized slot, and v1's addresses do not
+  # move. The named falsifier arms for these four gates live behind
+  # `-d:gdh1FalsifierArms` and are run by `tests/run_gdh1_gates.sh`, which
+  # requires each one to turn its own gate red; they are deliberately not in
+  # this corpus, whose members must all pass.
+  exec "nim c -r -d:release -p:src tests/test_gdh1_path_versions.nim"
   # The schema break that carries the corrected encode. A container written
   # under the superseded prefixSum[path_id] + line reads one line high under
   # the current decode -- silently, because the address is INSIDE the space

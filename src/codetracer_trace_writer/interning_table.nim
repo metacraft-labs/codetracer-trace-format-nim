@@ -148,6 +148,65 @@ proc ensurePathIdColumnAware*(ctfs: var Ctfs, it: var InterningTableWriter,
   it.lookup[path] = id
   ok(id)
 
+proc zeroLineCountDiagnostic*(path: string): string =
+  ## THE named diagnostic for a line-count-table record offered without a
+  ## count. Extracted into one proc rather than duplicated because two
+  ## call sites now raise it — ``ensureQualifiedPathIdWithLineCount``
+  ## (the deduping registration) and ``appendQualifiedPathWithLineCount``
+  ## (the versioned append) — and a second version of a file is exactly
+  ## the case where an implementer is tempted to let the count slide.
+  ## Two spellings of "the same" refusal is how a gate that asserts the
+  ## refusal by name stops discriminating.
+  "paths.dat: a line-count-table record needs a non-zero " &
+    "line_count for " & path & " — a file sized 0 shares its base with " &
+    "the next file, and the two are indistinguishable at decode. A " &
+    "writer that cannot count the file's lines records the ceiling it " &
+    "uses instead"
+
+proc appendQualifiedPathWithLineCount*(ctfs: var Ctfs,
+    it: var InterningTableWriter, qualifier, path: string,
+    lineCount: uint64): Result[uint64, string] =
+  ## Append a line-count-table ``paths.dat`` record for ``path`` WITHOUT
+  ## consulting the dedup lookup — the versioned-path registration
+  ## (design §6.1, ``registerPathVersion``).
+  ##
+  ## The record layout is exactly ``ensureQualifiedPathIdWithLineCount``'s
+  ## — ``payload_len + payload + line_count`` — and the payload is
+  ## byte-identical to the one an earlier version of the same path
+  ## already stored. That is the whole point: **a version is a path
+  ## index, never a path string.** Nothing is appended to the payload, no
+  ## generation is interposed into it, and no suffix is added, because
+  ## every consumer that resolves a user-supplied path resolves it by
+  ## string.
+  ##
+  ## The lookup is UPDATED to the new id rather than left alone. A path
+  ## string has exactly one *current* version, and the interning table is
+  ## the only place a later bare ``registerPath(path)`` can learn it; a
+  ## lookup left pointing at the superseded record would make the writer
+  ## and its own interning table disagree about which file a step-by-name
+  ## belongs to — the same class of mirrored-state defect that design
+  ## §6.4 requires deleting from the Godot fork, reintroduced one layer
+  ## down.
+  let payload = qualifiedPayload(qualifier, path)
+  if lineCount == 0:
+    return err(zeroLineCountDiagnostic(path))
+
+  let id = it.nextId
+  it.nextId += 1
+
+  var record: seq[byte] = @[]
+  encodeVarint(uint64(payload.len), record)
+  for i in 0 ..< payload.len:
+    record.add(byte(payload[i]))
+  encodeVarint(lineCount, record)
+
+  let appendRes = ctfs.append(it.table, record)
+  if appendRes.isErr:
+    return err(appendRes.error)
+
+  it.lookup[payload] = id
+  ok(id)
+
 proc ensureQualifiedPathIdWithLineCount*(ctfs: var Ctfs,
     it: var InterningTableWriter, qualifier, path: string,
     lineCount: uint64): Result[uint64, string] =
@@ -189,11 +248,7 @@ proc ensureQualifiedPathIdWithLineCount*(ctfs: var Ctfs,
     # to the record, not to the call.
     return ok(existing)
   if lineCount == 0:
-    return err("paths.dat: a line-count-table record needs a non-zero " &
-      "line_count for " & path & " — a file sized 0 shares its base with " &
-      "the next file, and the two are indistinguishable at decode. A " &
-      "writer that cannot count the file's lines records the ceiling it " &
-      "uses instead")
+    return err(zeroLineCountDiagnostic(path))
 
   let id = it.nextId
   it.nextId += 1
@@ -328,6 +383,13 @@ proc ensureQualifiedPathIdWithLineCount*(ctfs: var Ctfs,
   ## ``ensureQualifiedPathIdWithLineCount`` on ``InterningTableWriter``
   ## for the on-disk layout.
   ctfs.ensureQualifiedPathIdWithLineCount(t.paths, qualifier, path, lineCount)
+
+proc appendQualifiedPathWithLineCount*(ctfs: var Ctfs,
+    t: var TraceInterningTables, qualifier, path: string,
+    lineCount: uint64): Result[uint64, string] =
+  ## Wrapper for the NON-deduping versioned append (GDH-M1, design §6.1).
+  ## See ``appendQualifiedPathWithLineCount`` on ``InterningTableWriter``.
+  ctfs.appendQualifiedPathWithLineCount(t.paths, qualifier, path, lineCount)
 
 proc ensureQualifiedFunctionId*(ctfs: var Ctfs, t: var TraceInterningTables,
     qualifier, name: string): Result[uint64, string] =

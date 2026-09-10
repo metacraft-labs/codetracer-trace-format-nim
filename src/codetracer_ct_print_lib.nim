@@ -24,6 +24,7 @@ import std/[json, strutils, base64, algorithm]
 import results
 import codetracer_trace_writer/new_trace_reader
 import codetracer_trace_writer/meta_dat
+import codetracer_trace_writer/meta_flags_json
 import codetracer_trace_writer/step_encoding
 import codetracer_trace_writer/call_stream as v4calls
 import codetracer_trace_writer/io_event_stream
@@ -323,32 +324,9 @@ proc buildFullDocument*(reader: var NewTraceReader,
   meta["recorder"] = newJString(reader.meta.recorderId)
 
   # ----- meta.dat flag bits surfaced under `metadata.flags` -----
-  # Stable JSON anchor for golden tests: every flag bit gets its
-  # own boolean field, defaulting false on traces written before
-  # the flag was introduced.  Currently only the column-aware flag
-  # is exposed here; further flags follow the same pattern.
-  var flagsObj = newJObject()
-  flagsObj["has_column_aware_steps"] = newJBool(reader.meta.hasColumnAwareSteps)
-  flagsObj["has_alternate_source_views"] = newJBool(
-    reader.meta.hasAlternateSourceViews)
-  flagsObj["supports_column_breakpoints"] = newJBool(
-    reader.meta.supportsColumnBreakpoints)
-  flagsObj["supports_column_motions"] = newJBool(
-    reader.meta.supportsColumnMotions)
-  flagsObj["has_call_stream"] = newJBool(reader.meta.hasCallStream)
-  flagsObj["has_step_stream"] = newJBool(reader.meta.hasStepStream)
-  flagsObj["has_value_stream"] = newJBool(reader.meta.hasValueStream)
-  flagsObj["has_io_event_stream"] = newJBool(reader.meta.hasIoEventStream)
-  flagsObj["has_interning_tables"] = newJBool(reader.meta.hasInterningTables)
-  flagsObj["has_correlation_index"] = newJBool(reader.meta.hasCorrelationIndex)
-  # Whether the container STATES how large each of its files is, or leaves a
-  # reader to assume `DefaultLinesPerFile` for every one of them. False is the
-  # answer for every trace written before bit 14 existed, and it is the one an
-  # operator needs when a step's reported line looks wrong: under the
-  # assumption a file with more lines than the ceiling has its lines addressed
-  # inside the next file's range, and no reader can detect that.
-  flagsObj["has_line_count_table"] = newJBool(reader.meta.hasLineCountTable)
-  meta["flags"] = flagsObj
+  # ONE rendering, shared with the shipped `codetracer_ct_print` CLI — see
+  # `meta_flags_json`'s header for the drift this replaces.
+  meta["flags"] = metaFlagsJson(reader.meta)
   # Reader diagnostic, deliberately outside `flags` because it is not a
   # meta.dat bit: true when the trace declares line-only steps yet every
   # paths.dat record also decodes as a column-aware Layout A record. Either
@@ -390,6 +368,29 @@ proc buildFullDocument*(reader: var NewTraceReader,
     pathsArr.add(newJString(
       normalizePath(s, reader.meta.workdir, opts.stripPaths)))
   root["paths"] = pathsArr
+
+  # ----- path_versions (GDH-M1, design §6.1 / §7.0) -----
+  # Parallel to `paths`, one entry per path id: the file's own line count
+  # as the container states it, the 0-based version ordinal of this entry
+  # among the entries sharing its string, and how many such entries there
+  # are. `paths` stays a plain array of strings so every existing golden
+  # and consumer is untouched; this is where the index-is-the-version
+  # property becomes readable without linking the reader.
+  var pathVersionsArr = newJArray()
+  for i in 0'u64 ..< reader.pathCount():
+    var vObj = newJObject()
+    vObj["path_id"] = newJInt(int64(i))
+    let vo = reader.pathVersionOrdinal(i)
+    vObj["version_ordinal"] = if vo.isOk: newJInt(int64(vo.get()))
+                              else: newJInt(-1)
+    let vc = reader.pathVersionCount(i)
+    vObj["version_count"] = if vc.isOk: newJInt(int64(vc.get()))
+                            else: newJInt(-1)
+    # 0 means "this container does not state this file's size", not "the
+    # file has no lines" — see `recordedLineCount`.
+    vObj["recorded_line_count"] = newJInt(int64(reader.recordedLineCount(i)))
+    pathVersionsArr.add(vObj)
+  root["path_versions"] = pathVersionsArr
 
   # ----- functions -----
   var funcsArr = newJArray()
@@ -523,6 +524,17 @@ proc buildFullDocument*(reader: var NewTraceReader,
         let (pathId, line) = loc.get()
         stepObj["path_id"] = newJInt(int64(pathId))
         stepObj["line"] = newJInt(int64(line))
+        # GDH-M1 — which VERSION of that file the step ran in: the
+        # 0-based ordinal of `path_id` among the paths.dat entries
+        # carrying its string. Always emitted, including the `0` every
+        # legacy trace answers with, because a consumer must be able to
+        # tell "this file was never reloaded" from "this ct-print
+        # predates versioned paths" — a key that appears only when a
+        # version exists makes a scan for it pass on a trace that has
+        # none AND on a build that cannot see one.
+        let vOrd = reader.pathVersionOrdinal(uint64(pathId))
+        stepObj["path_version_ordinal"] =
+          if vOrd.isOk: newJInt(int64(vOrd.get())) else: newJInt(-1)
         let pStr = reader.path(uint64(pathId))
         if pStr.isOk:
           stepObj["path"] = newJString(

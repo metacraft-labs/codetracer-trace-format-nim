@@ -10,6 +10,7 @@
 ## single-stream events.log + meta.json + paths.json.
 
 import std/options
+import std/tables
 import results
 import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
@@ -212,6 +213,27 @@ type
       ## the file has.  Parallel to ``paths``.  Populated only when
       ## ``lineCountTable`` is on, in which case ``registerPath``
       ## requires a count for every path and no entry is ever zero.
+    currentPathVersions: Table[string, uint64]
+      ## GDH-M1 / design §6.1 — per path STRING, the id of the most
+      ## recently registered version of that file.
+      ##
+      ## Populated only by ``registerPathVersion``; a writer that never
+      ## registers a second version leaves it empty and every lookup
+      ## through it falls back to ``registerPath``, which is why an
+      ## existing recorder's output is unchanged byte-for-byte.
+      ##
+      ## It exists so the STRING-taking step path stays version-unaware:
+      ## the Godot fork's hot path is
+      ## ``trace_writer_register_step(handle, path_string, line)``, and
+      ## after a reload that string must resolve to the NEWEST index
+      ## without the caller knowing a reload happened. Only the reload
+      ## path is version-aware.
+      ##
+      ## Keyed on the bare path string rather than on the interning
+      ## payload: the qualifier is a per-writer producer namespace
+      ## (§6.2), constant for the lifetime of this writer, so within one
+      ## writer the two keys are in bijection — and the callers that ask
+      ## this question hold a path, not a payload.
 
     # Global line index (rebuilt when paths change)
     gli: GlobalLineIndex
@@ -828,6 +850,208 @@ proc registerPath*(w: var MultiStreamTraceWriter,
   ok(id)
 
 # ---------------------------------------------------------------------------
+# Versioned paths (GDH-M1 — design §6.1 of
+# ``codetracer-specs/Planned-Features/GDScript-Hot-Reload-Multi-Version-Sources.md``)
+#
+# The fault-injection arms below are what the campaign's falsifier clauses
+# name, compiled in ONLY when BOTH ``-d:gdh1FalsifierArms`` (the master
+# switch) and the arm's own define are given. Two defines rather than one so
+# that no single stray ``-d:`` can arm a mutation in a shipped build, and so
+# that a build carrying one is self-evident: the master switch emits a
+# compile-time warning. ``tests/test_gdh1_path_versions.nim`` asserts its own
+# inertness — a green run refuses to report PASS unless every arm is off.
+# ---------------------------------------------------------------------------
+
+when defined(gdh1FalsifierArms):
+  {.warning: "gdh1FalsifierArms: versioned-path fault injection is COMPILED IN. This build must never be shipped or measured as a green result.".}
+
+template gdh1Arm*(name: untyped): bool =
+  ## True iff the named falsifier arm is armed — the master switch AND the
+  ## arm's own define. Always a compile-time constant, so an unarmed build
+  ## contains none of the mutated code.
+  when defined(gdh1FalsifierArms): defined(name) else: false
+
+proc activeGdh1FalsifierArm*(): string =
+  ## The name of the armed falsifier mutation, or "" when none is.
+  ## Used by the gate to prove its own green run measured the real writer.
+  if gdh1Arm(gdh1FalsifyDedup): "gdh1FalsifyDedup"
+  elif gdh1Arm(gdh1FalsifyDefaultSlot): "gdh1FalsifyDefaultSlot"
+  elif gdh1Arm(gdh1FalsifyNoMirror): "gdh1FalsifyNoMirror"
+  elif gdh1Arm(gdh1FalsifyMangle): "gdh1FalsifyMangle"
+  elif gdh1Arm(gdh1FalsifyOverwrite): "gdh1FalsifyOverwrite"
+  elif gdh1Arm(gdh1FalsifyPrepend): "gdh1FalsifyPrepend"
+  elif gdh1Arm(gdh1FalsifyNoBoundsCheck): "gdh1FalsifyNoBoundsCheck"
+  elif gdh1Arm(gdh1FalsifyGlobalCurrent): "gdh1FalsifyGlobalCurrent"
+  elif gdh1Arm(gdh1FalsifyVersionWithoutTable): "gdh1FalsifyVersionWithoutTable"
+  else: ""
+
+template gdh1VersionKey(path: string): string =
+  ## The key ``currentPathVersions`` is indexed by.
+  ##
+  ## FALSIFIER (``gdh1FalsifyGlobalCurrent``, GDH-G1): collapse it to a
+  ## single global "most recently registered version" instead of one entry
+  ## per path string. That is the cheapest way to write the map, it makes
+  ## every assertion about the RELOADED file pass, and it silently
+  ## re-points every OTHER file's steps at the reloaded file's newest id.
+  ## The gate's `pathIdForStep` on an unrelated path is what catches it.
+  when gdh1Arm(gdh1FalsifyGlobalCurrent): ""
+  else: path
+
+proc registerPathVersion*(w: var MultiStreamTraceWriter,
+    path: string, lineCount: uint64): Result[uint64, string] =
+  ## Register a NEW VERSION of an already-registered path, and return the
+  ## new version's path id. Design §6.1.
+  ##
+  ## Unlike ``registerPath`` this **bypasses the interning lookup and
+  ## always appends** a ``paths.dat`` record. The payload is
+  ## byte-identical to the earlier version's — the virtual path string is
+  ## the same file, and only the INDEX discriminates the version. Nothing
+  ## is appended to, prefixed to, or interposed into the string; a
+  ## consumer that resolves a user-supplied ``res://foo.gd`` must keep
+  ## resolving it after a reload.
+  ##
+  ## The new version gets its OWN slot in the global position space,
+  ## sized to its own line count, appended after every existing file. That
+  ## is the arithmetic the feature rests on: v1's slot keeps its base and
+  ## its size, so every address already emitted against v1 still decodes
+  ## to v1, while v2's lines — which may lie past the end of v1 — get
+  ## addresses of their own instead of spilling into the next file.
+  ##
+  ## Requires the line-count table. Without it a ``paths.dat`` record has
+  ## nowhere to put a size, both versions would be laid out at the
+  ## ``DefaultLinesPerFile`` stride, and neither the writer's
+  ## ``checkLineWithinFile`` nor any reader could bound a version against
+  ## its own count — the mis-attribution would be silent, which is the
+  ## defect this milestone exists to remove rather than to inherit.
+  ##
+  ## Refused on a column-aware writer for the same reason
+  ## ``enableLineCountTable`` is: a Layout A record sizes its file in
+  ## addressable columns and carries its own count, so versioning there
+  ## is a different (and unbuilt) arithmetic.
+  if w.closed:
+    return err("writer is closed")
+  if w.columnAwareSteps:
+    return err("registerPathVersion: this writer is column-aware, whose " &
+      "paths.dat records size a file in addressable columns; versioned " &
+      "paths are defined for the line-only line-count-table layout")
+  # FALSIFIER (``gdh1FalsifyVersionWithoutTable``, 4th gate): drop the
+  # requirement that the writer states file sizes. A versioned record then
+  # has nowhere to put its count, both versions are laid out at the
+  # ``DefaultLinesPerFile`` stride, and no bound can be enforced against
+  # either — GDH-M0's silent mis-attribution mode, re-created one layer up.
+  if not w.lineCountTable and not gdh1Arm(gdh1FalsifyVersionWithoutTable):
+    return err("registerPathVersion: this writer has no line-count table, " &
+      "so a second record for " & path & " would carry no size and both " &
+      "versions would be laid out at the DefaultLinesPerFile stride. " &
+      "Neither the writer nor a reader could then bound a version " &
+      "against its own line count and the mis-attribution would be " &
+      "silent. Call enableLineCountTable before the first registerPath")
+
+  let registerName =
+    when gdh1Arm(gdh1FalsifyMangle):
+      # FALSIFIER (GDH-G2): disambiguate by mangling the string. This is
+      # the cheapest way to make "two entries" pass while breaking every
+      # consumer that resolves a path by name.
+      path & "#" & $(w.paths.len + 1)
+    else:
+      path
+  let recordedCount =
+    when gdh1Arm(gdh1FalsifyDefaultSlot):
+      # FALSIFIER (GDH-G1, arm 2): let the new version's slot fall back to
+      # the ceiling instead of stating the file's real size.
+      DefaultLinesPerFile
+    else:
+      lineCount
+
+  when gdh1Arm(gdh1FalsifyOverwrite):
+    # FALSIFIER (GDH-G4, arm 1): resize the EXISTING slot in place instead
+    # of appending a new one — the "just fix the size" cheat. Every file
+    # after the resized one then has its base moved under addresses that
+    # were already emitted.
+    let prevId = w.currentPathVersions.getOrDefault(path, high(uint64))
+    let existing =
+      if prevId != high(uint64): prevId
+      else:
+        var found = high(uint64)
+        for i in 0 ..< w.paths.len:
+          if w.paths[i] == path:
+            found = uint64(i)
+        found
+    if existing != high(uint64):
+      w.pathLineCounts[int(existing)] = lineCount
+      w.gliDirty = true
+      w.currentPathVersions[path] = existing
+      return ok(existing)
+
+  let idRes =
+    when gdh1Arm(gdh1FalsifyDedup):
+      # FALSIFIER (GDH-G1, arm 1): restore dedup — route the versioned
+      # registration back through the interning lookup.
+      w.container.ensureQualifiedPathIdWithLineCount(
+        w.interningPtr[], w.qualifier, registerName, recordedCount)
+    else:
+      w.container.appendQualifiedPathWithLineCount(
+        w.interningPtr[], w.qualifier, registerName, recordedCount)
+  if idRes.isErr:
+    return err(idRes.error)
+  let id = idRes.get()
+
+  if id == uint64(w.paths.len):
+    when gdh1Arm(gdh1FalsifyPrepend):
+      # FALSIFIER (GDH-G4, arm 2): put the new version at index 0 instead
+      # of appending. v1's base moves, so every address emitted against
+      # v1 after this point lands in a different file.
+      w.paths.insert(registerName, 0)
+      w.pathLineLengths.insert(@[], 0)
+      w.pathLineCounts.insert(recordedCount, 0)
+    else:
+      w.paths.add(registerName)
+      w.pathLineLengths.add(@[])
+      when gdh1Arm(gdh1FalsifyNoMirror):
+        # FALSIFIER (GDH-G1, arm 2, literal form): append the record but
+        # NOT the writer's own count, so the slot silently falls back to
+        # DefaultLinesPerFile in the space the steps are encoded in.
+        discard
+      else:
+        w.pathLineCounts.add(recordedCount)
+    w.gliDirty = true
+
+  w.currentPathVersions[gdh1VersionKey(path)] = id
+  ok(id)
+
+proc currentPathId*(w: MultiStreamTraceWriter,
+    path: string): Option[uint64] =
+  ## The id a bare ``registerStep(path, …)`` resolves ``path`` to today —
+  ## the id of its newest registered version — or ``none`` when no
+  ## version of this path has been registered through
+  ## ``registerPathVersion``.
+  ##
+  ## ``none`` is not "unknown": it is "this path has at most one entry,
+  ## so the interning lookup is the answer". Keeping the two apart is
+  ## what lets the FFI mirror be DELETED rather than kept in sync — a
+  ## caller asking this question gets the writer's own state or an
+  ## explicit "ask the interning table", never a re-derivation.
+  let found = w.currentPathVersions.getOrDefault(gdh1VersionKey(path), high(uint64))
+  if found == high(uint64):
+    none(uint64)
+  else:
+    some(found)
+
+proc pathIdForStep*(w: var MultiStreamTraceWriter,
+    path: string): Result[uint64, string] =
+  ## Resolve a path STRING to the id a step recorded now belongs to.
+  ##
+  ## This is the string-taking step path's entry point (design §6.1): the
+  ## newest version when the file has been reloaded, and otherwise
+  ## exactly what ``registerPath(path)`` has always returned — same call,
+  ## same interning, same bytes — so a recorder that never registers a
+  ## version is unaffected.
+  let current = w.currentPathId(path)
+  if current.isSome:
+    return ok(current.get())
+  w.registerPath(path)
+
+# ---------------------------------------------------------------------------
 # Alternate source views (Deminification Support).  Spec §
 # "Alternate Source Views (Deminification Support)" in
 # ``codetracer-trace-format-spec/internal-files.md``.
@@ -900,7 +1124,13 @@ proc registerStep*(w: var MultiStreamTraceWriter, pathId: uint64,
   ## is within a small delta of the previous one.
   if w.closed:
     return err("writer is closed")
-  ? w.checkLineWithinFile(pathId, line)
+  when gdh1Arm(gdh1FalsifyNoBoundsCheck):
+    # FALSIFIER (GDH-M1's fourth gate): drop the per-file bound. The step
+    # is then accepted, encodes into the NEXT file's range, and reads back
+    # as a location that was never recorded.
+    discard
+  else:
+    ? w.checkLineWithinFile(pathId, line)
 
   let gli = w.toGlobalLineIndex(pathId, line)
 

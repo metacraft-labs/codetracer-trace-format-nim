@@ -230,6 +230,13 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_managed_sender.nim", binary: "build/test-bin/test_managed_sender"),
   TestSpec(source: "tests/test_reader_v4.nim", binary: "build/test-bin/test_reader_v4"),
   TestSpec(source: "tests/test_source_views.nim", binary: "build/test-bin/test_source_views"),
+  # GDH-M1 — versioned paths: a path may be registered more than once and
+  # each version gets its own correctly sized slot in the position space.
+  # The FALSIFIER ARMS for these gates are not modelled here: they are
+  # mutations that must FAIL, and a build graph whose nodes must fail is a
+  # graph that cannot distinguish them from broken ones.
+  # `tests/run_gdh1_gates.sh` runs them.
+  TestSpec(source: "tests/test_gdh1_path_versions.nim", binary: "build/test-bin/test_gdh1_path_versions"),
 ]
 
 package codetracer_trace_format_nim:
