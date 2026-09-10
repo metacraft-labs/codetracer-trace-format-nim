@@ -7,6 +7,7 @@ import results
 import codetracer_ctfs/container
 import codetracer_trace_writer/linehits_builder
 import codetracer_trace_writer/multi_stream_writer
+import codetracer_trace_writer/global_line_index
 
 # ---------------------------------------------------------------------------
 # Test: materialized builder (standalone)
@@ -106,10 +107,13 @@ proc test_linehits_via_multi_stream_writer() =
   const NumSteps = 100
   const NumLines = 5
 
-  # Build expected mapping (using global line index)
-  # With DefaultLinesPerFile=100000, file 0, line L -> GLI = L
-  # Lines are 1..5, so GLI values are 1..5
-  var expected: array[NumLines, seq[uint64]]  # index 0..4 maps to GLI 1..5
+  # Expected mapping, keyed by the address the WRITER encodes each line
+  # to. Derived through `global_line_index` rather than restated here: the
+  # apportionment of addresses between files is the writer's convention,
+  # and a test that recomputes it by hand is one more copy to drift.
+  let space = buildGlobalLineIndex(
+    positionSpaceCounts([], [], 1, columnAware = false))
+  var expected: array[NumLines, seq[uint64]]  # index 0..4 maps to lines 1..5
   for i in 0 ..< NumSteps:
     let line = uint64((i mod NumLines) + 1)
     let stepId = uint64(i)
@@ -134,7 +138,7 @@ proc test_linehits_via_multi_stream_writer() =
 
   # Verify linehits via the builder (still accessible after close)
   for idx in 0 ..< NumLines:
-    let gli = uint64(idx + 1)
+    let gli = space.globalIndex(0, uint64(idx + 1))
     let exp = expected[idx]
     let hitsRes = w.linehits.lookupHits(gli)
     doAssert hitsRes.isOk, "lookupHits failed for GLI " & $gli &

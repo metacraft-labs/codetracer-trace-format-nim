@@ -692,9 +692,21 @@ proc decodeCborValueRecordImpl(dec: var CborDecoder): Result[ValueRecord, string
   of "Bool":
     discard ?dec.readTextString()  # "b"
     let b = ?dec.readBool()
-    discard ?dec.readTextString()  # "text"
-    discard ?dec.readTextString()  # value of "text" — derived from b, discarded
-    discard ?dec.readTextString()  # "type_id"
+    # `text` is optional. This writer emits it (map(4), carrying the printed
+    # boolean), but the Rust `ValueRecord::Bool` is `{kind, b, type_id}` —
+    # `text` is derived from `b`, so it was never added there. Reading it
+    # unconditionally made every container holding a boolean undecodable:
+    # the "type_id" key was consumed as the "text" key and the type id
+    # itself, an integer, failed `readTextString` with
+    # "expected text string (major 3), got major 0".
+    # Peek the key and disambiguate, exactly as "Struct" does for its
+    # optional "field_names".
+    var typeIdKey = ?dec.readTextString()
+    if typeIdKey == "text":
+      discard ?dec.readTextString()  # value of "text" — derived from b, discarded
+      typeIdKey = ?dec.readTextString()
+    if typeIdKey != "type_id":
+      return err("cbor: expected 'type_id' in Bool, got '" & typeIdKey & "'")
     let tid = ?dec.readUint()
     ok(ValueRecord(kind: vrkBool, boolVal: b, boolTypeId: TypeId(tid)))
 

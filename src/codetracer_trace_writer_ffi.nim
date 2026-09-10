@@ -33,7 +33,13 @@
 
 import codetracer_trace_writer
 import codetracer_trace_types
-import codetracer_ctfs
+# Import the CTFS submodules this file needs, one by one — NOT the
+# `codetracer_ctfs` umbrella. The umbrella re-exports `split_trace`,
+# `trace_storage_reader`, `network_reader` and `replication`, which reach
+# `createDir`, `walkDir` and the socket API. None of that is reachable on a
+# freestanding target, so pulling the umbrella in here stops this file
+# compiling for `--os:any` (see `tests/test_freestanding_writer_surface.nim`,
+# which is the C ABI's standing proof that it still does).
 # The post-hoc container entry points (`ct_container_create` /
 # `ct_container_append_files`) at the bottom of this file.
 import codetracer_ctfs/types
@@ -142,6 +148,22 @@ type
     pendingCallArgs: seq[CallArg]
 
     ctFilePath: string  # path to the .ct output file (set in begin_events)
+
+    # IN-MEMORY MODE. Set by `trace_writer_begin_in_memory` INSTEAD of
+    # `trace_writer_begin_events`, for an embedder that has no filesystem —
+    # a wasm module, or a host that wants the container's bytes rather than a
+    # file. `trace_writer_close` then retains the finished bytes here instead
+    # of opening `ctFilePath`, and `trace_writer_container_ptr` /
+    # `trace_writer_container_len` hand them back.
+    #
+    # The bytes are RETAINED rather than returned, because they must outlive
+    # the container: `closeCtfs` releases the writer's own storage, so a
+    # pointer into it would dangle the moment the writer is torn down. This
+    # copy is owned by the handle and lives until `trace_writer_free`.
+    inMemory: bool
+    containerData: seq[byte]
+    containerReady: bool
+
     programName: string  # stored from trace_writer_new, used when creating .ct
     interningQualifier: string
       ## IC-M2 — the fully-qualified-key origin namespace this writer stamps on
@@ -156,6 +178,25 @@ type
       ## Program argv recorded in meta.dat (CTFS spec §7).  Set via
       ## trace_writer_set_args; stored here and propagated to the
       ## multi-stream writer's metadata when/if it becomes ready.
+    recordingId: string
+      ## The canonical UUIDv7 recording identity (M-REC-1), when the CALLER
+      ## pins it.  Empty means "let the writer mint one", which is the
+      ## default and what every existing caller gets.
+      ##
+      ## It lives on the handle rather than being a `begin` argument because
+      ## identity is decided at CONSTRUCTION: the four constructors below all
+      ## take `recordingId` and validate it there, and a setter that ran after
+      ## one of them had already minted an id would have to rewrite a
+      ## container's identity rather than choose it.  So
+      ## ``trace_writer_set_recording_id`` refuses once a writer is ready,
+      ## instead of accepting a value it could not honour.
+      ##
+      ## An embedder with no entropy source is the case this exists for.  On
+      ## `wasm32-unknown-unknown` there is no CSPRNG and no wall clock, so
+      ## ``newUuidV7`` mints from whatever the host stubs answer — which is a
+      ## constant, and a constant recording id collides with every other
+      ## recording in a trace store.  Such a host has an id already (its page,
+      ## its transaction) and needs a way to say so.
     started: bool
     # Function registry: name+path+line -> id
     functions: seq[FunctionEntry]
@@ -280,9 +321,13 @@ proc trace_writer_new(
     useMultiStream: format == ffiBinary,
     hasPendingStep: false,
     pendingColumnDelta: 0,
+    inMemory: false,
+    containerData: @[],
+    containerReady: false,
     programName: prog,
     workdir: "",
     metaArgs: @[],
+    recordingId: "",
     started: false,
     functions: @[],
     functionIndex: initTable[string, csize_t](),
@@ -397,6 +442,14 @@ proc trace_writer_begin_events(
     setError("NULL handle")
     return 1.cint
 
+  # The symmetric half of `trace_writer_begin_in_memory`'s guard. Both `begin`s
+  # are idempotent no-ops on an already-open writer, so without this a caller
+  # that made both would silently get whichever it made first — and the one it
+  # got would be the one it did NOT ask for second.
+  if handle.inMemory:
+    setError("this writer is already open in memory; call trace_writer_begin_in_memory or trace_writer_begin_events, not both")
+    return 1.cint
+
   if handle.useMultiStream:
     if handle.msWriterReady:
       return 0.cint
@@ -427,6 +480,11 @@ proc trace_writer_begin_events(
       # dup-name guard would then reject a --source MCR, which is exactly the
       # latent collision IC-M2 removes.
       let sharedInterning = ctMcrSharedInterning()
+      # `handle.recordingId` is deliberately NOT passed here. An attached writer
+      # does not own `meta.dat` — MCR does, and MCR has already written the
+      # recording identity into the container this writer is joining. Handing a
+      # second id to the attach would either be ignored or would contradict the
+      # owner's, and neither is something a caller could act on.
       let ares = initMultiStreamWriterAttached(sharedCtfs, handle.programName,
         sharedInterning = sharedInterning, qualifier = handle.interningQualifier)
       if ares.isErr:
@@ -442,7 +500,8 @@ proc trace_writer_begin_events(
 
     # Standalone: the multi-stream writer always streams to disk as chunks seal
     # (createCtfsStreaming). ctPath == handle.ctFilePath.
-    let res = initMultiStreamWriter(ctPath, handle.programName)
+    let res = initMultiStreamWriter(ctPath, handle.programName,
+      recordingId = handle.recordingId)
     if res.isErr:
       setError(res.error)
       return 1.cint
@@ -467,7 +526,8 @@ proc trace_writer_begin_events(
   let (_, progBase, _) = splitFile(handle.programName)
   let ctPath = outDir / (progBase & ".ct")
 
-  let res = newTraceWriter(ctPath, handle.programName, @[], handle.workdir)
+  let res = newTraceWriter(ctPath, handle.programName, @[], handle.workdir,
+    recordingId = handle.recordingId)
   if res.isErr:
     setError(res.error)
     return 1.cint
@@ -475,6 +535,111 @@ proc trace_writer_begin_events(
   handle.writer = res.get()
   handle.writerReady = true
   0.cint
+
+proc trace_writer_begin_in_memory(
+    handle: TraceWriterHandle,
+): cint {.exportc, cdecl, dynlib.} =
+  ## The filesystem-free sibling of `trace_writer_begin_events`.
+  ##
+  ## `trace_writer_begin_events` takes an events PATH, derives a `.ct` path
+  ## from its parent directory, and `trace_writer_close` opens that path and
+  ## writes to it. An embedder with no filesystem — a wasm module, or a host
+  ## that wants the bytes rather than a file — had no way in at all: every
+  ## constructor on this C ABI was file-based.
+  ##
+  ## The layer below was already in memory. `initMultiStreamWriter` builds on
+  ## `createCtfs()` and keeps `path` only as `filePath` metadata, and
+  ## `newTraceWriterInMemory` is the single-stream equivalent. What was
+  ## missing was a way to reach either of them from C, and a way to get the
+  ## finished bytes back. This is that way; `trace_writer_container_ptr` and
+  ## `trace_writer_container_len` are the other half.
+  ##
+  ## Call this OR `trace_writer_begin_events`, never both: the second call
+  ## on a ready writer is a no-op in both, so a caller that made both would
+  ## silently get whichever it made first. Returns 0 on success.
+  if handle.isNil:
+    setError("NULL handle")
+    return 1.cint
+
+  if handle.useMultiStream:
+    if handle.msWriterReady:
+      if not handle.inMemory:
+        setError("this writer is already open on a file; in-memory mode must be chosen before the first begin")
+        return 1.cint
+      return 0.cint
+
+    # The empty path is deliberate and is not a placeholder for a real one:
+    # `filePath` is metadata the container never reads back, and an in-memory
+    # writer has no file to name. `trace_writer_close` refuses to write one.
+    let res = initMultiStreamWriter("", handle.programName,
+      recordingId = handle.recordingId)
+    if res.isErr:
+      setError(res.error)
+      return 1.cint
+
+    handle.msWriter = res.get()
+    handle.msWriter.metadata.workdir = handle.workdir
+    handle.msWriter.metadata.args = handle.metaArgs
+    handle.msWriterReady = true
+    handle.inMemory = true
+    handle.ctFilePath = ""
+    return 0.cint
+
+  if handle.writerReady:
+    if not handle.inMemory:
+      setError("this writer is already open on a file; in-memory mode must be chosen before the first begin")
+      return 1.cint
+    return 0.cint
+
+  let res = newTraceWriterInMemory(handle.programName, @[], handle.workdir,
+    recordingId = handle.recordingId)
+  if res.isErr:
+    setError(res.error)
+    return 1.cint
+
+  handle.writer = res.get()
+  handle.writerReady = true
+  handle.inMemory = true
+  handle.ctFilePath = ""
+  0.cint
+
+proc trace_writer_container_len(
+    handle: TraceWriterHandle,
+): csize_t {.exportc, cdecl, dynlib.} =
+  ## Length of the finished container, in bytes. Zero before `trace_writer_close`
+  ## and zero for a writer that is not in in-memory mode — which are two
+  ## different situations, so `trace_writer_container_ready` distinguishes them
+  ## rather than leaving a caller to read a zero two ways.
+  if handle.isNil:
+    setError("NULL handle")
+    return 0.csize_t
+  csize_t(handle.containerData.len)
+
+proc trace_writer_container_ready(
+    handle: TraceWriterHandle,
+): cint {.exportc, cdecl, dynlib.} =
+  ## 1 once `trace_writer_close` has retained a container, 0 before that.
+  ##
+  ## An EMPTY container is a legitimate result — a recording with no events
+  ## still has a `meta.dat` — so a zero length cannot stand in for "not
+  ## finished yet". This is the flag that can.
+  if handle.isNil:
+    setError("NULL handle")
+    return 0.cint
+  if handle.containerReady: 1.cint else: 0.cint
+
+proc trace_writer_container_ptr(
+    handle: TraceWriterHandle,
+): ptr uint8 {.exportc, cdecl, dynlib.} =
+  ## Pointer to the finished container's bytes, valid until
+  ## `trace_writer_free`. NULL before `trace_writer_close`, and NULL for a
+  ## zero-length container — read the length and the ready flag first.
+  if handle.isNil:
+    setError("NULL handle")
+    return nil
+  if handle.containerData.len == 0:
+    return nil
+  addr handle.containerData[0]
 
 proc trace_writer_finish_events(handle: TraceWriterHandle): cint {.exportc, cdecl, dynlib.} =
   if handle.isNil:
@@ -661,6 +826,14 @@ proc trace_writer_start(
       return
     let pathIdRes = handle.msWriter.registerPath(p)
     if pathIdRes.isErr:
+      # These entry points return void, so `last_error` is the only signal
+      # a C caller has. Returning silently makes a refused registration
+      # indistinguishable from a successful one, and the step that would
+      # have followed simply never appears in the trace. That matters most
+      # under the line-count table, where interning a path the caller
+      # never gave a count for is REFUSED — the caller has to be able to
+      # see why its steps went missing.
+      setError(pathIdRes.error)
       return
     let pathId = pathIdRes.get()
     # Buffer this as the first pending step
@@ -692,6 +865,44 @@ proc trace_writer_set_workdir(
       handle.msWriter.metadata.workdir = handle.workdir
   elif handle.writerReady:
     handle.writer.metadata.workdir = handle.workdir
+
+proc trace_writer_set_recording_id(
+    handle: TraceWriterHandle,
+    recording_id: cstring,
+): cint {.exportc, cdecl, dynlib.} =
+  ## Pin the recording's canonical UUIDv7 identity (M-REC-1, spec §3).
+  ## Returns 0 on success; on refusal returns 1 and names the reason in
+  ## ``trace_writer_last_error``.
+  ##
+  ## MUST be called before ``trace_writer_begin_in_memory`` /
+  ## ``trace_writer_begin_events``.  The four constructors resolve the identity
+  ## themselves — caller-provided when non-empty, freshly minted otherwise — so
+  ## after one of them has run there is an id in the metadata already, and
+  ## accepting a second one here would mean silently rewriting it.  A writer
+  ## that is already ready is therefore REFUSED rather than mutated.
+  ##
+  ## The id is validated by the same ``validateRecordingIdStr`` that
+  ## ``ct_write_meta_dat`` applies to the same field, so a caller cannot put a
+  ## string in ``meta.dat`` through this door that it could not put there
+  ## through that one.  An empty string is refused rather than treated as
+  ## "mint one": a caller that passes an empty id is a caller whose own id is
+  ## missing, and answering that with a fresh UUID hides it.
+  if handle.isNil:
+    setError("NULL handle")
+    return 1.cint
+  if handle.writerReady or handle.msWriterReady:
+    setError("the recording id must be set before the writer is begun; this writer is already open")
+    return 1.cint
+  let id = toNimStr(recording_id)
+  if id.len == 0:
+    setError("recording_id is empty; pass a canonical UUIDv7, or do not call this at all to have one minted")
+    return 1.cint
+  let valRes = validateRecordingIdStr(id)
+  if valRes.isErr:
+    setError("recording_id is not a canonical UUIDv7: " & valRes.error)
+    return 1.cint
+  handle.recordingId = id
+  0.cint
 
 proc trace_writer_set_interning_qualifier(
     handle: TraceWriterHandle,
@@ -789,6 +1000,14 @@ proc trace_writer_register_step(
 
     let pathIdRes = handle.msWriter.registerPath(p)
     if pathIdRes.isErr:
+      # These entry points return void, so `last_error` is the only signal
+      # a C caller has. Returning silently makes a refused registration
+      # indistinguishable from a successful one, and the step that would
+      # have followed simply never appears in the trace. That matters most
+      # under the line-count table, where interning a path the caller
+      # never gave a count for is REFUSED — the caller has to be able to
+      # see why its steps went missing.
+      setError(pathIdRes.error)
       return
     let pathId = pathIdRes.get()
     # Buffer this as the new pending step
@@ -1409,6 +1628,14 @@ proc ct_assignment_with_column(
     discard flushPendingStep(handle)
     let pathIdRes = handle.msWriter.registerPath(p)
     if pathIdRes.isErr:
+      # These entry points return void, so `last_error` is the only signal
+      # a C caller has. Returning silently makes a refused registration
+      # indistinguishable from a successful one, and the step that would
+      # have followed simply never appears in the trace. That matters most
+      # under the line-count table, where interning a path the caller
+      # never gave a count for is REFUSED — the caller has to be able to
+      # see why its steps went missing.
+      setError(pathIdRes.error)
       return
     let pathId = pathIdRes.get()
     if has_column != 0:
@@ -1712,6 +1939,79 @@ proc trace_writer_register_path_with_line_lengths(
       "ready (call trace_writer_begin_events first)")
     return 1.cint
   discard handle.writer.writePath(p)
+  0.cint
+
+proc trace_writer_enable_line_count_table(
+    handle: TraceWriterHandle,
+): cint {.exportc, cdecl, dynlib.} =
+  ## Opt this writer into recording a per-file line count in every
+  ## ``paths.dat`` record (``meta.dat`` bit 14).  Mirrors the Nim
+  ## ``enableLineCountTable``.
+  ##
+  ## After this call every path MUST be registered through
+  ## ``trace_writer_register_path_with_line_count``: the implicit
+  ## registration ``trace_writer_register_step`` performs for an unseen
+  ## path has no count to record and is refused by name.  A recorder
+  ## that cannot count a file's lines passes the ceiling it wants the
+  ## file laid out with (conventionally 100000) so the size the space
+  ## uses is the size the container states.
+  ##
+  ## Must be called before the first path is registered, and is refused
+  ## on a column-aware writer.  Returns 0 on success, non-zero on
+  ## failure (with ``last_error`` set).
+  if handle.isNil:
+    setError("trace_writer_enable_line_count_table: NULL handle")
+    return 1.cint
+  if not handle.useMultiStream:
+    setError("trace_writer_enable_line_count_table: the legacy " &
+      "single-stream backend has no paths.dat to record line counts in")
+    return 1.cint
+  if not handle.msWriterReady:
+    setError("trace_writer_enable_line_count_table: writer not ready " &
+      "(call trace_writer_begin_events first)")
+    return 1.cint
+  let res = handle.msWriter.enableLineCountTable()
+  if res.isErr:
+    setError(res.error)
+    return 1.cint
+  0.cint
+
+proc trace_writer_register_path_with_line_count(
+    handle: TraceWriterHandle,
+    path: cstring,
+    line_count: uint64,
+): cint {.exportc, cdecl, dynlib.} =
+  ## Register a source path together with the number of lines the file
+  ## has, which sizes the file's slot in the line-only global position
+  ## space (``paths.dat`` line-count table — see
+  ## ~codetracer-trace-format-spec/internal-files.md~ §"``paths.dat``
+  ## line-count table").
+  ##
+  ## Only meaningful on a writer that called
+  ## ``trace_writer_enable_line_count_table``; without it the bare
+  ## ``paths.dat`` record has nowhere to put the count and this behaves
+  ## exactly like registering the path alone.
+  ##
+  ## ``line_count`` of 0 is refused rather than defaulted: a file sized
+  ## 0 would share its base with the next file.
+  ##
+  ## Returns 0 on success, non-zero on failure (with ``last_error`` set).
+  if handle.isNil:
+    setError("trace_writer_register_path_with_line_count: NULL handle")
+    return 1.cint
+  if not handle.useMultiStream:
+    setError("trace_writer_register_path_with_line_count: the legacy " &
+      "single-stream backend has no paths.dat to record line counts in")
+    return 1.cint
+  if not handle.msWriterReady:
+    setError("trace_writer_register_path_with_line_count: writer not " &
+      "ready (call trace_writer_begin_events first)")
+    return 1.cint
+  let pathIdRes = handle.msWriter.registerPath(
+    toNimStr(path), lineCount = line_count)
+  if pathIdRes.isErr:
+    setError(pathIdRes.error)
+    return 1.cint
   0.cint
 
 proc trace_writer_register_source_view(
@@ -2173,12 +2473,22 @@ proc trace_writer_close(handle: TraceWriterHandle): cint {.exportc, cdecl, dynli
     if closeRes.isErr:
       setError(closeRes.error)
       return 1.cint
-    # Streaming writer: the exec/value/call/io/span chunks + meta.dat have been
-    # written into the streaming container at `handle.ctFilePath` as they were
-    # produced; closeCtfs() finalizes the on-disk image (writes the final root
-    # block and closes the file). No separate toBytes()/open(fmWrite) dump —
-    # that was the buffered mode, which balloons RAM and loses the trace if a
-    # long-running producer is killed before close.
+    if handle.inMemory:
+      # A writer with no file to stream into holds the whole container in
+      # RAM, so the finished image has to be lifted out of it here.
+      #
+      # RETAIN BEFORE RELEASING. `closeCtfs` frees the writer's own storage,
+      # so the copy has to be taken while it is still alive; a pointer into
+      # the writer would dangle at the next line.
+      handle.containerData = handle.msWriter.toBytes()
+      handle.containerReady = true
+    # A file-backed writer needs nothing here: the exec/value/call/io/span
+    # chunks + meta.dat were written into the streaming container at
+    # `handle.ctFilePath` as they were produced, and closeCtfs() finalizes the
+    # on-disk image (writes the final root block and closes the file). No
+    # toBytes()/open(fmWrite) dump — that was the buffered mode, which
+    # balloons RAM and loses the trace if a long-running producer is killed
+    # before close.
     handle.msWriter.closeCtfs()
     return 0.cint
 
@@ -2189,6 +2499,9 @@ proc trace_writer_close(handle: TraceWriterHandle): cint {.exportc, cdecl, dynli
   if res.isErr:
     setError(res.error)
     return 1.cint
+  if handle.inMemory:
+    handle.containerData = handle.writer.containerBytes()
+    handle.containerReady = true
   0.cint
 
 # ---------------------------------------------------------------------------
@@ -3012,36 +3325,71 @@ proc allocStringResult(s: string, outLen: ptr csize_t): ptr uint8 =
 # Reader lifecycle
 # ---------------------------------------------------------------------------
 
-proc ct_reader_open(path: cstring): pointer {.exportc, cdecl, dynlib.} =
-  ## Open a .ct trace file. Returns opaque reader handle or nil on failure.
-  ## Check trace_writer_last_error() for error message on failure.
-  if path.isNil:
-    setError("NULL path")
-    return nil
-  let p = $path
-  let res = openNewTrace(p)
-  if res.isErr:
-    setError(res.error)
-    return nil
-  let h = cast[TraceReaderHandle](alloc0(sizeof(NewTraceReader)))
-  h[] = res.get()
-  return cast[pointer](h)
+when ctHasFilesystem:
+  # The reader entry points that name a file, and the only ones in this
+  # family that do. The handle-based accessors below are byte readers and
+  # compile everywhere; on a target without a filesystem a handle comes from
+  # `openNewTraceFromBytes` instead.
 
-proc ct_reader_refresh(h: pointer, path: cstring): cint {.exportc, cdecl, dynlib.} =
-  ## Refresh an existing reader handle from the same growing .ct path.
-  ## Returns 0 on success, non-zero on error.
-  if h.isNil:
-    setError("NULL reader handle")
-    return 1
-  if path.isNil:
-    setError("NULL path")
-    return 1
-  let rh = cast[TraceReaderHandle](h)
-  let res = rh[].refresh($path)
-  if res.isErr:
-    setError(res.error)
-    return 1
-  return 0
+  proc ct_reader_open(path: cstring): pointer {.exportc, cdecl, dynlib.} =
+    ## Open a .ct trace file. Returns opaque reader handle or nil on failure.
+    ## Check trace_writer_last_error() for error message on failure.
+    if path.isNil:
+      setError("NULL path")
+      return nil
+    let p = $path
+    let res = openNewTrace(p)
+    if res.isErr:
+      setError(res.error)
+      return nil
+    let h = cast[TraceReaderHandle](alloc0(sizeof(NewTraceReader)))
+    h[] = res.get()
+    return cast[pointer](h)
+
+  proc ct_reader_open_assume_column_aware_paths(
+      path: cstring): pointer {.exportc, cdecl, dynlib.} =
+    ## Open a .ct trace file, reading its ``paths.dat`` records as
+    ## column-aware Layout A even when ``meta.dat`` bit 4 is clear.
+    ##
+    ## This is the recovery path for traces produced by a recorder that hit
+    ## the pre-``708ee44`` writer bug (Layout A records emitted under a clear
+    ## bit 4).  It is an assertion the CALLER makes, because the two record
+    ## layouts overlap and no inspection of the bytes can distinguish them —
+    ## which is why ``ct_reader_open`` never guesses.  Use
+    ## ``ct_reader_column_aware_paths_suspected`` on a normally-opened handle
+    ## to find candidates, then decide from what you know about the recorder.
+    ##
+    ## The parse is authoritative: on a trace whose records are not Layout A
+    ## the open FAILS (nil, with ``paths.dat[N]: …`` in
+    ## ``trace_writer_last_error``) rather than falling back to the line-only
+    ## reading.
+    if path.isNil:
+      setError("NULL path")
+      return nil
+    let p = $path
+    let res = openNewTrace(p, assumeColumnAwarePaths = true)
+    if res.isErr:
+      setError(res.error)
+      return nil
+    let h = cast[TraceReaderHandle](alloc0(sizeof(NewTraceReader)))
+    h[] = res.get()
+    return cast[pointer](h)
+
+  proc ct_reader_refresh(h: pointer, path: cstring): cint {.exportc, cdecl, dynlib.} =
+    ## Refresh an existing reader handle from the same growing .ct path.
+    ## Returns 0 on success, non-zero on error.
+    if h.isNil:
+      setError("NULL reader handle")
+      return 1
+    if path.isNil:
+      setError("NULL path")
+      return 1
+    let rh = cast[TraceReaderHandle](h)
+    let res = rh[].refresh($path)
+    if res.isErr:
+      setError(res.error)
+      return 1
+    return 0
 
 proc ct_reader_close(h: pointer) {.exportc, cdecl, dynlib.} =
   ## Close and free a reader handle. Passing NULL is a no-op.
@@ -3268,21 +3616,30 @@ proc ct_reader_workdir(h: pointer, outLen: ptr csize_t): ptr uint8 {.exportc, cd
 # Global line index resolution helper
 # ---------------------------------------------------------------------------
 #
-# The multi-stream writer encodes steps as globalLineIndex values using a
-# prefix-sum over per-file line counts (DefaultLinesPerFile = 100_000 per
-# file). To convert back to (path_id, line), the reader must reconstruct
-# the same prefix-sum. We build it lazily from the path count.
+# A line-only step is one integer that addresses one line, and the container
+# says nothing about how the integers were apportioned between files. The
+# space rebuilt here is `codetracer_trace_format_nim`'s own writer's —
+# `prefixSum[path_id] + (line - 1)`, each file's slot sized by
+# `global_line_index.fileAddressCount` exactly as the writer sizes it —
+# which is an assumption about the producer, not a property of the trace.
+# The Rust `codetracer_trace_writer` writes the same container format with a
+# different packing, `(path_id shl 32) or line`.
+#
+# Every accessor below therefore resolves through `tryResolve`, which
+# refuses an index this space cannot address rather than clamping it into a
+# file that exists. A caller that gets the refusal is holding a trace whose
+# positions this reader cannot interpret; a caller that gets a location has
+# one whose positions are at least consistent with the assumption named
+# above.
 
 import codetracer_trace_writer/global_line_index
 
 proc getOrBuildGli(rh: TraceReaderHandle): GlobalLineIndex =
-  ## Build a GlobalLineIndex from the reader's path count, using the same
-  ## DefaultLinesPerFile constant the writer uses.
-  let pathCount = rh[].pathCount()
-  var counts = newSeq[uint64](int(pathCount))
-  for i in 0 ..< int(pathCount):
-    counts[i] = DefaultLinesPerFile
-  buildGlobalLineIndex(counts)
+  ## Rebuild the writer's address space from the trace's paths and their
+  ## per-file line tables. See the note above on what the reconstruction
+  ## assumes, and `globalPositionSpace` for why the line tables are part
+  ## of the layout and not just of the column decode.
+  rh[].globalPositionSpace()
 
 # ---------------------------------------------------------------------------
 # ct_reader_step_location — resolve step N to (path_id, line)
@@ -3295,10 +3652,11 @@ proc ct_reader_step_location(
   ## Resolve step N to its source location (path_id, line).
   ## Returns 0 on success, non-zero on failure.
   ##
-  ## Internally, steps are stored as globalLineIndex values (a prefix-sum
-  ## encoding of path_id + line). This function resolves deltas within
-  ## the exec stream chunk and then maps the absolute GLI back to
-  ## (path_id, line) using the same DefaultLinesPerFile the writer used.
+  ## Resolves deltas within the exec stream chunk, then inverts the
+  ## absolute `global_position_index` through the writer's line-only
+  ## address space. When the index is not one that space can address the
+  ## call FAILS with the reason in `trace_writer_last_error` rather than
+  ## reporting a location — see the note above `getOrBuildGli`.
   if h.isNil or outPathId.isNil or outLine.isNil:
     setError("NULL parameter")
     return 1.cint
@@ -3311,9 +3669,12 @@ proc ct_reader_step_location(
     return 1.cint
   let globalIdx = gliRes.get()
 
-  # Resolve GLI to (path_id, line) using the same prefix-sum the writer used
   let gli = getOrBuildGli(rh)
-  let (pathId, line) = gli.resolve(globalIdx)
+  let resolved = gli.tryResolve(globalIdx)
+  if resolved.isErr:
+    setError("step " & $n & ": " & resolved.error)
+    return 1.cint
+  let (pathId, line) = resolved.get()
   outPathId[] = uint64(pathId)
   outLine[] = line
   0.cint
@@ -3366,7 +3727,11 @@ proc ct_reader_step_locations(
   let pidArr = cast[ptr UncheckedArray[uint64]](outPathIds)
   let lineArr = cast[ptr UncheckedArray[uint64]](outLines)
   for i in 0 ..< int(written):
-    let (pathId, line) = gli.resolve(glis[i])
+    let resolved = gli.tryResolve(glis[i])
+    if resolved.isErr:
+      setError("step " & $(startN + uint64(i)) & ": " & resolved.error)
+      return high(uint64)
+    let (pathId, line) = resolved.get()
     pidArr[i] = uint64(pathId)
     lineArr[i] = line
   written
@@ -3424,7 +3789,11 @@ proc ct_reader_step_locations_with_columns(
     # Legacy line-only trace: GLI resolves directly via prefix-sum.
     let gli = getOrBuildGli(rh)
     for i in 0 ..< int(written):
-      let (pathId, line) = gli.resolve(glis[i])
+      let resolved = gli.tryResolve(glis[i])
+      if resolved.isErr:
+        setError("step " & $(startN + uint64(i)) & ": " & resolved.error)
+        return high(uint64)
+      let (pathId, line) = resolved.get()
       pidArr[i] = uint64(pathId)
       lineArr[i] = line
       colArr[i] = 0
@@ -3457,7 +3826,11 @@ proc ct_reader_step_locations_with_columns(
     else:
       # Fall back to line-only resolution.  Column = 1 mirrors the
       # column-tracking cursor's default when per-line data is absent.
-      let (pathId, line) = gliFallback.resolve(glis[i])
+      let resolved = gliFallback.tryResolve(glis[i])
+      if resolved.isErr:
+        setError("step " & $(startN + uint64(i)) & ": " & resolved.error)
+        return high(uint64)
+      let (pathId, line) = resolved.get()
       pidArr[i] = uint64(pathId)
       lineArr[i] = line
       colArr[i] = 1
@@ -3573,6 +3946,30 @@ proc ct_reader_has_column_aware_steps(h: pointer): cint {.exportc, cdecl, dynlib
     return -1.cint
   let rh = cast[TraceReaderHandle](h)
   if rh[].meta.hasColumnAwareSteps: 1.cint else: 0.cint
+
+# ---------------------------------------------------------------------------
+# ct_reader_column_aware_paths_suspected — reader diagnostic
+# ---------------------------------------------------------------------------
+
+proc ct_reader_column_aware_paths_suspected(
+    h: pointer): cint {.exportc, cdecl, dynlib.} =
+  ## Return 1 when the trace declares line-only steps
+  ## (``ct_reader_has_column_aware_steps`` is 0) yet every ``paths.dat``
+  ## record also decodes as a complete column-aware Layout A record; 0
+  ## otherwise, -1 on a NULL handle.
+  ##
+  ## The two record layouts overlap, so this is a report and not a verdict:
+  ## an ordinary 97-byte ASCII path satisfies the Layout A grammar by
+  ## coincidence.  The reader keeps answering exactly as ``meta.dat``
+  ## declares — ``ct_reader_line_count_raw`` stays 0 and step locations stay
+  ## line-only.  A consumer that has independent grounds to believe the
+  ## recorder hit the pre-``708ee44`` meta-flag bug (which emitted Layout A
+  ## records under a clear bit 4) should surface this to its user rather
+  ## than reinterpret the trace on its own.
+  if h.isNil:
+    return -1.cint
+  let rh = cast[TraceReaderHandle](h)
+  if rh[].columnAwarePathsSuspected: 1.cint else: 0.cint
 
 proc ct_reader_supports_column_breakpoints(
     h: pointer): cint {.exportc, cdecl, dynlib.} =

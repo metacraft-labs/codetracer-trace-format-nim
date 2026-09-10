@@ -34,11 +34,12 @@ import ../codetracer_trace_types
 export results, value_stream.VariableValue, io_event_stream.IOEventKind,
        codetracer_trace_types.FilterProvenance, uuid_v7
 
-const
-  DefaultLinesPerFile*: uint64 = 100_000
-    ## Default assumed line count per file for GlobalLineIndex.
-    ## The real line counts would come from source files, which we
-    ## don't have at this level.
+# The line-only address-space stride, re-exported for the consumers that
+# reach it through this module. It is defined beside the prefix-sum
+# arithmetic in `global_line_index` because encoding with one value and
+# inverting with another produces plausible wrong positions that no
+# container check can catch.
+export global_line_index.DefaultLinesPerFile
 
 type
   SourceViewRecord* = object
@@ -189,6 +190,12 @@ type
       ## per spec §"Source Location Addressing".  Parallel to ``paths``;
       ## empty seq for files whose line_lengths the caller didn't
       ## supply.  Ignored when ``columnAwareSteps`` is false.
+    pathLineCounts: seq[uint64]
+      ## Per-path line counts, used in line-only mode to size each file's
+      ## slot in the global position space at exactly the number of lines
+      ## the file has.  Parallel to ``paths``.  Populated only when
+      ## ``lineCountTable`` is on, in which case ``registerPath``
+      ## requires a count for every path and no entry is ever zero.
 
     # Global line index (rebuilt when paths change)
     gli: GlobalLineIndex
@@ -279,6 +286,23 @@ type
       ## fires per-statement so the GUI can offer per-column motions
       ## (step-over / step-in / step-out at sub-statement granularity).
 
+    lineCountTable*: bool
+      ## True iff this writer records a per-file line count in every
+      ## ``paths.dat`` record and sizes each file's slot in the global
+      ## position space from it.  Sets ``FlagHasLineCountTable`` (bit 14)
+      ## on ``meta.dat`` at ``close()``.
+      ##
+      ## Defaults to false, so a writer that does not opt in produces a
+      ## container byte-identical to what it produced before the table
+      ## existed: bare ``paths.dat`` records, no bit 14, and every file
+      ## sized ``DefaultLinesPerFile`` by convention.  The default is not
+      ## a preference — bit 14 is rejecting at every reader that predates
+      ## it (``meta_dat.KnownFlags``), so reader support has to ship
+      ## everywhere before a recorder flips this.
+      ##
+      ## Mutually exclusive with ``columnAwareSteps``; see
+      ## ``enableLineCountTable``.
+
     # Deminification / alternate source views (spec §
     # "Alternate Source Views (Deminification Support)").  Buffered
     # in memory and serialized into ``source_views.dat`` /
@@ -323,25 +347,25 @@ proc interningPtr(w: var MultiStreamTraceWriter): ptr TraceInterningTables =
 proc rebuildGli(w: var MultiStreamTraceWriter) =
   ## Rebuild the global line index from the current set of paths.
   ##
-  ## In column-aware mode each file's slot is sized to the file's total
-  ## byte capacity (sum of per-line lengths) so the resulting
-  ## ``global_position_index`` matches the spec's byte-offset-based
-  ## addressing.  Files whose ``lineLengths`` weren't supplied fall back
-  ## to the legacy ``DefaultLinesPerFile`` allocation.
+  ## Each file's slot is sized to the number of positions the file has,
+  ## which is what the trace's addressing mode makes a position:
   ##
-  ## In line-only mode every file gets the legacy ``DefaultLinesPerFile``
-  ## allocation, preserving byte-for-byte output of pre-P6 traces.
-  var counts = newSeq[uint64](w.paths.len)
-  for i in 0 ..< w.paths.len:
-    if w.columnAwareSteps and i < w.pathLineLengths.len and
-       w.pathLineLengths[i].len > 0:
-      var total: uint64 = 0
-      for L in w.pathLineLengths[i]:
-        total += uint64(L)
-      counts[i] = max(total, 1'u64)
-    else:
-      counts[i] = DefaultLinesPerFile
-  w.gli = buildGlobalLineIndex(counts)
+  ## * column-aware — the file's total byte capacity (sum of its per-line
+  ##   lengths), so the resulting ``global_position_index`` matches the
+  ##   spec's byte-offset-based addressing;
+  ## * line-only with the line-count table — the file's line count, which
+  ##   ``registerPath`` required and ``paths.dat`` records;
+  ## * line-only without it — the ``DefaultLinesPerFile`` convention,
+  ##   preserving byte-for-byte output of pre-table traces.
+  ##
+  ## The sizing rule lives in ``global_line_index.positionSpaceCounts``
+  ## because the reader has to apply the same one — a file sized
+  ## differently there shifts the base of every file after it. Under the
+  ## line-count table the reader recovers the sizes from the container;
+  ## without it, neither the sizes nor the rule are recorded.
+  w.gli = buildGlobalLineIndex(
+    positionSpaceCounts(w.pathLineLengths, w.pathLineCounts,
+      w.paths.len, w.columnAwareSteps))
   w.gliDirty = false
 
 proc toGlobalLineIndex(w: var MultiStreamTraceWriter,
@@ -352,9 +376,10 @@ proc toGlobalLineIndex(w: var MultiStreamTraceWriter,
   ## column is 1, and subsequent ``DeltaColumn`` events advance it
   ## within the line).
   ##
-  ## In line-only mode, returns the legacy ``file_base + line`` value
-  ## so traces produced without column data are byte-for-byte identical
-  ## to pre-P6 output.
+  ## In line-only mode, returns ``file_base + (line - 1)`` — the same
+  ## 0-based in-file offset, with one address per line instead of one per
+  ## (line, column) position, so both modes put line 1 at the file's own
+  ## base. See ``global_line_index.globalIndex``.
   if w.gliDirty:
     w.rebuildGli()
   if w.columnAwareSteps and pathId < uint64(w.pathLineLengths.len) and
@@ -373,6 +398,38 @@ proc toGlobalLineIndex(w: var MultiStreamTraceWriter,
     return w.gli.prefixSum[int(pathId)] + lineOffset
   w.gli.globalIndex(int(pathId), line)
 
+proc checkLineWithinFile(w: var MultiStreamTraceWriter,
+    pathId: uint64, line: uint64): Result[void, string] =
+  ## Refuse a step whose line is past the end of the file's recorded slot.
+  ##
+  ## With a file sized to its real line count, a step one line past the
+  ## end addresses the FIRST line of the next file. That address is
+  ## inside the trace's space, so nothing downstream can refuse it:
+  ## ``tryResolve`` has no bound to test it against, and the reader
+  ## answers a ``(file, line)`` pair that the recorder never registered.
+  ## The only party that knows the file's size is the writer, which was
+  ## given the count, so the check is here.
+  ##
+  ## It applies exactly where a size is recorded. Without the line-count
+  ## table there is no per-file bound in the container to enforce, and
+  ## sizes come from the ``DefaultLinesPerFile`` convention — the check
+  ## would be enforcing a number the trace does not carry.
+  if not w.lineCountTable:
+    return ok()
+  if pathId >= uint64(w.pathLineCounts.len):
+    return err("step at path id " & $pathId & " line " & $line &
+      ": no path with that id has been registered (" &
+      $w.pathLineCounts.len & " registered)")
+  let count = w.pathLineCounts[int(pathId)]
+  if line > count:
+    return err("step at line " & $line & " of " & w.paths[int(pathId)] &
+      ", which this trace records as having " & $count & " line(s). The " &
+      "line is past the end of the file's slot in the global position " &
+      "space, so its address would be inside the NEXT file's range and " &
+      "read back as a location that was never recorded. Register the " &
+      "path with the file's real line count")
+  ok()
+
 # ---------------------------------------------------------------------------
 # Constructor
 # ---------------------------------------------------------------------------
@@ -382,16 +439,21 @@ proc initMultiStreamWriter*(path: string, program: string,
     recordingId: string = ""): Result[MultiStreamTraceWriter, string] =
   ## Create a new multi-stream trace writer.
   ##
-  ## The container is ALWAYS built on ``createCtfsStreaming(path)``: the
-  ## exec/value/call/io/span stream chunks flush to ``path`` on disk as they are
-  ## written, so a producer does not have to hold the whole trace in RAM until
-  ## close, and the container is durable/observable mid-run.  ``closeCtfs``
-  ## finalizes the on-disk image.
+  ## A writer with a ``path`` builds its container on
+  ## ``createCtfsStreaming(path)``: the exec/value/call/io/span stream chunks
+  ## flush to ``path`` on disk as they are written, so a producer does not have
+  ## to hold the whole trace in RAM until close, and the container is
+  ## durable/observable mid-run.  ``closeCtfs`` finalizes the on-disk image.
+  ## Streaming is not a mode a file-backed producer may opt out of: buffering
+  ## the trace and dumping it at close balloons RAM and loses everything if a
+  ## long-running producer is killed first.
   ##
-  ## The old buffer-in-memory-then-dump mode (``createCtfs`` + ``toBytes`` at
-  ## close) has been removed: every CTFS producer streams.  ``toBytes`` still
-  ## returns the full container image for in-memory consumers, and the streamed
-  ## container is byte-identical to what the buffered mode produced.
+  ## An EMPTY ``path`` selects the in-memory container instead.  That is not
+  ## the retired opt-out — it is the case where there is nothing to stream to:
+  ## the freestanding WebAssembly writer has no filesystem, so its host reads
+  ## the finished image out of ``toBytes`` (see ``trace_writer_begin_in_memory``
+  ## on the C ABI).  ``toBytes`` returns the same bytes either way; a streamed
+  ## container is byte-identical to a buffered one.
   ##
   ## ~recordingId~ defaults to a freshly-minted UUIDv7 (M-REC-1).  Pass
   ## an explicit canonical-form id to pin the recording's identity
@@ -409,10 +471,13 @@ proc initMultiStreamWriter*(path: string, program: string,
       return err("recordingId is not a canonical UUIDv7: " & valRes.error)
 
   var w: MultiStreamTraceWriter
-  let sres = createCtfsStreaming(path)
-  if sres.isErr:
-    return err("failed to create streaming CTFS container at " & path & ": " & sres.error)
-  w.ownedCtfs = sres.get()
+  if path.len == 0:
+    w.ownedCtfs = createCtfs()
+  else:
+    let sres = createCtfsStreaming(path)
+    if sres.isErr:
+      return err("failed to create streaming CTFS container at " & path & ": " & sres.error)
+    w.ownedCtfs = sres.get()
   w.metadata = TraceMetadata(
     recordingId: resolvedId, program: program, args: @[], workdir: "")
   w.paths = @[]
@@ -609,6 +674,42 @@ proc enableColumnMotionsSupport*(w: var MultiStreamTraceWriter) =
   w.supportsColumnMotions = true
   w.emitStepMap = false  # M26b — see enableColumnAwareSteps.
 
+proc enableLineCountTable*(w: var MultiStreamTraceWriter): Result[void, string] =
+  ## Opt this writer into recording a per-file line count.
+  ##
+  ## After this call every ``registerPath`` REQUIRES the file's line
+  ## count, each file's slot in the global position space is sized to
+  ## that count, ``registerStep`` refuses a line past a file's count, and
+  ## ``close()`` sets ``FlagHasLineCountTable`` (bit 14) on ``meta.dat``
+  ## so a reader lays the space out from the recorded sizes instead of
+  ## assuming ``DefaultLinesPerFile`` for every file.
+  ##
+  ## The count is required rather than optional because an omitted one
+  ## puts the reader back to assuming a size for that file — the defect
+  ## the table removes, per file instead of per trace. A recorder that
+  ## cannot count a file's lines passes ``DefaultLinesPerFile``, which
+  ## records the ceiling it used rather than leaving it to be inferred.
+  ##
+  ## Must be called before the first ``registerPath``: the table covers
+  ## every record in ``paths.dat``, and a path already interned under the
+  ## bare layout cannot grow a count.
+  ##
+  ## Refused on a column-aware writer. A Layout A record already carries
+  ## the file's ``line_count`` as the length of its per-line table, and
+  ## that mode sizes a file in addressable columns rather than lines, so
+  ## the two tables are not additive — they are two spellings of the same
+  ## field under two different units.
+  if w.columnAwareSteps:
+    return err("enableLineCountTable: this writer is column-aware, whose " &
+      "paths.dat records already carry the file's line_count and whose " &
+      "files are sized in addressable columns rather than lines")
+  if w.paths.len > 0:
+    return err("enableLineCountTable: " & $w.paths.len & " path(s) are " &
+      "already interned under the bare paths.dat layout and cannot grow " &
+      "a line count; enable the table before the first registerPath")
+  w.lineCountTable = true
+  ok()
+
 # ---------------------------------------------------------------------------
 # Filter provenance (TF-M7 — spec §7 / Trace-Filters.md §7)
 # ---------------------------------------------------------------------------
@@ -645,8 +746,18 @@ proc linehits*(w: var MultiStreamTraceWriter): var LinehitsBuilder =
 
 proc registerPath*(w: var MultiStreamTraceWriter,
     path: string,
-    lineLengths: openArray[uint32] = []): Result[uint64, string] =
+    lineLengths: openArray[uint32] = [],
+    lineCount: uint64 = 0): Result[uint64, string] =
   ## Register a source path and return its interned ID.
+  ##
+  ## ``lineCount`` is the number of lines the file has, and it sizes the
+  ## file's slot in the line-only global position space.  It is REQUIRED
+  ## on a writer that called ``enableLineCountTable`` and ignored on one
+  ## that did not — a bare ``paths.dat`` record has nowhere to put it,
+  ## and a column-aware record derives the same field from
+  ## ``lineLengths``.  A recorder that cannot count a file's lines passes
+  ## ``DefaultLinesPerFile`` so that the size the space was laid out with
+  ## is the size the container states.
   ##
   ## P6.5 / Layout A — ``lineLengths`` is the per-line addressable
   ## column count, used only when the writer has opted into
@@ -670,6 +781,9 @@ proc registerPath*(w: var MultiStreamTraceWriter,
       # line-only producers (MCR, the GDScript VM), so column-aware attach keeps
       # the bare record.
       w.container.ensurePathIdColumnAware(w.interningPtr[], path, lineLengths)
+    elif w.lineCountTable:
+      w.container.ensureQualifiedPathIdWithLineCount(
+        w.interningPtr[], w.qualifier, path, lineCount)
     else:
       w.container.ensureQualifiedPathId(w.interningPtr[], w.qualifier, path)
   if idRes.isErr:
@@ -690,6 +804,10 @@ proc registerPath*(w: var MultiStreamTraceWriter,
       w.pathLineLengths.add(lls)
     else:
       w.pathLineLengths.add(@[])
+    # Mirror the line count so ``rebuildGli`` sizes the file's slot to it.
+    # Zero outside the line-count table: no count was recorded, and
+    # ``positionSpaceCounts`` reads that as the pre-table convention.
+    w.pathLineCounts.add(if w.lineCountTable: lineCount else: 0'u64)
     w.gliDirty = true
   ok(id)
 
@@ -766,6 +884,7 @@ proc registerStep*(w: var MultiStreamTraceWriter, pathId: uint64,
   ## is within a small delta of the previous one.
   if w.closed:
     return err("writer is closed")
+  ? w.checkLineWithinFile(pathId, line)
 
   let gli = w.toGlobalLineIndex(pathId, line)
 
@@ -794,11 +913,12 @@ proc registerStep*(w: var MultiStreamTraceWriter, pathId: uint64,
   if w.linehitsBuilder.isSome:
     w.linehitsBuilder.get().recordHit(gli, w.stepCount)
 
-  # M26b — record into the prepopulated breakpoint index, keyed by the SAME
-  # gli the exec stream encoded so the resulting `step-map.ns` matches the
-  # db-backend's `unpack_global_line_index`-derived whole-table build.
+  # M26b — record into the prepopulated breakpoint index, keyed by the
+  # coordinates registered here.  A breakpoint request arrives as
+  # `(path_id, line)`; the packed `gli` is a writer convention the container
+  # does not record, so it is not a key (see step_map_builder's header).
   if w.emitStepMap:
-    w.stepMapBuilder.recordStep(gli, w.stepCount)
+    w.stepMapBuilder.recordStep(pathId, line, w.stepCount)
 
   w.lastGlobalLineIndex = gli
   w.lastPathId = pathId
@@ -841,6 +961,7 @@ proc registerStepWithColumn*(w: var MultiStreamTraceWriter,
     return err("registerStepWithColumn(columnDelta != 0) called on a " &
       "writer that has not opted into column-aware mode " &
       "(call enableColumnAwareSteps first)")
+  ? w.checkLineWithinFile(pathId, line)
 
   let baseGli = w.toGlobalLineIndex(pathId, line)
   let combinedGli = uint64(int64(baseGli) + columnDelta)
@@ -867,12 +988,12 @@ proc registerStepWithColumn*(w: var MultiStreamTraceWriter,
   if w.linehitsBuilder.isSome:
     w.linehitsBuilder.get().recordHit(combinedGli, w.stepCount)
 
-  # M26b — index into the breakpoint map.  In practice `emitStepMap` is only
-  # on for line-only writers (where `columnDelta == 0` and `combinedGli`
-  # packs `(path_id << 32) | line`), so the gli unpacks back to the recorded
-  # `(path_id, line)` exactly as the reader decodes it.
+  # M26b — index into the breakpoint map at the registered coordinates.
+  # `emitStepMap` is only on for line-only writers, where `columnDelta == 0`
+  # and this step is the line's first position, so the column the request
+  # cannot name is not lost by keying on the line alone.
   if w.emitStepMap:
-    w.stepMapBuilder.recordStep(combinedGli, w.stepCount)
+    w.stepMapBuilder.recordStep(pathId, line, w.stepCount)
 
   w.lastGlobalLineIndex = combinedGli
   w.lastPathId = pathId
@@ -1130,19 +1251,17 @@ proc flushSpans*(w: var MultiStreamTraceWriter): Result[void, string] =
   ## the writer's record buffer.  `close()` calls it anyway, so a batch
   ## recorder never needs to.  A no-op when no span has been registered.
   ##
-  ## **This does NOT yet make anything visible to a concurrent reader.**
-  ## `initMultiStreamWriter` builds the container with `createCtfs()`, i.e.
-  ## entirely in memory; the bytes reach the filesystem only when the caller
-  ## serialises them (`toBytes`, which the FFI does at
-  ## `trace_writer_close`).  Sealing a chunk therefore changes what an
-  ## already-materialised image would contain, not what is on disk right now.
+  ## On an IN-MEMORY writer (an empty `path`) this makes nothing visible to a
+  ## concurrent reader: there is no file, and the bytes exist only once the
+  ## caller serialises them (`toBytes`, which the FFI does at
+  ## `trace_writer_close`).  Sealing a chunk there changes what an
+  ## already-materialised image would contain, not what is on disk.
   ##
-  ## Live visibility needs one more change, not made here: the writer would
-  ## have to be built on `createCtfsStreaming(path)` so `syncEntry` lands the
-  ## chunk and its index entry on disk as they are sealed.  The span stream
-  ## itself is already ready for that — `flushChunk` writes the chunk body
-  ## before the index entry and syncs both, and `initSpanStreamReader` /
-  ## `readSpansSince` read a growing container (see
+  ## On a file-backed writer the container is `createCtfsStreaming(path)`, so
+  ## `syncEntry` lands the chunk and its index entry on disk as they are
+  ## sealed and a concurrent reader does see them.  `flushChunk` writes the
+  ## chunk body before the index entry and syncs both, and
+  ## `initSpanStreamReader` / `readSpansSince` read a growing container (see
   ## `span_stream_tail_during_active_write`, which drives exactly that path
   ## against a streaming container).
   if not w.hasSpans:
@@ -1700,7 +1819,12 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
     # RS-M1: unlike the four stream bits above, bit 13 is stamped ONLY when a
     # span was actually registered.  See `hasSpans` for why this one is
     # conditional: bit 13 is rejecting, not additive, at the reader.
-    hasSpanStream = w.hasSpans)
+    hasSpanStream = w.hasSpans,
+    # Bit 14 is stamped only when the writer opted into recording per-file
+    # line counts.  Like bit 13 it is rejecting, not additive, at the
+    # reader, so a writer that did not opt in must leave it clear — see
+    # `enableLineCountTable`.
+    hasLineCountTable = w.lineCountTable)
   if metaRes.isErr:
     return err("failed to write meta.dat: " & metaRes.error)
 

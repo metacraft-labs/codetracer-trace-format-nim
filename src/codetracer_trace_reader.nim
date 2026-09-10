@@ -30,6 +30,19 @@ import codetracer_trace_writer/global_line_index as v4_gli
 
 export results, codetracer_trace_types
 
+const
+  EventsLogHeaderV1* = [
+    # "CodeTracer" in hex leetspeak, then file-format version 1, then two
+    # reserved bytes that are zero in this version.
+    byte 0xC0, 0xDE, 0x72, 0xAC, 0xE2,
+    0x01,
+    0x00, 0x00
+  ]
+    ## The 8-byte CodeTracer file header the Rust `CtfsTraceWriter` writes at
+    ## the start of `events.log`, ahead of the first inline chunk header.  The
+    ## Nim `TraceWriter` does not write it, so `readEvents` treats it as
+    ## optional and skips it when present.
+
 # ---------------------------------------------------------------------------
 # Types
 # ---------------------------------------------------------------------------
@@ -377,19 +390,32 @@ proc readEventsV4(reader: var TraceReader): Result[void, string] =
     return err("failed to read step count: " & stepCountRes.error)
   let totalSteps = stepCountRes.get()
 
-  # Build a GLI matching the writer (DefaultLinesPerFile per file).
-  # IMPORTANT: this MUST stay in lock-step with
-  # `codetracer_trace_writer/multi_stream_writer.DefaultLinesPerFile`.
-  # If a future writer revision changes the assumed density (or starts
-  # writing per-file true line counts into the trace), this reader will
-  # silently misinterpret the (fileId, line) of every step. When that
-  # happens the writer should expose the counts via trace metadata and
-  # this code should read them back instead of assuming a constant.
-  const DefaultLinesPerFile: uint64 = 100_000
-  var lineCounts = newSeq[uint64](reader.paths.len)
-  for i in 0 ..< reader.paths.len:
-    lineCounts[i] = DefaultLinesPerFile
-  let gli = buildGlobalLineIndex(lineCounts)
+  # The line-only address space this reader inverts steps through.
+  #
+  # A line-only `global_position_index` is an integer that addresses one
+  # line, and nothing in the container says how the integers were
+  # apportioned between files: no stride, no per-file line count, no
+  # producer identifier. Inverting one is therefore an assumption about the
+  # producer, and the assumption made here is `codetracer_trace_format_nim`'s
+  # own writer — `prefixSum[path_id] + (line - 1)`, each file's slot sized by
+  # `global_line_index.fileAddressCount` exactly as
+  # `multi_stream_writer.rebuildGli` sizes it.
+  #
+  # It is not the only packing in circulation. The Rust
+  # `codetracer_trace_writer` produces the same container format and packs
+  # `(path_id shl 32) or line` (`step_stream.rs pack_global_line_index`),
+  # which `codetracer/src/db-backend` round-trips through for its own
+  # step streams. `tryResolve` is what keeps a trace from the other writer
+  # from being answered instead of reported: its positions land above the
+  # top of this space and the read fails by name.
+  #
+  # The space is laid out from the trace's own per-file line tables rather
+  # than from its path count, so a column-aware file that carries one is
+  # the size the writer gave it. Sizing every file `DefaultLinesPerFile`
+  # regardless puts the files that follow a tabled one too high, and the
+  # resulting position lands in the wrong file at a line that is in range —
+  # which `tryResolve` cannot refuse, because it is not outside anything.
+  let gli = nr.globalPositionSpace()
 
   # P6.5 / Piece B — column-tracking cursor.
   #
@@ -544,7 +570,10 @@ proc readEventsV4(reader: var TraceReader): Result[void, string] =
       else:
         let absGli = nr.stepAbsoluteGlobalLineIndex(n)
         if absGli.isOk and reader.paths.len > 0:
-          let (fileId, line) = gli.resolve(absGli.get())
+          let resolved = gli.tryResolve(absGli.get())
+          if resolved.isErr:
+            return err("step " & $n & ": " & resolved.error)
+          let (fileId, line) = resolved.get()
           var rec = StepRecord(pathId: PathId(uint64(fileId)),
                                line: Line(int64(line)))
           if cursorHasColumn:
@@ -641,7 +670,7 @@ const
   UnknownSizeMinBytes = 4096
   UnknownSizeCeilingBytes = 512 * 1024 * 1024
 
-proc inflateEventsLogChunk(compressed: openArray[byte]):
+proc inflateEventsLogChunk*(compressed: openArray[byte]):
     Result[seq[byte], string] =
   ## Inflate one `events.log` chunk, whether or not its Zstd frame header
   ## pledges the decompressed size.

@@ -51,8 +51,14 @@ when defined(nimPreviewSlimSystem):
 ## concern; if a future caller needs strict monotonicity, layer it on
 ## top.
 
-import std/times
-when defined(macosx) or defined(ios) or defined(freebsd) or defined(openbsd):
+when defined(ctHostClock):
+  # Freestanding targets (`--os:any`) have no `struct tm`, so `std/times` does
+  # not compile there. The host supplies the wall clock instead.
+  proc ctHostUnixMs(): uint64 {.importc: "ct_host_unix_ms".}
+else:
+  import std/times
+when defined(macosx) or defined(ios) or defined(freebsd) or defined(openbsd) or
+     defined(ctLeanRecord):
   # `getentropy(2)` DIRECTLY, on every Apple/BSD build — not behind a define.
   #
   # `std/sysrand`'s macOS backend is `SecRandomCopyBytes`, which carries a
@@ -72,11 +78,16 @@ when defined(macosx) or defined(ios) or defined(freebsd) or defined(openbsd):
   # Nothing is given up.  `SecRandomCopyBytes` is a wrapper over the same
   # kernel entropy this call reaches directly; on Darwin `getentropy(2)` IS the
   # CSPRNG, capped at 256 bytes per call, and the only draw here is 10 bytes.
-  # So this is a removal, not a capability gate — which is why it is
-  # unconditional rather than another `when defined(...)` arm to be forgotten.
-  # It replaces the `ctLeanRecord` arm that used to guard it, because a knob
-  # that has to be remembered is a knob that will be missed by the build that
-  # needs it most.
+  # So this is a removal, not a capability gate on those platforms — which is
+  # why the Apple/BSD arm is unconditional rather than a `when defined(...)`
+  # knob to be forgotten.
+  #
+  # `ctLeanRecord` stays as an explicit opt-in for targets that are neither
+  # Apple nor BSD and have no `std/sysrand` backend worth linking. The
+  # freestanding WebAssembly writer (`wasm/build-trace-writer-standalone.sh`)
+  # is the one that needs it: `std/sysrand` there is a WASI `random_get`
+  # import, and an import is exactly what that build exists to avoid, so
+  # `wasm/standalone/trace_writer_host_stub.c` supplies `getentropy` instead.
   proc c_getentropy(buf: pointer, n: csize_t): cint
     {.importc: "getentropy", header: "<sys/random.h>".}
   proc urandom(dest: var openArray[byte]): bool =
@@ -106,8 +117,12 @@ type
 
 proc unixMs(): uint64 =
   ## Return the current Unix epoch in whole milliseconds.  Uses
-  ## `std/times.epochTime()` so the value matches `date +%s%3N`.
-  uint64(epochTime() * 1000.0)
+  ## `std/times.epochTime()` so the value matches `date +%s%3N`, or the
+  ## host-supplied clock when `ctHostClock` is defined.
+  when defined(ctHostClock):
+    ctHostUnixMs()
+  else:
+    uint64(epochTime() * 1000.0)
 
 # ---------------------------------------------------------------------------
 # Generation
