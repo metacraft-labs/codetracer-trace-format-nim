@@ -1,18 +1,24 @@
 {.push raises: [].}
 
-## The reader's `paths.json` fallback, and the decoder underneath it.
+## The `paths.json` string-array decoder, and the retirement of the sidecar
+## it used to serve.
 ##
-## `paths.json` is the only JSON document `new_trace_reader` parses. It used to
+## `paths.json` was the only JSON document `new_trace_reader` parsed. It used to
 ## be parsed with `std/json`, which reaches `parseFloat` and so libc's
 ## `strtod` — a symbol a freestanding target has no definition of, which stopped
 ## the reader linking for `wasm32-unknown-unknown` over a float parser no `.ct`
 ## container ever needs. `decodeJsonStringArray` replaced it.
 ##
-## These tests exist because that swap must not have changed what the reader
-## READS. They cover the grammar a path can legitimately contain — escaped
-## backslashes on a Windows path, `\/`, non-ASCII via `\uXXXX`, and characters
-## outside the BMP via a surrogate pair — and the malformed documents whose
-## contract is "no fallback, not a crash".
+## The sidecar is now retired: no reader path consults it, and a container
+## carrying one is read entirely from the binary interning tables. The decoder
+## survives as the only string-array parser here a freestanding target can
+## link, so its grammar stays covered — escaped backslashes on a Windows path,
+## `\/`, non-ASCII via `\uXXXX`, characters outside the BMP via a surrogate
+## pair, and the malformed documents whose contract is "no result, not a
+## crash".
+##
+## The last test is the retirement itself: a container whose only source of
+## paths is `paths.json` now reports none, whatever that document says.
 
 import std/options
 import results
@@ -109,33 +115,27 @@ proc test_refuses_an_unescaped_control_character() =
   echo "PASS: test_refuses_an_unescaped_control_character"
 
 # ---------------------------------------------------------------------------
-# The reader's use of it
+# The reader no longer uses it
 # ---------------------------------------------------------------------------
 
-proc test_the_reader_falls_back_to_paths_json() =
-  let paths = pathsSeenBy("[\"/src/main.py\", \"/src/helper.py\"]")
-  doAssert paths == @["/src/main.py", "/src/helper.py"], $paths
-  echo "PASS: test_the_reader_falls_back_to_paths_json"
+proc test_the_reader_no_longer_reads_paths_json() =
+  # The retirement. A well-formed `paths.json` naming two real paths is the
+  # document that used to produce two paths; it now produces none, because
+  # nothing reads it. Opening still succeeds — a retired sidecar is ignored,
+  # not rejected.
+  doAssert pathsSeenBy("[\"/src/main.py\", \"/src/helper.py\"]").len == 0
+  echo "PASS: test_the_reader_no_longer_reads_paths_json"
 
-proc test_the_fallback_decodes_escapes() =
-  let paths = pathsSeenBy("[\"C:\\\\Users\\\\caf\\u00e9\\\\main.py\"]")
-  doAssert paths == @["C:\\Users\\caf\xC3\xA9\\main.py"], $paths
-  echo "PASS: test_the_fallback_decodes_escapes"
-
-proc test_a_malformed_paths_json_leaves_no_paths() =
-  # The contract is a quiet empty fallback: the container is otherwise
-  # well-formed, so opening it must still succeed.
-  for text in ["[1, 2]", "{\"paths\": []}", "[\"unterminated", "not json"]:
+proc test_any_paths_json_leaves_no_paths() =
+  # Well-formed, malformed and absent now have the same answer, which is the
+  # point of retiring the sidecar: there is no document-shaped behaviour left
+  # to get wrong. The container is otherwise well-formed, so it must open.
+  for text in ["[\"/src/main.py\"]", "[]", "[1, 2]", "{\"paths\": []}",
+               "[\"unterminated", "not json"]:
     let r = openNewTraceFromBytes(containerWithPathsJson(text))
     doAssert r.isOk, "open failed for: " & text
     doAssert r.get().pathCount() == 0'u64, "expected no paths for: " & text
-  echo "PASS: test_a_malformed_paths_json_leaves_no_paths"
-
-proc test_an_empty_paths_json_leaves_no_paths() =
-  let r = openNewTraceFromBytes(containerWithPathsJson("[]"))
-  doAssert r.isOk
-  doAssert r.get().pathCount() == 0'u64
-  echo "PASS: test_an_empty_paths_json_leaves_no_paths"
+  echo "PASS: test_any_paths_json_leaves_no_paths"
 
 when isMainModule:
   test_decodes_a_plain_array()
@@ -148,10 +148,8 @@ when isMainModule:
   test_refuses_a_lone_surrogate()
   test_refuses_a_document_that_is_not_an_array_of_strings()
   test_refuses_an_unescaped_control_character()
-  test_the_reader_falls_back_to_paths_json()
-  test_the_fallback_decodes_escapes()
-  test_a_malformed_paths_json_leaves_no_paths()
-  test_an_empty_paths_json_leaves_no_paths()
-  echo "All paths.json fallback tests passed!"
+  test_the_reader_no_longer_reads_paths_json()
+  test_any_paths_json_leaves_no_paths()
+  echo "All paths.json decoder tests passed!"
 
 {.pop.}

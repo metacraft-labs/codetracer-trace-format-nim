@@ -5,6 +5,7 @@ import std/json
 import results
 import codetracer_ctfs
 import codetracer_trace_writer
+import codetracer_trace_writer/meta_dat
 
 # ---------------------------------------------------------------------------
 # Helpers: read back internal files from raw CTFS bytes
@@ -128,22 +129,22 @@ proc test_metadata() =
   doAssert readRes.isOk, "failed to read .ct file"
   let data = readRes.get()
 
-  let metaStr = readInternalFileStr(data, "meta.json")
-  doAssert metaStr.len > 0, "meta.json is empty"
+  # `meta.dat` is the metadata document; the legacy `meta.json` sidecar this
+  # test used to read is retired and must NOT be written any more.
+  doAssert findInternalFile(data, "meta.json") == (0'u64, 0'u64),
+    "meta.json was written; the legacy JSON sidecar is retired"
 
-  try:
-    let node = parseJson(metaStr)
-    doAssert node["program"].getStr() == "my_program",
-      "program mismatch: " & node["program"].getStr()
-    doAssert node["args"].len == 2, "args length mismatch"
-    doAssert node["args"][0].getStr() == "--verbose"
-    doAssert node["args"][1].getStr() == "input.txt"
-    doAssert node["workdir"].getStr() == "/home/user/project",
-      "workdir mismatch: " & node["workdir"].getStr()
-  except JsonParsingError:
-    doAssert false, "meta.json is not valid JSON: " & metaStr
-  except KeyError:
-    doAssert false, "meta.json missing expected key"
+  let metaBytes = readInternalFileData(data, "meta.dat")
+  doAssert metaBytes.len > 0, "meta.dat is empty"
+  let parsed = readMetaDat(metaBytes)
+  doAssert parsed.isOk, "meta.dat did not parse: " & parsed.error
+  let meta = parsed.get()
+  doAssert meta.program == "my_program", "program mismatch: " & meta.program
+  doAssert meta.args.len == 2, "args length mismatch"
+  doAssert meta.args[0] == "--verbose"
+  doAssert meta.args[1] == "input.txt"
+  doAssert meta.workdir == "/home/user/project",
+    "workdir mismatch: " & meta.workdir
 
   cleanupFile(path)
   echo "PASS: test_metadata"
@@ -176,19 +177,19 @@ proc test_paths() =
   doAssert readRes.isOk
   let data = readRes.get()
 
-  let pathsStr = readInternalFileStr(data, "paths.json")
-  doAssert pathsStr.len > 0, "paths.json is empty"
+  # Paths ride in `meta.dat` now; the legacy `paths.json` sidecar is retired.
+  doAssert findInternalFile(data, "paths.json") == (0'u64, 0'u64),
+    "paths.json was written; the legacy JSON sidecar is retired"
 
-  try:
-    let arr = parseJson(pathsStr)
-    doAssert arr.len == 5, "paths count mismatch: " & $arr.len
-    for i in 0 ..< 5:
-      doAssert arr[i].getStr() == testPaths[i],
-        "path mismatch at " & $i & ": " & arr[i].getStr()
-  except JsonParsingError:
-    doAssert false, "paths.json is not valid JSON"
-  except KeyError:
-    doAssert false, "paths.json missing expected element"
+  let metaBytes = readInternalFileData(data, "meta.dat")
+  doAssert metaBytes.len > 0, "meta.dat is empty"
+  let parsed = readMetaDat(metaBytes)
+  doAssert parsed.isOk, "meta.dat did not parse: " & parsed.error
+  let recordedPaths = parsed.get().paths
+  doAssert recordedPaths.len == 5, "paths count mismatch: " & $recordedPaths.len
+  for i in 0 ..< 5:
+    doAssert recordedPaths[i] == testPaths[i],
+      "path mismatch at " & $i & ": " & recordedPaths[i]
 
   cleanupFile(path)
   echo "PASS: test_paths"
@@ -409,16 +410,19 @@ proc test_ctfs_structure() =
   doAssert readRes.isOk
   let data = readRes.get()
 
-  # Check all 4 expected internal files exist
-  let expectedFiles = ["events.log", "events.fmt", "meta.json", "paths.json"]
+  # Check the expected internal files exist
+  let expectedFiles = ["events.log", "events.fmt", "meta.dat"]
   for name in expectedFiles:
     let (fileSize, mapBlock) = findInternalFile(data, name)
     doAssert mapBlock != 0,
       "internal file not found: " & name
-    # events.log, meta.json, paths.json should have non-zero sizes
-    # (events.fmt is small but non-zero)
     doAssert fileSize > 0,
       "internal file has zero size: " & name
+
+  # The legacy JSON sidecars are retired and must not be written.
+  for name in ["meta.json", "paths.json"]:
+    doAssert findInternalFile(data, name) == (0'u64, 0'u64),
+      "legacy JSON sidecar was written: " & name
 
   # Verify base40 encoding produces expected values
   let eventsLogEncoded = base40Encode("events.log")
@@ -479,25 +483,16 @@ proc test_rust_reader_format() =
   let fmtStr = readInternalFileStr(data, "events.fmt")
   doAssert fmtStr == "split-binary"
 
-  # 5. meta.json is valid JSON with expected fields
-  let metaStr = readInternalFileStr(data, "meta.json")
-  try:
-    let meta = parseJson(metaStr)
-    doAssert meta.hasKey("program")
-    doAssert meta.hasKey("args")
-    doAssert meta.hasKey("workdir")
-  except JsonParsingError:
-    doAssert false, "meta.json is not valid JSON"
-  except KeyError:
-    doAssert false, "meta.json missing expected key"
-
-  # 6. paths.json is a JSON array
-  let pathsStr = readInternalFileStr(data, "paths.json")
-  try:
-    let paths = parseJson(pathsStr)
-    doAssert paths.kind == JArray
-  except JsonParsingError:
-    doAssert false, "paths.json is not valid JSON"
+  # 5. meta.dat parses and carries the expected fields.  The legacy
+  #    `meta.json` / `paths.json` sidecars are retired and must be absent.
+  let metaBytes = readInternalFileData(data, "meta.dat")
+  doAssert metaBytes.len > 0, "meta.dat is empty"
+  let metaParsed = readMetaDat(metaBytes)
+  doAssert metaParsed.isOk, "meta.dat did not parse: " & metaParsed.error
+  doAssert findInternalFile(data, "meta.json") == (0'u64, 0'u64),
+    "meta.json was written; the legacy JSON sidecar is retired"
+  doAssert findInternalFile(data, "paths.json") == (0'u64, 0'u64),
+    "paths.json was written; the legacy JSON sidecar is retired"
 
   # 7. events.log has chunk header structure
   let eventsData = readInternalFileData(data, "events.log")

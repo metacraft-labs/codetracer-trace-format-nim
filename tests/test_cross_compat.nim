@@ -16,6 +16,7 @@ import std/[os, json, strutils]
 import results
 import codetracer_ctfs
 import codetracer_trace_writer
+import codetracer_trace_writer/meta_dat
 import codetracer_trace_writer/split_binary
 
 # ---------------------------------------------------------------------------
@@ -160,8 +161,9 @@ proc test_base40_file_names() =
   doAssert readRes.isOk
   let data = readRes.get()
 
-  # All 4 internal files must be present and findable by base40 name
-  let expectedFiles = ["events.log", "events.fmt", "meta.json", "paths.json"]
+  # Every internal file this writer emits must be present and findable by
+  # base40 name.  The legacy `meta.json` / `paths.json` sidecars are retired.
+  let expectedFiles = ["events.log", "events.fmt", "meta.dat"]
   for name in expectedFiles:
     let (fileSize, mapBlock) = findInternalFile(data, name)
     doAssert mapBlock != 0,
@@ -169,8 +171,9 @@ proc test_base40_file_names() =
     doAssert fileSize > 0,
       "internal file has zero size: " & name
 
-  # Verify base40 roundtrip for all names
-  for name in expectedFiles:
+  # base40 must still round-trip the retired names: containers written before
+  # the retirement remain decodable, they just carry nothing we read.
+  for name in @expectedFiles & @["meta.json", "paths.json"]:
     let encoded = base40Encode(name)
     let decoded = base40Decode(encoded)
     doAssert decoded == name,
@@ -206,18 +209,25 @@ proc test_events_fmt_split_binary() =
   echo "PASS: test_events_fmt_split_binary"
 
 # ---------------------------------------------------------------------------
-# Test: meta.json has required fields for Rust reader
+# Test: meta.dat carries the fields a cross-language reader needs
 # ---------------------------------------------------------------------------
 
-proc test_meta_json_structure() =
-  ## Rust reader expects meta.json with: program, args, workdir fields.
-  let path = getTmpPath("test_cross_compat_meta.ct")
+proc test_meta_dat_structure() =
+  ## The Rust reader takes program / args / workdir / paths from `meta.dat`.
+  ## The legacy `meta.json` + `paths.json` sidecars this pair of tests used to
+  ## assert are retired, so the cross-language contract now rests on the
+  ## binary document alone.
+  let path = getTmpPath("test_cross_meta_dat.ct")
   cleanupFile(path)
 
-  var writerRes = newTraceWriter(path, "my_program", @["--verbose", "input.txt"],
-                                  workdir = "/home/user/project")
+  var writerRes = newTraceWriter(path, "cross_program",
+                                 @["--a", "b.txt"],
+                                 workdir = "/w")
   doAssert writerRes.isOk
   var w = writerRes.get()
+  let testPaths = @["/src/a.nim", "/src/b.nim"]
+  for tp in testPaths:
+    doAssert w.writePath(tp).isOk
   doAssert w.writeStep(0, 1).isOk
   doAssert w.close().isOk
 
@@ -225,73 +235,26 @@ proc test_meta_json_structure() =
   doAssert readRes.isOk
   let data = readRes.get()
 
-  let metaStr = readInternalFileStr(data, "meta.json")
-  doAssert metaStr.len > 0, "meta.json is empty"
+  for legacy in ["meta.json", "paths.json"]:
+    doAssert findInternalFile(data, legacy) == (0'u64, 0'u64),
+      "legacy JSON sidecar was written: " & legacy
 
-  try:
-    let meta = parseJson(metaStr)
-    # Required by Rust: program field (string)
-    doAssert meta.hasKey("program"), "meta.json missing 'program'"
-    doAssert meta["program"].kind == JString
-    doAssert meta["program"].getStr() == "my_program"
-    # Required by Rust: args field (array of strings)
-    doAssert meta.hasKey("args"), "meta.json missing 'args'"
-    doAssert meta["args"].kind == JArray
-    doAssert meta["args"].len == 2
-    doAssert meta["args"][0].getStr() == "--verbose"
-    doAssert meta["args"][1].getStr() == "input.txt"
-    # Required by Rust: workdir field (string)
-    doAssert meta.hasKey("workdir"), "meta.json missing 'workdir'"
-    doAssert meta["workdir"].kind == JString
-    doAssert meta["workdir"].getStr() == "/home/user/project"
-  except JsonParsingError:
-    doAssert false, "meta.json is not valid JSON: " & metaStr
-  except KeyError:
-    doAssert false, "meta.json missing expected key"
+  let metaBytes = readInternalFileData(data, "meta.dat")
+  doAssert metaBytes.len > 0, "meta.dat is empty"
+  let parsed = readMetaDat(metaBytes)
+  doAssert parsed.isOk, "meta.dat did not parse: " & parsed.error
+  let meta = parsed.get()
+  doAssert meta.program == "cross_program", "program mismatch: " & meta.program
+  doAssert meta.args.len == 2, "args length mismatch"
+  doAssert meta.workdir == "/w", "workdir mismatch: " & meta.workdir
+  doAssert meta.paths.len == 2, "paths count mismatch: " & $meta.paths.len
+  for i in 0 ..< 2:
+    doAssert meta.paths[i] == testPaths[i],
+      "path mismatch at " & $i & ": " & meta.paths[i]
+  doAssert meta.recordingId.len > 0, "meta.dat carries no recording_id"
 
   cleanupFile(path)
-  echo "PASS: test_meta_json_structure"
-
-# ---------------------------------------------------------------------------
-# Test: paths.json is a JSON array of strings
-# ---------------------------------------------------------------------------
-
-proc test_paths_json_structure() =
-  ## Rust reader expects paths.json to be a JSON array of path strings.
-  let path = getTmpPath("test_cross_compat_paths.ct")
-  cleanupFile(path)
-
-  var writerRes = newTraceWriter(path, "test", @[])
-  doAssert writerRes.isOk
-  var w = writerRes.get()
-  doAssert w.writePath("/src/main.rs").isOk
-  doAssert w.writePath("/src/lib.rs").isOk
-  doAssert w.writeStep(0, 1).isOk
-  doAssert w.close().isOk
-
-  let readRes = readCtfsFromFile(path)
-  doAssert readRes.isOk
-  let data = readRes.get()
-
-  let pathsStr = readInternalFileStr(data, "paths.json")
-  doAssert pathsStr.len > 0, "paths.json is empty"
-
-  try:
-    let paths = parseJson(pathsStr)
-    doAssert paths.kind == JArray, "paths.json should be a JSON array"
-    doAssert paths.len == 2, "expected 2 paths, got: " & $paths.len
-    doAssert paths[0].kind == JString
-    doAssert paths[0].getStr() == "/src/main.rs"
-    doAssert paths[1].getStr() == "/src/lib.rs"
-  except JsonParsingError:
-    doAssert false, "paths.json is not valid JSON"
-
-  cleanupFile(path)
-  echo "PASS: test_paths_json_structure"
-
-# ---------------------------------------------------------------------------
-# Test: Chunk header format (16 bytes)
-# ---------------------------------------------------------------------------
+  echo "PASS: test_meta_dat_structure"
 
 proc test_chunk_header_format() =
   ## Rust reader expects chunk headers in events.log:
@@ -650,26 +613,29 @@ proc test_full_ct_file_structure() =
   doAssert data[5] == 4'u8
 
   # 2. All internal files present
-  for name in ["events.log", "events.fmt", "meta.json", "paths.json"]:
+  for name in ["events.log", "events.fmt", "meta.dat"]:
     let (sz, mb) = findInternalFile(data, name)
     doAssert mb != 0, "missing: " & name
     doAssert sz > 0, "empty: " & name
 
+  # 2b. The legacy JSON sidecars are retired.
+  for name in ["meta.json", "paths.json"]:
+    doAssert findInternalFile(data, name) == (0'u64, 0'u64),
+      "legacy JSON sidecar was written: " & name
+
   # 3. events.fmt
   doAssert readInternalFileStr(data, "events.fmt") == "split-binary"
 
-  # 4. meta.json
-  let meta = parseJson(readInternalFileStr(data, "meta.json"))
-  doAssert meta["program"].getStr() == "cross_compat_test"
-  doAssert meta["args"].len == 2
-  doAssert meta["workdir"].getStr() == "/workspace"
-
-  # 5. paths.json
-  let paths = parseJson(readInternalFileStr(data, "paths.json"))
-  doAssert paths.kind == JArray
-  doAssert paths.len == 2
-  doAssert paths[0].getStr() == "/src/main.rs"
-  doAssert paths[1].getStr() == "/src/lib.rs"
+  # 4. meta.dat carries the metadata and the paths
+  let metaParsed = readMetaDat(readInternalFileData(data, "meta.dat"))
+  doAssert metaParsed.isOk, "meta.dat did not parse: " & metaParsed.error
+  let meta = metaParsed.get()
+  doAssert meta.program == "cross_compat_test"
+  doAssert meta.args.len == 2
+  doAssert meta.workdir == "/workspace"
+  doAssert meta.paths.len == 2
+  doAssert meta.paths[0] == "/src/main.rs"
+  doAssert meta.paths[1] == "/src/lib.rs"
 
   # 6. events.log has valid chunk(s)
   let eventsData = readInternalFileData(data, "events.log")
@@ -689,8 +655,7 @@ proc test_full_ct_file_structure() =
 test_ctfs_magic_version_blocksize()
 test_base40_file_names()
 test_events_fmt_split_binary()
-test_meta_json_structure()
-test_paths_json_structure()
+test_meta_dat_structure()
 test_chunk_header_format()
 test_split_binary_tag_ordering()
 test_fixed_size_event_layouts()

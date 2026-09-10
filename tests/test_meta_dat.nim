@@ -573,72 +573,14 @@ proc test_meta_dat_read_too_short() {.raises: [].} =
   echo "PASS: test_meta_dat_read_too_short"
 
 
-proc writeJsonString(c: var Ctfs, f: var CtfsInternalFile,
-                    s: string): Result[void, string] =
-  ## Helper to write a string as bytes to an internal file.
-  if s.len > 0:
-    let bytes = cast[seq[byte]](s)
-    ? c.writeToFile(f, bytes)
-  ok()
-
-
-proc test_meta_dat_backward_compat() {.raises: [].} =
-  ## Create a CTFS container with meta.json + paths.json (old format),
-  ## write to a temp file, open with openTrace, verify it reads correctly.
-  var c = createCtfs()
-
-  # Add meta.json
-  let metaFileRes = c.addFile("meta.json")
-  doAssert metaFileRes.isOk, "addFile meta.json failed"
-  var metaFile = metaFileRes.get()
-
-  # M-REC-1: meta.json fallback path now also requires recording_id.
-  let metaJson = """{"recording_id":"01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb","program":"/bin/old_prog","args":["--old","flag"],"workdir":"/old/dir"}"""
-  let wRes1 = writeJsonString(c, metaFile, metaJson)
-  doAssert wRes1.isOk, "write meta.json failed"
-
-  # Add paths.json
-  let pathsFileRes = c.addFile("paths.json")
-  doAssert pathsFileRes.isOk, "addFile paths.json failed"
-  var pathsFile = pathsFileRes.get()
-
-  let pathsJson = """["/old/src/a.nim","/old/src/b.nim"]"""
-  let wRes2 = writeJsonString(c, pathsFile, pathsJson)
-  doAssert wRes2.isOk, "write paths.json failed"
-
-  # Write to temp file
-  let tmpPath = getTempDir() / "test_meta_dat_compat.ct"
-  let saveRes = c.writeCtfsToFile(tmpPath)
-  doAssert saveRes.isOk, "writeCtfsToFile failed: " & saveRes.unsafeError
-  c.closeCtfs()
-
-  # Open with openTrace — should fall back to JSON
-  let traceRes = openTrace(tmpPath)
-  doAssert traceRes.isOk, "openTrace failed: " & traceRes.unsafeError
-
-  let reader = traceRes.get()
-  doAssert reader.metadata.program == "/bin/old_prog",
-    "program mismatch: " & reader.metadata.program
-  doAssert reader.metadata.workdir == "/old/dir",
-    "workdir mismatch: " & reader.metadata.workdir
-  doAssert reader.metadata.args.len == 2, "args count mismatch"
-  doAssert reader.metadata.args[0] == "--old", "arg0 mismatch"
-  doAssert reader.metadata.args[1] == "flag", "arg1 mismatch"
-  doAssert reader.paths.len == 2, "paths count mismatch"
-  doAssert reader.paths[0] == "/old/src/a.nim", "path0 mismatch"
-  doAssert reader.paths[1] == "/old/src/b.nim", "path1 mismatch"
-
-  # Clean up
-  try: removeFile(tmpPath)
-  except OSError: discard
-
-  echo "PASS: test_meta_dat_backward_compat"
-
-
 proc test_meta_dat_openTrace_binary() {.raises: [].} =
-  ## Create a CTFS container with meta.dat (new format),
-  ## write to a temp file, open with openTrace, verify it reads correctly.
-  ## Also compare toJson output with a JSON-based container to verify identical format.
+  ## Create a CTFS container with meta.dat, write it to a temp file, open it
+  ## with openTrace and verify it reads back correctly.
+  ##
+  ## This used to also build a second container carrying the legacy
+  ## `meta.json` + `paths.json` sidecars and assert the two `toJson()` outputs
+  ## were identical.  That comparison retired with the sidecars: there is only
+  ## one metadata document now, so there is no second path to agree with.
   var c = createCtfs()
 
   let metaDatFileRes = c.addFile("meta.dat")
@@ -661,59 +603,19 @@ proc test_meta_dat_openTrace_binary() {.raises: [].} =
   doAssert saveRes.isOk, "writeCtfsToFile failed: " & saveRes.unsafeError
   c.closeCtfs()
 
-  # Open with openTrace — should use meta.dat path
   let traceRes = openTrace(tmpPath)
   doAssert traceRes.isOk, "openTrace failed: " & traceRes.unsafeError
-
   let reader = traceRes.get()
   doAssert reader.metadata.program == "/bin/test_prog",
     "program mismatch: " & reader.metadata.program
+  doAssert reader.metadata.args == @["--flag", "value"], "args mismatch"
   doAssert reader.metadata.workdir == "/tmp/test",
     "workdir mismatch: " & reader.metadata.workdir
-  doAssert reader.metadata.args.len == 2, "args count mismatch"
-  doAssert reader.metadata.args[0] == "--flag", "arg0 mismatch"
-  doAssert reader.metadata.args[1] == "value", "arg1 mismatch"
-  doAssert reader.paths.len == 2, "paths count mismatch"
-  doAssert reader.paths[0] == "/src/main.nim", "path0 mismatch"
-  doAssert reader.paths[1] == "/src/lib.nim", "path1 mismatch"
+  doAssert reader.metadata.recordingId == TestRecordingId,
+    "recording_id mismatch: " & reader.metadata.recordingId
+  doAssert reader.paths == paths, "paths mismatch"
 
-  # Now create an equivalent JSON-based container and compare toJson output
-  var cJson = createCtfs()
-
-  let metaJsonFileRes = cJson.addFile("meta.json")
-  doAssert metaJsonFileRes.isOk
-  var metaJsonFile = metaJsonFileRes.get()
-  let metaJsonStr = """{"recording_id":"01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb","program":"/bin/test_prog","args":["--flag","value"],"workdir":"/tmp/test"}"""
-  let w1 = writeJsonString(cJson, metaJsonFile, metaJsonStr)
-  doAssert w1.isOk
-
-  let pathsJsonFileRes = cJson.addFile("paths.json")
-  doAssert pathsJsonFileRes.isOk
-  var pathsJsonFile = pathsJsonFileRes.get()
-  let pathsJsonStr = """["/src/main.nim","/src/lib.nim"]"""
-  let w2 = writeJsonString(cJson, pathsJsonFile, pathsJsonStr)
-  doAssert w2.isOk
-
-  let tmpPathJson = getTempDir() / "test_meta_dat_json_compare.ct"
-  let saveRes2 = cJson.writeCtfsToFile(tmpPathJson)
-  doAssert saveRes2.isOk
-  cJson.closeCtfs()
-
-  let traceResJson = openTrace(tmpPathJson)
-  doAssert traceResJson.isOk, "openTrace JSON failed: " & traceResJson.unsafeError
-
-  let readerJson = traceResJson.get()
-
-  # Compare toJson output — should be identical
-  let jsonBinary = reader.toJson()
-  let jsonFallback = readerJson.toJson()
-  doAssert jsonBinary == jsonFallback,
-    "toJson output differs between binary and JSON metadata"
-
-  # Clean up
   try: removeFile(tmpPath)
-  except OSError: discard
-  try: removeFile(tmpPathJson)
   except OSError: discard
 
   echo "PASS: test_meta_dat_openTrace_binary"
@@ -1132,6 +1034,5 @@ test_meta_dat_roundtrip_empty_filter_provenance()
 test_meta_dat_no_filter_provenance_omits_flag()
 test_meta_dat_read_bad_magic()
 test_meta_dat_read_too_short()
-test_meta_dat_backward_compat()
 test_meta_dat_openTrace_binary()
 test_meta_dat_strict_unknown_flag_rejection()

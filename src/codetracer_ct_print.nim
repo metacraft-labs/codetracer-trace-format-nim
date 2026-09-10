@@ -1724,8 +1724,7 @@ type
     adkUnreadable    ## file does not exist / cannot be opened
     adkNotCtfs       ## file exists but lacks CTFS magic — let v2/v3 path try
     adkCtfsCorrupt   ## CTFS magic OK but root header looks broken — hard error
-    adkNative        ## CTFS with `tNNN` thread streams (or legacy meta.json
-                     ## + recordingMode) → native MCR decoder
+    adkNative        ## CTFS with `tNNN` thread streams → native MCR decoder
     adkV4MultiStream ## CTFS with the split per-kind streams → v4 path
 
 proc detectAutoKind(filePath: string): (AutoDetectKind, string) =
@@ -1738,14 +1737,13 @@ proc detectAutoKind(filePath: string): (AutoDetectKind, string) =
   let data = dataR.get()
   if data.len < 16 or not ctfs_container.hasCtfsMagic(data):
     return (adkNotCtfs, "no CTFS magic — not a .ct bundle")
+  # Both layouts carry `meta.dat`, so the metadata document does not route
+  # anything; `tNNN` per-thread streams are what identify an MCR bundle.
+  # A container missing `meta.dat` entirely is left to the v4 reader, which
+  # reports the absence with its own message.
   let infoR = detectNativeBundle(data)
   if infoR.isErr:
-    # A container with no metadata document at all is not something either
-    # decoder can read; anything else is a v4 bundle for the v4 reader.
-    # (Routing no longer keys off "meta.json missing": current MCR bundles
-    # carry only `meta.dat`, and `detectNativeBundle` now accepts either —
-    # `isNativeBundle` discriminates on the presence of `tNNN` streams.)
-    if infoR.error.startsWith("metadata missing"):
+    if infoR.error.startsWith("meta.dat missing"):
       return (adkV4MultiStream, "")
     return (adkCtfsCorrupt, infoR.error)
   if isNativeBundle(data):
@@ -1811,7 +1809,7 @@ proc main() =
 
   # ----- Native MCR shard path (auto-detect or --native) -----
   # The native recorder writes a CTFS shard with per-thread `tNNNN` streams
-  # and a `meta.json` (vs the v4 layout's `meta.dat` + interning tables).
+  # (vs the v4 layout's split per-kind streams + interning tables).
   # Without this branch ct-print used to silently emit `-1` sentinel counts.
   if nativeMode == "force":
     emitNativeFull(filePath, format, stripPaths)

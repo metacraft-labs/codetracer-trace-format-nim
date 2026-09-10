@@ -9,8 +9,10 @@ when defined(nimPreviewSlimSystem):
 ## Produces .ct files with:
 ##   events.log  — split-binary events compressed with seekable Zstd
 ##   events.fmt  — the string "split-binary"
-##   meta.json   — {"program": "...", "args": [...], "workdir": "..."}
-##   paths.json  — ["/path/to/file1.nim", ...]
+##   meta.dat    — binary metadata (program / args / workdir / paths /
+##                 recording_id).  The legacy `meta.json` + `paths.json`
+##                 JSON sidecars this writer used to emit alongside it are
+##                 retired; `meta.dat` is the format.
 
 import std/json
 import std/options
@@ -45,13 +47,14 @@ type
     ctfs: Ctfs                       ## CTFS container
     eventsFile: CtfsInternalFile     ## Handle for events.log
     encoder: SplitBinaryEncoder      ## Event serializer
-    paths*: seq[string]              ## Registered paths (for paths.json)
+    paths*: seq[string]              ## Registered paths (written into meta.dat)
     metadata*: TraceMetadata         ## Program name, args, workdir
     eventCount: uint64               ## Total events written
     chunkEventCount: int             ## Events in current chunk
     chunkThreshold: int              ## Events per chunk
     closed*: bool
     filePath: string                 ## Path to .ct file
+    metaDatWritten: bool             ## `writeMetaDat` already ran for this writer
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -335,6 +338,7 @@ proc writeMetaDat*(w: var TraceWriter, recorderId: string = "",
       mcrFields = mcrFields)
   if wRes.isErr:
     return err("failed to write meta.dat: " & wRes.error)
+  w.metaDatWritten = true
   ok()
 
 # ---------------------------------------------------------------------------
@@ -365,55 +369,18 @@ proc close*(w: var TraceWriter): Result[void, string] =
     if writeRes.isErr:
       return err("failed to write events.fmt: " & writeRes.error)
 
-  # Write meta.json (legacy JSON sidecar; readers prefer meta.dat).
-  block:
-    let metaRes = w.ctfs.addFile("meta.json")
+  # Write the metadata document if the caller did not already.
+  #
+  # This used to be implicit in a bad way: `close` wrote the legacy
+  # `meta.json` + `paths.json` sidecars unconditionally, while `meta.dat` was
+  # written only when a caller opted in by calling `writeMetaDat` itself.  So
+  # a container closed without that call had metadata ONLY in the retired
+  # sidecars, and retiring them without this would have produced containers
+  # with no metadata at all.
+  if not w.metaDatWritten:
+    let metaRes = w.writeMetaDat()
     if metaRes.isErr:
-      return err("failed to add meta.json: " & metaRes.error)
-    var metaFile = metaRes.get()
-    var metaJson: string
-    try:
-      var node = newJObject()
-      # M-REC-1: recording_id is required.  Surfaces in the JSON
-      # fallback path so cross-tool consumers that only know how to
-      # parse meta.json still see the canonical id.
-      node["recording_id"] = newJString(w.metadata.recordingId)
-      node["program"] = newJString(w.metadata.program)
-      var argsArr = newJArray()
-      for arg in w.metadata.args:
-        argsArr.add(newJString(arg))
-      node["args"] = argsArr
-      node["workdir"] = newJString(w.metadata.workdir)
-      metaJson = $node
-    except ValueError:
-      return err("failed to serialize meta.json")
-    var metaBytes = newSeq[byte](metaJson.len)
-    for i in 0 ..< metaJson.len:
-      metaBytes[i] = byte(metaJson[i])
-    let writeRes = w.ctfs.writeToFile(metaFile, metaBytes)
-    if writeRes.isErr:
-      return err("failed to write meta.json: " & writeRes.error)
-
-  # Write paths.json
-  block:
-    let pathsRes = w.ctfs.addFile("paths.json")
-    if pathsRes.isErr:
-      return err("failed to add paths.json: " & pathsRes.error)
-    var pathsFile = pathsRes.get()
-    var pathsJson: string
-    try:
-      var arr = newJArray()
-      for p in w.paths:
-        arr.add(newJString(p))
-      pathsJson = $arr
-    except ValueError:
-      return err("failed to serialize paths.json")
-    var pathsBytes = newSeq[byte](pathsJson.len)
-    for i in 0 ..< pathsJson.len:
-      pathsBytes[i] = byte(pathsJson[i])
-    let writeRes = w.ctfs.writeToFile(pathsFile, pathsBytes)
-    if writeRes.isErr:
-      return err("failed to write paths.json: " & writeRes.error)
+      return err(metaRes.error)
 
   # Release encoder buffer
   w.encoder.destroy()

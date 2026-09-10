@@ -63,14 +63,6 @@ type
     typeReader: InterningTableReader
     varnameReader: InterningTableReader
 
-    # paths.json fallback for traces that don't carry a binary paths
-    # interning table yet (the M13 ct_recorder writer populates
-    # paths.json but the binary paths.dat / paths.off table is still
-    # an open TODO per the meta-json-retirement work tracked in
-    # codetracer-specs/Planned-Work/Legacy-CTFS-Format-Cleanup.md).
-    # When pathReader is empty we fall back to this list so callers
-    # get the source paths they actually recorded.
-    pathsJson: seq[string]
 
     # P6.5 / Layout A — per-file line-length tables, parsed from the
     # column-aware paths.dat records when `meta.hasColumnAwareSteps`
@@ -141,13 +133,18 @@ type
 # paths.json
 # ---------------------------------------------------------------------------
 #
-# ``paths.json`` is the only JSON document this reader parses, and its schema
-# is fixed by the spec: an array of source-path strings. Reading it with
-# ``std/json`` costs far more than the schema does — ``parsejson`` reaches
+# ``paths.json`` was the only JSON document this reader ever parsed, and its
+# schema was fixed by the spec: an array of source-path strings. Reading it
+# with ``std/json`` cost far more than the schema did — ``parsejson`` reaches
 # ``parseFloat``, which reaches libc's ``strtod``, which a freestanding target
-# has no definition of. The module then fails to LINK for
+# has no definition of. The module then failed to LINK for
 # ``wasm32-unknown-unknown`` over a float parser no ``.ct`` container ever
-# needs. The decoder below is the whole grammar the document can contain.
+# needed. The decoder below is the whole grammar the document could contain.
+#
+# The sidecar itself is retired and no reader path calls this any more. The
+# decoder is kept because it is the only string-array parser here that a
+# freestanding target can link, and because dropping it would take its
+# escape/surrogate test corpus with it.
 
 proc appendUtf8(dest: var string, cp: uint32) =
   ## Append one code point to ``dest`` in UTF-8, the encoding a Nim string
@@ -479,8 +476,10 @@ proc openNewTraceFromBytes*(data: seq[byte],
   # the misdecodes `readMetaDat`'s version and unknown-flag-bit checks exist
   # to prevent, and discarding its error here is what let them through.
   #
-  # A container with NO meta.dat is a different case and still opens: the
-  # legacy `paths.json` fallback below is the reading for those.
+  # A container with NO meta.dat opens with the flags at their defaults.
+  # It used to be the case that such a container was read through the
+  # legacy `paths.json` sidecar; that sidecar is retired, so a container
+  # without meta.dat is now read entirely from the binary tables.
   let metaDataRes = readInternalFile(data, "meta.dat", blockSize, maxEntries)
   if metaDataRes.isOk:
     let metaRes = readMetaDat(metaDataRes.get())
@@ -500,21 +499,6 @@ proc openNewTraceFromBytes*(data: seq[byte],
 
   let vnRes = initInterningTableReader(data, "varnames", blockSize, maxEntries)
   if vnRes.isOk: reader.varnameReader = vnRes.get()
-
-  # paths.json fallback: when no binary paths interning table is
-  # present, try the JSON form ct_recorder writes (M13).  The
-  # binary table is preferred when both exist — see pathCount / path.
-  if reader.pathReader.count() == 0:
-    let pathsJsonRes = readInternalFile(data, "paths.json", blockSize, maxEntries)
-    if pathsJsonRes.isOk:
-      let pathsBytes = pathsJsonRes.get()
-      if pathsBytes.len > 0:
-        var pathsTxt = newString(pathsBytes.len)
-        for i, b in pathsBytes:
-          pathsTxt[i] = char(b)
-        let parsed = decodeJsonStringArray(pathsTxt)
-        if parsed.isSome:
-          reader.pathsJson = parsed.get()
 
   # P6.5 / Layout A — the shape of a ``paths.dat`` record is decided by
   # ``meta.dat`` bit 4 (``FlagHasColumnAwareSteps``).  When it is set
@@ -729,8 +713,6 @@ proc path*(r: NewTraceReader, id: uint64): Result[string, string] =
       ok(r.lineCountPayloads[int(id)])
     else:
       r.pathReader.readById(id)
-  elif r.pathsJson.len > 0 and id < uint64(r.pathsJson.len):
-    ok(r.pathsJson[int(id)])
   else:
     r.pathReader.readById(id)  # error path — preserve the original error
 
@@ -763,9 +745,7 @@ proc columnAwarePathsSuspected*(r: NewTraceReader): bool =
   r.layoutASuspected
 
 proc pathCount*(r: NewTraceReader): uint64 =
-  let binary = r.pathReader.count()
-  if binary > 0: binary
-  else: uint64(r.pathsJson.len)
+  r.pathReader.count()
 
 # ---------------------------------------------------------------------------
 # Alternate source views (Deminification Support).  See spec §

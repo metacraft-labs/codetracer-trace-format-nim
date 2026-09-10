@@ -282,91 +282,31 @@ proc openTrace*(path: string): Result[TraceReader, string] =
     isV4: isV4,
   )
 
-  # Try meta.dat first (new binary format), fall back to meta.json + paths.json.
+  # `meta.dat` is the metadata document.  The legacy `meta.json` + `paths.json`
+  # JSON sidecars are retired and are not read.
   #
   # "meta.dat is not in this container" and "meta.dat is in this container but
-  # its blocks are not" are different answers, and only the first one may fall
-  # back. Reading a damaged entry as an absent one is what let a trace whose
-  # `meta.dat` mapping root had been lost open **successfully**, with an empty
-  # program name and no source paths, instead of reporting the damage.
-  if findInternalFileEntry(data, "meta.dat", maxEntries).found:
-    let metaDatRes = readInternalFile(data, "meta.dat", blockSize, maxEntries)
-    if metaDatRes.isErr:
-      return err("meta.dat is present in this container but its blocks are " &
-                 "not: " & metaDatRes.error)
-    let parsed = readMetaDat(metaDatRes.get())
-    if parsed.isOk:
-      let contents = parsed.get()
-      # M-REC-1: surface recording_id from the parsed metadata.
-      reader.metadata.recordingId = contents.recordingId
-      reader.metadata.program = contents.program
-      reader.metadata.workdir = contents.workdir
-      reader.metadata.args = contents.args
-      reader.paths = contents.paths
-    else:
-      return err("meta.dat present but corrupt: " & parsed.error)
-  else:
-    # Fall back to meta.json + paths.json (legacy JSON sidecar).
-    # M-REC-1: pre-1.0 the spec rejects metadata without recording_id,
-    # so we require the JSON to carry one too.
-    let metaRes = readInternalFile(data, "meta.json", blockSize, maxEntries)
-    if metaRes.isErr and findInternalFileEntry(data, "meta.json", maxEntries).found:
-      return err("meta.json is present in this container but its blocks are " &
-                 "not: " & metaRes.error)
-    if metaRes.isOk:
-      let metaStr = bytesToString(metaRes.get())
-      var recordingIdFromJson = ""
-      try:
-        let node = parseJson(metaStr)
-        recordingIdFromJson =
-          node.getOrDefault("recording_id").getStr("")
-        reader.metadata.program = node.getOrDefault("program").getStr("")
-        reader.metadata.workdir = node.getOrDefault("workdir").getStr("")
-        let argsNode = node.getOrDefault("args")
-        if argsNode != nil and argsNode.kind == JArray:
-          for item in argsNode:
-            reader.metadata.args.add(item.getStr(""))
-      except JsonParsingError:
-        return err("failed to parse meta.json")
-      except KeyError:
-        return err("unexpected key error in meta.json")
-      except IOError:
-        return err("IO error parsing meta.json")
-      except OSError:
-        return err("OS error parsing meta.json")
-      except ValueError:
-        return err("value error parsing meta.json")
-      except Exception:
-        return err("unexpected error parsing meta.json")
-      let valRes = validateRecordingIdStr(recordingIdFromJson)
-      if valRes.isErr:
-        return err("meta.json: invalid or missing recording_id: " &
-                   valRes.error)
-      reader.metadata.recordingId = recordingIdFromJson
-
-    let pathsRes = readInternalFile(data, "paths.json", blockSize, maxEntries)
-    if pathsRes.isErr and findInternalFileEntry(data, "paths.json", maxEntries).found:
-      return err("paths.json is present in this container but its blocks are " &
-                 "not: " & pathsRes.error)
-    if pathsRes.isOk:
-      let pathsStr = bytesToString(pathsRes.get())
-      try:
-        let arr = parseJson(pathsStr)
-        if arr.kind == JArray:
-          for item in arr:
-            reader.paths.add(item.getStr(""))
-      except JsonParsingError:
-        return err("failed to parse paths.json")
-      except KeyError:
-        return err("unexpected key error in paths.json")
-      except IOError:
-        return err("IO error parsing paths.json")
-      except OSError:
-        return err("OS error parsing paths.json")
-      except ValueError:
-        return err("value error parsing paths.json")
-      except Exception:
-        return err("unexpected error parsing paths.json")
+  # its blocks are not" are different answers, and both are errors now that
+  # there is nothing to fall back to. Reading a damaged entry as an absent one
+  # is what let a trace whose `meta.dat` mapping root had been lost open
+  # **successfully**, with an empty program name and no source paths, instead
+  # of reporting the damage.
+  if not findInternalFileEntry(data, "meta.dat", maxEntries).found:
+    return err("meta.dat missing: this container carries no metadata document")
+  let metaDatRes = readInternalFile(data, "meta.dat", blockSize, maxEntries)
+  if metaDatRes.isErr:
+    return err("meta.dat is present in this container but its blocks are " &
+               "not: " & metaDatRes.error)
+  let parsed = readMetaDat(metaDatRes.get())
+  if parsed.isErr:
+    return err("meta.dat present but corrupt: " & parsed.error)
+  let contents = parsed.get()
+  # M-REC-1: surface recording_id from the parsed metadata.
+  reader.metadata.recordingId = contents.recordingId
+  reader.metadata.program = contents.program
+  reader.metadata.workdir = contents.workdir
+  reader.metadata.args = contents.args
+  reader.paths = contents.paths
 
   ok(reader)
 
