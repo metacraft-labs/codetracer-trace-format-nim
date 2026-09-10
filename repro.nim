@@ -107,12 +107,12 @@ const
   CrossReadPool = "codetracer_trace_format_nim.crossread-serial"
 
 # The reproducible green corpus. It is the union of the nimble ``test``
-# task (51 files) and the four CI-only reader/network tests
+# task and the four CI-only reader/network tests
 # (``test_cross_format`` / ``test_query_protocol`` / ``test_network_reader``
 # / ``test_replication``), PLUS the additional in-tree unit tests that
 # compile + run clean on a headless Linux host under ``-d:release -p:src``
 # (``test_ct_print_full`` / ``test_ct_print_native`` / ``test_managed_sender``
-# / ``test_reader_v4`` / ``test_source_views`` / ``test_column_aware_steps``).
+# / ``test_reader_v4`` / ``test_source_views``).
 # Every listed file compiles and runs to exit 0 with ``-d:release -p:src``;
 # ``-d:release`` is a faithful superset of the per-file flags the nimble
 # task uses (the non-release files run identically under it).
@@ -131,11 +131,15 @@ const
 # --nimMainPrefix:codetracerTraceWriter`` compile reason (``TestSpec`` has
 # no field for either flag) — but unlike the two above these DO run, in the
 # nimble ``test`` task and therefore in ``just test``:
-# ``tests/test_line_only_orphan_carry_forward.nim`` and
-# ``tests/test_orphan_call_args_step_location.nim``. Both drive the C FFI
-# entry points directly to pin ``flushPendingStep``'s orphan-values
-# branch. Teaching ``TestSpec`` about the two flags so reprobuild covers
-# them as well is worth doing and is tracked separately.
+# ``tests/test_line_only_orphan_carry_forward.nim``,
+# ``tests/test_orphan_call_args_step_location.nim``,
+# ``tests/test_reader_ffi_column_aware_paths.nim`` and
+# ``tests/test_reader_ffi_line_only_position_space.nim``. All four drive the
+# C FFI entry points directly — the first two to pin ``flushPendingStep``'s
+# orphan-values branch, the last two to pin what the ABI does with a
+# ``paths.dat`` layout and a step position it cannot resolve on its own.
+# Teaching ``TestSpec`` about the two flags so reprobuild covers them as
+# well is worth doing and is tracked separately.
 const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_base40.nim", binary: "build/test-bin/test_base40"),
   TestSpec(source: "tests/test_container.nim", binary: "build/test-bin/test_container"),
@@ -182,6 +186,9 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_span_stream.nim", binary: "build/test-bin/test_span_stream"),
   TestSpec(source: "tests/test_multi_stream_integration.nim", binary: "build/test-bin/test_multi_stream_integration"),
   TestSpec(source: "tests/test_new_trace_reader.nim", binary: "build/test-bin/test_new_trace_reader"),
+  TestSpec(source: "tests/test_paths_dat_layout_authority.nim", binary: "build/test-bin/test_paths_dat_layout_authority"),
+  TestSpec(source: "tests/test_line_only_position_space.nim", binary: "build/test-bin/test_line_only_position_space"),
+  TestSpec(source: "tests/test_mixed_column_aware_position_space.nim", binary: "build/test-bin/test_mixed_column_aware_position_space"),
   TestSpec(source: "tests/test_reader_calls_events.nim", binary: "build/test-bin/test_reader_calls_events"),
   TestSpec(source: "tests/test_reader_integration.nim", binary: "build/test-bin/test_reader_integration"),
   TestSpec(source: "tests/test_nim_step_stream_crossread.nim", binary: "build/test-bin/test_nim_step_stream_crossread", pooled: true),
@@ -206,6 +213,7 @@ const testSpecs: seq[TestSpec] = @[
   # A streaming-compressed `events.log` chunk pledges no content size;
   # CONTENTSIZE_UNKNOWN used to reach `int(...)` and raise a RangeDefect.
   TestSpec(source: "tests/test_events_log_unpledged_frame.nim", binary: "build/test-bin/test_events_log_unpledged_frame"),
+  TestSpec(source: "tests/test_ct_print_unresolvable_position.nim", binary: "build/test-bin/test_ct_print_unresolvable_position"),
   # CI-only (not in the nimble task) reader / network suites.
   TestSpec(source: "tests/test_cross_format.nim", binary: "build/test-bin/test_cross_format"),
   TestSpec(source: "tests/test_query_protocol.nim", binary: "build/test-bin/test_query_protocol"),

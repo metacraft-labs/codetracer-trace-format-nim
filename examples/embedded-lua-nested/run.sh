@@ -3,8 +3,8 @@
 # verify it (GDScript-Recorder milestone N3: Generalization, NO fork).
 #
 # Steps:
-#   1. build host.c (embeds Lua via nixpkgs lua5_4; links the vendored CTFS
-#      writer libcodetracer_trace_writer.a).
+#   1. build host.c (embeds Lua via nixpkgs lua5_4; links this repo's own
+#      libcodetracer_trace_writer.a, built by `just build-static-lib`).
 #   2. run it: Lua's OWN per-line hook drives a materialized Lua .ct, joined to
 #      the host's native coordinate index at the host<->VM boundary.
 #   3. decode via ct-print --full and assert with scripts/verify_n3.py:
@@ -39,6 +39,33 @@ if [[ -z "$CT_PRINT" ]]; then
 fi
 echo "run.sh: using ct-print at $CT_PRINT"
 
+# The writer this example links is the one THIS repo builds, not a copy of it.
+#
+# A prebuilt `vendor/libcodetracer_trace_writer.a` used to be committed here.
+# An example that lives inside the repo defining the writer cannot vendor that
+# writer without the copy going stale, and this one did: it kept producing
+# `meta.dat` v3 containers after the global-line-index correction moved the
+# format to v4, and nothing reported it, because no CI lane and no `just`
+# target reaches this directory. The repo's own `.gitignore` excludes `*.a` and
+# `*.so`; the vendored copy was the single tracked exception to that rule.
+#
+# So the library is resolved, never carried. `$CT_TRACE_WRITER_LIB` wins if
+# set; otherwise it is the repo-root artefact, and a missing one is an error
+# naming the command that produces it rather than a fallback to something
+# older. The header comes from `../../include` for the same reason.
+LIB="${CT_TRACE_WRITER_LIB:-}"
+if [[ -z "$LIB" ]]; then
+  LIB="$(cd ../.. && pwd)/libcodetracer_trace_writer.a"
+fi
+if [[ ! -f "$LIB" ]]; then
+  echo "run.sh: no CTFS writer static library at $LIB" >&2
+  echo "        Build it from the repo root with:" >&2
+  echo "            just build-static-lib      # or: nimble buildStaticLib" >&2
+  echo "        (or point CT_TRACE_WRITER_LIB at one you already have)." >&2
+  exit 2
+fi
+echo "run.sh: linking CTFS writer at $LIB"
+
 # ---- 1. build the native host -------------------------------------------------
 # macOS: the CTFS writer's Nim/arc runtime needs -framework Security
 # -framework CoreFoundation; Linux would use -lm -lpthread instead.
@@ -51,8 +78,8 @@ fi
 
 echo "run.sh: building host..."
 clang -O1 -g -std=c11 \
-  $(pkg-config --cflags lua5.4) -Ivendor \
-  host.c vendor/libcodetracer_trace_writer.a \
+  $(pkg-config --cflags lua5.4) -I../../include \
+  host.c "$LIB" \
   $(pkg-config --libs lua5.4) \
   $(pkg-config --libs libzstd) \
   "${FRAMEWORKS[@]}" \

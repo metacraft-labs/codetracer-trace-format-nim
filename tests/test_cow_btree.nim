@@ -275,6 +275,42 @@ proc test_serialize_roundtrip() =
     doAssert t2.lookup(i).get() == d, "roundtrip mismatch for " & $i
   echo "PASS: test_serialize_roundtrip"
 
+proc test_loaded_tree_reports_its_key_count() =
+  ## `count` is not in the NamespaceHeader, so a loaded tree has to recount it.
+  ## Until it did, `count()` answered 0 for an image whose `keys()` returned
+  ## every key — the shape of a wrong answer that reads as a plausible one
+  ## ("the namespace is empty") rather than as a failure. Every consumer that
+  ## sizes a namespace it did not itself build depends on this: the reader of
+  ## `linehits.tc` is one.
+  var t = initCowBTree(cltTypeB)
+  const Keys = 250'u64
+  for i in 1'u64 .. Keys:
+    var d = newSeq[byte](16)
+    for b in 0 ..< 16: d[b] = byte((i + uint64(b)) and 0xFF)
+    doAssert t.insertAndCommit(i, d).isOk
+  # An update must not inflate the count — it is live keys, not insertions.
+  var again = newSeq[byte](16)
+  doAssert t.insertAndCommit(1'u64, again).isOk
+  doAssert t.count() == Keys, "writer count: got " & $t.count()
+
+  let loaded = loadCowBTreeForTest(t.serialize(), cltTypeB)
+  doAssert loaded.isOk
+  let t2 = loaded.get()
+  doAssert t2.count() == Keys,
+    "loaded count: got " & $t2.count() & ", expected " & $Keys
+  doAssert uint64(t2.keys().get().len) == t2.count(),
+    "loaded count disagrees with the key walk: count=" & $t2.count() &
+    " keys=" & $t2.keys().get().len
+
+  # An empty namespace must still load as empty rather than as "unknown".
+  let emptyTree = initCowBTree(cltTypeB)
+  let emptyLoaded = loadCowBTreeForTest(emptyTree.serialize(), cltTypeB)
+  doAssert emptyLoaded.isOk
+  doAssert emptyLoaded.get().count() == 0'u64,
+    "empty namespace loaded with count " & $emptyLoaded.get().count()
+
+  echo "PASS: test_loaded_tree_reports_its_key_count"
+
 # --- Rust → Nim cross-read (M4) ---------------------------------------------
 
 proc parseHexLE(hex: string): seq[byte] {.raises: [ValueError].} =
@@ -353,5 +389,6 @@ when isMainModule:
   test_freelist_whole_block_reclaim()
   test_btree_page_reclaimed_after_oldest_reader()
   test_serialize_roundtrip()
+  test_loaded_tree_reports_its_key_count()
   test_reads_rust_written_cow_image()
   echo "All CoW B-tree tests passed."

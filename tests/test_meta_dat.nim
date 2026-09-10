@@ -93,7 +93,8 @@ proc test_meta_dat_write_layout() {.raises: [].} =
   pos = 4
 
   # Version
-  doAssert readU16LEAt(raw, pos) == 3, "version mismatch (expected v3, M-REC-1)"
+  doAssert readU16LEAt(raw, pos) == MetaDatVersion,
+    "version mismatch: the writer must stamp the current schema version"
   pos += 2
 
   # Flags
@@ -175,7 +176,8 @@ proc test_meta_dat_with_mcr_fields() {.raises: [].} =
   pos = 4
 
   # Version
-  doAssert readU16LEAt(raw, pos) == 3, "version mismatch (v3 from M-REC-1)"
+  doAssert readU16LEAt(raw, pos) == MetaDatVersion,
+    "version mismatch: the writer must stamp the current schema version"
   pos += 2
 
   # Flags — bit 0 should be set
@@ -286,7 +288,8 @@ proc test_meta_dat_empty_fields() {.raises: [].} =
   # Magic + version + flags = 8 bytes
   doAssert raw[0] == 0x43 and raw[1] == 0x54 and raw[2] == 0x4D and raw[3] == 0x44
   pos = 4
-  doAssert readU16LEAt(raw, pos) == 3
+  doAssert readU16LEAt(raw, pos) == MetaDatVersion,
+    "version mismatch: the writer must stamp the current schema version"
   pos += 2
   doAssert readU16LEAt(raw, pos) == 0
   pos += 2
@@ -319,7 +322,7 @@ proc test_meta_dat_empty_fields() {.raises: [].} =
   # zeros (each 1 byte) = 50 bytes total.
   doAssert pos == raw.len, "trailing bytes: consumed " & $pos & " of " & $raw.len
   doAssert raw.len == 50,
-    "expected 50 bytes for minimal v3 meta.dat, got " & $raw.len
+    "expected 50 bytes for a minimal meta.dat, got " & $raw.len
 
   c.closeCtfs()
   echo "PASS: test_meta_dat_empty_fields"
@@ -349,7 +352,7 @@ proc test_meta_dat_roundtrip() {.raises: [].} =
   doAssert parsed.isOk, "readMetaDat failed: " & parsed.unsafeError
 
   let contents = parsed.get()
-  doAssert contents.version == 3, "version mismatch (expected v3)"
+  doAssert contents.version == MetaDatVersion, "version mismatch"
   doAssert contents.recordingId == TestRecordingId,
     "recording_id round-trip failed: got " & contents.recordingId
   doAssert contents.program == "/usr/bin/myapp", "program mismatch: " & contents.program
@@ -830,8 +833,12 @@ proc test_meta_dat_reader_rejects_missing_recording_id() {.raises: [].} =
   # Magic
   for b in [0x43'u8, 0x54, 0x4D, 0x44]:
     buf.add(b)
-  # Version = 3
-  buf.add(3'u8); buf.add(0'u8)
+  # Version — the CURRENT one, so the empty recording_id below is what the
+  # parse refuses. Stamped from the constant rather than a literal: pinned to
+  # a superseded number this buffer would be refused for its VERSION and the
+  # recording_id rule would go untested while the test still passed.
+  buf.add(byte(MetaDatVersion and 0xFF))
+  buf.add(byte((MetaDatVersion shr 8) and 0xFF))
   # Flags = 0
   buf.add(0'u8); buf.add(0'u8)
   # Empty recording_id (varint 0 — zero-length string)
@@ -920,7 +927,11 @@ proc test_meta_dat_strict_unknown_flag_rejection() {.raises: [].} =
     var buf = newSeq[byte](0)
     for b in [0x43'u8, 0x54, 0x4D, 0x44]:
       buf.add(b)
-    buf.add(3'u8); buf.add(0'u8)               # version 3
+    # The CURRENT version, so an unknown flag bit is what the parse refuses.
+    # A superseded number here would be refused for its version instead, and
+    # the flag-rejection contract would go untested.
+    buf.add(byte(MetaDatVersion and 0xFF))
+    buf.add(byte((MetaDatVersion shr 8) and 0xFF))
     buf.add(byte(flags and 0xFF))
     buf.add(byte((flags shr 8) and 0xFF))
     # recording_id (canonical UUIDv7)
@@ -1073,13 +1084,31 @@ proc test_meta_dat_strict_unknown_flag_rejection() {.raises: [].} =
     doAssert resAll6.get().hasSpanStream
 
   block:
-    # Bit 14 (0x4000) is still unallocated — retarget the strict-rejection
-    # probe to it now that bit 13 is known.  (Bits 14 and 15 are the last two
-    # free bits and are deliberately left unallocated by RS-M1; see
-    # `FlagHasSpanStream`'s note on flag-space exhaustion.)
-    let res = readMetaDat(craft(FlagHasColumnAwareSteps or 0x4000'u16))
+    # Bit 14 is allocated to FlagHasLineCountTable, so it must ROUND-TRIP
+    # rather than reject — the same positive assertion every allocated bit
+    # gets above.  It is checked ALONE: a header setting it together with
+    # bit 4 declares the same paths.dat field under two record layouts, and
+    # `writeMetaDat` refuses to produce one.
+    let res = readMetaDat(craft(FlagHasLineCountTable))
+    doAssert res.isOk,
+      "bit 14 (FlagHasLineCountTable) must round-trip: " &
+      (if res.isErr: res.error else: "ok")
+    doAssert res.get().hasLineCountTable
+    doAssert not res.get().hasSpanStream
+    doAssert not res.get().hasColumnAwareSteps
+
+  block:
+    # Bit 15 (0x8000) is the last unallocated bit — retarget the
+    # strict-rejection probe to it now that bit 14 is known.  When bit 15 is
+    # allocated the flag word has to grow, and this probe has to be
+    # rewritten against whatever that growth defines as unknown.
+    const LastReservedBit: uint16 = 0x8000
+    doAssert (LastReservedBit and KnownFlags) == 0,
+      "the probe must name a bit this reader does NOT know, or it proves " &
+      "nothing about the rejection contract"
+    let res = readMetaDat(craft(FlagHasColumnAwareSteps or LastReservedBit))
     doAssert res.isErr,
-      "bit 4 + bit 14 must reject because bit 14 is unknown"
+      "bit 4 + bit 15 must reject because bit 15 is unknown"
     doAssert "unknown" in res.error,
       "rejection error must mention 'unknown'; got: " & res.error
 

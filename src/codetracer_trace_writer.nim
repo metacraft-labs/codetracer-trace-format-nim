@@ -167,6 +167,43 @@ proc newTraceWriter*(path: string, program: string, args: seq[string],
 
   ok(w)
 
+proc newTraceWriterInMemory*(program: string, args: seq[string],
+    workdir: string = "",
+    chunkThreshold: int = DefaultChunkThreshold,
+    recordingId: string = ""): Result[TraceWriter, string] =
+  ## In-memory sibling of `newTraceWriter`: the container is built entirely in
+  ## a `seq[byte]` and never touches the filesystem. `containerBytes` returns
+  ## it after `close`.
+  var resolvedId = recordingId
+  if resolvedId.len == 0:
+    let uuidRes = newUuidV7()
+    if uuidRes.isErr:
+      return err("failed to mint recording_id: " & uuidRes.error)
+    resolvedId = $uuidRes.get()
+  else:
+    let valRes = validateRecordingIdStr(resolvedId)
+    if valRes.isErr:
+      return err("recordingId is not a canonical UUIDv7: " & valRes.error)
+
+  var w = TraceWriter(
+    ctfs: createCtfs(),
+    encoder: SplitBinaryEncoder.init(),
+    paths: @[],
+    metadata: TraceMetadata(
+      recordingId: resolvedId, program: program, args: args, workdir: workdir),
+    eventCount: 0, chunkEventCount: 0, chunkThreshold: chunkThreshold,
+    closed: false, filePath: "")
+
+  let eventsRes = w.ctfs.addFile("events.log")
+  if eventsRes.isErr:
+    return err("failed to add events.log: " & eventsRes.error)
+  w.eventsFile = eventsRes.get()
+  ok(w)
+
+proc containerBytes*(w: TraceWriter): lent seq[byte] =
+  ## The finished container. Only meaningful for an in-memory writer.
+  w.ctfs.data
+
 proc writeEvent*(w: var TraceWriter, event: TraceLowLevelEvent): Result[void, string] =
   ## Write a single event. Events are buffered and compressed in chunks.
   if w.closed:

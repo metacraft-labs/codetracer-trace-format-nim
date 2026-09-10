@@ -148,6 +148,69 @@ proc ensurePathIdColumnAware*(ctfs: var Ctfs, it: var InterningTableWriter,
   it.lookup[path] = id
   ok(id)
 
+proc ensureQualifiedPathIdWithLineCount*(ctfs: var Ctfs,
+    it: var InterningTableWriter, qualifier, path: string,
+    lineCount: uint64): Result[uint64, string] =
+  ## Line-count-table `paths.dat` record, written when the trace sets
+  ## ``meta.dat`` ``FlagHasLineCountTable`` (bit 14):
+  ##
+  ## ```
+  ## payload_len: varint
+  ## payload:     [u8] × payload_len
+  ## line_count:  varint
+  ## ```
+  ##
+  ## The framing is the first three fields of the column-aware Layout A
+  ## record (``ensurePathIdColumnAware``) and stops there: a line-only
+  ## trace addresses lines, so the file's size is its line count and
+  ## there is no per-line table to follow. Which of the two a reader
+  ## decodes is decided by the ``meta.dat`` bits, never by inspecting the
+  ## bytes — the record spaces overlap.
+  ##
+  ## ``payload`` is the interning payload, so a qualified producer's
+  ## ``qualifier & US & path`` round-trips exactly as it does in the bare
+  ## layout (``qualifiedPayload`` / ``splitInterningPayload``); dedup is
+  ## keyed on the same payload for the same reason.
+  ##
+  ## ``lineCount`` is the number of lines the file has, and it is what
+  ## the file's slot in the global position space is sized to. It is
+  ## required: a record without one would put the reader back to
+  ## assuming a size, which is what this layout exists to remove. A
+  ## caller that cannot determine a file's real line count passes the
+  ## ``DefaultLinesPerFile`` ceiling it intends to use, so that the
+  ## number the space was laid out with is the number on the wire.
+  let payload = qualifiedPayload(qualifier, path)
+  let existing = it.lookup.getOrDefault(payload, high(uint64))
+  if existing != high(uint64):
+    # An already-interned path has already had its count written; this
+    # call writes no record, so it has nothing to require. The dedup
+    # lookup therefore comes BEFORE the count check rather than after
+    # it: recorders re-name a path on every step, and the count belongs
+    # to the record, not to the call.
+    return ok(existing)
+  if lineCount == 0:
+    return err("paths.dat: a line-count-table record needs a non-zero " &
+      "line_count for " & path & " — a file sized 0 shares its base with " &
+      "the next file, and the two are indistinguishable at decode. A " &
+      "writer that cannot count the file's lines records the ceiling it " &
+      "uses instead")
+
+  let id = it.nextId
+  it.nextId += 1
+
+  var record: seq[byte] = @[]
+  encodeVarint(uint64(payload.len), record)
+  for i in 0 ..< payload.len:
+    record.add(byte(payload[i]))
+  encodeVarint(lineCount, record)
+
+  let appendRes = ctfs.append(it.table, record)
+  if appendRes.isErr:
+    return err(appendRes.error)
+
+  it.lookup[payload] = id
+  ok(id)
+
 proc count*(it: InterningTableWriter): uint64 = it.nextId
 
 # Reader
@@ -245,6 +308,14 @@ proc ensureVarnameId*(ctfs: var Ctfs, t: var TraceInterningTables, name: string)
 proc ensureQualifiedPathId*(ctfs: var Ctfs, t: var TraceInterningTables,
     qualifier, path: string): Result[uint64, string] =
   ctfs.ensureQualifiedId(t.paths, qualifier, path)
+
+proc ensureQualifiedPathIdWithLineCount*(ctfs: var Ctfs,
+    t: var TraceInterningTables, qualifier, path: string,
+    lineCount: uint64): Result[uint64, string] =
+  ## Wrapper for the line-count-table `paths.dat` record encoding.  See
+  ## ``ensureQualifiedPathIdWithLineCount`` on ``InterningTableWriter``
+  ## for the on-disk layout.
+  ctfs.ensureQualifiedPathIdWithLineCount(t.paths, qualifier, path, lineCount)
 
 proc ensureQualifiedFunctionId*(ctfs: var Ctfs, t: var TraceInterningTables,
     qualifier, name: string): Result[uint64, string] =

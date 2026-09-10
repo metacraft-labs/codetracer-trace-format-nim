@@ -30,10 +30,12 @@ import codetracer_trace_writer/call_stream as v4calls
 import codetracer_trace_writer/io_event_stream
 import codetracer_trace_writer/value_stream
 import codetracer_trace_writer/global_line_index
-import codetracer_trace_writer/multi_stream_writer  # for DefaultLinesPerFile
+import codetracer_trace_writer/multi_stream_writer
+import codetracer_trace_writer/span_stream          # for --spans
 import codetracer_trace_writer/cbor
 import codetracer_trace_types
 import codetracer_ctfs/container as ctfs_container
+import codetracer_ctfs/types as ctfs_types  # header geometry for --spans
 import native_decoder
 
 # ---------------------------------------------------------------------------
@@ -77,31 +79,34 @@ proc addEventMetadata*(obj: JsonNode, metadata: seq[byte]) =
     # Not JSON, or not a marker — the raw string above is all we can say.
     discard
 
-proc buildGliFromMeta(meta: MetaDatContents): GlobalLineIndex =
-  ## Rebuild the global line index from the meta.dat paths list
-  ## using the same DefaultLinesPerFile the writer uses.
-  var counts = newSeq[uint64](meta.paths.len)
-  for i in 0 ..< meta.paths.len:
-    counts[i] = DefaultLinesPerFile
-  buildGlobalLineIndex(counts)
-
-proc resolveGli(gli: GlobalLineIndex, globalIdx: uint64): (int, uint64) =
-  ## Convert global line index to (pathId, line).
-  gli.resolve(globalIdx)
+proc resolveGli(gli: GlobalLineIndex,
+    globalIdx: uint64): Result[(int, uint64), string] =
+  ## Invert a line-only ``global_position_index`` to ``(pathId, line)``,
+  ## or say why it cannot be inverted.
+  ##
+  ## Through ``tryResolve``, not ``resolve``: the packing is a writer
+  ## convention the container does not record and the writers of this
+  ## format disagree about it, so an index the space cannot address is
+  ## reported rather than clamped into a file that exists (see
+  ## ``global_line_index``'s module header). ct-print's business is
+  ## saying what the container holds, and "this position is not one this
+  ## trace can hold" is part of that.
+  gli.tryResolve(globalIdx)
 
 proc resolveStepLocation(reader: var NewTraceReader,
-    gli: GlobalLineIndex, stepGli: uint64): (int, uint64) =
+    gli: GlobalLineIndex, stepGli: uint64): Result[(int, uint64), string] =
   ## Resolve a step's absolute ``global_position_index`` to ``(pathId,
   ## line)``.  Column-aware traces encode GLI as a byte-offset (cumulative
   ## sum of preceding line_lengths), so the legacy line-count-based
-  ## ``gli.resolve`` returns garbage on them.  Route through the spec-
-  ## canonical ``decodeGlobalPositionIndex`` when the column-aware flag is
-  ## set; fall back to the line-count resolver for legacy traces.
+  ## resolver returns garbage on them.  Route through the spec-canonical
+  ## ``decodeGlobalPositionIndex`` when the column-aware flag is set; fall
+  ## back to the line-only space for legacy traces and for the
+  ## column-aware files that carry no per-line table.
   if reader.meta.hasColumnAwareSteps:
     let posRes = reader.decodeGlobalPositionIndex(stepGli)
     if posRes.isOk:
-      return (int(posRes.get().file), uint64(posRes.get().line))
-  gli.resolve(stepGli)
+      return ok((int(posRes.get().file), uint64(posRes.get().line)))
+  gli.tryResolve(stepGli)
 
 proc precomputeStepGlis(reader: var NewTraceReader): seq[uint64] =
   ## Walk the exec stream once and return a seq mapping step_index →
@@ -417,6 +422,15 @@ proc printMetaJsonV4(reader: var NewTraceReader) =
   flagsObj["has_io_event_stream"] = newJBool(reader.meta.hasIoEventStream)
   flagsObj["has_interning_tables"] = newJBool(reader.meta.hasInterningTables)
   meta["flags"] = flagsObj
+  # Reader diagnostic, deliberately outside `flags` because it is not a
+  # meta.dat bit: true when the trace declares line-only steps yet every
+  # paths.dat record also decodes as a column-aware Layout A record. Either
+  # the resemblance is coincidental and harmless, or the recorder emitted
+  # Layout A records without setting bit 4 (a writer bug fixed in 708ee44).
+  # The reader keeps reading the trace as its meta.dat declares; this field
+  # is how an operator finds out there is a question to answer.
+  meta["column_aware_paths_suspected"] = newJBool(
+    reader.columnAwarePathsSuspected)
 
   if reader.meta.hasFilterProvenance:
     var filtersArr = newJArray()
@@ -459,7 +473,7 @@ proc printMetaJsonV4(reader: var NewTraceReader) =
 # ---------------------------------------------------------------------------
 
 proc printJsonV4(reader: var NewTraceReader) =
-  let gli = buildGliFromMeta(reader.meta)
+  let gli = reader.globalPositionSpace()
 
   var root = newJObject()
 
@@ -498,12 +512,19 @@ proc printJsonV4(reader: var NewTraceReader) =
     for i in 0'u64 ..< uint64(allGlis.len):
       var stepObj = newJObject()
       stepObj["index"] = newJInt(int64(i))
-      let (pathId, line) = resolveStepLocation(reader, gli, allGlis[int(i)])
-      stepObj["path_id"] = newJInt(int64(pathId))
-      stepObj["line"] = newJInt(int64(line))
-      let pathStr = reader.path(uint64(pathId))
-      if pathStr.isOk:
-        stepObj["path"] = newJString(pathStr.get())
+      let loc = resolveStepLocation(reader, gli, allGlis[int(i)])
+      if loc.isErr:
+        # No `path_id` / `line` / `path` key at all: a consumer that reads
+        # them gets a missing key rather than a position that was never
+        # in the trace.
+        stepObj["position_error"] = newJString(loc.error)
+      else:
+        let (pathId, line) = loc.get()
+        stepObj["path_id"] = newJInt(int64(pathId))
+        stepObj["line"] = newJInt(int64(line))
+        let pathStr = reader.path(uint64(pathId))
+        if pathStr.isOk:
+          stepObj["path"] = newJString(pathStr.get())
       let ev = reader.step(i)
       if ev.isOk:
         stepObj["kind"] = newJString($ev.get().kind)
@@ -593,7 +614,11 @@ proc stepEventToJson(reader: var NewTraceReader, gli: GlobalLineIndex,
   stepObj["step_index"] = newJInt(int64(stepIdx))
 
   block resolveStep:
-    let (pathId, line) = resolveStepLocation(reader, gli, stepGli)
+    let loc = resolveStepLocation(reader, gli, stepGli)
+    if loc.isErr:
+      stepObj["position_error"] = newJString(loc.error)
+      break resolveStep
+    let (pathId, line) = loc.get()
     stepObj["path_id"] = newJInt(int64(pathId))
     stepObj["line"] = newJInt(int64(line))
     let pathStr = reader.path(uint64(pathId))
@@ -667,7 +692,7 @@ proc stepEventToJson(reader: var NewTraceReader, gli: GlobalLineIndex,
   nodes
 
 proc printJsonEventsV4(reader: var NewTraceReader) =
-  let gli = buildGliFromMeta(reader.meta)
+  let gli = reader.globalPositionSpace()
 
   # Pre-load all IO events indexed by stepId for quick lookup
   var ioByStep: seq[(uint64, IOEvent, uint64)]  # (stepId, event, index)
@@ -789,7 +814,7 @@ proc buildFullDocument(reader: var NewTraceReader,
   ##     events: [ {kind: "...", ...}, ... ] }
   ## All variable values and call args/returns are decoded from CBOR into
   ## structured JSON objects matching the ValueRecord variant layout.
-  let gli = buildGliFromMeta(reader.meta)
+  let gli = reader.globalPositionSpace()
   var root = newJObject()
 
   # ----- metadata -----
@@ -828,6 +853,15 @@ proc buildFullDocument(reader: var NewTraceReader,
   flagsObj["has_io_event_stream"] = newJBool(reader.meta.hasIoEventStream)
   flagsObj["has_interning_tables"] = newJBool(reader.meta.hasInterningTables)
   meta["flags"] = flagsObj
+  # Reader diagnostic, deliberately outside `flags` because it is not a
+  # meta.dat bit: true when the trace declares line-only steps yet every
+  # paths.dat record also decodes as a column-aware Layout A record. Either
+  # the resemblance is coincidental and harmless, or the recorder emitted
+  # Layout A records without setting bit 4 (a writer bug fixed in 708ee44).
+  # The reader keeps reading the trace as its meta.dat declares; this field
+  # is how an operator finds out there is a question to answer.
+  meta["column_aware_paths_suspected"] = newJBool(
+    reader.columnAwarePathsSuspected)
 
   # ----- trace_filter provenance (TF-M7, spec §7) -----
   # Materialized as `metadata.trace_filter.filters[].{path,sha256}` per
@@ -1010,7 +1044,11 @@ proc buildFullDocument(reader: var NewTraceReader,
         stepObj["kind"] = newJString("step")
         stepObj["step_index"] = newJInt(int64(stepIdx))
         block emitStep:
-          let (pathId, line) = resolveStepLocation(reader, gli, stepGli)
+          let loc = resolveStepLocation(reader, gli, stepGli)
+          if loc.isErr:
+            stepObj["position_error"] = newJString(loc.error)
+            break emitStep
+          let (pathId, line) = loc.get()
           stepObj["path_id"] = newJInt(int64(pathId))
           stepObj["line"] = newJInt(int64(line))
           let pStr = reader.path(uint64(pathId))
@@ -1229,6 +1267,118 @@ proc printMarkersV4(reader: var NewTraceReader, opts: FullOpts) =
       alignLeft(boundary, 24) & "  " & alignLeft(key, 19) & "  " &
       align($stepId, 4) & "  " & showValue
 
+proc printSpans(filePath: string, jsonOut: bool) =
+  ## List the container's SPAN STREAM — the intervals `spans.dat` / `spans.idx`
+  ## hold, with `spantype.ns`'s type name resolved onto each record.
+  ##
+  ## The span stream is the only stream ct-print could not show. It is not an
+  ## event kind, so it never appears in `--full` / `--events`, and the two
+  ## consumers that need to see it — the request-span panel and the mixed-trace
+  ## native<->VM crossings — had no way to inspect a container from a shell.
+  ## Without this, "the recording carries N crossing spans" could only be
+  ## asserted from inside a Rust or Nim test, which is precisely the kind of
+  ## claim that ends up unverified.
+  ##
+  ## Reads the raw container rather than going through a trace reader: the span
+  ## stream is self-describing (`initSpanStreamReader` parses `spans.idx` and
+  ## decompresses only the chunks it is asked for), so this works on a
+  ## still-growing container and on bundles either reader flavour would reject.
+  ##
+  ## Records are shown SETTLED (last-record-wins per `span_id`), so a crossing
+  ## that was opened and later completed is one row carrying its final
+  ## `end_step`, not two.
+  let dataR = ctfs_container.readCtfsFromFile(filePath)
+  if dataR.isErr:
+    quit("ct-print: cannot read container: " & dataR.error)
+  let bytes = dataR.get()
+
+  # The container's OWN root geometry, from its extended header (block size at
+  # byte 8, root-entry count at byte 12), exactly as `native_decoder.nim` reads
+  # it. Taking `initSpanStreamReader`'s defaults instead is a silent-wrong-answer
+  # bug, and it was one: `DefaultMaxRootEntries` is 31, while a real MCR
+  # recording of a 30-thread process declares 128 and parks `spans.dat` in root
+  # slot 67 (past the per-thread `tNNN`/`iNNN` pairs). Scanning 31 slots misses
+  # it, `readInternalFile` says "internal file not found", and the tool that
+  # exists so a span count need not be taken on trust prints `spans: 0` for a
+  # container that has 450 bytes of them.
+  if bytes.len < HeaderSize + ExtHeaderSize:
+    quit("ct-print: file too small to be a CTFS container: " & filePath)
+  let blockSize = readU32LE(bytes, 8)
+  let maxRoot = readU32LE(bytes, 12)
+  if blockSize == 0'u32 or maxRoot == 0'u32 or int(maxRoot) > 4096:
+    quit("ct-print: nonsensical CTFS root header (blockSize=" & $blockSize &
+      " maxRootEntries=" & $maxRoot & ") in " & filePath)
+
+  # "No span stream" and "the span stream is there but would not open" are
+  # different answers and must not share an exit. Decide which one it is from
+  # the ROOT DIRECTORY — the presence of the member — before attributing an
+  # open failure to absence.
+  let hasSpanMember = ctfs_container.hasInternalFile(bytes, "spans.dat", maxRoot)
+
+  let rRes = initSpanStreamReader(bytes, blockSize, maxRoot)
+  if rRes.isErr:
+    if hasSpanMember:
+      # The member exists and the reader still refused it: that is damage or a
+      # format mismatch, never "zero spans". Fail loudly.
+      quit("ct-print: container carries a spans.dat member but its span " &
+        "stream would not open: " & rRes.error)
+    # A container without `spans.dat` is ordinary — most recordings have no
+    # spans. Say so, with the reason, and report zero rather than pretending
+    # to have looked.
+    if jsonOut:
+      echo "[]"
+    else:
+      echo "spans: 0"
+      echo "  (no span stream in this container: " & rRes.error & ")"
+    return
+  let reader = rRes.get()
+
+  let settledRes = reader.settledSpans()
+  if settledRes.isErr:
+    quit("ct-print: failed to read the span stream: " & settledRes.error)
+  let spans = settledRes.get()
+
+  if jsonOut:
+    var arr = newJArray()
+    for s in spans:
+      var o = newJObject()
+      o["span_id"] = %(s.spanId)
+      o["parent_span_id"] = %(s.parentSpanId)
+      o["span_type"] = %(s.spanType)
+      o["label"] = %(s.label)
+      o["open"] = %(s.isOpen)
+      o["external"] = %(s.isExternal)
+      o["status"] = %($s.status)
+      o["thread_id"] = %(s.threadId)
+      o["process_ord"] = %(s.processOrd)
+      o["start_step"] = %(s.startStep)
+      o["end_step"] = %(s.endStep)
+      o["start_wall_ns"] = %(s.startWallNs)
+      o["end_wall_ns"] = %(s.endWallNs)
+      var meta = newJObject()
+      for (k, v) in s.metadata:
+        meta[k] = %v
+      o["metadata"] = meta
+      arr.add(o)
+    try:
+      echo pretty(arr, indent = 2)
+    except ValueError:
+      echo $arr
+    return
+
+  echo "spans: " & $spans.len & " settled (" & $reader.count() &
+    " records in " & $reader.chunkCount() & " chunk(s))"
+  if spans.len == 0:
+    return
+  echo ""
+  echo "  #  span_id  parent  type                 open  start_step  end_step  label"
+  echo "-".repeat(94)
+  for i, s in spans:
+    echo align($(i + 1), 3) & "  " & align($s.spanId, 7) & "  " &
+      align($s.parentSpanId, 6) & "  " & alignLeft(s.spanType, 19) & "  " &
+      alignLeft((if s.isOpen: "yes" else: "no"), 4) & "  " &
+      align($s.startStep, 10) & "  " & align($s.endStep, 8) & "  " & s.label
+
 proc printEventsJsonlV4(reader: var NewTraceReader, opts: FullOpts) =
   ## Emit one JSON object per line. The first line is the header
   ## (metadata + interning tables). Subsequent lines are one event each.
@@ -1251,7 +1401,7 @@ proc printEventsJsonlV4(reader: var NewTraceReader, opts: FullOpts) =
 # ---------------------------------------------------------------------------
 
 proc printTextV4(reader: var NewTraceReader) =
-  let gli = buildGliFromMeta(reader.meta)
+  let gli = reader.globalPositionSpace()
 
   echo "=== Trace (v4 multi-stream) ==="
   echo "program: " & reader.meta.program
@@ -1281,8 +1431,13 @@ proc printTextV4(reader: var NewTraceReader) =
   for stepIdx in 0'u64 ..< totalSteps:
     var pathStr = "?"
     var lineNum: uint64 = 0
+    var posError = ""
     block resolveStep:
-      let (pathId, line) = resolveStepLocation(reader, gli, allGlis[int(stepIdx)])
+      let loc = resolveStepLocation(reader, gli, allGlis[int(stepIdx)])
+      if loc.isErr:
+        posError = loc.error
+        break resolveStep
+      let (pathId, line) = loc.get()
       lineNum = line
       let p = reader.path(uint64(pathId))
       if p.isOk:
@@ -1296,7 +1451,12 @@ proc printTextV4(reader: var NewTraceReader) =
       if fn.isOk:
         funcStr = fn.get()
 
-    echo "Step " & $stepIdx & ": " & pathStr & ":" & $lineNum & " (" & funcStr & ")"
+    if posError.len > 0:
+      echo "Step " & $stepIdx & ": <unresolved position> (" & funcStr & ")"
+      echo "  " & posError
+    else:
+      echo "Step " & $stepIdx & ": " & pathStr & ":" & $lineNum &
+        " (" & funcStr & ")"
 
     # Print values
     let vals = reader.values(stepIdx)
@@ -1356,7 +1516,7 @@ proc followV4(filePath: string, pollMs: int) =
       continue
 
     var reader = readerRes.get()
-    let gli = buildGliFromMeta(reader.meta)
+    let gli = reader.globalPositionSpace()
     var hadNewEvents = false
 
     let sc = reader.stepCount()
@@ -1374,13 +1534,16 @@ proc followV4(filePath: string, pollMs: int) =
         stepObj["type"] = newJString("step")
         stepObj["step_index"] = newJInt(int64(stepIdx))
         if usableGlis:
-          let (pathId, line) = resolveGli(
-            gli, newGlis[int(stepIdx - lastStepCount)])
-          stepObj["path_id"] = newJInt(int64(pathId))
-          stepObj["line"] = newJInt(int64(line))
-          let pathStr = reader.path(uint64(pathId))
-          if pathStr.isOk:
-            stepObj["path"] = newJString(pathStr.get())
+          let loc = resolveGli(gli, newGlis[int(stepIdx - lastStepCount)])
+          if loc.isErr:
+            stepObj["position_error"] = newJString(loc.error)
+          else:
+            let (pathId, line) = loc.get()
+            stepObj["path_id"] = newJInt(int64(pathId))
+            stepObj["line"] = newJInt(int64(line))
+            let pathStr = reader.path(uint64(pathId))
+            if pathStr.isOk:
+              stepObj["path"] = newJString(pathStr.get())
 
         let callRes = reader.callForStep(stepIdx)
         if callRes.isOk:
@@ -1487,6 +1650,13 @@ Usage:
                                           that let a cross-process origin
                                           chain enter or leave this
                                           recording. Add --json-out for
+                                          machine-readable output.
+  ct-print --spans <file.ct>             List the container's span stream
+                                          (spans.dat/spans.idx), settled
+                                          last-record-wins: request spans,
+                                          process spans, and the native<->VM
+                                          crossing spans a mixed trace
+                                          carries. Add --json-out for
                                           machine-readable output.
   ct-print --follow <file.ct>            Tail the trace as it is written
                                           (NDJSON output).
@@ -1603,6 +1773,7 @@ proc main() =
       of "full": format = "full"
       of "events": format = "events"
       of "markers": format = "markers"
+      of "spans": format = "spans"
       of "follow": follow = true
       of "strip-paths": stripPaths = true
       of "json-out": jsonOut = true
@@ -1629,6 +1800,14 @@ proc main() =
     quit(1)
 
   let opts = FullOpts(stripPaths: stripPaths, jsonOut: jsonOut)
+
+  # ----- Span stream -----
+  # Handled before the reader selection below because the span stream is read
+  # straight off the container and is therefore independent of which event
+  # reader (v4 split / legacy events.log / native shard) the bundle needs.
+  if format == "spans":
+    printSpans(filePath, jsonOut)
+    return
 
   # ----- Native MCR shard path (auto-detect or --native) -----
   # The native recorder writes a CTFS shard with per-thread `tNNNN` streams
