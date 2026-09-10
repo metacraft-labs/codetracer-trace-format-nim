@@ -479,7 +479,7 @@ type
       ## extension traces always have it clear; the legacy interning remains
       ## the source of truth when it is clear.
     hasCorrelationIndex*: bool
-      ## WTCI: True iff FlagHasCorrelationIndex (bit 14) was set.  A HINT that
+      ## WTCI: True iff FlagHasCorrelationIndex (bit 15) was set.  A HINT that
       ## the container carries `corrmark.ns` + `markers.dat`/`.off`; the file
       ## entry, not this bit, is what a consumer must consult to tell "never
       ## indexed" from "indexed and covering nothing" (contract §9).
