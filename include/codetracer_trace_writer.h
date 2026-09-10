@@ -277,6 +277,103 @@ int trace_writer_register_span(trace_writer_t handle,
  */
 int trace_writer_flush_spans(trace_writer_t handle);
 
+/* ------------------------------------------------------------------------
+ * Correlation markers
+ *
+ * Implemented ONCE here, as trace_writer_register_span is, so the ~20 CTFS
+ * recorders bind to it rather than each constructing the on-disk payload. A
+ * recorder whose field names drifted would write markers that are INVISIBLE
+ * rather than broken, and nothing would report an error.
+ *
+ * Every string is (pointer, length), never NUL-terminated: a host string may
+ * legally contain NUL (Ruby's can), and NUL-terminated marshalling both
+ * truncates it and, on that side, raises from rb_string_value_cstr — a known
+ * process-wedge regression.
+ *
+ * key_value / show_value must ALREADY be stringified UTF-8. This library
+ * never calls back into the host to render a value: a conversion that can
+ * raise must run before the binding takes the writer lock, because a host
+ * exception can longjmp past the lock guard's destructor and wedge the
+ * process permanently.
+ *
+ * A binding owns the no-op-when-not-recording behaviour. User code calls
+ * these unconditionally, and "no active recording" is not an error there.
+ *
+ * All return 0 on success and non-zero on failure; see
+ * trace_writer_last_error.
+ * ------------------------------------------------------------------------ */
+
+/*
+ * Intern a boundary label and write its id to *out_id.
+ *
+ * THE PRIMARY OPERATION, mirroring path interning. Call it ONCE per boundary,
+ * outside the hot path, then pass the integer to
+ * trace_writer_mark_correlation_by_id — so the per-crossing call does no
+ * string lookup, no interning and no allocation. If the string form were
+ * primary each recorder would grow its own label cache and they would drift.
+ */
+int trace_writer_ensure_marker_id(trace_writer_t handle,
+    const uint8_t* label, size_t label_len,
+    uint64_t* out_id);
+
+/*
+ * Declare a boundary crossing against an already-interned label id.
+ *
+ * key_text / show_text are the NAMES the two values were read under.
+ * show_text is load-bearing rather than cosmetic: a cross-process origin
+ * chain resumes its walk on that name in the sending recording, so a marker
+ * that drops it is visible with its history unreachable. Pass empty for the
+ * defaults ("key", and "show" when a show_value is present).
+ */
+int trace_writer_mark_correlation_by_id(trace_writer_t handle,
+    uint64_t marker_id,
+    const uint8_t* boundary_label, size_t boundary_label_len,
+    const uint8_t* direction, size_t direction_len,
+    const uint8_t* key_value, size_t key_value_len,
+    const uint8_t* show_value, size_t show_value_len,
+    const uint8_t* description, size_t description_len,
+    const uint8_t* key_text, size_t key_text_len,
+    const uint8_t* show_text, size_t show_text_len);
+
+/* Convenience wrapper: interns boundary_id, then forwards to _by_id. */
+int trace_writer_mark_correlation(trace_writer_t handle,
+    const uint8_t* direction, size_t direction_len,
+    const uint8_t* boundary_id, size_t boundary_id_len,
+    const uint8_t* key_value, size_t key_value_len,
+    const uint8_t* show_value, size_t show_value_len,
+    const uint8_t* description, size_t description_len,
+    const uint8_t* key_text, size_t key_text_len,
+    const uint8_t* show_text, size_t show_text_len);
+
+/*
+ * Declare that this recording covers a distributed-trace span, so a consumer
+ * holding an OTel (trace_id, span_id) can decide that with one index lookup
+ * instead of downloading and decoding the recording.
+ *
+ * trace_id is the 16 WIRE bytes and span_id the 8 WIRE bytes — NOT a hex
+ * rendering. The index keys on the wire bytes, so passing hex here builds an
+ * index keyed on something no consumer computes: present, correct-looking and
+ * permanently unqueryable. Use the _hex form below when the host's OTel API
+ * hands you hex; it is a wrapper over this one, so the conversion has a
+ * single implementation rather than one per recorder.
+ *
+ * This mints no marker payload and no I/O event: a span-coverage marker has
+ * no send/recv sense and no pairing domain, so forcing it into one would make
+ * the pairing index try to pair spans with each other.
+ */
+int trace_writer_mark_span_coverage(trace_writer_t handle,
+    const uint8_t* trace_id, size_t trace_id_len,
+    const uint8_t* span_id, size_t span_id_len,
+    uint64_t wall_time_unix_ns,
+    uint64_t monotonic_time_ns);
+
+/* Hex form: 32 hex characters for trace_id, 16 for span_id, either case. */
+int trace_writer_mark_span_coverage_hex(trace_writer_t handle,
+    const uint8_t* trace_id_hex, size_t trace_id_hex_len,
+    const uint8_t* span_id_hex, size_t span_id_hex_len,
+    uint64_t wall_time_unix_ns,
+    uint64_t monotonic_time_ns);
+
 /*
  * Open a native<->VM crossing span (Mixed-Trace-Debugging.md §3) and return its
  * minted span_id — the handle to pass to trace_writer_end_crossing.  The

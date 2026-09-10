@@ -35,6 +35,7 @@ import codetracer_trace_writer/span_stream          # for --spans
 import codetracer_trace_writer/cbor
 import codetracer_trace_types
 import codetracer_ctfs/container as ctfs_container
+import codetracer_trace_writer/corrmark_builder
 import codetracer_ctfs/types as ctfs_types  # header geometry for --spans
 import native_decoder
 
@@ -421,6 +422,7 @@ proc printMetaJsonV4(reader: var NewTraceReader) =
   flagsObj["has_value_stream"] = newJBool(reader.meta.hasValueStream)
   flagsObj["has_io_event_stream"] = newJBool(reader.meta.hasIoEventStream)
   flagsObj["has_interning_tables"] = newJBool(reader.meta.hasInterningTables)
+  flagsObj["has_correlation_index"] = newJBool(reader.meta.hasCorrelationIndex)
   meta["flags"] = flagsObj
   # Reader diagnostic, deliberately outside `flags` because it is not a
   # meta.dat bit: true when the trace declares line-only steps yet every
@@ -687,6 +689,15 @@ proc stepEventToJson(reader: var NewTraceReader, gli: GlobalLineIndex,
     ioObj["kind"] = newJString($io.kind)
     ioObj["step_id"] = newJInt(int64(io.stepId))
     ioObj["data"] = newJString(bytesToUtf8(io.data))
+    # The metadata slot, and a correlation marker hoisted out of it when the
+    # slot holds one.  `--json-events` used to drop the slot entirely, which
+    # made every correlation marker INVISIBLE in this mode while `--full`
+    # showed it — so a recorder's own test written against `--json-events`
+    # would report a perfectly good marker as missing and send the reader
+    # looking for a recorder bug that was not there.  A marker's whole failure
+    # mode is being invisible rather than broken; a decoder that hides one is
+    # the same defect one level up.
+    addEventMetadata(ioObj, io.metadata)
     nodes.add(ioObj)
 
   nodes
@@ -852,6 +863,7 @@ proc buildFullDocument(reader: var NewTraceReader,
   flagsObj["has_value_stream"] = newJBool(reader.meta.hasValueStream)
   flagsObj["has_io_event_stream"] = newJBool(reader.meta.hasIoEventStream)
   flagsObj["has_interning_tables"] = newJBool(reader.meta.hasInterningTables)
+  flagsObj["has_correlation_index"] = newJBool(reader.meta.hasCorrelationIndex)
   meta["flags"] = flagsObj
   # Reader diagnostic, deliberately outside `flags` because it is not a
   # meta.dat bit: true when the trace declares line-only steps yet every
@@ -1267,6 +1279,117 @@ proc printMarkersV4(reader: var NewTraceReader, opts: FullOpts) =
       alignLeft(boundary, 24) & "  " & alignLeft(key, 19) & "  " &
       align($stepId, 4) & "  " & showValue
 
+proc printCorrelationIndexV4(filePath: string, opts: FullOpts) =
+  ## Report the recording's correlation index — `corrmark.ns`.
+  ##
+  ## THE ONLY VIEW OF SPAN COVERAGE. A boundary crossing also writes a
+  ## `MarkerPayload` into the event stream, so `--markers` can show it; a
+  ## span-coverage declaration deliberately writes no payload and no event
+  ## (contract §10.2), so nothing outside the index records it. Without this
+  ## view a recorder that declared coverage and a recorder that dropped the
+  ## call on the floor produce byte-identical observable output, which is the
+  ## precise failure class this campaign exists to remove.
+  ##
+  ## THE ABSENT CASE IS REPORTED, NOT ELIDED. A recording with no index has
+  ## never been indexed and says nothing about any span; a recording with an
+  ## empty index has been indexed and covers none. They are different answers
+  ## (contract §9), and reporting both as "0 entries" is what made the
+  ## original lookup failure so hard to place.
+  ## Dispatched for EVERY container layout, before the native / v4 split.
+  ## `corrmark.ns` is a container member, not a stream, so which decoder owns
+  ## the event streams is irrelevant here — and routing this through the v4
+  ## branch alone would have made the index invisible on exactly the
+  ## recordings (native, multi-threaded) whose lookups this campaign is about.
+  let dataRes = ctfs_container.readCtfsFromFile(filePath)
+  if dataRes.isErr:
+    quit("Error: " & dataRes.error)
+  let data = dataRes.get()
+  proc u32le(buf: openArray[byte], off: int): uint32 =
+    for i in 0 ..< 4:
+      result = result or (uint32(buf[off + i]) shl (i * 8))
+  let blockSize = u32le(data, 8)
+  let maxEntries = u32le(data, 12)
+  # The program name is a nicety; a container whose meta.dat this build cannot
+  # parse must still report its index rather than refusing.
+  var program = filePath
+  let metaBytes = ctfs_container.readInternalFile(
+    data, "meta.dat", blockSize, maxEntries)
+  if metaBytes.isOk:
+    let parsed = readMetaDat(metaBytes.get())
+    if parsed.isOk:
+      program = parsed.get().program
+  let nsRes = ctfs_container.readInternalFile(
+    data, CorrmarkNamespaceName, blockSize, maxEntries)
+
+  if nsRes.isErr:
+    if opts.jsonOut:
+      var root = newJObject()
+      root["correlation_index"] = newJString("absent")
+      root["entries"] = newJArray()
+      echo pretty(root, indent = 2)
+      return
+    echo "program: " & program
+    echo "correlation index: ABSENT"
+    echo ""
+    echo "  This recording was never indexed. That is NOT the same as"
+    echo "  covering no span: a consumer must report it as unindexed rather"
+    echo "  than as a recording that does not cover the span it was asked"
+    echo "  about."
+    return
+
+  var idxRes = openCorrmarkIndex(nsRes.get())
+  if idxRes.isErr:
+    quit("Error: corrmark.ns is present but unreadable: " & idxRes.error)
+  var idx = idxRes.get()
+  let entriesRes = idx.allEntries()
+  if entriesRes.isErr:
+    quit("Error: " & entriesRes.error)
+  let entries = entriesRes.get()
+
+  if opts.jsonOut:
+    var arr = newJArray()
+    for e in entries:
+      var obj = newJObject()
+      if e.kind == MarkerKindSpan:
+        obj["kind"] = newJString("span_coverage")
+        obj["trace_id"] = newJString(e.traceIdHexOf())
+        obj["span_id"] = newJString(e.spanIdHexOf())
+      else:
+        obj["kind"] = newJString("boundary")
+        obj["marker_id"] = newJInt(int64(e.markerIdOf()))
+      obj["wall_time_unix_ns"] = newJInt(int64(e.wallTimeUnixNs))
+      obj["monotonic_time_ns"] = newJInt(int64(e.monotonicTimeNs))
+      obj["geid"] = newJInt(int64(e.geid))
+      obj["thread_id"] = newJInt(int64(e.threadId))
+      obj["exit"] = newJBool((e.flags and MarkerFlagExit) != 0)
+      arr.add(obj)
+    var root = newJObject()
+    root["correlation_index"] = newJString("present")
+    root["entries"] = arr
+    echo pretty(root, indent = 2)
+    return
+
+  echo "program: " & program
+  echo "correlation index: present, " & $entries.len & " entr" &
+    (if entries.len == 1: "y" else: "ies")
+  if entries.len == 0:
+    echo ""
+    echo "  Indexed, and covering nothing. A lookup against this recording is"
+    echo "  a definitive no, unlike one against a recording with no index."
+    return
+  echo ""
+  echo "  #  kind            trace_id / marker                 span_id            geid  wall_time_unix_ns"
+  echo "-".repeat(104)
+  for i, e in entries:
+    let kindText = if e.kind == MarkerKindSpan: "span_coverage" else: "boundary"
+    let left =
+      if e.kind == MarkerKindSpan: e.traceIdHexOf()
+      else: "marker_id=" & $e.markerIdOf()
+    let right = if e.kind == MarkerKindSpan: e.spanIdHexOf() else: ""
+    echo align($(i + 1), 3) & "  " & alignLeft(kindText, 14) & "  " &
+      alignLeft(left, 32) & "  " & alignLeft(right, 17) & "  " &
+      align($e.geid, 4) & "  " & $e.wallTimeUnixNs
+
 proc printSpans(filePath: string, jsonOut: bool) =
   ## List the container's SPAN STREAM — the intervals `spans.dat` / `spans.idx`
   ## hold, with `spantype.ns`'s type name resolved onto each record.
@@ -1645,6 +1768,12 @@ Usage:
                                           Suitable for golden snapshots.
   ct-print --events <file.ct>            JSONL: header line + one event per
                                           line (compact, diff-friendly).
+  ct-print --correlation-index <file.ct> Report the recording's correlation
+                                          index: which distributed-trace spans
+                                          it covers, and whether it was indexed
+                                          at all (an unindexed recording says
+                                          nothing about any span, which is not
+                                          the same as covering none)
   ct-print --markers <file.ct>           List the trace's correlation
                                           markers — the boundary crossings
                                           that let a cross-process origin
@@ -1771,6 +1900,7 @@ proc main() =
       of "full": format = "full"
       of "events": format = "events"
       of "markers": format = "markers"
+      of "correlation-index": format = "correlation-index"
       of "spans": format = "spans"
       of "follow": follow = true
       of "strip-paths": stripPaths = true
@@ -1798,6 +1928,10 @@ proc main() =
     quit(1)
 
   let opts = FullOpts(stripPaths: stripPaths, jsonOut: jsonOut)
+
+  if format == "correlation-index":
+    printCorrelationIndexV4(filePath, opts)
+    return
 
   # ----- Span stream -----
   # Handled before the reader selection below because the span stream is read

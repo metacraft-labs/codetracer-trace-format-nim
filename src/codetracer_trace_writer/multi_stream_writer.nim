@@ -17,6 +17,7 @@ import ../codetracer_ctfs/streaming
 import ../codetracer_ctfs/variable_record_table
 import ../codetracer_ctfs/crossing_state
 import ./meta_dat
+import ./corrmark_builder
 import ./interning_table
 import ./exec_stream
 import ./value_stream
@@ -130,6 +131,21 @@ type
     spanWriter: SpanStreamWriter
       ## RS-M1 span stream.  Created LAZILY on the first `registerSpan` call —
       ## see `hasSpans`.
+    markerLabels: InterningTableWriter
+      ## `markers.dat` + `markers.off` — the correlation-marker label table,
+      ## the same Variable-Size Record Table shape as paths/funcs/types/
+      ## varnames.  Created LAZILY on the first `ensureMarkerId`, so a
+      ## recording that declares no marker gains no files.
+    hasMarkerLabels: bool
+    correlationMarkers: seq[CorrelationMarker]
+      ## Correlation markers declared during this recording
+      ## (`Correlation-Markers.md` §2.4).  Accumulated here and bulk-loaded
+      ## into `corrmark.ns` at close, because the index is a constructor over a
+      ## known set rather than something inserted into per marker.
+      ##
+      ## A recording with no markers writes no namespace at all: its ABSENCE is
+      ## a distinct, meaningful answer ("never indexed") from an empty index
+      ## ("indexed, covers nothing").  See the contract §9.
     nextSpanId: uint64
       ## Monotonic span-id generator for spans this writer MINTS itself — i.e.
       ## native↔VM crossing spans (`beginCrossing`/`endCrossing`,
@@ -1468,6 +1484,215 @@ proc registerIOEvent*(w: var MultiStreamTraceWriter, kind: IOEventKind,
 # Exception events
 # ---------------------------------------------------------------------------
 
+proc jsonEscape(s: string): string =
+  ## Minimal JSON string escaping for the MarkerPayload document.
+  result = newStringOfCap(s.len + 8)
+  for c in s:
+    case c
+    of '"': result.add("\\\"")
+    of '\\': result.add("\\\\")
+    of '\n': result.add("\\n")
+    of '\r': result.add("\\r")
+    of '\t': result.add("\\t")
+    else:
+      if c < ' ':
+        const hex = "0123456789abcdef"
+        result.add("\\u00")
+        result.add(hex[(int(c) shr 4) and 0xF])
+        result.add(hex[int(c) and 0xF])
+      else:
+        result.add(c)
+
+proc ensureMarkerId*(w: var MultiStreamTraceWriter, label: string):
+    Result[uint64, string] =
+  ## Intern a correlation-marker label and return its numeric id.
+  ##
+  ## THE PRIMARY OPERATION, mirroring `ensure_path_id`.  A caller hoists this
+  ## out of its hot path — once per boundary, not once per crossing — and then
+  ## passes the integer to `registerCorrelationMarkerById`, so the per-marker
+  ## call does no string lookup.  Interning is the only part that touches a
+  ## hash map, which is the same reason a binding must keep it off the hot
+  ## path as it keeps host-language conversion off it.
+  ##
+  ## `markers.dat` / `markers.off` are created LAZILY here, not in
+  ## `initTraceInterningTables`: the four standard tables are made for every
+  ## trace, and a fifth there would put marker files into every container ever
+  ## written.  A recording that declares no marker gains no files.
+  if w.closed:
+    return err("writer is closed")
+  if not w.hasMarkerLabels:
+    w.markerLabels = ?initInterningTableWriter(w.container, "markers")
+    w.hasMarkerLabels = true
+  ensureMarkerLabelId(w.container, w.markerLabels, label)
+
+proc registerCorrelationMarkerById*(w: var MultiStreamTraceWriter,
+    direction: string, markerId: uint64, boundaryLabel: string,
+    keyValue: string, showValue: string = "", description: string = "",
+    keyText: string = "key", showText: string = "",
+    stepId: Option[uint64] = none(uint64)):
+    Result[void, string] =
+  ## Declare a correlation marker against an already-interned label id.
+  ##
+  ## THE PRIMARY HOT-PATH ENTRY POINT (`Correlation-Markers.md` §2.4),
+  ## implemented once here so the ~20 CTFS recorders bind to it rather than
+  ## each building the payload — a recorder whose field names drifted would
+  ## write markers that are INVISIBLE rather than broken.
+  ##
+  ## `boundaryLabel` is passed alongside the id because the on-disk
+  ## `MarkerPayload` carries `boundary_id` as TEXT for the debugger, while the
+  ## index keys on the id.  A caller that has hoisted `ensureMarkerId` already
+  ## holds the label, so this costs it nothing.
+  ##
+  ## Two things happen, and both matter:
+  ##
+  ## 1. The `MarkerPayload` goes into an IO event's metadata slot, where every
+  ##    existing consumer looks.  Field names must match `MarkerPayload` in
+  ##    `db-backend/src/correlation_markers.rs`.
+  ## 2. It is indexed into `corrmark.ns` for lookup without decoding the
+  ##    event stream.
+  ##
+  ## NO STEP IS MINTED.  The marker attaches to the enclosing step — the line
+  ## the call sits on.  Minting one would insert an exec-stream event no user
+  ## code executed and shift every later step index, which is what spans'
+  ## `start_step`/`end_step` are measured in.
+  ##
+  ## `stepId` names that enclosing step, and **one value serves both halves**:
+  ## the `MarkerPayload` event's `step_id` and the index entry's `geid`. They
+  ## MUST be the same number. They were not: the event defaulted to
+  ## `stepCount - 1` while the index recorded `stepCount`, so a single marker
+  ## carried two different coordinates and a consumer that resumed from the
+  ## index landed one step away from where `ct print` showed the marker. Found
+  ## by the JavaScript recorder while becoming a thin binding, which is
+  ## precisely the review §11a.2 asks a binding to perform on this API.
+  ##
+  ## `none` means "the last step this writer emitted", which is right for a
+  ## caller that writes its steps eagerly. A caller that BUFFERS a step — the
+  ## C ABI does, so values registered after `trace_writer_register_step` still
+  ## attach to it — must pass the id explicitly, because at marker time the
+  ## step for the marker's own line has not been emitted yet and
+  ## `stepCount - 1` names the previous one (issue #601, the same accounting
+  ## `trace_writer_register_special_event` documents).
+  ##
+  ## `keyText` and `showText` are the NAMES the two values were read under —
+  ## `key_text` is the textual form of the `key=<expr>` declaration, and
+  ## `showText` is the binding the shown value came from. `showText` is
+  ## load-bearing rather than cosmetic: a cross-process origin chain resumes
+  ## its walk on that name in the sending recording, so a marker that drops it
+  ## is visible with its history unreachable. They were hard-coded to "key" and
+  ## "show" here until the JavaScript recorder — the only end-to-end
+  ## implementation that predates this shared API — turned out to pass a real
+  ## binding name, which is exactly the kind of signal contract §11a.2 says to
+  ## treat as the API's shape being wrong rather than to work around.
+  ##
+  ## `keyValue` / `showValue` are ALREADY-STRINGIFIED UTF-8: this library never
+  ## calls back into the host to render a value, because a conversion that can
+  ## raise must not run under the writer lock — a Ruby exception `longjmp`s
+  ## past Rust destructors and strands the guard.
+  if w.closed:
+    return err("writer is closed")
+
+  let dir = if direction == "recv" or direction == "receive": "recv" else: "send"
+    ## An unrecognised direction becomes "send" rather than an error, matching
+    ## the JS recorder: a marker with no side is unpairable, and an unpairable
+    ## marker is worse than one that picked a side.
+
+  var payload = "{\"marker_id\":" & $markerId
+  payload.add(",\"boundary_id\":\"" & jsonEscape(boundaryLabel) & "\"")
+  payload.add(",\"direction\":\"" & dir & "\"")
+  payload.add(",\"key_text\":\"" &
+    jsonEscape(if keyText.len > 0: keyText else: "key") & "\"")
+  payload.add(",\"key_value\":\"" & jsonEscape(keyValue) & "\"")
+  if showValue.len > 0 or showText.len > 0:
+    payload.add(",\"show_text\":\"" &
+      jsonEscape(if showText.len > 0: showText else: "show") & "\"")
+    payload.add(",\"show_value\":\"" & jsonEscape(showValue) & "\"")
+  if description.len > 0:
+    payload.add(",\"description\":\"" & jsonEscape(description) & "\"")
+  payload.add("}")
+
+  var metaBytes = newSeq[byte](payload.len)
+  for k, c in payload:
+    metaBytes[k] = byte(c)
+  let enclosingStep =
+    if stepId.isSome: stepId.get()
+    elif w.stepCount > 0: w.stepCount - 1
+    else: 0'u64
+
+  ?w.registerIOEvent(ioStdout, [], metaBytes, stepId = some(enclosingStep))
+
+  w.correlationMarkers.add(initBoundaryMarker(
+    markerId, keyValue, isRecv = dir == "recv", geid = enclosingStep))
+  ok()
+
+proc registerCorrelationMarker*(w: var MultiStreamTraceWriter,
+    direction: string, boundaryId: string, keyValue: string,
+    showValue: string = "", description: string = "",
+    keyText: string = "key", showText: string = "",
+    stepId: Option[uint64] = none(uint64)):
+    Result[void, string] =
+  ## String-label convenience: interns `boundaryId`, then forwards.
+  ##
+  ## A WRAPPER OVER THE NUMERIC PATH, never the reverse.  If the string form
+  ## were primary, every binding would grow its own label cache and they would
+  ## drift — which is the reason this moved into the shared writer at all.
+  let id = ?w.ensureMarkerId(boundaryId)
+  w.registerCorrelationMarkerById(
+    direction, id, boundaryId, keyValue, showValue, description,
+    keyText, showText, stepId)
+
+proc registerSpanCoverage*(w: var MultiStreamTraceWriter,
+    traceIdBe: openArray[byte], spanIdBe: openArray[byte],
+    wallTimeUnixNs: uint64, monotonicTimeNs: uint64,
+    threadId: uint64 = 0, isExit: bool = false,
+    stepId: Option[uint64] = none(uint64)): Result[void, string] =
+  ## Declare that this recording covers a distributed-trace span
+  ## (`corrmark.ns` kind 0).
+  ##
+  ## THE ENTRY POINT AN OBSERVABILITY RECORDER CALLS per served request, so a
+  ## consumer holding an OTel `(trace_id, span_id)` can decide whether this
+  ## recording covers it with one B-tree lookup instead of decoding the event
+  ## stream.
+  ##
+  ## Ids are the WIRE bytes — 16 and 8 — not a hex rendering.  Hashing the hex
+  ## would key the index on something no consumer computes; `decodeHexId` is
+  ## provided for bindings whose host hands them hex.
+  ##
+  ## **This mints no `MarkerPayload` and no IO event**, unlike
+  ## `registerCorrelationMarkerById`.  A span-coverage marker has no send/recv
+  ## sense and no pairing domain, so forcing it into a `MarkerPayload` would
+  ## make the pairing index try to pair spans with each other (contract
+  ## §10.2).  One index, two kinds; two payload shapes.
+  ##
+  ## `geid` is the ENCLOSING step — the coordinate a consumer resumes replay
+  ## from — and follows the same rule as a boundary marker's: `none` means the
+  ## last step this writer emitted, and a caller that buffers its steps (the C
+  ## ABI) passes the id explicitly. No step is minted, for the reason in
+  ## §11a.6.
+  if w.closed:
+    return err("writer is closed")
+  let enclosingStep =
+    if stepId.isSome: stepId.get()
+    elif w.stepCount > 0: w.stepCount - 1
+    else: 0'u64
+  let m = ?initSpanMarker(traceIdBe, spanIdBe, wallTimeUnixNs,
+    monotonicTimeNs, geid = enclosingStep, threadId = threadId,
+    isExit = isExit)
+  w.correlationMarkers.add(m)
+  ok()
+
+proc registerSpanCoverageHex*(w: var MultiStreamTraceWriter,
+    traceIdHex: string, spanIdHex: string,
+    wallTimeUnixNs: uint64, monotonicTimeNs: uint64,
+    threadId: uint64 = 0, isExit: bool = false,
+    stepId: Option[uint64] = none(uint64)): Result[void, string] =
+  ## Hex convenience over `registerSpanCoverage`, for callers whose OTel API
+  ## hands them the canonical 32/16-character hex ids.  A WRAPPER: the byte
+  ## form stays primary so the conversion has exactly one implementation.
+  let traceId = ?decodeHexId(traceIdHex, 16)
+  let spanId = ?decodeHexId(spanIdHex, 8)
+  w.registerSpanCoverage(traceId, spanId, wallTimeUnixNs, monotonicTimeNs,
+    threadId, isExit, stepId)
+
 proc registerRaise*(w: var MultiStreamTraceWriter, exceptionTypeId: uint64,
     message: openArray[byte]): Result[void, string] =
   ## Register a raise event in the execution stream.
@@ -1774,8 +1999,29 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   # lifetime is the owner's too, so an attached `close` must not write meta.dat
   # or `closeCtfs` — it just marks itself closed and returns.
   if w.attached:
+    # Publish this writer's entry sizes before handing the container back to
+    # its owner: `writeToFile` only updates them in block 0's in-memory image.
+    w.container.syncRootBlock()
     w.closed = true
     return ok()
+
+  # Write corrmark.ns — the correlation index — when this recording declared
+  # any markers.  A recording with none writes NO namespace: its absence says
+  # "never indexed", which a consumer must not report as "does not cover that
+  # span" (contract §9).  That is why this is conditional rather than always
+  # emitting an empty index.
+  if w.correlationMarkers.len > 0:
+    let imageRes = serializeCorrmarkNamespace(w.correlationMarkers)
+    if imageRes.isErr:
+      return err("failed to build corrmark.ns: " & imageRes.error)
+    let image = imageRes.get()
+    let nsFileRes = w.container.addFile(CorrmarkNamespaceName)
+    if nsFileRes.isErr:
+      return err("failed to add corrmark.ns: " & nsFileRes.error)
+    var nsFile = nsFileRes.get()
+    let writeRes = w.container.writeToFile(nsFile, image)
+    if writeRes.isErr:
+      return err("failed to write corrmark.ns: " & writeRes.error)
 
   # Write meta.dat
   let metaFileRes = w.container.addFile("meta.dat")
@@ -1824,23 +2070,49 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
     # line counts.  Like bit 13 it is rejecting, not additive, at the
     # reader, so a writer that did not opt in must leave it clear — see
     # `enableLineCountTable`.
-    hasLineCountTable = w.lineCountTable)
+    hasLineCountTable = w.lineCountTable,
+    # WTCI (bit 15): stamped only when the recording actually declared a
+    # marker, i.e. exactly when `corrmark.ns` was written above.  The bit is
+    # a hint and the file entry is the authority, so the two must never be
+    # able to disagree: a bit set over a container with no index would
+    # reintroduce the exact ambiguity the contract's §9 removes.
+    hasCorrelationIndex = w.correlationMarkers.len > 0)
   if metaRes.isErr:
     return err("failed to write meta.dat: " & metaRes.error)
 
+  # Publish block 0 — the root entry array, which carries every internal
+  # file's size.  `writeToFile` maintains those sizes in the in-memory image
+  # and flushes only the data block it filled, so without this the container
+  # on disk reports each member's size as of the last `addFile`: `meta.dat`,
+  # written last, reads back as 0 bytes and the whole recording decodes as an
+  # empty program.  One 4 KiB write per recording.
+  w.container.syncRootBlock()
+
   w.closed = true
   ok()
+
+proc isClosed*(w: MultiStreamTraceWriter): bool =
+  ## True once `close` has run.  Exposed so a caller that finalizes on a
+  ## teardown path (the C ABI's `trace_writer_free`) can tell "already closed,
+  ## nothing to flush" from "still open", instead of driving buffered writes
+  ## into a closed writer and reporting the resulting error as a real one.
+  w.closed
 
 proc toBytes*(w: var MultiStreamTraceWriter): seq[byte] =
   ## Get the serialized CTFS bytes. Must call close() first.
   w.container.toBytes()
 
-proc closeCtfs*(w: var MultiStreamTraceWriter) =
+proc closeCtfs*(w: var MultiStreamTraceWriter): Result[void, string]
+    {.discardable.} =
   ## Release any resources held by the underlying CTFS container.
   ##
   ## No-op for an ATTACHED writer: the container is owned by another writer,
   ## which is responsible for finalizing and closing it.  Only the owner's
   ## `closeCtfs` may write the final root block and close the stream file.
+  ##
+  ## Returns the container's finalization error instead of dropping it: this
+  ## is the write that makes the recording durable, so a failure here means
+  ## the trace on disk is incomplete.
   if w.attached:
-    return
+    return ok()
   w.container.closeCtfs()

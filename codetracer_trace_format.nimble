@@ -53,6 +53,12 @@ task test, "Run all tests":
   exec "nim c -r tests/test_trace_reader_null_mapping_root.nim"
   exec "nim c -r tests/test_golden_fixtures.nim"
   exec "nim c -r tests/test_cross_compat.nim"
+  exec "nim c -r tests/test_xxh64.nim"
+  # -d:release: the scale ladder builds a 100k-key index; a debug build
+  # turns that measurement into a multi-minute wait for no extra coverage.
+  exec "nim c -r -d:release tests/test_corrmark_builder.nim"
+  exec "nim c -r tests/test_correlation_marker_api.nim"
+  exec "nim c -r tests/test_close_publishes_entry_sizes.nim"
   # Reading a combined-stream bundle written by the sibling Rust
   # `CtfsTraceWriter`: it prefixes `events.log` with the 8-byte CodeTracer
   # file header the Nim writer omits, and its chunks are streaming-encoder

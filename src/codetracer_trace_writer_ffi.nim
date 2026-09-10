@@ -336,19 +336,44 @@ proc trace_writer_new(
   )
   return state
 
+proc flushPendingStep(handle: TraceWriterHandle,
+    orphanPathId: uint64 = high(uint64),
+    orphanLine: uint64 = 0'u64): cint
+  ## Forward-declared: `trace_writer_free` finalizes through the same path
+  ## `trace_writer_close` does, and it is defined above it.
+
 proc trace_writer_free(handle: TraceWriterHandle) {.exportc, cdecl, dynlib.} =
   ## Free a trace writer handle. Passing NULL is a no-op.
   if handle.isNil:
     return
-  # Close if writer was actually created and not already closed
+  # Close if writer was actually created and not already closed.
+  #
+  # A recorder that frees without an explicit `trace_writer_close` still gets
+  # a COMPLETE recording: the buffered step is flushed first, and both the
+  # writer's close and the container's finalization are checked.  This path
+  # used to `discard` all three, so a close that failed produced a finalized
+  # container the caller was told nothing about.  `free` has no return channel,
+  # so the failure is recorded in the FFI's last-error slot, which
+  # `trace_writer_last_error` reports.
   if handle.useMultiStream:
     if handle.msWriterReady:
+      if not handle.msWriter.isClosed():
+        let flushRc = flushPendingStep(handle)
+        if flushRc != 0:
+          setError("trace_writer_free: failed to flush the pending step: " &
+            lastError)
       # close() is idempotent — safe to call even if already closed
-      discard handle.msWriter.close()
-      handle.msWriter.closeCtfs()
+      let closeRes = handle.msWriter.close()
+      if closeRes.isErr:
+        setError("trace_writer_free: close failed: " & closeRes.error)
+      let ctfsRes = handle.msWriter.closeCtfs()
+      if ctfsRes.isErr:
+        setError("trace_writer_free: closeCtfs failed: " & ctfsRes.error)
   else:
     if handle.writerReady and not handle.writer.closed:
-      discard handle.writer.close()
+      let closeRes = handle.writer.close()
+      if closeRes.isErr:
+        setError("trace_writer_free: close failed: " & closeRes.error)
   try:
     `=destroy`(handle[])
   except:
@@ -1404,6 +1429,223 @@ proc toIOEventKind(k: FfiEventLogKind): IOEventKind =
     ioError
   of ffiElkTraceLogEvent, ffiElkEvmEvent:
     ioStderr
+
+proc ptrLenToString(p: ptr UncheckedArray[byte], n: csize_t): string =
+  ## Materialise a (ptr, len) pair.  NOT `$cstring`: a caller's string may
+  ## legally contain NUL — Ruby's can — and NUL-terminated marshalling both
+  ## truncates it and, on the Ruby side, raises from `rb_string_value_cstr`,
+  ## which is one of the recorder's known process-wedge regressions.
+  if p.isNil or n == 0:
+    return ""
+  result = newString(int(n))
+  for i in 0 ..< int(n):
+    result[i] = char(p[i])
+
+proc enclosingStepId(handle: TraceWriterHandle): uint64 =
+  ## The step a marker or an I/O event declared right now belongs to.
+  ##
+  ## NOT `stepCount - 1`. `trace_writer_register_step` only BUFFERS its step, so
+  ## that values registered afterwards still attach to it, and a marker is
+  ## declared while that step is still pending — so the buffered step will take
+  ## index `stepCount`, and `stepCount - 1` names the PREVIOUS one. Attributing
+  ## output to the previous step is issue #601, and the same accounting
+  ## `trace_writer_next_step_index` documents.
+  if handle.hasPendingStep: handle.msWriter.stepCount
+  elif handle.msWriter.stepCount > 0: handle.msWriter.stepCount - 1
+  else: 0'u64
+
+proc trace_writer_ensure_marker_id(
+    handle: TraceWriterHandle,
+    label: ptr UncheckedArray[byte], label_len: csize_t,
+    out_id: ptr uint64,
+): cint {.exportc, cdecl, dynlib.} =
+  ## Intern a correlation-marker label; writes its numeric id to `out_id`.
+  ##
+  ## THE PRIMARY OPERATION, mirroring `ensure_path_id`.  A binding calls this
+  ## ONCE per boundary, outside its hot path, and then passes the integer to
+  ## `trace_writer_mark_correlation_by_id` — so the per-crossing call does no
+  ## string lookup, no interning, and no allocation on the binding side.
+  ##
+  ## Returns 0 on success, 1 on failure.
+  if handle.isNil or out_id.isNil:
+    return 1
+  if not handle.useMultiStream or not handle.msWriterReady:
+    return 1
+  let res = handle.msWriter.ensureMarkerId(
+    ptrLenToString(label, label_len))
+  if res.isErr:
+    return 1
+  out_id[] = res.get()
+  0.cint
+
+proc trace_writer_mark_correlation_by_id(
+    handle: TraceWriterHandle,
+    marker_id: uint64,
+    boundary_label: ptr UncheckedArray[byte], boundary_label_len: csize_t,
+    direction: ptr UncheckedArray[byte], direction_len: csize_t,
+    key_value: ptr UncheckedArray[byte], key_value_len: csize_t,
+    show_value: ptr UncheckedArray[byte], show_value_len: csize_t,
+    description: ptr UncheckedArray[byte], description_len: csize_t,
+    key_text: ptr UncheckedArray[byte], key_text_len: csize_t,
+    show_text: ptr UncheckedArray[byte], show_text_len: csize_t,
+): cint {.exportc, cdecl, dynlib.} =
+  ## Declare a correlation marker against an interned label id.
+  ##
+  ## THE PRIMARY HOT-PATH ENTRY POINT.  `trace_writer_mark_correlation` below
+  ## is a convenience wrapper over this one, not the other way round: if the
+  ## string form were primary every binding would grow its own label cache and
+  ## they would drift, which is what putting this in the shared writer exists
+  ## to prevent.
+  if handle.isNil:
+    return 1
+  if not handle.useMultiStream or not handle.msWriterReady:
+    return 1
+  let res = handle.msWriter.registerCorrelationMarkerById(
+    ptrLenToString(direction, direction_len),
+    marker_id,
+    ptrLenToString(boundary_label, boundary_label_len),
+    ptrLenToString(key_value, key_value_len),
+    ptrLenToString(show_value, show_value_len),
+    ptrLenToString(description, description_len),
+    ptrLenToString(key_text, key_text_len),
+    ptrLenToString(show_text, show_text_len),
+    stepId = some(enclosingStepId(handle)))
+  (if res.isOk: 0.cint else: 1.cint)
+
+proc trace_writer_mark_correlation(
+    handle: TraceWriterHandle,
+    direction: ptr UncheckedArray[byte], direction_len: csize_t,
+    boundary_id: ptr UncheckedArray[byte], boundary_id_len: csize_t,
+    key_value: ptr UncheckedArray[byte], key_value_len: csize_t,
+    show_value: ptr UncheckedArray[byte], show_value_len: csize_t,
+    description: ptr UncheckedArray[byte], description_len: csize_t,
+    key_text: ptr UncheckedArray[byte], key_text_len: csize_t,
+    show_text: ptr UncheckedArray[byte], show_text_len: csize_t,
+): cint {.exportc, cdecl, dynlib.} =
+  ## Declare a correlation marker (`Correlation-Markers.md` §2.4).
+  ##
+  ## THE ENTRY POINT EVERY RECORDER BINDS TO.  Implemented once here, as
+  ## `trace_writer_register_span` already is for spans, so the ~20 CTFS
+  ## recorders do not each construct a `MarkerPayload` and drift — a recorder
+  ## whose field names fall out of step writes markers that are invisible
+  ## rather than broken, and nothing reports an error.
+  ##
+  ## Every string is (ptr, len), never NUL-terminated: see `ptrLenToString`.
+  ##
+  ## `key_value` and `show_value` must ALREADY BE STRINGIFIED UTF-8.  This
+  ## library never calls back into the host language to render a value: a
+  ## conversion that can raise must run before the binding takes the writer
+  ## lock, because a Ruby exception `longjmp`s past Rust destructors and
+  ## strands the guard, wedging the process permanently.
+  ##
+  ## Returns 0 on success, 1 on failure.  A binding is responsible for the
+  ## no-op-when-not-recording behaviour: user code calls this unconditionally,
+  ## and "no active recording" is not an error.
+  if handle.isNil:
+    return 1
+
+  let dir = ptrLenToString(direction, direction_len)
+  let boundary = ptrLenToString(boundary_id, boundary_id_len)
+  let key = ptrLenToString(key_value, key_value_len)
+  let show = ptrLenToString(show_value, show_value_len)
+  let desc = ptrLenToString(description, description_len)
+
+  if handle.useMultiStream:
+    # Same guard every other multi-stream entry point uses: a marker that
+    # arrives before `trace_writer_begin_events` created the writer is dropped
+    # rather than indexing an empty stream table, because an unhandled defect
+    # cannot be caught across the C boundary and would kill the RECORDED
+    # process.
+    if not handle.msWriterReady:
+      return 1
+    let res = handle.msWriter.registerCorrelationMarker(
+      dir, boundary, key, show, desc,
+      ptrLenToString(key_text, key_text_len),
+      ptrLenToString(show_text, show_text_len),
+      stepId = some(enclosingStepId(handle)))
+    return (if res.isOk: 0.cint else: 1.cint)
+  1.cint
+
+proc trace_writer_mark_span_coverage(
+    handle: TraceWriterHandle,
+    trace_id: ptr UncheckedArray[byte], trace_id_len: csize_t,
+    span_id: ptr UncheckedArray[byte], span_id_len: csize_t,
+    wall_time_unix_ns: uint64,
+    monotonic_time_ns: uint64,
+): cint {.exportc, cdecl, dynlib.} =
+  ## Declare that this recording covers a distributed-trace span.
+  ##
+  ## THE ENTRY POINT AN OBSERVABILITY RECORDER BINDS TO, called once per
+  ## served request.  It is what lets a consumer holding an OTel
+  ## `(trace_id, span_id)` decide whether this recording covers that span with
+  ## a single index lookup, instead of downloading and decoding the recording.
+  ##
+  ## `trace_id` is the 16 WIRE bytes and `span_id` the 8 WIRE bytes — not a
+  ## hex rendering.  The index keys on the wire bytes, so hex here would build
+  ## an index keyed on something no consumer ever computes: present, correct
+  ## looking, and permanently unqueryable.  Use
+  ## `trace_writer_mark_span_coverage_hex` when the host hands you hex; it is
+  ## a wrapper over this, so the conversion has one implementation.
+  ##
+  ## Returns 0 on success, 1 on failure (see `trace_writer_last_error`).  A
+  ## binding is responsible for the no-op-when-not-recording behaviour: user
+  ## code calls this unconditionally and "no active recording" is not an error.
+  if handle.isNil:
+    setError("NULL handle")
+    return 1.cint
+  if not handle.useMultiStream or not handle.msWriterReady:
+    setError("no active CTFS recording")
+    return 1.cint
+  if trace_id.isNil or span_id.isNil:
+    setError("NULL trace_id or span_id")
+    return 1.cint
+
+  var traceBytes = newSeq[byte](int(trace_id_len))
+  for i in 0 ..< int(trace_id_len): traceBytes[i] = trace_id[i]
+  var spanBytes = newSeq[byte](int(span_id_len))
+  for i in 0 ..< int(span_id_len): spanBytes[i] = span_id[i]
+
+  let res = handle.msWriter.registerSpanCoverage(
+    traceBytes, spanBytes, wall_time_unix_ns, monotonic_time_ns,
+    stepId = some(enclosingStepId(handle)))
+  if res.isErr:
+    setError(res.error)
+    return 1.cint
+  0.cint
+
+proc trace_writer_mark_span_coverage_hex(
+    handle: TraceWriterHandle,
+    trace_id_hex: ptr UncheckedArray[byte], trace_id_hex_len: csize_t,
+    span_id_hex: ptr UncheckedArray[byte], span_id_hex_len: csize_t,
+    wall_time_unix_ns: uint64,
+    monotonic_time_ns: uint64,
+): cint {.exportc, cdecl, dynlib.} =
+  ## Hex convenience over `trace_writer_mark_span_coverage`, for the common
+  ## case where the host's OTel API hands the ids out as the canonical 32- and
+  ## 16-character lowercase hex strings.
+  ##
+  ## The conversion lives in the shared library rather than in each binding
+  ## for the reason the whole marker API does: ~20 recorders each writing a
+  ## hex parser is ~20 chances to key the index on the wrong bytes, and that
+  ## mistake reports no error anywhere.
+  ##
+  ## (ptr, len), never NUL-terminated — see `ptrLenToString`.
+  if handle.isNil:
+    setError("NULL handle")
+    return 1.cint
+  if not handle.useMultiStream or not handle.msWriterReady:
+    setError("no active CTFS recording")
+    return 1.cint
+
+  let res = handle.msWriter.registerSpanCoverageHex(
+    ptrLenToString(trace_id_hex, trace_id_hex_len),
+    ptrLenToString(span_id_hex, span_id_hex_len),
+    wall_time_unix_ns, monotonic_time_ns,
+    stepId = some(enclosingStepId(handle)))
+  if res.isErr:
+    setError(res.error)
+    return 1.cint
+  0.cint
 
 proc trace_writer_register_special_event(
     handle: TraceWriterHandle,
@@ -2489,7 +2731,14 @@ proc trace_writer_close(handle: TraceWriterHandle): cint {.exportc, cdecl, dynli
     # toBytes()/open(fmWrite) dump — that was the buffered mode, which
     # balloons RAM and loses the trace if a long-running producer is killed
     # before close.
-    handle.msWriter.closeCtfs()
+    let ctfsRes = handle.msWriter.closeCtfs()
+    if ctfsRes.isErr:
+      # The final write is what publishes block 0's entry-size array; losing
+      # it leaves a container whose members read back empty.  Reporting
+      # success here would hand the recorder a corrupt trace it believes is
+      # complete.
+      setError(ctfsRes.error)
+      return 1.cint
     return 0.cint
 
   if not handle.writerReady:

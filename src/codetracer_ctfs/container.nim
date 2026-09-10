@@ -253,18 +253,61 @@ proc truncateFileContent*(c: var Ctfs, f: CtfsInternalFile):
     c.flushBlock(mapBlock)
   ok(CtfsInternalFile(entryIndex: f.entryIndex, writePos: 0, dataBlockCount: 0))
 
-proc closeCtfs*(c: var Ctfs) =
-  ## Close the container. When streaming, flushes all data and closes the file.
+proc syncRootBlock*(c: var Ctfs) =
+  ## Publish block 0 — the header and the root file-entry array — to the
+  ## streaming file.
+  ##
+  ## **The entry array holds every internal file's SIZE, and `writeToFile`
+  ## updates that size in memory only.** It flushes the data block it just
+  ## filled, so the payload is durable, but block 0 is rewritten only by
+  ## `addFile` / `truncateFileContent` / `closeCtfs`. A container read off
+  ## disk in between therefore reports the size each entry had at the last
+  ## such call — and for the file written LAST, that size is 0, so the member
+  ## reads back empty while its bytes sit in the container untouched.
+  ##
+  ## `meta.dat` is always the last file a trace writer writes, which made this
+  ## the observable form of the defect: `close()` returned `ok`, and a reader
+  ## that opened the path without a `closeCtfs()` saw an empty program with
+  ## every capability flag clear and gated every stream count to
+  ## "(unavailable)". Pinned by `tests/test_close_publishes_entry_sizes.nim`.
+  ##
+  ## The stdio buffer is flushed as well.  `flushBlockRange` only issues the
+  ## write; without the flush the published block 0 can still be sitting in
+  ## the runtime's buffer, so a reader in this process — a test decoding the
+  ## trace it has just written — reads the pre-close image back.
   if c.streaming:
+    c.flushBlock(0)
     try:
-      # Final flush of all in-memory data to disk.
-      c.streamFile.setFilePos(0)
-      discard c.streamFile.writeBuffer(addr c.data[0], c.data.len)
       c.streamFile.flushFile()
-      c.streamFile.close()
     except IOError, OSError:
       discard
-    c.streaming = false
+
+proc closeCtfs*(c: var Ctfs): Result[void, string] {.discardable.} =
+  ## Close the container. When streaming, flushes all data and closes the file.
+  ##
+  ## Returns the I/O failure rather than swallowing it. The final write is the
+  ## one that publishes block 0's entry-size array, so losing it silently
+  ## yields a container whose members read back empty — a corrupt recording
+  ## that reports success. `{.discardable.}` keeps the ~50 existing
+  ## statement-position callers compiling, but a caller on a recording path
+  ## should check it.
+  if not c.streaming:
+    return ok()
+  var failure = ""
+  try:
+    # Final flush of all in-memory data to disk.
+    c.streamFile.setFilePos(0)
+    discard c.streamFile.writeBuffer(addr c.data[0], c.data.len)
+    c.streamFile.flushFile()
+    c.streamFile.close()
+  except IOError as e:
+    failure = "failed to finalize CTFS container: " & e.msg
+  except OSError as e:
+    failure = "OS error finalizing CTFS container: " & e.msg
+  c.streaming = false
+  if failure.len > 0:
+    return err(failure)
+  ok()
 
 proc entryIndex*(f: CtfsInternalFile): int =
   ## Return the file entry index (for use with syncEntry).

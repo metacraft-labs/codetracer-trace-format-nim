@@ -340,6 +340,7 @@ proc buildFullDocument*(reader: var NewTraceReader,
   flagsObj["has_value_stream"] = newJBool(reader.meta.hasValueStream)
   flagsObj["has_io_event_stream"] = newJBool(reader.meta.hasIoEventStream)
   flagsObj["has_interning_tables"] = newJBool(reader.meta.hasInterningTables)
+  flagsObj["has_correlation_index"] = newJBool(reader.meta.hasCorrelationIndex)
   # Whether the container STATES how large each of its files is, or leaves a
   # reader to assume `DefaultLinesPerFile` for every one of them. False is the
   # answer for every trace written before bit 14 existed, and it is the one an
