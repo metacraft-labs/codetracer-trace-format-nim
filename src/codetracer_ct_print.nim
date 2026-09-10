@@ -417,6 +417,7 @@ proc printMetaJsonV4(reader: var NewTraceReader) =
   flagsObj["has_value_stream"] = newJBool(reader.meta.hasValueStream)
   flagsObj["has_io_event_stream"] = newJBool(reader.meta.hasIoEventStream)
   flagsObj["has_interning_tables"] = newJBool(reader.meta.hasInterningTables)
+  flagsObj["has_correlation_index"] = newJBool(reader.meta.hasCorrelationIndex)
   meta["flags"] = flagsObj
 
   if reader.meta.hasFilterProvenance:
@@ -837,6 +838,7 @@ proc buildFullDocument(reader: var NewTraceReader,
   flagsObj["has_value_stream"] = newJBool(reader.meta.hasValueStream)
   flagsObj["has_io_event_stream"] = newJBool(reader.meta.hasIoEventStream)
   flagsObj["has_interning_tables"] = newJBool(reader.meta.hasInterningTables)
+  flagsObj["has_correlation_index"] = newJBool(reader.meta.hasCorrelationIndex)
   meta["flags"] = flagsObj
 
   # ----- trace_filter provenance (TF-M7, spec §7) -----
@@ -1239,8 +1241,7 @@ proc printMarkersV4(reader: var NewTraceReader, opts: FullOpts) =
       alignLeft(boundary, 24) & "  " & alignLeft(key, 19) & "  " &
       align($stepId, 4) & "  " & showValue
 
-proc printCorrelationIndexV4(filePath: string, program: string,
-                             opts: FullOpts) =
+proc printCorrelationIndexV4(filePath: string, opts: FullOpts) =
   ## Report the recording's correlation index — `corrmark.ns`.
   ##
   ## THE ONLY VIEW OF SPAN COVERAGE. A boundary crossing also writes a
@@ -1256,6 +1257,11 @@ proc printCorrelationIndexV4(filePath: string, program: string,
   ## empty index has been indexed and covers none. They are different answers
   ## (contract §9), and reporting both as "0 entries" is what made the
   ## original lookup failure so hard to place.
+  ## Dispatched for EVERY container layout, before the native / v4 split.
+  ## `corrmark.ns` is a container member, not a stream, so which decoder owns
+  ## the event streams is irrelevant here — and routing this through the v4
+  ## branch alone would have made the index invisible on exactly the
+  ## recordings (native, multi-threaded) whose lookups this campaign is about.
   let dataRes = ctfs_container.readCtfsFromFile(filePath)
   if dataRes.isErr:
     quit("Error: " & dataRes.error)
@@ -1265,6 +1271,15 @@ proc printCorrelationIndexV4(filePath: string, program: string,
       result = result or (uint32(buf[off + i]) shl (i * 8))
   let blockSize = u32le(data, 8)
   let maxEntries = u32le(data, 12)
+  # The program name is a nicety; a container whose meta.dat this build cannot
+  # parse must still report its index rather than refusing.
+  var program = filePath
+  let metaBytes = ctfs_container.readInternalFile(
+    data, "meta.dat", blockSize, maxEntries)
+  if metaBytes.isOk:
+    let parsed = readMetaDat(metaBytes.get())
+    if parsed.isOk:
+      program = parsed.get().program
   let nsRes = ctfs_container.readInternalFile(
     data, CorrmarkNamespaceName, blockSize, maxEntries)
 
@@ -1743,6 +1758,10 @@ proc main() =
 
   let opts = FullOpts(stripPaths: stripPaths, jsonOut: jsonOut)
 
+  if format == "correlation-index":
+    printCorrelationIndexV4(filePath, opts)
+    return
+
   # ----- Native MCR shard path (auto-detect or --native) -----
   # The native recorder writes a CTFS shard with per-thread `tNNNN` streams
   # (vs the v4 layout's split per-kind streams + interning tables).
@@ -1837,8 +1856,6 @@ proc main() =
       case format
       of "summary": printSummaryV4(reader)
       of "markers": printMarkersV4(reader, opts)
-      of "correlation-index":
-        printCorrelationIndexV4(filePath, reader.meta.program, opts)
       of "meta-json": printMetaJsonV4(reader)
       of "json": printJsonV4(reader)
       of "json-events": printJsonEventsV4(reader)

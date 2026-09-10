@@ -1912,7 +1912,13 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
     # RS-M1: unlike the four stream bits above, bit 13 is stamped ONLY when a
     # span was actually registered.  See `hasSpans` for why this one is
     # conditional: bit 13 is rejecting, not additive, at the reader.
-    hasSpanStream = w.hasSpans)
+    hasSpanStream = w.hasSpans,
+    # WTCI: stamped only when the recording actually declared a marker, i.e.
+    # exactly when `corrmark.ns` was written above.  The bit is a hint and the
+    # file entry is the authority, so the two must never be able to disagree:
+    # a bit set over a container with no index would reintroduce the exact
+    # ambiguity the contract's §9 removes.
+    hasCorrelationIndex = w.correlationMarkers.len > 0)
   if metaRes.isErr:
     return err("failed to write meta.dat: " & metaRes.error)
 

@@ -221,15 +221,42 @@ const
     ## opt in explicitly and containers without spans are byte-identical to
     ## what the writer produced before this bit existed.
     ##
-    ## Bits 14 and 15 are deliberately left UNALLOCATED.  With bits 0-13
-    ## taken, two remain in the `u16` and there are more queued consumers
-    ## than bits; whether the last bit becomes an "extended flag word
-    ## follows" escape (or the field is widened by a meta.dat version bump)
-    ## is a format decision that needs its own milestone, with reader support
-    ## landed first.  See CTFS-Binary-Format.md §"Flag-space exhaustion".
+    ## Bit 14 is now ``FlagHasCorrelationIndex`` (below); bit 15 is the last
+    ## free bit, and whether it becomes an "extended flag word follows"
+    ## escape (or the field is widened by a meta.dat version bump) is a format
+    ## decision that needs its own milestone, with reader support landed
+    ## first.  See CTFS-Binary-Format.md §"Flag-space exhaustion".
     ##
     ## Must match ``codetracer_trace_writer::meta_dat::FLAG_HAS_SPAN_STREAM``
     ## (Rust) and the db-backend ``FLAG_HAS_SPAN_STREAM`` bit 13 (RS-M2).
+  FlagHasCorrelationIndex*: uint16 = 0x4000      # bit 14 — WTCI
+    ## When set, the container carries `corrmark.ns` — the record-time B-tree
+    ## index of the distributed-trace spans and boundary crossings this
+    ## recording covers — together with the `markers.dat` / `markers.off`
+    ## interning table its boundary labels resolve through.  It rides on ONE
+    ## bit rather than joining bit 12's set because the label table is
+    ## meaningless without the index, and because bit 12's meaning is a
+    ## settled three-way agreement describing four tables two of those readers
+    ## have no use for.
+    ##
+    ## **A HINT, NOT A GATE, and not the authority.**  Whether a recording was
+    ## indexed is answered by the presence of the `corrmark.ns` FILE ENTRY,
+    ## which a consumer already parses to find anything at all.  That matters
+    ## because the distinction the contract requires — "never indexed" versus
+    ## "indexed and covering nothing" — is a statement about the recording
+    ## rather than about any span, and a flag that could disagree with the
+    ## entry array would make it ambiguous again.  See
+    ## ``codetracer-specs/Testing/CTFS-Correlation-Marker-Contract.md`` §9.
+    ##
+    ## Recognising the bit is nonetheless load-bearing on the READ side:
+    ## ``KnownFlags`` + ``readMetaDat`` refuse a container carrying any bit
+    ## outside the known mask, so a reader without this constant rejects every
+    ## marker-bearing recording outright instead of ignoring an index it has
+    ## no use for.  Reader support therefore ships before the writer sets it —
+    ## the same rollout rule bit 13 records.
+    ##
+    ## Must match ``codetracer_trace_writer::meta_dat::FLAG_HAS_CORRELATION_INDEX``
+    ## (Rust) and the db-backend ``FLAG_HAS_CORRELATION_INDEX`` bit 14.
   FlagHasCallStream*: uint16 = 0x100             # bit 8 — M17a
     ## When set, the materialized `.ct` carries a dedicated call stream
     ## (`calls.dat` + its companion seekable index `calls.idx`) in
@@ -257,7 +284,8 @@ const
     FlagHasValueStream or
     FlagHasIoEventStream or
     FlagHasInterningTables or
-    FlagHasSpanStream)
+    FlagHasSpanStream or
+    FlagHasCorrelationIndex)
     ## P6.5 (column-extension back-compat): every flag bit this reader
     ## understands.  ``readMetaDat`` rejects any meta.dat whose flag
     ## word has bits outside this mask set, per
@@ -362,6 +390,11 @@ type
       ## with O(1) random access via the `.off` offset indices.  Pre-
       ## extension traces always have it clear; the legacy interning remains
       ## the source of truth when it is clear.
+    hasCorrelationIndex*: bool
+      ## WTCI: True iff FlagHasCorrelationIndex (bit 14) was set.  A HINT that
+      ## the container carries `corrmark.ns` + `markers.dat`/`.off`; the file
+      ## entry, not this bit, is what a consumer must consult to tell "never
+      ## indexed" from "indexed and covering nothing" (contract §9).
     hasSpanStream*: bool
       ## RS-M1: True iff FlagHasSpanStream was set on the meta.dat header.
       ## When set, the trace carries `spans.dat` + `spans.idx` (interval
@@ -421,6 +454,7 @@ proc writeMetaDat*(
     hasIoEventStream: bool = false,
     hasInterningTables: bool = false,
     hasSpanStream: bool = false,
+    hasCorrelationIndex: bool = false,
 ): Result[void, string] =
   ## Write binary meta.dat to a CTFS internal file.
   ##
@@ -483,6 +517,8 @@ proc writeMetaDat*(
     flags = flags or FlagHasInterningTables
   if hasSpanStream:
     flags = flags or FlagHasSpanStream
+  if hasCorrelationIndex:
+    flags = flags or FlagHasCorrelationIndex
   ? c.writeU16LE(f, flags)
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.
@@ -612,6 +648,7 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
 
   var contents = MetaDatContents(version: version)
   contents.hasColumnAwareSteps = (flags and FlagHasColumnAwareSteps) != 0
+  contents.hasCorrelationIndex = (flags and FlagHasCorrelationIndex) != 0
   contents.hasAlternateSourceViews =
     (flags and FlagHasAlternateSourceViews) != 0
   contents.supportsColumnBreakpoints =

@@ -336,6 +336,7 @@ proc buildFullDocument*(reader: var NewTraceReader,
   flagsObj["has_value_stream"] = newJBool(reader.meta.hasValueStream)
   flagsObj["has_io_event_stream"] = newJBool(reader.meta.hasIoEventStream)
   flagsObj["has_interning_tables"] = newJBool(reader.meta.hasInterningTables)
+  flagsObj["has_correlation_index"] = newJBool(reader.meta.hasCorrelationIndex)
   meta["flags"] = flagsObj
 
   # ----- trace_filter provenance (TF-M7, spec §7) -----
