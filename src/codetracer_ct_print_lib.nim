@@ -25,6 +25,7 @@ import results
 import codetracer_trace_writer/new_trace_reader
 import codetracer_trace_writer/meta_dat
 import codetracer_trace_writer/meta_flags_json
+import codetracer_trace_writer/source_reload_json
 import codetracer_trace_writer/step_encoding
 import codetracer_trace_writer/call_stream as v4calls
 import codetracer_trace_writer/io_event_stream
@@ -451,6 +452,16 @@ proc buildFullDocument*(reader: var NewTraceReader,
   counts["values"] = newJInt(if vcR.isOk: int64(vcR.get()) else: -1)
   let icR = reader.ioEventCount()
   counts["io_events"] = newJInt(if icR.isOk: int64(icR.get()) else: -1)
+  # GDH-M2: how many source-reload markers the container carries.
+  # ALWAYS emitted, including the `0` every trace without a reload
+  # answers with, for the reason `path_version_ordinal` is always
+  # emitted: a key that appears only when a marker exists makes a scan
+  # for it pass on a trace that has none AND on a build that cannot see
+  # one. It is also what lets a caller check an `--events` dump is
+  # COMPLETE: the step entries plus the source_reload entries must
+  # account for every exec record.
+  let srR = reader.sourceReloadCount()
+  counts["source_reloads"] = newJInt(if srR.isOk: int64(srR.get()) else: -1)
   root["counts"] = counts
 
   # ----- events (interleaved, source-order) -----
@@ -510,88 +521,126 @@ proc buildFullDocument*(reader: var NewTraceReader,
           eventsArr.add(callObj)
 
       # 2) the step event itself
-      var stepObj = newJObject()
-      stepObj["kind"] = newJString("step")
-      stepObj["step_index"] = newJInt(int64(stepIdx))
-      block emitStep:
-        let loc = resolveGli(gli, stepGli)
-        if loc.isErr:
-          # No `path_id` / `line` / `path` key at all: a consumer that
-          # reads them gets a missing key rather than a position that was
-          # never in the trace.
-          stepObj["position_error"] = newJString(loc.error)
-          break emitStep
-        let (pathId, line) = loc.get()
-        stepObj["path_id"] = newJInt(int64(pathId))
-        stepObj["line"] = newJInt(int64(line))
-        # GDH-M1 — which VERSION of that file the step ran in: the
-        # 0-based ordinal of `path_id` among the paths.dat entries
-        # carrying its string. Always emitted, including the `0` every
-        # legacy trace answers with, because a consumer must be able to
-        # tell "this file was never reloaded" from "this ct-print
-        # predates versioned paths" — a key that appears only when a
-        # version exists makes a scan for it pass on a trace that has
-        # none AND on a build that cannot see one.
-        let vOrd = reader.pathVersionOrdinal(uint64(pathId))
-        stepObj["path_version_ordinal"] =
-          if vOrd.isOk: newJInt(int64(vOrd.get())) else: newJInt(-1)
-        let pStr = reader.path(uint64(pathId))
-        if pStr.isOk:
-          stepObj["path"] = newJString(
-            normalizePath(pStr.get(), reader.meta.workdir, opts.stripPaths))
-        # P1.4: surface the per-step column for column-aware traces so
-        # JSON-events / --full consumers can read the resolved
-        # ``(file, line, column)`` directly without having to walk the
-        # exec stream themselves.  The decoder errors on legacy traces;
-        # we leave the field absent in that case to keep the JSON
-        # bit-for-bit compatible with pre-column-aware tooling.
-        if reader.meta.hasColumnAwareSteps:
-          let posRes = reader.decodeGlobalPositionIndex(stepGli)
-          if posRes.isOk:
-            stepObj["column"] = newJInt(int64(posRes.get().column))
-      let stepEv = reader.step(stepIdx)
-      if stepEv.isOk:
-        let se = stepEv.get()
-        stepObj["step_kind"] = newJString($se.kind)
-        case se.kind
-        of sekRaise:
-          stepObj["exception_type_id"] = newJInt(int64(se.exceptionTypeId))
-          stepObj["exception_message"] = newJString(bytesToUtf8(se.message))
-        of sekCatch:
-          stepObj["catch_exception_type_id"] = newJInt(int64(se.catchExceptionTypeId))
-        of sekThreadStart:
-          stepObj["thread_id"] = newJInt(int64(se.startThreadId))
-        of sekThreadExit:
-          stepObj["thread_id"] = newJInt(int64(se.exitThreadId))
-        of sekThreadSwitch:
-          stepObj["thread_id"] = newJInt(int64(se.threadId))
-        else:
-          discard
-      let callForStep = reader.callForStep(stepIdx)
-      if callForStep.isOk:
-        let cs = callForStep.get()
-        stepObj["function_id"] = newJInt(int64(cs.functionId))
-        let fn = reader.function(cs.functionId)
-        if fn.isOk:
-          stepObj["function"] = newJString(fn.get())
-        stepObj["depth"] = newJInt(int64(cs.depth))
-      var valsArr = newJArray()
-      let vals = reader.values(stepIdx)
-      if vals.isOk:
-        for v in vals.get():
-          var vObj = newJObject()
-          vObj["varname_id"] = newJInt(int64(v.varnameId))
-          let vn = reader.varname(v.varnameId)
-          if vn.isOk:
-            vObj["varname"] = newJString(vn.get())
-          vObj["type_id"] = newJInt(int64(v.typeId))
-          let tn = reader.typeName(v.typeId)
-          if tn.isOk:
-            vObj["type_name"] = newJString(tn.get())
-          vObj["value"] = decodeValueBytesToJson(v.data)
-          valsArr.add(vObj)
-      stepObj["vars"] = valsArr
-      eventsArr.add(stepObj)
+      #
+      # GDH-M2 / design §7.3: a reload marker is a timeline ANNOTATION
+      # with no source location, so it gets its own event kind instead of
+      # being rendered as a step at whatever position the running
+      # absolute address happens to hold.  Read first, because the
+      # decision is about which object to build.
+      let stepEvEarly = reader.step(stepIdx)
+      let isSourceReload =
+        stepEvEarly.isOk and stepEvEarly.get().kind == sekSourceReload
+      # A record that could not be DECODED gets its own kind and never
+      # becomes a `kind="step"` entry. Without this arm the marker test
+      # above (an `isOk and ...`) reads a failed decode as "not a marker",
+      # and the record is rendered as an ordinary step at whatever
+      # position the running absolute address happens to hold — the
+      # PREVIOUS step's. The refusal this milestone added reaches exactly
+      # here: a container carrying tag 0x08 without declaring it fails at
+      # this call, and would otherwise be dumped as a plausible step
+      # stream with no error in it anywhere.
+      let isUnreadable = stepEvEarly.isErr
+      if isSourceReload:
+        eventsArr.add(sourceReloadEventJson(stepEvEarly.get(), stepIdx))
+      elif isUnreadable:
+        var errObj = newJObject()
+        errObj["kind"] = newJString("step_error")
+        errObj["step_index"] = newJInt(int64(stepIdx))
+        errObj["error"] = newJString(stepEvEarly.error)
+        eventsArr.add(errObj)
+      # NOT `continue`: blocks 3 and 4 below emit the IO events and call
+      # exits recorded AT this exec index, and those are not the step
+      # object. `registerSourceReload` advances the writer's step count,
+      # so a call whose `exitStep` is `stepCount - 1` can legitimately
+      # land on a marker's index; skipping the rest of the iteration
+      # dropped that `call_exit` silently. The sibling `ct-print` never
+      # had this shape, so the two `--events` implementations disagreed —
+      # the drift `source_reload_json` exists to prevent.
+      block emitStepEntry:
+        if isSourceReload or isUnreadable:
+          break emitStepEntry
+        var stepObj = newJObject()
+        stepObj["kind"] = newJString("step")
+        stepObj["step_index"] = newJInt(int64(stepIdx))
+        block emitStep:
+          let loc = resolveGli(gli, stepGli)
+          if loc.isErr:
+            # No `path_id` / `line` / `path` key at all: a consumer that
+            # reads them gets a missing key rather than a position that was
+            # never in the trace.
+            stepObj["position_error"] = newJString(loc.error)
+            break emitStep
+          let (pathId, line) = loc.get()
+          stepObj["path_id"] = newJInt(int64(pathId))
+          stepObj["line"] = newJInt(int64(line))
+          # GDH-M1 — which VERSION of that file the step ran in: the
+          # 0-based ordinal of `path_id` among the paths.dat entries
+          # carrying its string. Always emitted, including the `0` every
+          # legacy trace answers with, because a consumer must be able to
+          # tell "this file was never reloaded" from "this ct-print
+          # predates versioned paths" — a key that appears only when a
+          # version exists makes a scan for it pass on a trace that has
+          # none AND on a build that cannot see one.
+          let vOrd = reader.pathVersionOrdinal(uint64(pathId))
+          stepObj["path_version_ordinal"] =
+            if vOrd.isOk: newJInt(int64(vOrd.get())) else: newJInt(-1)
+          let pStr = reader.path(uint64(pathId))
+          if pStr.isOk:
+            stepObj["path"] = newJString(
+              normalizePath(pStr.get(), reader.meta.workdir, opts.stripPaths))
+          # P1.4: surface the per-step column for column-aware traces so
+          # JSON-events / --full consumers can read the resolved
+          # ``(file, line, column)`` directly without having to walk the
+          # exec stream themselves.  The decoder errors on legacy traces;
+          # we leave the field absent in that case to keep the JSON
+          # bit-for-bit compatible with pre-column-aware tooling.
+          if reader.meta.hasColumnAwareSteps:
+            let posRes = reader.decodeGlobalPositionIndex(stepGli)
+            if posRes.isOk:
+              stepObj["column"] = newJInt(int64(posRes.get().column))
+        let stepEv = reader.step(stepIdx)
+        if stepEv.isOk:
+          let se = stepEv.get()
+          stepObj["step_kind"] = newJString($se.kind)
+          case se.kind
+          of sekRaise:
+            stepObj["exception_type_id"] = newJInt(int64(se.exceptionTypeId))
+            stepObj["exception_message"] = newJString(bytesToUtf8(se.message))
+          of sekCatch:
+            stepObj["catch_exception_type_id"] = newJInt(int64(se.catchExceptionTypeId))
+          of sekThreadStart:
+            stepObj["thread_id"] = newJInt(int64(se.startThreadId))
+          of sekThreadExit:
+            stepObj["thread_id"] = newJInt(int64(se.exitThreadId))
+          of sekThreadSwitch:
+            stepObj["thread_id"] = newJInt(int64(se.threadId))
+          else:
+            discard
+        let callForStep = reader.callForStep(stepIdx)
+        if callForStep.isOk:
+          let cs = callForStep.get()
+          stepObj["function_id"] = newJInt(int64(cs.functionId))
+          let fn = reader.function(cs.functionId)
+          if fn.isOk:
+            stepObj["function"] = newJString(fn.get())
+          stepObj["depth"] = newJInt(int64(cs.depth))
+        var valsArr = newJArray()
+        let vals = reader.values(stepIdx)
+        if vals.isOk:
+          for v in vals.get():
+            var vObj = newJObject()
+            vObj["varname_id"] = newJInt(int64(v.varnameId))
+            let vn = reader.varname(v.varnameId)
+            if vn.isOk:
+              vObj["varname"] = newJString(vn.get())
+            vObj["type_id"] = newJInt(int64(v.typeId))
+            let tn = reader.typeName(v.typeId)
+            if tn.isOk:
+              vObj["type_name"] = newJString(tn.get())
+            vObj["value"] = decodeValueBytesToJson(v.data)
+            valsArr.add(vObj)
+        stepObj["vars"] = valsArr
+        eventsArr.add(stepObj)
 
       # 3) IO events at this step
       for (sid, ev, idx) in ioByStep:

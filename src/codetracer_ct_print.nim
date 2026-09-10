@@ -26,6 +26,7 @@ import codetracer_trace_reader
 import codetracer_trace_writer/new_trace_reader
 import codetracer_trace_writer/meta_dat
 import codetracer_trace_writer/meta_flags_json
+import codetracer_trace_writer/source_reload_json
 import codetracer_trace_writer/step_encoding
 import codetracer_trace_writer/call_stream as v4calls
 import codetracer_trace_writer/io_event_stream
@@ -482,6 +483,16 @@ proc printMetaJsonV4(reader: var NewTraceReader) =
   counts["functions"] = newJInt(int64(reader.functionCount()))
   counts["types"] = newJInt(int64(reader.typeCount()))
   counts["varnames"] = newJInt(int64(reader.varnameCount()))
+  # GDH-M2: how many source-reload markers the container carries.
+  # ALWAYS emitted, including the `0` every trace without a reload
+  # answers with, for the reason `path_version_ordinal` is always
+  # emitted: a key that appears only when a marker exists makes a scan
+  # for it pass on a trace that has none AND on a build that cannot see
+  # one. It is also what lets a caller check an `--events` dump is
+  # COMPLETE: the step entries plus the source_reload entries must
+  # account for every exec record.
+  let srR = reader.sourceReloadCount()
+  counts["source_reloads"] = newJInt(if srR.isOk: int64(srR.get()) else: -1)
   root["counts"] = counts
 
   echo pretty(root)
@@ -989,6 +1000,16 @@ proc buildFullDocument(reader: var NewTraceReader,
   counts["values"] = newJInt(if vcR.isOk: int64(vcR.get()) else: -1)
   let icR = reader.ioEventCount()
   counts["io_events"] = newJInt(if icR.isOk: int64(icR.get()) else: -1)
+  # GDH-M2: how many source-reload markers the container carries.
+  # ALWAYS emitted, including the `0` every trace without a reload
+  # answers with, for the reason `path_version_ordinal` is always
+  # emitted: a key that appears only when a marker exists makes a scan
+  # for it pass on a trace that has none AND on a build that cannot see
+  # one. It is also what lets a caller check an `--events` dump is
+  # COMPLETE: the step entries plus the source_reload entries must
+  # account for every exec record.
+  let srR = reader.sourceReloadCount()
+  counts["source_reloads"] = newJInt(if srR.isOk: int64(srR.get()) else: -1)
   root["counts"] = counts
 
   # ----- events (interleaved, source-order) -----
@@ -1078,7 +1099,35 @@ proc buildFullDocument(reader: var NewTraceReader,
       # index) is unaffected.
       let stepEv = reader.step(stepIdx)
       let isDeltaColumnNudge = stepEv.isOk and stepEv.get().kind == sekDeltaColumn
-      if not isDeltaColumnNudge:
+      # GDH-M2 / design §7.3: the reload marker is a timeline ANNOTATION,
+      # not a step.  It has no source location, so rendering it as a
+      # `kind="step"` entry would attach it to whatever position the
+      # running absolute address happened to hold — the previous step's —
+      # and invite a consumer to navigate to it.  It gets its own kind,
+      # and `counts.steps` (logicalStepCount) excludes it, so the two
+      # stay consistent.
+      let isSourceReload = stepEv.isOk and stepEv.get().kind == sekSourceReload
+      if isSourceReload:
+        eventsArr.add(sourceReloadEventJson(stepEv.get(), stepIdx))
+      # A record that could not be DECODED gets its own kind, and never
+      # falls through into the `kind="step"` branch below.  Both booleans
+      # above are `isOk and ...`, so without this arm a failed decode
+      # reads as "not a nudge and not a marker" and is rendered as an
+      # ordinary step — at whatever position the running absolute address
+      # happens to hold, i.e. the PREVIOUS step's.  That is exactly the
+      # mis-attribution the marker branch above exists to prevent, and it
+      # is reachable by the refusal this milestone added: a container
+      # carrying tag 0x08 without declaring it fails HERE, and would
+      # otherwise be dumped as a plausible step stream with no error in it
+      # anywhere.
+      let isUnreadable = stepEv.isErr
+      if isUnreadable:
+        var errObj = newJObject()
+        errObj["kind"] = newJString("step_error")
+        errObj["step_index"] = newJInt(int64(stepIdx))
+        errObj["error"] = newJString(stepEv.error)
+        eventsArr.add(errObj)
+      if not isDeltaColumnNudge and not isSourceReload and not isUnreadable:
         var stepObj = newJObject()
         stepObj["kind"] = newJString("step")
         stepObj["step_index"] = newJInt(int64(stepIdx))

@@ -1130,7 +1130,13 @@ proc ensureExecReader(r: var NewTraceReader): Result[void, string] =
     # never set the flag and use the legacy framing (per-chunk u32 count +
     # total_events trailer); ``legacy = not hasStepStream`` keeps them readable.
     let res = initExecStreamReader(r.data, int(r.blockSize), int(r.maxEntries),
-      legacy = not r.meta.hasStepStream)
+      legacy = not r.meta.hasStepStream,
+      # GDH-M2: tag 0x08 is decodable only where the container declares
+      # it.  A container that carries the tag with the flag clear is
+      # refused BY NAME here rather than decoded — see
+      # `decodeStepEvent`'s `allowSourceReload` note for why skipping is
+      # strictly worse than refusing.
+      allowSourceReload = r.meta.hasSourceReload)
     if res.isErr: return err(res.error)
     r.execReader = res.get()
     r.execLoaded = true
@@ -1210,7 +1216,7 @@ proc logicalStepCount*(r: var NewTraceReader): Result[uint64, string] =
   ## events read in bulk).  Looping ``readEvent`` is O(N²) because
   ## each call re-scans from the chunk start.
   ?r.ensureExecReader()
-  if not r.meta.hasColumnAwareSteps:
+  if not r.meta.hasColumnAwareSteps and not r.meta.hasSourceReload:
     return ok(r.execReader.totalEvents)
   var n: uint64 = 0
   var chunkBuf: seq[StepEvent]
@@ -1223,9 +1229,83 @@ proc logicalStepCount*(r: var NewTraceReader): Result[uint64, string] =
       case ev.kind
       of sekDeltaColumn:
         discard
+      of sekSourceReload:
+        # GDH-M2 / design §7.3: the reload marker is a timeline
+        # ANNOTATION, not a step.  It has no source location, so a
+        # consumer must not be able to step to it, and counting it as a
+        # step would put a position-less entry in the middle of a
+        # position-indexed sequence.
+        discard
       else:
         n += 1
   ok(n)
+
+proc sourceReloadCount*(r: var NewTraceReader): Result[uint64, string] =
+  ## GDH-M2 — how many ``TagSourceReload`` markers the execution stream
+  ## carries.  Zero on a container that does not declare the extended
+  ## flag, WITHOUT walking the stream: the tag cannot legally be present
+  ## there and a reader that walked anyway would be asserting on bytes it
+  ## has already refused.
+  ##
+  ## The exec reader is nonetheless OPENED before that early return, and
+  ## the ordering is the whole point.  Opening is not walking — it costs
+  ## the stream's header, not its chunks, so the fast path stays fast —
+  ## but without it this proc answers ``0`` for a container whose
+  ## execution stream is truncated, absent or refused, and "there are no
+  ## markers" becomes indistinguishable from "I never looked".  That
+  ## conflation is the defect this whole campaign exists to remove
+  ## (HLX-M1's resolver answered "not found" when it could not read the
+  ## table), and it would have been reachable through ``ct-print`` on
+  ## EVERY container written to date, since they are all v4.
+  ?r.ensureExecReader()
+  if not r.meta.hasSourceReload:
+    return ok(0'u64)
+  var n: uint64 = 0
+  var chunkBuf: seq[StepEvent]
+  let total = int(r.execReader.totalEvents)
+  let chunkSize = int(r.execReader.chunkSize)
+  let chunkCount = (total + chunkSize - 1) div chunkSize
+  for chunkIdx in 0 ..< chunkCount:
+    discard ?r.execReader.readChunkEvents(chunkIdx, chunkBuf)
+    for ev in chunkBuf:
+      if ev.kind == sekSourceReload:
+        n += 1
+  ok(n)
+
+type SourceReloadMarker* = object
+  ## One decoded ``TagSourceReload`` event, together with the exec-stream
+  ## index it occupies.  The index is what ties the marker to the steps on
+  ## either side of it — which is the whole point of recording the
+  ## boundary rather than inferring it from the path indices (§6.3.1).
+  stepIndex*: uint64
+  reloadOrdinal*: uint64
+  changed*: seq[SourceReloadChange]
+  inFlightFrames*: uint64
+
+proc sourceReloads*(r: var NewTraceReader): Result[seq[SourceReloadMarker], string] =
+  ## Every reload marker in the trace, in stream order.
+  ##
+  ## Like ``sourceReloadCount``, the exec reader is OPENED before the
+  ## undeclared-container early return: an empty seq must mean "this
+  ## stream carries no markers", never "this stream could not be read".
+  var markers: seq[SourceReloadMarker] = @[]
+  ?r.ensureExecReader()
+  if not r.meta.hasSourceReload:
+    return ok(markers)
+  var chunkBuf: seq[StepEvent]
+  let total = int(r.execReader.totalEvents)
+  let chunkSize = int(r.execReader.chunkSize)
+  let chunkCount = (total + chunkSize - 1) div chunkSize
+  for chunkIdx in 0 ..< chunkCount:
+    let firstIdx = ?r.execReader.readChunkEvents(chunkIdx, chunkBuf)
+    for offset, ev in chunkBuf:
+      if ev.kind == sekSourceReload:
+        markers.add(SourceReloadMarker(
+          stepIndex: firstIdx + uint64(offset),
+          reloadOrdinal: ev.reloadOrdinal,
+          changed: ev.changed,
+          inFlightFrames: ev.inFlightFrames))
+  ok(markers)
 
 proc stepAbsoluteGlobalLineIndices*(r: var NewTraceReader,
     startN: uint64, count: uint64,

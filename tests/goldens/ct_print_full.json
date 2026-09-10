@@ -18,7 +18,8 @@
       "has_io_event_stream": true,
       "has_interning_tables": false,
       "has_correlation_index": false,
-      "has_line_count_table": false
+      "has_line_count_table": false,
+      "has_source_reload": false
     },
     "column_aware_paths_suspected": false
   },
@@ -77,7 +78,8 @@
     "steps": 10,
     "calls": 2,
     "values": 10,
-    "io_events": 2
+    "io_events": 2,
+    "source_reloads": 0
   },
   "events": [
     {

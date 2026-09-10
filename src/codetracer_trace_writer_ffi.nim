@@ -69,6 +69,19 @@ var emptyStr {.threadvar.}: string
 proc setError(msg: string) =
   lastError = msg
 
+proc trace_writer_clear_last_error(): void {.exportc, cdecl, dynlib.} =
+  ## Reset this thread's error buffer to the empty string.
+  ##
+  ## Exists because ``trace_writer_last_error`` is STICKY: nothing on a
+  ## success path clears it, so "the buffer is non-empty" cannot be read
+  ## as "the call I just made failed" — it may be a message an earlier
+  ## call left behind. A caller that wants to attribute an error to a
+  ## specific call clears the buffer first and asserts it is empty at
+  ## that point; without this entry point that is not expressible from C
+  ## at all, and an assertion on a non-empty buffer would pass on a stale
+  ## message (trap 5 — a sentinel that collides with a legitimate value).
+  lastError = ""
+
 proc trace_writer_last_error(): cstring {.exportc, cdecl, dynlib.} =
   ## Retrieve the last error message for the current thread.
   ## Returns a pointer valid until the next FFI call on the same thread.
@@ -2265,6 +2278,127 @@ proc trace_writer_register_path_with_line_count(
     return 1.cint
   0.cint
 
+# ---------------------------------------------------------------------------
+# Versioned paths (GDH-M3 — design §6.4)
+# ---------------------------------------------------------------------------
+
+when defined(gdh3FalsifierArms):
+  {.warning: "gdh3FalsifierArms: versioned-path C ABI fault injection is COMPILED IN. This build must never be shipped or measured as a green result.".}
+
+template gdh3Arm(name: untyped): bool =
+  ## True iff the named GDH-M3 falsifier arm is armed — the master switch
+  ## AND the arm's own define.  Two defines rather than one so no single
+  ## stray ``-d:`` can arm a mutation in a shipped build.
+  when defined(gdh3FalsifierArms): defined(name) else: false
+
+const CtTwInvalidPathId = high(uint64)
+  ## The failure return of the two entry points below.  A path id is an
+  ## index into ``paths.dat``, so ``UINT64_MAX`` is not a value either
+  ## call can legitimately produce — a container would need 2^64 records
+  ## to reach it.  It is named rather than written as a literal so the
+  ## header's ``CT_TW_INVALID_PATH_ID`` and this constant move together.
+
+proc trace_writer_register_path_version(
+    handle: TraceWriterHandle,
+    path: cstring,
+    line_count: uint64,
+): uint64 {.exportc, cdecl, dynlib.} =
+  ## Register a NEW VERSION of an already-registered path and return
+  ## **the writer's own** id for it (design §6.4).
+  ##
+  ## This is the entry point a hot-reload host calls after the observer
+  ## tells it a source file changed. It bypasses the interning lookup and
+  ## always appends a ``paths.dat`` record whose payload is byte-identical
+  ## to the earlier version's: the virtual path string is the same file,
+  ## and only the INDEX discriminates the version. A subsequent bare
+  ## ``trace_writer_register_step(handle, path, line)`` on that string
+  ## resolves to the id returned here, so the caller's hot path stays
+  ## version-unaware.
+  ##
+  ## Requires ``trace_writer_enable_line_count_table``: a versioned record
+  ## with nowhere to put its size would put both versions back on the
+  ## ``DefaultLinesPerFile`` stride, where no bound can be enforced
+  ## against either and the mis-attribution is silent. The refusal names
+  ## the missing table.
+  ##
+  ## Returns ``CT_TW_INVALID_PATH_ID`` (``UINT64_MAX``) on failure, with
+  ## ``trace_writer_last_error`` set to a message naming the path. The
+  ## error buffer is CLEARED on entry, so a non-empty buffer after this
+  ## call is always this call's message and never a stale one.
+  trace_writer_clear_last_error()
+  if handle.isNil:
+    setError("trace_writer_register_path_version: NULL handle")
+    return CtTwInvalidPathId
+  if not handle.useMultiStream:
+    setError("trace_writer_register_path_version: the legacy " &
+      "single-stream backend has no paths.dat to version")
+    return CtTwInvalidPathId
+  if not handle.msWriterReady:
+    setError("trace_writer_register_path_version: writer not ready " &
+      "(call trace_writer_begin_events first)")
+    return CtTwInvalidPathId
+  let res = handle.msWriter.registerPathVersion(toNimStr(path), line_count)
+  # FALSIFIER (``gdh3FalsifyDiscardResult``,
+  # gdh3_refused_registration_reaches_the_c_caller): discard the writer's
+  # Result and answer with a plausible id.  This is not a hypothetical
+  # mutation — the header records that THREE void entry points used to
+  # return silently on a refused path registration, and the consequence
+  # was a C caller whose steps went missing with nothing in last_error to
+  # say why.  The gate must catch it on last_error being EMPTY, not on
+  # the return value alone.
+  when gdh3Arm(gdh3FalsifyDiscardResult):
+    return 0'u64
+  if res.isErr:
+    setError(res.error)
+    return CtTwInvalidPathId
+  res.get()
+
+proc trace_writer_current_path_id(
+    handle: TraceWriterHandle,
+    path: cstring,
+): uint64 {.exportc, cdecl, dynlib.} =
+  ## The id a bare ``trace_writer_register_step(handle, path, …)`` would
+  ## attribute a step to right now — the newest registered version of
+  ## ``path`` when it has been reloaded, and its ordinary interned id
+  ## when it has not.
+  ##
+  ## **This exists so a caller can DELETE any mirror of the writer's
+  ## interning counter, not so it can keep one in sync.** A host that
+  ## re-derives path ids by counting first sightings is correct only
+  ## while the writer interns in first-seen order from 0, and
+  ## ``trace_writer_register_path_version`` makes that false: from the
+  ## first reload onward the mirror drifts, and every subsequent
+  ## ``trace_writer_register_source_view`` attaches to the wrong file,
+  ## silently.
+  ##
+  ## Returns ``CT_TW_INVALID_PATH_ID`` (``UINT64_MAX``) on failure, with
+  ## ``trace_writer_last_error`` set. A path this writer has never seen
+  ## is a failure, not a fresh registration: under the line-count table
+  ## the writer has no size to lay the file out with, and answering with
+  ## a newly minted id would hand the caller a path the recording does
+  ## not describe.
+  trace_writer_clear_last_error()
+  if handle.isNil:
+    setError("trace_writer_current_path_id: NULL handle")
+    return CtTwInvalidPathId
+  if not handle.useMultiStream:
+    setError("trace_writer_current_path_id: the legacy single-stream " &
+      "backend has no paths.dat ids to answer with")
+    return CtTwInvalidPathId
+  if not handle.msWriterReady:
+    setError("trace_writer_current_path_id: writer not ready " &
+      "(call trace_writer_begin_events first)")
+    return CtTwInvalidPathId
+  let p = toNimStr(path)
+  let found = handle.msWriter.pathIdIfRegistered(p)
+  if found.isNone:
+    setError("trace_writer_current_path_id: no path " & p & " has been " &
+      "registered on this writer. Register the step (or the path) first; " &
+      "answering with a freshly minted id would put a file in paths.dat " &
+      "that the recording never executed")
+    return CtTwInvalidPathId
+  found.get()
+
 proc trace_writer_register_source_view(
     handle: TraceWriterHandle,
     path_id: uint64,
@@ -3497,6 +3631,21 @@ proc stepEventToJson(ev: StepEvent): string =
     "{\"kind\":\"thread_exit\",\"thread_id\":" & $ev.exitThreadId & "}"
   of sekDeltaColumn:
     "{\"kind\":\"delta_column\",\"column_delta\":" & $ev.columnDelta & "}"
+  of sekSourceReload:
+    # GDH-M2 — design §6.3.  Rendered in full rather than as a bare kind:
+    # a marker whose payload the instrument does not print is a marker a
+    # consumer cannot check against the ids the steps around it resolve
+    # to, which is the whole property GDH-G7 exists to defend.
+    var changedJson = "["
+    for i, ch in ev.changed:
+      if i > 0: changedJson.add(",")
+      changedJson.add("{\"old_path_id\":" & $ch.oldPathId &
+        ",\"new_path_id\":" & $ch.newPathId &
+        ",\"generation\":" & $ch.generation & "}")
+    changedJson.add("]")
+    "{\"kind\":\"source_reload\",\"reload_ordinal\":" & $ev.reloadOrdinal &
+      ",\"changed\":" & changedJson &
+      ",\"in_flight_frames\":" & $ev.inFlightFrames & "}"
 
 proc variableValueToJson(v: VariableValue): string =
   "{\"varname_id\":" & $v.varnameId &

@@ -52,6 +52,11 @@ proc metaFlagsJson*(meta: MetaDatContents): JsonNode =
   # assumption a file with more lines than the ceiling has its lines addressed
   # inside the next file's range, and no reader can detect that.
   result["has_line_count_table"] = newJBool(meta.hasLineCountTable)
+  # GDH-M2: whether the container declares the source-reload marker, i.e.
+  # whether step-stream tag 0x08 may legally appear.  False for every
+  # trace written before the extended flag word existed (schema version
+  # 4), which is every trace any recorder produces today.
+  result["has_source_reload"] = newJBool(meta.hasSourceReload)
 
 proc metaFlagKeys*(): seq[string] =
   ## The key set ``metaFlagsJson`` produces, for a consumer that wants to

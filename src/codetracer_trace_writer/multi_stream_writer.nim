@@ -20,6 +20,7 @@ import ../codetracer_ctfs/crossing_state
 import ./meta_dat
 import ./corrmark_builder
 import ./interning_table
+import ./gdh2_arms
 import ./exec_stream
 import ./value_stream
 import ./call_stream
@@ -213,6 +214,15 @@ type
       ## the file has.  Parallel to ``paths``.  Populated only when
       ## ``lineCountTable`` is on, in which case ``registerPath``
       ## requires a count for every path and no entry is ever zero.
+    sourceReloads: uint64
+      ## GDH-M2 / design §6.3 — how many ``TagSourceReload`` markers this
+      ## writer has emitted.  Doubles as the source of the next marker's
+      ## 1-based ``reload_ordinal`` and as the condition under which
+      ## ``close`` sets ``FlagExtHasSourceReload``.
+      ##
+      ## Zero for every recorder that never reloads, which is what keeps
+      ## the container at ``meta.dat`` schema version 4 and byte-identical
+      ## to what this writer produced before GDH-M2.
     currentPathVersions: Table[string, uint64]
       ## GDH-M1 / design §6.1 — per path STRING, the id of the most
       ## recently registered version of that file.
@@ -1036,6 +1046,28 @@ proc currentPathId*(w: MultiStreamTraceWriter,
     none(uint64)
   else:
     some(found)
+
+proc pathIdIfRegistered*(w: MultiStreamTraceWriter,
+    path: string): Option[uint64] =
+  ## The id ``path`` already has, WITHOUT registering it — the newest
+  ## version when the file has been reloaded, its ordinary interned id
+  ## when it has not, and ``none`` when this writer has never seen it.
+  ##
+  ## A pure query. That is the point: it is what a host calls to replace
+  ## a mirrored interning counter, and a lookup that silently registered
+  ## the path it was asked about would put a file in ``paths.dat`` that
+  ## the recording never executed — and, under the line-count table,
+  ## would have to invent a size for it.
+  let current = w.currentPathId(path)
+  if current.isSome:
+    return current
+  # Reverse scan so that, if a version was ever appended without going
+  # through `currentPathVersions`, the NEWEST record still wins — the
+  # same rule `registerStep` follows.
+  for i in countdown(w.paths.len - 1, 0):
+    if w.paths[i] == path:
+      return some(uint64(i))
+  none(uint64)
 
 proc pathIdForStep*(w: var MultiStreamTraceWriter,
     path: string): Result[uint64, string] =
@@ -1986,6 +2018,120 @@ proc registerCatch*(w: var MultiStreamTraceWriter,
 # and the reason the Ruby recorder's three add_event call sites could not
 # capture thread lifecycle events.
 
+# ---------------------------------------------------------------------------
+# Source reload markers (GDH-M2 — design §6.3)
+# ---------------------------------------------------------------------------
+
+proc registerSourceReload*(w: var MultiStreamTraceWriter,
+    changed: openArray[SourceReloadChange],
+    inFlightFrames: uint64 = 0): Result[uint64, string] =
+  ## Emit a ``TagSourceReload`` marker at the current point in the
+  ## execution stream and return its 1-based ``reload_ordinal``.
+  ##
+  ## The marker is what makes a reload DISCOVERABLE in the container
+  ## rather than inferable from the path indices (design §6.3.1).  It is
+  ## a timeline annotation, not a position: it carries no global position
+  ## index, does not move the running absolute address, and must not be
+  ## steppable-to.  It nonetheless occupies an exec-stream record — and
+  ## therefore an index in the parallel value stream — because every
+  ## consumer walks ``step(n)`` / ``values(n)`` in lock-step and a record
+  ## in one stream with no counterpart in the other desynchronises both.
+  ##
+  ## Every field is REQUIRED to be meaningful:
+  ##
+  ## * ``changed`` must be non-empty. A marker with no changed files says
+  ##   a reload happened and refuses to say what it did, which is worse
+  ##   than no marker: a consumer cannot distinguish it from a reload
+  ##   whose files it failed to record.
+  ## * ``oldPathId`` and ``newPathId`` must be DISTINCT and both already
+  ##   registered. Equal ids would mean the reload minted no new index,
+  ##   i.e. the post-reload steps are about to be attributed to the
+  ##   pre-reload version — the exact mis-attribution GDH-M0 measured.
+  ## * ``generation`` must be >= 2. Design §4.3 fixes generation 1 as the
+  ##   content the process started with, so a literal 1 here is a
+  ##   protocol error rather than a plausible value — chosen deliberately
+  ##   so the `symbolGeneration: 1` defect (`repro_hcr_agent.c:1338`, a
+  ##   constant inside a format string) is refused rather than inherited.
+  ##
+  ## The ordinal is the writer's own count, not a caller-supplied number,
+  ## so a second reload cannot repeat the first's.
+  if w.closed:
+    return err("writer is closed")
+  # FALSIFIER (``gdh2FalsifyZeroedMarker``, gdh2_reload_marker_round_trips):
+  # drop every validation and emit a marker whose payload is all zeros.
+  # This is the cheapest way to make "the reload is discoverable" pass —
+  # the container plainly carries a marker, the count is right, and the
+  # kind is right — while the marker says nothing that can be checked
+  # against the trace.  GDH-G7's standing instruction is that a zeroed
+  # marker must NOT satisfy the gate, so the gate cross-ties every field
+  # to the ids the steps on either side of the marker resolve to.
+  when gdh2Arm(gdh2FalsifyZeroedMarker):
+    let zeroOrdinal = w.sourceReloads + 1
+    let zeroEv = StepEvent(kind: sekSourceReload,
+      reloadOrdinal: zeroOrdinal,
+      changed: @[SourceReloadChange(oldPathId: 0, newPathId: 0, generation: 0)],
+      inFlightFrames: 0)
+    let zeroRes = w.container.writeEvent(w.execWriter, zeroEv)
+    if zeroRes.isErr:
+      return err("failed to write source_reload event: " & zeroRes.error)
+    let zeroVal = w.container.writeStepValues(w.valueWriter, @[])
+    if zeroVal.isErr:
+      return err("failed to write source_reload values: " & zeroVal.error)
+    w.sourceReloads = zeroOrdinal
+    w.stepCount += 1
+    return ok(zeroOrdinal)
+  if changed.len == 0:
+    return err("registerSourceReload: no changed files. A marker that " &
+      "records a reload without recording what it changed cannot be " &
+      "told apart from one whose files were lost, and design §6.3.1 " &
+      "exists to stop a consumer inferring the transition")
+  let pathCount = uint64(w.paths.len)
+  for i, ch in changed.pairs:
+    if ch.oldPathId >= pathCount:
+      return err("registerSourceReload: changed[" & $i & "].old_path_id " &
+        $ch.oldPathId & " is not a registered path (" & $pathCount &
+        " registered)")
+    if ch.newPathId >= pathCount:
+      return err("registerSourceReload: changed[" & $i & "].new_path_id " &
+        $ch.newPathId & " is not a registered path (" & $pathCount &
+        " registered)")
+    if ch.oldPathId == ch.newPathId:
+      return err("registerSourceReload: changed[" & $i & "] reports " &
+        "old_path_id == new_path_id == " & $ch.oldPathId & ". A reload " &
+        "that minted no new path index cannot attribute its post-reload " &
+        "steps to the version that ran them")
+    if ch.generation < 2:
+      return err("registerSourceReload: changed[" & $i & "].generation " &
+        "is " & $ch.generation & ". Generation 1 is the content the " &
+        "process started with (design §4.3), so a reload's generation " &
+        "is 2 or more; 1 is a protocol error, not a plausible value")
+
+  let ordinal = w.sourceReloads + 1
+  var changedSeq = newSeq[SourceReloadChange](changed.len)
+  for i in 0 ..< changed.len:
+    changedSeq[i] = changed[i]
+  let ev = StepEvent(kind: sekSourceReload,
+    reloadOrdinal: ordinal, changed: changedSeq,
+    inFlightFrames: inFlightFrames)
+  let res = w.container.writeEvent(w.execWriter, ev)
+  if res.isErr:
+    return err("failed to write source_reload event: " & res.error)
+
+  # Keep the value stream in lock-step, exactly as raise / catch / the
+  # thread events do.
+  let valRes = w.container.writeStepValues(w.valueWriter, @[])
+  if valRes.isErr:
+    return err("failed to write source_reload values: " & valRes.error)
+
+  w.sourceReloads = ordinal
+  w.stepCount += 1
+  ok(ordinal)
+
+proc sourceReloadCount*(w: MultiStreamTraceWriter): uint64 =
+  ## Markers emitted so far.  Exposed so a caller can assert the writer
+  ## agrees with the container it produced.
+  w.sourceReloads
+
 proc registerThreadSwitch*(w: var MultiStreamTraceWriter,
     threadId: uint64): Result[void, string] =
   ## Register a thread-switch event in the execution stream.
@@ -2306,7 +2452,16 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
     # a hint and the file entry is the authority, so the two must never be
     # able to disagree: a bit set over a container with no index would
     # reintroduce the exact ambiguity the contract's §9 removes.
-    hasCorrelationIndex = w.correlationMarkers.len > 0)
+    hasCorrelationIndex = w.correlationMarkers.len > 0,
+    # GDH-M2: the EXTENDED flag (schema version 5's flags_ext bit 0) is
+    # stamped only when a `TagSourceReload` marker was actually emitted.
+    # Conditional for the same reason bits 13-15 are, and with one extra
+    # consequence: setting it also moves the container to schema version
+    # 5, which every reader that predates GDH-M2 refuses by name.  A
+    # writer that stamped it unconditionally would make every existing
+    # reader refuse every new recording — the rollout hazard bit 13's
+    # documentation warns about, one field over.
+    hasSourceReload = w.sourceReloads > 0)
   if metaRes.isErr:
     return err("failed to write meta.dat: " & metaRes.error)
 

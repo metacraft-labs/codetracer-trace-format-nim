@@ -57,6 +57,7 @@ import ../codetracer_ctfs/streaming
 import ../codetracer_ctfs/zstd_bindings
 import ../codetracer_ctfs/chunk_cache
 import ./step_encoding
+import ./gdh2_arms
 import ./varint
 
 const
@@ -110,6 +111,12 @@ type
       ## only touched a bounded slice of the step stream (rather than
       ## scanning the whole stream) assert this counter stays small.  See
       ## ``chunkDecompressions`` / ``NewTraceReader.execChunkDecompressions``.
+    allowSourceReload: bool
+      ## GDH-M2: does the container declare ``FlagExtHasSourceReload``?
+      ## Passed down to every ``decodeStepEvent`` call, so tag 0x08 is
+      ## accepted only where the header says it may appear.  Default
+      ## FALSE, so a caller that has not been taught about the flag
+      ## refuses the tag rather than decoding it.
     payloadStart: int          ## byte offset within a decompressed chunk where
                                ## the first encoded event begins: 4 in legacy
                                ## mode (past the u32 count header), 0 in SPEC
@@ -270,7 +277,8 @@ proc totalEvents*(w: ExecStreamWriter): uint64 = w.totalEvents
 # Reader
 # ---------------------------------------------------------------------------
 
-proc decodeSpecChunkRecordCount(compressed: openArray[byte]): Result[int, string] =
+proc decodeSpecChunkRecordCount(compressed: openArray[byte],
+    allowSourceReload: bool): Result[int, string] =
   ## Decompress a SPEC-layout chunk (header-less payload) and count its
   ## records by decoding forward to the end of the chunk.  Used to recover the
   ## last chunk's record count (the SPEC ``steps.idx`` carries no
@@ -292,17 +300,30 @@ proc decodeSpecChunkRecordCount(compressed: openArray[byte]): Result[int, string
   var pos = 0
   var count = 0
   while pos < raw.len:
-    let ev = decodeStepEvent(raw, pos)
+    let ev = decodeStepEvent(raw, pos, allowSourceReload)
     if ev.isErr:
       return err("failed to count records in last step chunk: " & ev.error)
-    inc count
+    # FALSIFIER (``gdh2FalsifyUncountedMarker``,
+    # gdh2_reload_marker_round_trips): treat the reload marker as "not a
+    # record" while still consuming its bytes.  This is the SHORTER,
+    # PLAUSIBLE step stream the strict-rejection contract exists to
+    # prevent — no error, no diagnostic, just a total that disagrees with
+    # the value stream's.  It is here to prove the gate's count
+    # comparison has teeth: the naive skip arm cascades into a different
+    # tag error and never reaches it.
+    when gdh2Arm(gdh2FalsifyUncountedMarker):
+      if ev.get().kind != sekSourceReload:
+        inc count
+    else:
+      inc count
   ok(count)
 
 proc initExecStreamReader*(ctfsBytes: openArray[byte],
     blockSize: int = 4096,
     maxEntries: int = 170,
     legacy: bool = false,
-    cacheBytes: uint64 = DefaultStreamChunkCacheBytes): Result[ExecStreamReader, string] =
+    cacheBytes: uint64 = DefaultStreamChunkCacheBytes,
+    allowSourceReload: bool = false): Result[ExecStreamReader, string] =
   ## Read an execution stream from CTFS bytes.
   ##
   ## ``legacy`` selects the on-disk framing (see module docs):
@@ -393,7 +414,7 @@ proc initExecStreamReader*(ctfsBytes: openArray[byte],
       if startOff > endOff:
         return err("last chunk offset past end of steps.dat")
       let lastCount = ?decodeSpecChunkRecordCount(
-        datData.toOpenArray(startOff, endOff - 1))
+        datData.toOpenArray(startOff, endOff - 1), allowSourceReload)
       totalEvents = uint64(lastChunk) * uint64(chunkSize) + uint64(lastCount)
 
   ok(ExecStreamReader(
@@ -403,6 +424,7 @@ proc initExecStreamReader*(ctfsBytes: openArray[byte],
     totalEventsVal: totalEvents,
     legacy: legacy,
     cache: initChunkCache[ExecChunkMeta](offsets.len, cacheBytes),
+    allowSourceReload: allowSourceReload,
     payloadStart: payloadStart,
   ))
 
@@ -478,11 +500,17 @@ proc chunkSlot(r: var ExecStreamReader,
     var starts: seq[int32] = @[]
     while pos < r.cache.data(slot).len:
       starts.add(int32(pos))
-      let ev = decodeStepEvent(r.cache.data(slot), pos)
+      let ev = decodeStepEvent(r.cache.data(slot), pos, r.allowSourceReload)
       if ev.isErr:
         return err("failed to count records in chunk " & $chunkIdx & ": " &
           ev.error)
-      inc count
+      # FALSIFIER (``gdh2FalsifyUncountedMarker``) — see
+      # decodeSpecChunkRecordCount above.
+      when gdh2Arm(gdh2FalsifyUncountedMarker):
+        if ev.get().kind != sekSourceReload:
+          inc count
+      else:
+        inc count
     r.cache.meta(slot).eventCount = uint32(count)
     r.cache.meta(slot).starts = starts
     r.cache.meta(slot).startsBuilt = true
@@ -502,7 +530,7 @@ proc ensureRecordStarts(r: var ExecStreamReader, slot: int,
   var pos = r.payloadStart
   for i in 0 ..< count:
     starts.add(int32(pos))
-    let ev = decodeStepEvent(r.cache.data(slot), pos)
+    let ev = decodeStepEvent(r.cache.data(slot), pos, r.allowSourceReload)
     if ev.isErr:
       return err("failed to decode event " & $i & " while scanning chunk " &
         $chunkIdx & ": " & ev.error)
@@ -530,7 +558,7 @@ proc readEvent*(r: var ExecStreamReader,
     return err("event " & $eventIndex & " past the end of chunk " & $chunkIdx)
 
   var pos = int(r.cache.meta(slot).starts[eventInChunk])
-  decodeStepEvent(r.cache.data(slot), pos)
+  decodeStepEvent(r.cache.data(slot), pos, r.allowSourceReload)
 
 proc readChunkEvents*(r: var ExecStreamReader,
     chunkIdx: int,
@@ -557,7 +585,7 @@ proc readChunkEvents*(r: var ExecStreamReader,
 
   var pos = r.payloadStart
   for i in 0 ..< eventCount:
-    let evRes = decodeStepEvent(r.cache.data(slot), pos)
+    let evRes = decodeStepEvent(r.cache.data(slot), pos, r.allowSourceReload)
     if evRes.isErr:
       return err("failed to decode event " & $i & " while streaming chunk " &
         $chunkIdx & ": " & evRes.error)

@@ -237,6 +237,12 @@ const testSpecs: seq[TestSpec] = @[
   # graph that cannot distinguish them from broken ones.
   # `tests/run_gdh1_gates.sh` runs them.
   TestSpec(source: "tests/test_gdh1_path_versions.nim", binary: "build/test-bin/test_gdh1_path_versions"),
+  # GDH-M2 — the reload marker. Same rule as above: the falsifier arms are
+  # mutations that must FAIL and are run by `tests/run_gdh2_gates.sh`, not
+  # modelled here. The byte-identity gate is not modelled either — it needs a
+  # build of the writer from a DIFFERENT revision, which is not a node this
+  # graph can express.
+  TestSpec(source: "tests/test_gdh2_reload_marker.nim", binary: "build/test-bin/test_gdh2_reload_marker"),
 ]
 
 package codetracer_trace_format_nim:

@@ -88,6 +88,12 @@ tests/test_*
 !tests/test_*.nim
 !tests/test_*.nims
 !tests/test_*.sh
+# C sources under tests/ are SOURCE, not build output. `tests/test_ffi.c` was
+# committed before this catch-all existed and so survived it; `tests/test_ffi`
+# (the binary gcc produces beside it) is exactly what the catch-all is for.
+# Without this re-include a new C gate is silently untracked — it compiles,
+# runs green locally, and is simply absent from the commit.
+!tests/test_*.c
 tests/bench_*
 !tests/bench_*.nim
 !tests/bench_*.nims

@@ -122,6 +122,16 @@ task test, "Run all tests":
   # requires each one to turn its own gate red; they are deliberately not in
   # this corpus, whose members must all pass.
   exec "nim c -r -d:release -p:src tests/test_gdh1_path_versions.nim"
+  # GDH-M2 — the reload boundary is discoverable in the container: step-stream
+  # tag 0x08 (`TagSourceReload`) round-trips with its ordinal, its
+  # (old_path_id, new_path_id, generation) triples and its in-flight count, and
+  # a container carrying the tag WITHOUT declaring it is refused by name rather
+  # than decoded into a shorter, plausible step stream. Like GDH-M1's, the
+  # named falsifier arms live behind `-d:gdh2FalsifierArms` and are run by
+  # `tests/run_gdh2_gates.sh`; that script also owns the byte-identity gate,
+  # which needs a SECOND build of the writer (from the pinned pre-campaign
+  # revision) and so cannot be a corpus member.
+  exec "nim c -r -d:release -p:src tests/test_gdh2_reload_marker.nim"
   # The schema break that carries the corrected encode. A container written
   # under the superseded prefixSum[path_id] + line reads one line high under
   # the current decode -- silently, because the address is INSIDE the space

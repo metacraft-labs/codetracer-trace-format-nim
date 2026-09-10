@@ -5,13 +5,17 @@ when defined(nimPreviewSlimSystem):
 
 ## Binary meta.dat writer for CTFS trace metadata.
 ##
-## Layout (version 4):
+## Layout (version 4; version 5 adds one word, marked below):
 ##   [4] magic "CTMD"
 ##   [2] version u16 LE
 ##   [2] flags u16 LE (bit 0: has_mcr_fields,
 ##                    bit 1: has_replay_launch_fields,
 ##                    bit 2: has_layout_snapshot,
 ##                    bit 3: has_trace_filter_provenance)
+##   [4] flags_ext u32 LE   -- VERSION 5 ONLY (bit 0: has_source_reload)
+##                            Absent at version 4.  The version field is
+##                            the discriminator; nothing about the bytes
+##                            distinguishes the two shapes.
 ##   varint-prefixed recording_id string  (M-REC-1; required, UUIDv7,
 ##                                         lowercase hyphenated 36-char form)
 ##   varint-prefixed program string
@@ -106,6 +110,19 @@ when defined(nimPreviewSlimSystem):
 ##        is what says it did, and that is exactly what a v3 container
 ##        does not record.  ``readMetaDat`` therefore refuses v3 and
 ##        below by name rather than decoding them one line high.
+##   v5 — GDH-M2 (2026-09-10): inserts a ``[4] flags_ext u32 LE`` word
+##        after the u16 flags, because bits 0..15 are all assigned and
+##        no spare one is left to gate step-stream tag ``0x08``
+##        (``TagSourceReload``).  **Written ONLY when an extended flag
+##        is actually set** — a recording with no reload is still a v4
+##        header, byte for byte.  ``readMetaDat`` accepts 4 and 5; a
+##        reader that predates v5 refuses a v5 container by name at
+##        metadata-parse time, which is the strict-rejection rollout
+##        rule bits 13-15 record, obtained from the version field
+##        instead of from a flag bit that does not exist.  See
+##        ``MetaDatVersionExtendedFlags`` and
+##        ``codetracer-specs/Planned-Features/GDScript-Hot-Reload-Multi-Version-Sources.md``
+##        §6.3 / GDH-OQ-2.
 
 import std/options
 import std/strutils
@@ -115,10 +132,57 @@ import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
 import ./varint
 import ./uuid_v7
+import ./gdh2_arms
 
 const
   MetaDatMagic*: array[4, byte] = [0x43'u8, 0x54, 0x4D, 0x44]  # "CTMD"
   MetaDatVersion*: uint16 = 4
+    ## The version written when NO extended flag is set — which is every
+    ## container any recorder produces today.  Kept at 4 deliberately:
+    ## see ``MetaDatVersionExtendedFlags``.
+  MetaDatVersionExtendedFlags*: uint16 = 5
+    ## GDH-M2 (2026-09-10) — the version written when at least one
+    ## EXTENDED flag is set.  A v5 header is a v4 header with a
+    ## ``[4] flags_ext u32 LE`` word inserted immediately after the
+    ## ``[2] flags u16 LE`` word; everything after it is unchanged.
+    ##
+    ## **Why the field widened rather than spending "the last bit".**
+    ## There is no last bit.  Bits 0..15 are all assigned above, and bit
+    ## 15 (``FlagHasCorrelationIndex``) took the final one.  GDH-OQ-2 was
+    ## posed as "spend bit 15 or widen"; the first arm was already gone
+    ## when the question was written, so widening is the only option that
+    ## exists, not the more expensive of two.
+    ##
+    ## **Why the version is CONDITIONAL rather than bumped outright.**
+    ## An unconditional bump would change the bytes of every container,
+    ## including ones with no reload in them — which GDH-G9 forbids, and
+    ## which would make every current reader refuse every current trace
+    ## for a feature it does not use.  Emitting v5 only when an extended
+    ## flag is actually set gives three properties at once:
+    ##
+    ##   * a recording with no reload is BYTE-IDENTICAL to what this
+    ##     writer produced before GDH-M2 — same version, same 8-byte
+    ##     header, no ext word;
+    ##   * a reader that predates this constant refuses a v5 container by
+    ##     name (``unsupported version 5``) at metadata-parse time,
+    ##     before a step stream is touched — the same strict-rejection
+    ##     rollout rule bits 13/14/15 record, obtained from the version
+    ##     field instead of from a flag bit there is no room for;
+    ##   * the container carries its own discriminator, so the two header
+    ##     shapes are never distinguished by guessing.  That is the rule
+    ##     the v4 bump itself was written to enforce (see the v4 note in
+    ##     the version history): when two encodings of one field are both
+    ##     in range, the version is what tells them apart.
+    ##
+    ## The rollout cost is unchanged from a flag bit's: reader support
+    ## must ship everywhere BEFORE any writer sets an extended flag.
+  SupportedMetaDatVersions*: array[2, uint16] = [4'u16, 5'u16]
+    ## Every schema version ``readMetaDat`` decodes.  A singleton until
+    ## GDH-M2; v5 differs from v4 by exactly the ``flags_ext`` word, and
+    ## the version says which shape the bytes are in, so accepting both
+    ## costs no ambiguity.  Versions at or below
+    ## ``LastShiftedGlobalIndexVersion`` are refused by name before this
+    ## set is consulted.
   LastShiftedGlobalIndexVersion*: uint16 = 3
     ## The highest schema version whose writer packed a line-only
     ## ``global_position_index`` as ``prefixSum[path_id] + line``.
@@ -374,6 +438,36 @@ const
     FlagHasSpanStream or
     FlagHasLineCountTable or
     FlagHasCorrelationIndex)
+
+  FlagExtHasSourceReload*: uint32 = 1          # ext bit 0 (global bit 16)
+    ## GDH-M2 — when set, the execution stream is permitted to contain
+    ## step-event tag ``0x08`` (``TagSourceReload``), the source-version
+    ## transition marker of design §6.3.  Clear (and therefore absent,
+    ## since a clear extended word means a v4 header with no word at all)
+    ## means the container carries no reload markers and a reader must
+    ## REFUSE tag 0x08 rather than skip it.
+    ##
+    ## This is the first bit of the ``flags_ext`` u32 that
+    ## ``MetaDatVersionExtendedFlags`` introduces.  It is not additive at
+    ## the reader for exactly the reason bits 13-15 are not: the step
+    ## stream gains a record shape an older decoder cannot measure the
+    ## length of, so an older reader must refuse the container rather
+    ## than decode a shorter, plausible step stream.  The refusal it
+    ## actually performs is on the VERSION (``unsupported version 5``),
+    ## which is why widening was chosen over an escape bit there was no
+    ## room for.
+    ##
+    ## Like bits 13/14/15, no recorder sets it by default: the writer
+    ## sets it only when a ``TagSourceReload`` event was actually
+    ## emitted, so a container without a reload is byte-identical to one
+    ## produced before this constant existed.
+
+  KnownExtFlags*: uint32 = FlagExtHasSourceReload
+    ## Every ``flags_ext`` bit this reader understands.  ``readMetaDat``
+    ## rejects a v5 header whose extended word has bits outside this
+    ## mask, the same strict-rejection contract ``KnownFlags`` enforces
+    ## for the u16.  31 bits remain, so the next flag after this one is
+    ## an ordinary addition rather than another format decision.
     ## P6.5 (column-extension back-compat): every flag bit this reader
     ## understands.  ``readMetaDat`` rejects any meta.dat whose flag
     ## word has bits outside this mask set, per
@@ -500,6 +594,21 @@ type
       ## per-file size and every file occupies `DefaultLinesPerFile`
       ## addresses by convention.  Like bit 13 this bit is not additive
       ## for readers that predate it — see `FlagHasLineCountTable`.
+    hasSourceReload*: bool
+      ## GDH-M2: True iff the header is at schema version 5 AND its
+      ## `flags_ext` word carries `FlagExtHasSourceReload`.  When set,
+      ## the execution stream may contain step-event tag `0x08`
+      ## (`TagSourceReload`) and a reader must pass
+      ## `allowSourceReload = true` down to `decodeStepEvent`.  Clear
+      ## means the tag must be REFUSED, not skipped: its record length
+      ## is not recoverable without decoding it, so a skip re-reads the
+      ## payload varints as further events and the stream decodes
+      ## shorter and plausibly.
+    flagsExt*: uint32
+      ## The raw `flags_ext` word — 0 at schema version 4, where the
+      ## word is absent entirely.  Surfaced so a consumer can report
+      ## what a container DECLARED, not only what this reader knows how
+      ## to act on.
 
 proc writeRawBytes(
     c: var Ctfs, f: var CtfsInternalFile,
@@ -510,6 +619,13 @@ proc writeU16LE(
     c: var Ctfs, f: var CtfsInternalFile,
     val: uint16): Result[void, string] =
   let bytes = [byte(val and 0xFF), byte((val shr 8) and 0xFF)]
+  c.writeToFile(f, bytes)
+
+proc writeU32LE(
+    c: var Ctfs, f: var CtfsInternalFile,
+    val: uint32): Result[void, string] =
+  let bytes = [byte(val and 0xFF), byte((val shr 8) and 0xFF),
+               byte((val shr 16) and 0xFF), byte((val shr 24) and 0xFF)]
   c.writeToFile(f, bytes)
 
 proc writeVarint(
@@ -552,6 +668,7 @@ proc writeMetaDat*(
     hasSpanStream: bool = false,
     hasLineCountTable: bool = false,
     hasCorrelationIndex: bool = false,
+    hasSourceReload: bool = false,
 ): Result[void, string] =
   ## Write binary meta.dat to a CTFS internal file.
   ##
@@ -570,8 +687,23 @@ proc writeMetaDat*(
   # Magic
   ? c.writeRawBytes(f, MetaDatMagic)
 
-  # Version
-  ? c.writeU16LE(f, MetaDatVersion)
+  # Version.  GDH-M2: the schema version is decided by whether any
+  # EXTENDED flag is set, so it is computed here and written below,
+  # after the flag words are assembled.  A container with no extended
+  # flag stays at ``MetaDatVersion`` and its bytes are unchanged.
+  var extFlags: uint32 = 0
+  # FALSIFIER (``gdh2FalsifyAlwaysSetBit``, gdh2_no_reload_container_is_byte_identical):
+  # stamp the extended flag on every container instead of only on one
+  # that carries a marker.  This is the rollout hazard bit 13's own
+  # documentation warns about, and here it is worse than a spare bit
+  # would be: setting it also moves the header to schema version 5, so
+  # EVERY reader in the workspace refuses EVERY new recording, for a
+  # feature the recording does not use.
+  if hasSourceReload or gdh2Arm(gdh2FalsifyAlwaysSetBit):
+    extFlags = extFlags or FlagExtHasSourceReload
+  let schemaVersion =
+    if extFlags != 0: MetaDatVersionExtendedFlags else: MetaDatVersion
+  ? c.writeU16LE(f, schemaVersion)
 
   # Flags
   var flags: uint16 = 0
@@ -629,6 +761,11 @@ proc writeMetaDat*(
   if hasCorrelationIndex:
     flags = flags or FlagHasCorrelationIndex
   ? c.writeU16LE(f, flags)
+
+  # Extended flags — schema version 5 only.  Absent at version 4, which
+  # is what keeps a no-reload container byte-identical.
+  if schemaVersion == MetaDatVersionExtendedFlags:
+    ? c.writeU32LE(f, extFlags)
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.
   ? c.writeVarintString(f, meta.recordingId)
@@ -751,10 +888,50 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
       "records nothing else that tells the two apart. Re-record the trace " &
       "with a current recorder. Spec: " &
       "codetracer-trace-format-spec/internal-files.md \"Global Line Index\"")
-  if version != MetaDatVersion:
-    return err("meta.dat: unsupported version " & $version & ", expected " & $MetaDatVersion)
+  var versionSupported = false
+  for v in SupportedMetaDatVersions:
+    if version == v:
+      versionSupported = true
+  if not versionSupported:
+    return err("meta.dat: unsupported version " & $version & ", expected " &
+      $MetaDatVersion & " or " & $MetaDatVersionExtendedFlags)
 
   let flags = readU16LE(data, 6)
+
+  # GDH-M2: the extended flag word.  Present at schema version 5 ONLY,
+  # immediately after the u16 flags, and absent at version 4 — the
+  # version field is the sole discriminator, exactly as it is for the
+  # v3/v4 global-index encode.  Every consumer that reads the u16 flags
+  # at offset 6 is therefore unaffected by the widening; only a consumer
+  # that reads PAST it must know the version.
+  var flagsExt: uint32 = 0
+  var headerEnd = 8
+  if version == MetaDatVersionExtendedFlags:
+    if data.len < 12:
+      return err("meta.dat: schema version " &
+        $MetaDatVersionExtendedFlags & " declares a flags_ext word but " &
+        "the header is only " & $data.len & " bytes")
+    flagsExt = uint32(data[8]) or (uint32(data[9]) shl 8) or
+      (uint32(data[10]) shl 16) or (uint32(data[11]) shl 24)
+    headerEnd = 12
+    let unknownExt = flagsExt and (not KnownExtFlags)
+    if unknownExt != 0:
+      return err("meta.dat: unknown extended flag bits set: 0x" &
+        toHex(BiggestInt(unknownExt), 8))
+    if flagsExt == 0:
+      # A v5 header whose extended word is zero is a container that
+      # spent a schema version on nothing.  Refused rather than
+      # accepted, because it is the shape a writer produces when it
+      # bumps the version unconditionally — the mutation GDH-G9's
+      # falsifier names — and accepting it would make "no reload" and
+      # "reload machinery present but silent" indistinguishable at the
+      # byte level.
+      return err("meta.dat: schema version " &
+        $MetaDatVersionExtendedFlags & " with an all-zero flags_ext " &
+        "word. Version " & $MetaDatVersionExtendedFlags & " exists to " &
+        "carry extended flags; a container with none must be written " &
+        "at version " & $MetaDatVersion & " so that it stays " &
+        "byte-identical to one produced before the word existed")
 
   # P6.5: strict back-compat rejection.  Any flag bit outside this
   # reader's ``KnownFlags`` set causes the open to fail cleanly rather
@@ -789,9 +966,11 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
       "line_count as the length of its per-line table. Re-record the trace " &
       "with a current recorder")
 
-  var pos = 8
+  var pos = headerEnd
 
   var contents = MetaDatContents(version: version)
+  contents.flagsExt = flagsExt
+  contents.hasSourceReload = (flagsExt and FlagExtHasSourceReload) != 0
   contents.hasColumnAwareSteps = (flags and FlagHasColumnAwareSteps) != 0
   contents.hasCorrelationIndex = (flags and FlagHasCorrelationIndex) != 0
   contents.hasAlternateSourceViews =
@@ -927,6 +1106,12 @@ proc appendU16LE(buf: var seq[byte], val: uint16) =
   buf.add(byte(val and 0xFF))
   buf.add(byte((val shr 8) and 0xFF))
 
+proc appendU32LE(buf: var seq[byte], val: uint32) =
+  buf.add(byte(val and 0xFF))
+  buf.add(byte((val shr 8) and 0xFF))
+  buf.add(byte((val shr 16) and 0xFF))
+  buf.add(byte((val shr 24) and 0xFF))
+
 proc appendVarintStr(buf: var seq[byte], s: string) =
   encodeVarint(uint64(s.len), buf)
   for i in 0 ..< s.len:
@@ -954,6 +1139,7 @@ proc writeMetaDatToBuffer*(
     hasInterningTables: bool = false,
     hasSpanStream: bool = false,
     hasLineCountTable: bool = false,
+    hasSourceReload: bool = false,
 ): seq[byte] =
   ## Serialize meta.dat to an in-memory byte buffer.
   ## This is the same format as writeMetaDat but without needing a CTFS container.
@@ -971,8 +1157,14 @@ proc writeMetaDatToBuffer*(
   for b in MetaDatMagic:
     result.add(b)
 
-  # Version
-  result.appendU16LE(MetaDatVersion)
+  # Version.  GDH-M2: version 5 iff an EXTENDED flag is set; see
+  # ``MetaDatVersionExtendedFlags``.
+  var extFlags: uint32 = 0
+  if hasSourceReload:
+    extFlags = extFlags or FlagExtHasSourceReload
+  let schemaVersion =
+    if extFlags != 0: MetaDatVersionExtendedFlags else: MetaDatVersion
+  result.appendU16LE(schemaVersion)
 
   # Flags
   var flags: uint16 = 0
@@ -1021,6 +1213,10 @@ proc writeMetaDatToBuffer*(
   if hasLineCountTable:
     flags = flags or FlagHasLineCountTable
   result.appendU16LE(flags)
+
+  # Extended flags — schema version 5 only (absent at version 4).
+  if schemaVersion == MetaDatVersionExtendedFlags:
+    result.appendU32LE(extFlags)
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.
   result.appendVarintStr(meta.recordingId)

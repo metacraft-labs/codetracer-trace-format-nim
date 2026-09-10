@@ -2,6 +2,7 @@
 
 ## Tests for global line index and step event encoding.
 
+import std/strutils
 import codetracer_trace_writer/global_line_index
 import codetracer_trace_writer/step_encoding
 
@@ -96,6 +97,11 @@ proc test_delta_step_encode_decode() {.raises: [].} =
     of sekDeltaColumn:
       doAssert ev.columnDelta == orig.columnDelta,
         "columnDelta mismatch at event " & $i
+    of sekSourceReload:
+      doAssert false,
+        "the 10K mixed sequence emits no source-reload markers; tag 0x08 " &
+        "has its own round-trip below because it is the one tag the " &
+        "decoder refuses unless the container declares it"
 
   doAssert pos == buf.len, "did not consume all bytes"
 
@@ -176,6 +182,63 @@ proc test_mixed_event_sequence_roundtrip() {.raises: [].} =
   doAssert pos == buf.len, "did not consume all bytes in mixed-event test"
   echo "PASS: test_mixed_event_sequence_roundtrip"
 
+proc test_source_reload_tag_byte() {.raises: [].} =
+  ## GDH-M2: tag byte allocation check.  ``sekSourceReload`` encodes the
+  ## first byte as 0x08.  Tags 0x00..0x07 are already taken, so this
+  ## guards against accidental re-allocation the same way the
+  ## ``DeltaColumn`` check above does.
+  var buf: seq[byte]
+  encodeStepEvent(StepEvent(kind: sekSourceReload, reloadOrdinal: 1,
+    changed: @[SourceReloadChange(oldPathId: 0, newPathId: 2, generation: 2)],
+    inFlightFrames: 0), buf)
+  doAssert buf.len >= 1, "encoded SourceReload should have at least a tag byte"
+  doAssert buf[0] == 0x08'u8,
+    "SourceReload tag byte should be 0x08, got 0x" & $buf[0].uint
+  echo "PASS: test_source_reload_tag_byte"
+
+proc test_source_reload_roundtrip() {.raises: [].} =
+  ## GDH-M2: the marker round-trips with every field, including a
+  ## multi-file change list and a non-zero in-flight count, and — the
+  ## point of the tag's gating — it is REFUSED BY NAME when the caller
+  ## does not say the container declares it.
+  let ev = StepEvent(kind: sekSourceReload,
+    reloadOrdinal: 7,
+    changed: @[
+      SourceReloadChange(oldPathId: 0, newPathId: 4, generation: 2),
+      SourceReloadChange(oldPathId: 1, newPathId: 5, generation: 3),
+    ],
+    inFlightFrames: 12)
+  var buf: seq[byte]
+  encodeStepEvent(ev, buf)
+
+  var pos = 0
+  let ok = decodeStepEvent(buf, pos, allowSourceReload = true)
+  doAssert ok.isOk, "decode failed: " & ok.error
+  let got = ok.get
+  doAssert got.kind == sekSourceReload, "kind mismatch: " & $got.kind
+  doAssert got.reloadOrdinal == 7, "ordinal mismatch: " & $got.reloadOrdinal
+  doAssert got.changed.len == 2, "changed count: " & $got.changed.len
+  doAssert got.changed[0].oldPathId == 0 and got.changed[0].newPathId == 4 and
+    got.changed[0].generation == 2, "changed[0] mismatch"
+  doAssert got.changed[1].oldPathId == 1 and got.changed[1].newPathId == 5 and
+    got.changed[1].generation == 3, "changed[1] mismatch"
+  doAssert got.inFlightFrames == 12, "inFlightFrames: " & $got.inFlightFrames
+  doAssert pos == buf.len, "did not consume all bytes"
+
+  # The gating, and its diagnostic.  A decoder that SKIPPED the tag would
+  # re-read the payload varints as further events, so the stream would
+  # decode shorter and plausibly rather than fail — which is why the
+  # default is refusal and why the message has to name the tag.
+  var pos2 = 0
+  let refused = decodeStepEvent(buf, pos2)
+  doAssert refused.isErr,
+    "tag 0x08 was ACCEPTED over a container that does not declare it"
+  doAssert refused.error.contains("tag: 8"),
+    "the refusal does not name the tag: " & refused.error
+  doAssert refused.error.contains("FlagExtHasSourceReload"),
+    "the refusal does not name the missing flag: " & refused.error
+  echo "PASS: test_source_reload_roundtrip"
+
 proc bench_delta_step_bytes_per_step() {.raises: [].} =
   ## Encode 100K steps (90% DeltaStep, 10% AbsoluteStep), measure bytes/step.
   let totalSteps = 100_000
@@ -203,5 +266,7 @@ test_delta_step_encode_decode()
 test_delta_column_tag_byte()
 test_delta_column_roundtrip()
 test_mixed_event_sequence_roundtrip()
+test_source_reload_tag_byte()
+test_source_reload_roundtrip()
 bench_delta_step_bytes_per_step()
 echo "ALL PASS: test_step_encoding"

@@ -602,6 +602,15 @@ proc readEventsV4(reader: var TraceReader): Result[void, string] =
       reader.events.add(TraceLowLevelEvent(
         kind: tleThreadSwitch,
         threadSwitchId: ThreadId(stepEv.threadId)))
+    of sekSourceReload:
+      # GDH-M2: the reload marker has no v3 `TraceLowLevelEvent`
+      # counterpart and is deliberately NOT synthesized into one.  It is
+      # not a step (design §7.3 — a timeline annotation with no source
+      # location), and the v3 event vocabulary has no annotation kind, so
+      # inventing one here would put a position-less entry into a stream
+      # every v3 consumer walks as positions.  Consumers that need the
+      # boundary read it through `NewTraceReader.sourceReloads`.
+      discard
 
     # 3c. tleValue for each attached variable value.
     let valsRes = nr.values(n)

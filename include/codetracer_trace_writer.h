@@ -87,6 +87,22 @@ void codetracer_trace_writer_init(void);
 
 const char* trace_writer_last_error(void);
 
+/*
+ * Reset this thread's error buffer to "".
+ *
+ * trace_writer_last_error() is STICKY: nothing on a success path clears it,
+ * so a non-empty buffer does NOT mean "the call I just made failed" — it may
+ * be a message an earlier call left behind.  Clear it before a call whose
+ * error you intend to attribute, and assert it is empty at that point.
+ * Without this entry point that is not expressible from C, and a check that
+ * only asserts "non-empty" passes on a stale message.
+ *
+ * trace_writer_register_path_version and trace_writer_current_path_id clear
+ * it on entry themselves, so for those two a non-empty buffer afterwards is
+ * always that call's message.
+ */
+void trace_writer_clear_last_error(void);
+
 /* --------------------------------------------------------------------------
  * Lifecycle
  * -------------------------------------------------------------------------- */
@@ -155,6 +171,108 @@ void trace_writer_set_interning_qualifier(trace_writer_t handle,
                                           const char* qualifier);
 void trace_writer_register_step(trace_writer_t handle,
                                 const char* path, int64_t line);
+
+/* --------------------------------------------------------------------------
+ * Per-file line counts (meta.dat bit 14) and versioned paths
+ *
+ * The first two entry points below have been exported by the FFI since the
+ * line-count table landed and were MISSING FROM THIS HEADER until GDH-M3.
+ * The consequence was concrete rather than cosmetic: this header is what the
+ * Godot fork vendors, so the fork could not turn bit 14 on at all, and every
+ * recording it produced laid every file out at the DefaultLinesPerFile
+ * stride — under which a step past a file's real end is addressed inside the
+ * NEXT file's range and read back as a (path, line) pair that was never
+ * recorded, with nothing for the reader to refuse it against.
+ * -------------------------------------------------------------------------- */
+
+/*
+ * Opt this writer into recording a per-file line count in every paths.dat
+ * record (meta.dat bit 14).  Must be called BEFORE the first path is
+ * registered, and is refused on a column-aware writer.
+ *
+ * After this call every path must be registered through
+ * trace_writer_register_path_with_line_count: the implicit registration that
+ * trace_writer_register_step performs for an unseen path has no count to
+ * record and is refused by name.  A recorder that cannot count a file's lines
+ * passes the ceiling it wants the file laid out with (conventionally 100000),
+ * so the size the space uses is the size the container states.
+ *
+ * Returns 0 on success, non-zero on failure (see trace_writer_last_error).
+ */
+int trace_writer_enable_line_count_table(trace_writer_t handle);
+
+/*
+ * Register a source path together with the number of lines the file has,
+ * which sizes the file's slot in the line-only global position space.
+ * Only meaningful on a writer that called trace_writer_enable_line_count_table.
+ * A line_count of 0 is refused rather than defaulted: a file sized 0 would
+ * share its base with the next file.
+ *
+ * Returns 0 on success, non-zero on failure (see trace_writer_last_error).
+ */
+int trace_writer_register_path_with_line_count(trace_writer_t handle,
+                                               const char* path,
+                                               uint64_t line_count);
+
+/*
+ * The failure return of the two uint64_t-returning path entry points below.
+ * A path id is an index into paths.dat, so UINT64_MAX is not a value either
+ * call can legitimately produce.
+ */
+#define CT_TW_INVALID_PATH_ID ((uint64_t)0xFFFFFFFFFFFFFFFFULL)
+
+/*
+ * Register a NEW VERSION of an already-registered path and return THE
+ * WRITER'S OWN id for it.
+ *
+ * This is what a hot-reload host calls after an external observer tells it a
+ * source file changed.  It bypasses the interning lookup and always appends a
+ * paths.dat record whose payload is byte-identical to the earlier version's:
+ * the virtual path string is the same file, and only the INDEX discriminates
+ * the version.  Nothing is appended to, prefixed to, or interposed into the
+ * string, so a consumer that resolves a user-supplied path keeps resolving it
+ * after a reload.
+ *
+ * The new version gets its own correctly sized slot in the global position
+ * space, appended after every existing file, so addresses already emitted
+ * against the old version keep decoding to it.  Requires
+ * trace_writer_enable_line_count_table; without it a versioned record has
+ * nowhere to put its size and the refusal names the missing table.
+ *
+ * A subsequent bare trace_writer_register_step(handle, path, line) on that
+ * string resolves to the id returned here, so a recorder's hot path stays
+ * version-unaware — only the reload path is version-aware.
+ *
+ * Returns CT_TW_INVALID_PATH_ID on failure, with trace_writer_last_error set
+ * to a message naming the path.  The error buffer is cleared on entry.
+ */
+uint64_t trace_writer_register_path_version(trace_writer_t handle,
+                                            const char* path,
+                                            uint64_t line_count);
+
+/*
+ * The id a bare trace_writer_register_step(handle, path, ...) would attribute
+ * a step to right now: the newest registered version of `path` when it has
+ * been reloaded, and its ordinary interned id when it has not.
+ *
+ * THIS EXISTS SO A CALLER CAN DELETE ANY MIRROR OF THE WRITER'S INTERNING
+ * COUNTER, NOT SO IT CAN KEEP ONE IN SYNC.  A host that re-derives path ids
+ * by counting first sightings is correct only while the writer interns in
+ * first-seen order from 0, and trace_writer_register_path_version makes that
+ * false: from the first reload onward the mirror drifts, and every subsequent
+ * trace_writer_register_source_view attaches to the WRONG FILE, silently.
+ *
+ * This is a pure query — it never registers the path it is asked about.  A
+ * path this writer has never seen is a failure, not a fresh registration:
+ * answering with a newly minted id would put a file in paths.dat that the
+ * recording never executed, and under bit 14 would have to invent a size for
+ * it.
+ *
+ * Returns CT_TW_INVALID_PATH_ID on failure, with trace_writer_last_error set.
+ * The error buffer is cleared on entry.
+ */
+uint64_t trace_writer_current_path_id(trace_writer_t handle,
+                                      const char* path);
 
 size_t trace_writer_ensure_function_id(trace_writer_t handle,
     const char* name, const char* path, int64_t line);
