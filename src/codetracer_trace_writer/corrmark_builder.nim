@@ -409,6 +409,59 @@ proc lookupBoundary*(idx: var CorrmarkIndex, markerId: uint64, keyValue: string)
       hits.add(m)
   ok(hits)
 
+proc allEntries*(idx: var CorrmarkIndex): Result[seq[CorrelationMarker], string] =
+  ## Every entry in the index, in ascending key order.
+  ##
+  ## FOR INSPECTION, NOT FOR LOOKUP.  This is O(index) by construction and is
+  ## the operator-facing view (`ct print --correlation-index`) — the whole
+  ## point of the B-tree is that answering "does this recording cover span X"
+  ## never walks it. A consumer that resolves a correlation key with this has
+  ## reintroduced the scan the index exists to remove.
+  ##
+  ## Span-coverage entries are otherwise invisible: unlike a boundary
+  ## crossing, a kind-0 entry mints no `MarkerPayload` and no IO event
+  ## (contract §10.2), so nothing in the event stream records it and no
+  ## `ct print` mode could show it. Without a view like this, a recorder that
+  ## declared coverage and a recorder that silently dropped the call produce
+  ## output that is identical.
+  let keysRes = idx.tree.keys()
+  if keysRes.isErr:
+    return err("corrmark.ns: " & keysRes.error)
+  var entries: seq[CorrelationMarker] = @[]
+  for key in keysRes.get():
+    let descRes = idx.tree.lookup(key)
+    if descRes.isErr:
+      continue
+    let desc = descRes.get()
+    if desc.len < 16:
+      return err("corrmark.ns: short descriptor")
+    let off = int(readU64LE(desc, 0))
+    let size = int(readU64LE(desc, 8))
+    if size < 4 or off + size > idx.image.len:
+      return err("corrmark.ns: descriptor out of range")
+    let count = int(readU32LE(idx.image, off))
+    if 4 + count * CorrmarkEntrySize > size:
+      return err("corrmark.ns: bucket overruns its descriptor")
+    for i in 0 ..< count:
+      entries.add(decodeEntry(idx.image, off + 4 + i * CorrmarkEntrySize))
+  ok(entries)
+
+proc traceIdHexOf*(m: CorrelationMarker): string =
+  ## The kind-0 trace id, rendered as the canonical 32-character lowercase hex.
+  const hex = "0123456789abcdef"
+  result = newStringOfCap(32)
+  for b in m.traceId:
+    result.add(hex[int(b shr 4)])
+    result.add(hex[int(b and 0x0F)])
+
+proc spanIdHexOf*(m: CorrelationMarker): string =
+  ## The kind-0 span id, rendered as the canonical 16-character lowercase hex.
+  const hex = "0123456789abcdef"
+  result = newStringOfCap(16)
+  for b in m.spanId:
+    result.add(hex[int(b shr 4)])
+    result.add(hex[int(b and 0x0F)])
+
 proc lookupCorrelationMarkers*(image: openArray[byte],
                                traceIdBe: openArray[byte],
                                spanIdBe: openArray[byte]):

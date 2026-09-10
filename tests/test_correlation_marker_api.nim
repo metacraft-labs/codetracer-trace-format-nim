@@ -294,11 +294,42 @@ proc test_span_ids_are_wire_bytes_not_hex() =
   removeFile(path)
   echo "PASS: test_span_ids_are_wire_bytes_not_hex"
 
+proc test_index_is_enumerable_for_inspection() =
+  ## Span coverage has no other observable surface. A kind-0 entry mints no
+  ## `MarkerPayload` and no IO event (contract §10.2), so a recorder that
+  ## declared coverage and one that dropped the call produce byte-identical
+  ## event streams. `allEntries` — and `ct print --correlation-index` over it —
+  ## is what tells them apart, which is why it exists despite being O(index)
+  ## and therefore useless as a lookup.
+  let path = getTempDir() / "test_corrmark_enumerate.ct"
+  removeFile(path)
+  recordSpanCoverage(path)
+
+  let data = readCtfsFromFile(path).get()
+  var idx = openCorrmarkIndex(readNamespace(data).get()).get()
+  let entries = idx.allEntries()
+  doAssert entries.isOk, entries.error
+  doAssert entries.get().len == 1,
+    "expected the one declared span, got " & $entries.get().len
+
+  let e = entries.get()[0]
+  doAssert e.kind == MarkerKindSpan
+  doAssert e.traceIdHexOf() == DemoTraceIdHex,
+    "trace id must render back to the hex it was declared with, got " &
+    e.traceIdHexOf()
+  doAssert e.spanIdHexOf() == DemoSpanIdHex, e.spanIdHexOf()
+  doAssert e.wallTimeUnixNs == DemoWallNs
+  doAssert e.monotonicTimeNs == DemoMonotonicNs
+
+  removeFile(path)
+  echo "PASS: test_index_is_enumerable_for_inspection"
+
 when isMainModule:
   test_marker_payload_decodes_through_ct_print()
   test_marker_mints_no_step()
   test_marker_is_indexed_in_corrmark_ns()
   test_span_coverage_is_indexed_and_confirmable()
   test_span_ids_are_wire_bytes_not_hex()
+  test_index_is_enumerable_for_inspection()
   test_absence_is_distinguishable()
   echo "=== correlation marker API tests passed ==="
