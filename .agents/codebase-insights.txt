@@ -94,13 +94,118 @@
   events.log-only bundle was opened by the v4 reader and produced an empty
   event array (lazy split readers found nothing).
 
+## The line-only global_position_index has TWO packings and no discriminator
+A pre-extension trace's step position is one varint that "addresses one line"
+(spec trace-events.md §"Back-Compatibility"). The spec does not say how the
+integers are apportioned between files, and a container records nothing about
+it — no stride, no per-file line count, no producer id. Two writers of this
+format disagree:
+
+- this repo — `prefixSum[path_id] + (line - 1)`, DefaultLinesPerFile (100_000)
+  addresses per file. multi_stream_writer.toGlobalLineIndex + global_line_index.
+  The in-file offset is 0-based, so a file's first line sits at the file's own
+  base and its last at base + count - 1.
+- the Rust codetracer_trace_writer — `(path_id shl 32) or line`.
+  step_stream.rs pack_global_line_index / unpack_global_line_index. Its own
+  module doc says the divergence "is *not* repaired here".
+
+So inverting one is an assumption about the producer. `global_line_index.
+tryResolve` states it and refuses addresses that contradict it (>= totalLines);
+`resolve` is the unchecked form that clamps to the last file and answers with a
+path id that exists. Every reader path here that handles a position from a
+container uses tryResolve. Re-derived: 2 paths, step at (path 1, line 7) is
+100006 under this repo's packing and 4294967303 under the Rust one; feeding
+4294967301 (Rust's (1,5)) to the unchecked resolve gives (path 1, line
+4294867302). See tests/test_line_only_position_space.nim.
+
+Three consequences of the divergence were fixed after that, in this repo:
+
+- step_map_builder.recordStep used to key `step-map.ns` by unpackGlobalLineIndex
+  of the EXEC-STREAM gli — the RUST inverse applied to a NIM-packed integer.
+  Re-derived: a step written at (path 1, line 7) was indexed at
+  (path 0, line 100006), so a breakpoint anywhere in a path above 0 resolved
+  against an empty entry. It now keys on the (pathId, line) registerStep was
+  called with, which is also what a breakpoint request arrives as; the gli is
+  not a key. tests/test_step_map_builder.nim
+  test_writer_step_map_keys_second_path.
+- new_trace_reader.ensurePositionTables gave a COLUMN-AWARE file with no
+  line-length table size 0, where multi_stream_writer.rebuildGli gives it
+  DefaultLinesPerFile. Re-derived on a mixed trace (file 0 lengths [10,10],
+  file 1 none): a step at (file 1, line 1) encodes to 20,
+  decodeGlobalPositionIndex refused it, and the line-only fallback answered
+  (file 0, line 21) — INSIDE the valid space, so tryResolve could not catch it.
+  The sizing rule is now global_line_index.fileAddressCount /
+  positionSpaceCounts and the writer, the reader's position tables and the
+  line-only fallback (new_trace_reader.globalPositionSpace, used by
+  readEventsV4 and the FFI accessors) all go through it.
+  tests/test_mixed_column_aware_position_space.nim.
+- ct-print (src/codetracer_ct_print.nim resolveGli/resolveStepLocation,
+  src/codetracer_ct_print_lib.nim resolveGli) used the unchecked resolve on six
+  JSON/text emission sites. They go through tryResolve now; an unresolvable
+  position emits `position_error` and NO path_id/line/path key, so a consumer
+  reading `line` gets a missing key rather than a fabricated number.
+  tests/test_ct_print_unresolvable_position.nim.
+
+STILL OPEN, outside this repo:
+- codetracer/src/db-backend/src/ctfs_trace_reader inverted the same steps.dat
+  two ways: the LAZY path via unpack_global_line_index, the EAGER path via this
+  repo's FFI, with mod.rs claiming in prose that they agree. The lazy path is
+  the live one (this writer always sets has_step_stream). Addressed on the
+  codetracer branch zk/db-backend-line-only-step-decode by handing the lazy
+  stream the container's own address space
+  (ctfs_trace_reader::line_only_position::LineOnlyPositionSpace), which reads
+  an address as prefix-sum when the space can hold it, as (path_id shl 32) or
+  line when it cannot and the resulting path exists, and refuses by name
+  otherwise. Not yet merged, and follow-mode
+  (follow_stream_source.decode_step_chunk) still applies the shifted inverse
+  unconditionally: it decodes committed chunks append-only, before the path
+  table is necessarily complete, so the space it would invert through is not
+  known at the time it decodes.
+- The divergence itself. Reader-side disambiguation works because the
+  prefix-sum space is falsifiable and the shifted one is not, but an address in
+  [DefaultLinesPerFile, top) is well-formed under both and no container field
+  separates them. That needs a discriminator at the FORMAT level — a producer
+  id or an explicit stride in meta.dat — not more reader-side defence.
+
+## meta.dat v4 is the discriminator for THIS repo's own encode change
+This repo encoded `prefixSum[path_id] + line` until 2026-09. That address is
+INSIDE the space, so tryResolve cannot refuse it and such a bundle reads back
+one line high, silently — unlike the Rust packing, which is only catchable
+because it lands outside. Re-derived on real fixtures: steps recorded at
+(0,3) (1,7) (0,12) come back as lines 4, 8, 13, and the committed
+codetracer request-panel `ruby_sinatra/ruby.ct` walks its `/api/users`
+handler one line late, ending on a BLANK line.
+
+So MetaDatVersion is 4 and readMetaDat refuses <= LastShiftedGlobalIndexVersion
+(3) by name. This does NOT discriminate this repo from the Rust writer — that
+one also stamps 3, and the bullet above still stands for it. It discriminates
+this repo's own before/after, which is all a version can do.
+
+Two gates, not one: bumping the version alone was NOT enough, because
+new_trace_reader.openNewTraceFromBytes parsed meta.dat and DISCARDED the
+error, opening the container with a zeroed `meta` instead. Every meta.dat
+check — the version, and the P6.5 unknown-flag-bit rejection that predates it
+— was unreachable from the container entry points until that error was
+propagated. Anything else that parses meta.dat best-effort is worth the same
+look; the Rust `read_meta_dat_flags` has a documented "invalid meta.dat =>
+false, never an error" caller (has_call_stream) with the same shape.
+
+## test_path_filter needs libpcre on the loader path
+It uses std/re, which dlopens libpcre.so at runtime. The dev shell does not put
+pcre on LD_LIBRARY_PATH, so a bare `nimble test` fails there with "could not
+load: libpcre.so(.3|.1|)". repro.nim links pcre directly for its own edge; for
+`nimble test` prepend a pcre lib dir to LD_LIBRARY_PATH.
+
 ## Known PRE-EXISTING test failures on dev (NOT caused by M23e-1 work)
-- tests/test_column_aware_steps.nim test_strict_meta_flag_rejection: asserts
-  readMetaDat rejects flag bit 8 (0x100) as "unknown/reserved", but bit 8 is
-  FlagHasCallStream (allocated in M17a) — stale test, fails on clean dev.
+- tests/test_column_aware_steps.nim test_strict_meta_flag_rejection: picks a
+  bit that is supposed to be unallocated and asserts readMetaDat rejects it,
+  so it goes stale every time a flag bit is allocated (bit 5, then 6, then 8,
+  then 13 = FlagHasSpanStream). It now uses bit 14 (0x4000). When the next bit
+  is allocated in KnownFlags, move this test up with it — and note that a
+  failure here ABORTS the whole file, hiding the five column-aware tests that
+  run after it.
 - tests/test_ram_cache.nim: hard-coded perf threshold (<1000 ns/read) fails on
   slower/loaded machines (~2200 ns/read observed on macOS arm64). Timing flake.
-- Neither is in the nimble `test` task's hard path in a way M23e-1 touched.
 
 ## M34b: the nimble `test` task is GREEN (was 48 pass / 3 fail)
 Running every `exec` line of the nimble `test` task independently on

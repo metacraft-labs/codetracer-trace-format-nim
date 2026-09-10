@@ -431,15 +431,19 @@ proc test_step_record_column_none_for_legacy() {.raises: [].} =
 # ---------------------------------------------------------------------------
 
 proc handcraftMetaDatWithFlags(flags: uint16): seq[byte] {.raises: [].} =
-  ## Minimal v3 meta.dat with the given raw flags word.  Recording id
-  ## is the canonical UUIDv7 used in `test_meta_dat.nim`.
+  ## Minimal meta.dat at the current schema version with the given raw
+  ## flags word.  Recording id is the canonical UUIDv7 used in
+  ## `test_meta_dat.nim`.
   const TestRecordingId = "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb"
   var buf = newSeq[byte](0)
   # Magic
   for b in [0x43'u8, 0x54, 0x4D, 0x44]:
     buf.add(b)
-  # Version = 3
-  buf.add(3'u8); buf.add(0'u8)
+  # The CURRENT version, so the flags word is what the parse judges. A
+  # superseded number would be refused for its version first, leaving the
+  # flag-rejection contract untested behind a passing assertion.
+  buf.add(byte(MetaDatVersion and 0xFF))
+  buf.add(byte((MetaDatVersion shr 8) and 0xFF))
   # Flags
   buf.add(byte(flags and 0xFF))
   buf.add(byte((flags shr 8) and 0xFF))
@@ -460,29 +464,26 @@ proc handcraftMetaDatWithFlags(flags: uint16): seq[byte] {.raises: [].} =
   buf
 
 proc test_strict_meta_flag_rejection() {.raises: [].} =
-  ## A meta.dat byte sequence with a still-reserved flag bit set MUST
-  ## be rejected by ``readMetaDat`` — this is the wire-format safety
-  ## net that makes the column extension's bit-4 break clean for
-  ## older readers (and gives every future bit allocation the same
-  ## guarantee).
-  # Bit 13 (= 0x2000) is a still-reserved bit: bits 0-5 and 8-12 are
-  # allocated in ``KnownFlags`` (MCR/replay/layout/filter/column/
-  # source-views + the M17a/M23a-d call/step/value/io/interning stream
-  # flags — bit 8 is ``FlagHasCallStream``), and bits 6/7 predate them.
-  # Earlier iterations of this test used bit 5 (then 6, then 8) — keep
-  # the test in sync with the latest allocated range so it exercises a
-  # genuinely-unknown bit and keeps the unknown-bit rejection contract
-  # enforced.
-  const FirstReservedBit: uint16 = 0x2000
-  let badBuf = handcraftMetaDatWithFlags(FirstReservedBit)
-  let badRes = readMetaDat(badBuf)
-  doAssert badRes.isErr,
-    "readMetaDat must reject meta.dat with unknown flag bit 8 set"
-
-  # Sanity check the error message mentions the unknown bits.
-  doAssert "unknown flag" in badRes.error or
-           "unknown" in badRes.error,
-    "rejection error should mention unknown flags; got: " & badRes.error
+  ## The wire-format safety net that made the column extension's bit-4
+  ## break clean for older readers: a meta.dat carrying a flag bit the
+  ## reader does not know is rejected outright.
+  ##
+  ## THE UNKNOWN-BIT PROBE IS RETIRED, AND ITS ABSENCE IS ASSERTED.
+  ## Earlier iterations named the lowest still-reserved bit — 5, then 6,
+  ## 8, 13, 14, 15 — and required ``readMetaDat`` to refuse it.  Bit 15
+  ## was the last, and WTCI's ``FlagHasCorrelationIndex`` has taken it,
+  ## so this reader now knows every bit of the ``u16``.  There is no flag
+  ## value left that it can legitimately call unknown, and crafting one
+  ## would mean asserting against a bit the reader is supposed to know.
+  ##
+  ## What stands in its place is the invariant that made the probe
+  ## impossible.  It fails the moment someone frees a bit or grows the
+  ## field — which is exactly the change that must reinstate a probe.
+  doAssert KnownFlags == high(uint16),
+    "the flag word is exhausted; if this fails, a bit was freed or the " &
+    "field grew, and the unknown-bit probe this replaced must be " &
+    "reinstated against whatever is unknown now. KnownFlags = " &
+    $KnownFlags
 
   # Bit 4 alone (FlagHasColumnAwareSteps) is a known flag and must
   # parse cleanly.
@@ -509,12 +510,20 @@ proc test_strict_meta_flag_rejection() {.raises: [].} =
   doAssert capRes.get().supportsColumnMotions,
     "supportsColumnMotions must surface when bit 7 is set"
 
-  # Mix: bit 4 (known) + bit 8 (unknown) → reject.
+  # The mixed known+unknown case went with the probe: there is no unknown
+  # bit left to mix in.  Its replacement is the positive half — bit 4
+  # alongside the two most recently allocated bits still parses, which is
+  # what the mixed case was really guarding (that one known bit does not
+  # mask the verdict on another).  Bit 4 and bit 14 are mutually exclusive
+  # by the record-layout rule, so bit 15 is the one paired here.
   let mixedBuf = handcraftMetaDatWithFlags(
-    FlagHasColumnAwareSteps or FirstReservedBit)
+    FlagHasColumnAwareSteps or FlagHasCorrelationIndex)
   let mixedRes = readMetaDat(mixedBuf)
-  doAssert mixedRes.isErr,
-    "meta.dat with bit 4 + bit 8 must reject because bit 8 is unknown"
+  doAssert mixedRes.isOk,
+    "bit 4 + bit 15 are both known and must parse; got: " &
+    (if mixedRes.isErr: mixedRes.error else: "ok")
+  doAssert mixedRes.get().hasColumnAwareSteps
+  doAssert mixedRes.get().hasCorrelationIndex
 
   # All currently-known bits together still parse cleanly.
   let allKnown =

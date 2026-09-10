@@ -139,15 +139,18 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
   # ------ 8. Build global line index ------
   let gli = buildGlobalLineIndex(@[10'u64, 5'u64])
   doAssert gli.totalLines == 15, "totalLines should be 15"
-  # main.py line 1 -> global 1, helper.py line 0 -> global 10
-  doAssert gli.globalIndex(0, 1) == 1, "globalIndex(0,1)"
-  doAssert gli.globalIndex(1, 0) == 10, "globalIndex(1,0)"
+  # Lines are 1-based and the in-file offset is 0-based, so each file's
+  # first line sits at the file's own base: main.py line 1 -> global 0,
+  # main.py line 10 (its last) -> global 9, helper.py line 1 -> global 10.
+  doAssert gli.globalIndex(0, 1) == 0, "globalIndex(0,1)"
+  doAssert gli.globalIndex(0, 10) == 9, "globalIndex(0,10)"
+  doAssert gli.globalIndex(1, 1) == 10, "globalIndex(1,1)"
 
   # Resolve back
-  let (fileId, line) = gli.resolve(1)
-  doAssert fileId == 0 and line == 1, "resolve(1)"
+  let (fileId, line) = gli.resolve(0)
+  doAssert fileId == 0 and line == 1, "resolve(0)"
   let (fileId2, line2) = gli.resolve(10)
-  doAssert fileId2 == 1 and line2 == 0, "resolve(10)"
+  doAssert fileId2 == 1 and line2 == 1, "resolve(10)"
 
   # ------ 9. Init stream writers ------
   let execRes = initExecStreamWriter(ctfs, chunkSize = 64)
@@ -167,8 +170,8 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
   var ioWriter = ioRes.get()
 
   # ------ 10. Write trace events ------
-  # Step 0: AbsoluteStep at main.py:1 (global line = 1)
-  let step0Idx = gli.globalIndex(0, 1)  # = 1
+  # Step 0: AbsoluteStep at main.py:1 (global line = 0, main.py's base)
+  let step0Idx = gli.globalIndex(0, 1)  # = 0
   let wr0 = ctfs.writeEvent(execWriter, StepEvent(
     kind: sekAbsoluteStep, globalLineIndex: step0Idx))
   doAssert wr0.isOk, "step0 failed: " & wr0.error
@@ -387,11 +390,11 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
   var er = execReader.get()
   doAssert er.totalEvents() == 8, "exec totalEvents mismatch: " & $er.totalEvents()
 
-  # Event 0: AbsoluteStep(globalLineIndex=1)
+  # Event 0: AbsoluteStep(globalLineIndex=0)
   let ev0 = er.readEvent(0)
   doAssert ev0.isOk, "readEvent 0 failed: " & ev0.error
   doAssert ev0.get().kind == sekAbsoluteStep, "event0 kind mismatch"
-  doAssert ev0.get().globalLineIndex == 1, "event0 gli mismatch: " &
+  doAssert ev0.get().globalLineIndex == 0, "event0 gli mismatch: " &
     $ev0.get().globalLineIndex
 
   # Event 1: DeltaStep(+1)

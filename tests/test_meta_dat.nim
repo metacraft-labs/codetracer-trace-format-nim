@@ -93,7 +93,8 @@ proc test_meta_dat_write_layout() {.raises: [].} =
   pos = 4
 
   # Version
-  doAssert readU16LEAt(raw, pos) == 3, "version mismatch (expected v3, M-REC-1)"
+  doAssert readU16LEAt(raw, pos) == MetaDatVersion,
+    "version mismatch: the writer must stamp the current schema version"
   pos += 2
 
   # Flags
@@ -175,7 +176,8 @@ proc test_meta_dat_with_mcr_fields() {.raises: [].} =
   pos = 4
 
   # Version
-  doAssert readU16LEAt(raw, pos) == 3, "version mismatch (v3 from M-REC-1)"
+  doAssert readU16LEAt(raw, pos) == MetaDatVersion,
+    "version mismatch: the writer must stamp the current schema version"
   pos += 2
 
   # Flags — bit 0 should be set
@@ -286,7 +288,8 @@ proc test_meta_dat_empty_fields() {.raises: [].} =
   # Magic + version + flags = 8 bytes
   doAssert raw[0] == 0x43 and raw[1] == 0x54 and raw[2] == 0x4D and raw[3] == 0x44
   pos = 4
-  doAssert readU16LEAt(raw, pos) == 3
+  doAssert readU16LEAt(raw, pos) == MetaDatVersion,
+    "version mismatch: the writer must stamp the current schema version"
   pos += 2
   doAssert readU16LEAt(raw, pos) == 0
   pos += 2
@@ -319,7 +322,7 @@ proc test_meta_dat_empty_fields() {.raises: [].} =
   # zeros (each 1 byte) = 50 bytes total.
   doAssert pos == raw.len, "trailing bytes: consumed " & $pos & " of " & $raw.len
   doAssert raw.len == 50,
-    "expected 50 bytes for minimal v3 meta.dat, got " & $raw.len
+    "expected 50 bytes for a minimal meta.dat, got " & $raw.len
 
   c.closeCtfs()
   echo "PASS: test_meta_dat_empty_fields"
@@ -349,7 +352,7 @@ proc test_meta_dat_roundtrip() {.raises: [].} =
   doAssert parsed.isOk, "readMetaDat failed: " & parsed.unsafeError
 
   let contents = parsed.get()
-  doAssert contents.version == 3, "version mismatch (expected v3)"
+  doAssert contents.version == MetaDatVersion, "version mismatch"
   doAssert contents.recordingId == TestRecordingId,
     "recording_id round-trip failed: got " & contents.recordingId
   doAssert contents.program == "/usr/bin/myapp", "program mismatch: " & contents.program
@@ -732,8 +735,12 @@ proc test_meta_dat_reader_rejects_missing_recording_id() {.raises: [].} =
   # Magic
   for b in [0x43'u8, 0x54, 0x4D, 0x44]:
     buf.add(b)
-  # Version = 3
-  buf.add(3'u8); buf.add(0'u8)
+  # Version — the CURRENT one, so the empty recording_id below is what the
+  # parse refuses. Stamped from the constant rather than a literal: pinned to
+  # a superseded number this buffer would be refused for its VERSION and the
+  # recording_id rule would go untested while the test still passed.
+  buf.add(byte(MetaDatVersion and 0xFF))
+  buf.add(byte((MetaDatVersion shr 8) and 0xFF))
   # Flags = 0
   buf.add(0'u8); buf.add(0'u8)
   # Empty recording_id (varint 0 — zero-length string)
@@ -814,15 +821,22 @@ proc test_meta_dat_strict_unknown_flag_rejection() {.raises: [].} =
   ##     ``FlagHasValueStream``, bit 11 to M23c's
   ##     ``FlagHasIoEventStream``, bit 12 to M23d's
   ##     ``FlagHasInterningTables``, and bit 13 to RS-M1's
-  ##     ``FlagHasSpanStream``.  Each time a new bit landed
-  ##     this test was retargeted to the next unknown bit so the
-  ##     strict-rejection contract stays exercised.  Only bits 14
-  ##     and 15 remain free.)
+  ##     ``FlagHasSpanStream``, bit 14 to ``FlagHasLineCountTable``
+  ##     and bit 15 to WTCI's ``FlagHasCorrelationIndex``.  Each time a
+  ##     new bit landed this test was retargeted to the next unknown bit
+  ##     so the strict-rejection contract stayed exercised.  With bit 15
+  ##     allocated there is no unknown bit left to retarget to, and the
+  ##     probe is replaced by the exhaustion invariant — see the last
+  ##     block of this test.)
   proc craft(flags: uint16): seq[byte] {.raises: [].} =
     var buf = newSeq[byte](0)
     for b in [0x43'u8, 0x54, 0x4D, 0x44]:
       buf.add(b)
-    buf.add(3'u8); buf.add(0'u8)               # version 3
+    # The CURRENT version, so an unknown flag bit is what the parse refuses.
+    # A superseded number here would be refused for its version instead, and
+    # the flag-rejection contract would go untested.
+    buf.add(byte(MetaDatVersion and 0xFF))
+    buf.add(byte((MetaDatVersion shr 8) and 0xFF))
     buf.add(byte(flags and 0xFF))
     buf.add(byte((flags shr 8) and 0xFF))
     # recording_id (canonical UUIDv7)
@@ -832,6 +846,14 @@ proc test_meta_dat_strict_unknown_flag_rejection() {.raises: [].} =
     # program, args_count, workdir, recorder_id, paths_count — all empty/zero.
     buf.add(0'u8); buf.add(0'u8); buf.add(0'u8); buf.add(0'u8); buf.add(0'u8)
     buf
+
+  proc craftVersion(version: uint16): seq[byte] {.raises: [].} =
+    ## `craft` with the version overwritten, for the other half of the
+    ## header-rejection contract.  Flags are left clear so the refusal can
+    ## only be about the version.
+    result = craft(0)
+    result[4] = byte(version and 0xFF)
+    result[5] = byte((version shr 8) and 0xFF)
 
   block:
     let res = readMetaDat(craft(0))
@@ -975,11 +997,24 @@ proc test_meta_dat_strict_unknown_flag_rejection() {.raises: [].} =
     doAssert resAll6.get().hasSpanStream
 
   block:
-    # Bit 14 is now FlagHasCorrelationIndex, so it must ROUND-TRIP rather than
-    # reject — the same positive assertion every allocated bit above gets.
+    # Bit 14 is FlagHasLineCountTable, so it must ROUND-TRIP rather than
+    # reject — the same positive assertion every allocated bit gets above.
+    # It is checked ALONE: a header setting it together with bit 4 declares
+    # the same paths.dat field under two record layouts, and `writeMetaDat`
+    # refuses to produce one.
+    let resLct = readMetaDat(craft(FlagHasLineCountTable))
+    doAssert resLct.isOk,
+      "bit 14 (FlagHasLineCountTable) must round-trip: " &
+      (if resLct.isErr: resLct.error else: "ok")
+    doAssert resLct.get().hasLineCountTable
+    doAssert not resLct.get().hasSpanStream
+    doAssert not resLct.get().hasColumnAwareSteps
+
+  block:
+    # Bit 15 is FlagHasCorrelationIndex, so it too must ROUND-TRIP.
     let res = readMetaDat(craft(FlagHasCorrelationIndex))
     doAssert res.isOk,
-      "bit 14 (FlagHasCorrelationIndex) must round-trip: " &
+      "bit 15 (FlagHasCorrelationIndex) must round-trip: " &
       (if res.isErr: res.error else: "ok")
     doAssert res.get().hasCorrelationIndex
     doAssert not res.get().hasSpanStream
@@ -989,20 +1024,31 @@ proc test_meta_dat_strict_unknown_flag_rejection() {.raises: [].} =
       FlagHasIoEventStream or FlagHasInterningTables or FlagHasSpanStream or
       FlagHasCorrelationIndex))
     doAssert resAll7.isOk,
-      "bits 8..14 (all seven stream/index bits) must round-trip: " &
+      "bits 8..13 and 15 (all seven stream/index bits) must round-trip: " &
       (if resAll7.isErr: resAll7.error else: "ok")
     doAssert resAll7.get().hasCorrelationIndex
 
   block:
-    # Bit 15 (0x8000) is the LAST free bit — retarget the strict-rejection
-    # probe to it now that bit 14 is allocated.  Keeping a probe on a genuinely
-    # unallocated bit is what proves the mask still rejects, rather than the
-    # test having quietly become a test of nothing.
-    let res = readMetaDat(craft(FlagHasColumnAwareSteps or 0x8000'u16))
-    doAssert res.isErr,
-      "bit 4 + bit 15 must reject because bit 15 is unknown"
-    doAssert "unknown" in res.error,
-      "rejection error must mention 'unknown'; got: " & res.error
+    # THE STRICT-REJECTION PROBE IS RETIRED, AND THAT IS AN ASSERTION, NOT AN
+    # OMISSION.  The probe used to name the lowest still-unallocated bit and
+    # require `readMetaDat` to refuse it.  Bits 14 and 15 were the last two,
+    # and both are now allocated, so this reader knows every bit of the u16
+    # and there is no flag value left that it can legitimately call unknown.
+    # Crafting one would mean asserting against a bit the reader is supposed
+    # to know, which is a test of nothing.
+    #
+    # What replaces it is the invariant that made the probe impossible: the
+    # known mask is the whole word.  This fails the moment someone adds a
+    # flag without widening the field — which is precisely the change that
+    # has to rewrite the rejection contract rather than extend it.
+    doAssert KnownFlags == high(uint16),
+      "the flag word is exhausted; if this fails, a bit was freed or the " &
+      "field grew, and the unknown-flag probe above must be reinstated " &
+      "against whatever is unknown now. KnownFlags = " & $KnownFlags
+    # The rejection PATH itself stays covered by the version check, which is
+    # the other half of the same contract.
+    let res = readMetaDat(craftVersion(99'u16))
+    doAssert res.isErr, "an unknown meta.dat version must be refused"
 
   echo "PASS: test_meta_dat_strict_unknown_flag_rejection"
 

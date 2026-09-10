@@ -111,3 +111,10 @@ src/macro_sourcemap_*.json
 # Test-output CTFS containers (writers always stream to disk now)
 *.ct
 *.ct.head.json
+
+# WebAssembly build outputs (wasm/build-*.sh)
+wasm/build/
+wasm/build-standalone/
+wasm/build-trace-writer-standalone/
+wasm/build-trace-reader-standalone/
+wasm/build-emscripten/

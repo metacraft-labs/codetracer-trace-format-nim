@@ -9,8 +9,11 @@
 ##   - `decodeValueBytesToJson(bytes)` — decode CBOR + render to JsonNode.
 ##   - `FullOpts` and `buildFullDocument(reader, opts)` — produce the full
 ##     content-faithful dump used by `ct-print --full` and `--events`.
-##   - `buildGliFromMeta`, `resolveGli` — global-line-index helpers shared
-##     with the legacy text/JSON paths.
+##   - `resolveGli` — the line-only global-position-index inverse shared
+##     with the legacy text/JSON paths. It REFUSES an index the trace's
+##     address space cannot hold rather than answering with a plausible
+##     `(path, line)`; the emitted event then carries `position_error`
+##     instead of `path_id` / `line` / `path`.
 ##
 ## All output is deterministic: stable key order, no timestamps, no PIDs,
 ## no machine-specific paths unless the input itself contained them. The
@@ -74,16 +77,17 @@ proc isCorrelationMarker*(event: JsonNode): bool =
   ## decoded correlation-marker payload?
   event.kind == JObject and event.hasKey("correlation_marker")
 
-proc buildGliFromMeta*(meta: MetaDatContents): GlobalLineIndex =
-  ## Rebuild the global line index from the meta.dat paths list using the
-  ## same DefaultLinesPerFile as the writer.
-  var counts = newSeq[uint64](meta.paths.len)
-  for i in 0 ..< meta.paths.len:
-    counts[i] = DefaultLinesPerFile
-  buildGlobalLineIndex(counts)
-
-proc resolveGli*(gli: GlobalLineIndex, globalIdx: uint64): (int, uint64) =
-  gli.resolve(globalIdx)
+proc resolveGli*(gli: GlobalLineIndex,
+    globalIdx: uint64): Result[(int, uint64), string] =
+  ## Invert a line-only ``global_position_index`` to ``(pathId, line)``,
+  ## or say why it cannot be inverted.
+  ##
+  ## Through ``tryResolve``, not ``resolve``: the packing is a writer
+  ## convention the container does not record and the writers of this
+  ## format disagree about it, so an index the space cannot address is
+  ## reported rather than clamped into a file that exists (see
+  ## ``global_line_index``'s module header).
+  gli.tryResolve(globalIdx)
 
 proc precomputeStepGlis*(reader: var NewTraceReader): seq[uint64] =
   ## Walk the exec stream once and return a seq mapping step_index →
@@ -297,7 +301,7 @@ proc buildFullDocument*(reader: var NewTraceReader,
   ## Each event entry has a `kind` field: "step" | "call_entry" | "call_exit"
   ## | "io". Variable values, call args, and return values are decoded from
   ## CBOR into structured JSON matching the ValueRecord variant layout.
-  let gli = buildGliFromMeta(reader.meta)
+  let gli = reader.globalPositionSpace()
   var root = newJObject()
 
   # ----- metadata -----
@@ -337,7 +341,23 @@ proc buildFullDocument*(reader: var NewTraceReader,
   flagsObj["has_io_event_stream"] = newJBool(reader.meta.hasIoEventStream)
   flagsObj["has_interning_tables"] = newJBool(reader.meta.hasInterningTables)
   flagsObj["has_correlation_index"] = newJBool(reader.meta.hasCorrelationIndex)
+  # Whether the container STATES how large each of its files is, or leaves a
+  # reader to assume `DefaultLinesPerFile` for every one of them. False is the
+  # answer for every trace written before bit 14 existed, and it is the one an
+  # operator needs when a step's reported line looks wrong: under the
+  # assumption a file with more lines than the ceiling has its lines addressed
+  # inside the next file's range, and no reader can detect that.
+  flagsObj["has_line_count_table"] = newJBool(reader.meta.hasLineCountTable)
   meta["flags"] = flagsObj
+  # Reader diagnostic, deliberately outside `flags` because it is not a
+  # meta.dat bit: true when the trace declares line-only steps yet every
+  # paths.dat record also decodes as a column-aware Layout A record. Either
+  # the resemblance is coincidental and harmless, or the recorder emitted
+  # Layout A records without setting bit 4 (a writer bug fixed in 708ee44).
+  # The reader keeps reading the trace as its meta.dat declares; this field
+  # is how an operator finds out there is a question to answer.
+  meta["column_aware_paths_suspected"] = newJBool(
+    reader.columnAwarePathsSuspected)
 
   # ----- trace_filter provenance (TF-M7, spec §7) -----
   # Materialized as `metadata.trace_filter.filters[].{path,sha256}` per
@@ -493,7 +513,14 @@ proc buildFullDocument*(reader: var NewTraceReader,
       stepObj["kind"] = newJString("step")
       stepObj["step_index"] = newJInt(int64(stepIdx))
       block emitStep:
-        let (pathId, line) = resolveGli(gli, stepGli)
+        let loc = resolveGli(gli, stepGli)
+        if loc.isErr:
+          # No `path_id` / `line` / `path` key at all: a consumer that
+          # reads them gets a missing key rather than a position that was
+          # never in the trace.
+          stepObj["position_error"] = newJString(loc.error)
+          break emitStep
+        let (pathId, line) = loc.get()
         stepObj["path_id"] = newJInt(int64(pathId))
         stepObj["line"] = newJInt(int64(line))
         let pStr = reader.path(uint64(pathId))

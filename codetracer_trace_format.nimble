@@ -59,6 +59,11 @@ task test, "Run all tests":
   exec "nim c -r -d:release tests/test_corrmark_builder.nim"
   exec "nim c -r tests/test_correlation_marker_api.nim"
   exec "nim c -r tests/test_close_publishes_entry_sizes.nim"
+  # Reading a combined-stream bundle written by the sibling Rust
+  # `CtfsTraceWriter`: it prefixes `events.log` with the 8-byte CodeTracer
+  # file header the Nim writer omits, and its chunks are streaming-encoder
+  # frames that do not pledge a decompressed size.
+  exec "nim c -r -p:src tests/test_rust_written_events_log.nim"
   exec "nim c -r tests/test_meta_dat.nim"
   exec "nim c -r tests/test_namespace_descriptor.nim"
   exec "nim c -d:release -r tests/test_sub_block_pool.nim"
@@ -80,6 +85,55 @@ task test, "Run all tests":
   exec "nim c -r -p:src tests/test_span_stream.nim"
   exec "nim c -r -d:release -p:src tests/test_multi_stream_integration.nim"
   exec "nim c -r -d:release -p:src tests/test_new_trace_reader.nim"
+  # The reader's `paths.json` fallback and the `["a","b"]` decoder underneath
+  # it, which replaced `std/json` there: `parseJson` reaches `parseFloat` and so
+  # libc's `strtod`, which no freestanding target defines, and the reader could
+  # not LINK for wasm32 over a float no container contains.
+  exec "nim c -r -d:release -p:src tests/test_paths_json_fallback.nim"
+  # meta.dat bit 4 is the sole authority on the paths.dat record layout: the
+  # line-only and Layout A record spaces overlap (a 97-byte ASCII path decodes
+  # as a complete Layout A record), so a reader that infers the layout from
+  # the bytes answers a line-only trace with a truncated path, a fabricated
+  # per-file line table and the wrong step line — with no error.
+  exec "nim c -r -d:release -p:src tests/test_paths_dat_layout_authority.nim"
+  # A line-only global_position_index says nothing about how its integers were
+  # apportioned between files, and the two writers of this container format
+  # disagree — prefixSum[path_id] + (line - 1) here, (path_id shl 32) or line
+  # in the Rust codetracer_trace_writer. Inverting one is an assumption, so
+  # it has to be a falsifiable one: an address outside the space is refused
+  # by name rather than clamped into a file that exists.
+  exec "nim c -r -d:release -p:src tests/test_line_only_position_space.nim"
+  # The file boundary in that space. An address is prefixSum[file_id] +
+  # (line - 1), so a file's slot holds exactly the lines it has. Encoding
+  # + line instead leaves each base unused and pushes a file's last line
+  # into the next file's range — invisible behind an oversized stride,
+  # a wrong answer at every boundary once slots are sized to real counts.
+  exec "nim c -r -d:release -p:src tests/test_global_line_index_boundary.nim"
+  # The per-file line-count table (meta.dat bit 14): a line-only container
+  # that STATES how large each of its files is instead of leaving a reader
+  # to assume DefaultLinesPerFile. With the sizes recorded, a step past a
+  # file's count addresses the next file and nothing downstream can tell
+  # that apart from a real location — so the writer refuses it.
+  exec "nim c -r -d:release -p:src tests/test_line_count_table.nim"
+  # The schema break that carries the corrected encode. A container written
+  # under the superseded prefixSum[path_id] + line reads one line high under
+  # the current decode -- silently, because the address is INSIDE the space
+  # and tryResolve has nothing to refuse. meta.dat's version is the only
+  # field that can tell the two apart, so v3 and below are refused by name.
+  # Carries its own mutation control: resolving the same container's
+  # addresses without the gate is what puts every step one line high.
+  # `include`s codetracer_trace_writer_ffi to drive ct_reader_open, so it
+  # needs --mm:arc and the --nimMainPrefix the FFI's NimMain importc expects.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_meta_dat_v3_global_index_refusal.nim"
+  # The column-aware step encoding end to end: the writer's opt-in, the
+  # DeltaColumn round-trip, Layout A paths.dat, the position decoder, and the
+  # meta.dat unknown-flag-bit rejection that keeps the extension clean.
+  exec "nim c -r -d:release -p:src tests/test_column_aware_steps.nim"
+  # A column-aware trace may table some of its files and not others, and the
+  # two kinds of file take different amounts of the position space. Writer
+  # and reader size them by one rule; sizing an untabled file 0 in the reader
+  # put every later file's base too low and answered out of the file before.
+  exec "nim c -r -d:release -p:src tests/test_mixed_column_aware_position_space.nim"
   exec "nim c -r -d:release -p:src tests/test_reader_calls_events.nim"
   exec "nim c -r -d:release -p:src tests/test_reader_integration.nim"
   # M24a-1: cross-read proof — a Nim-written production steps.dat is read by
@@ -102,6 +156,10 @@ task test, "Run all tests":
   exec "nim c -r -d:release -p:src tests/test_crossing_state.nim"
   exec "nim c -r -d:release -p:src tests/test_multi_stream_attach.nim"
   exec "nim c -r -d:release -p:src tests/test_linehits_builder.nim"
+  # The READ side of `linehits.tc`. The builder's own lookups answer from the
+  # Table it filled while recording and never touch the serialised B-tree, so a
+  # consumer that did not write the trace needs its own coverage.
+  exec "nim c -r -d:release -p:src tests/test_linehits_reader.nim"
   exec "nim c -r -d:release -p:src tests/test_memwrites_builder.nim"
   exec "nim c -r -d:release -p:src tests/test_step_map_builder.nim"
   exec "nim c -r -p:src tests/test_partial_trace_cache.nim"
@@ -120,6 +178,9 @@ task test, "Run all tests":
   # This reader tested only for CONTENTSIZE_ERROR and converted the UNKNOWN
   # sentinel to `int`, killing `ct-print` with a RangeDefect.
   exec "nim c -r -d:release -p:src tests/test_events_log_unpledged_frame.nim"
+  # ct-print reports a step position it cannot resolve instead of emitting
+  # the plausible wrong (path, line) the unchecked inverse produces.
+  exec "nim c -r -d:release -p:src tests/test_ct_print_unresolvable_position.nim"
   # Line-only orphan pending-value carry-forward (92fce3a regression).
   # `include`s codetracer_trace_writer_ffi, so it needs --mm:arc and the
   # --nimMainPrefix the FFI's NimMain importc expects (see buildStaticLib).
@@ -133,6 +194,42 @@ task test, "Run all tests":
   # and the flow view rendered program output one source line too high.
   # Same FFI-`include` compile requirements as the two tests above.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_io_event_pending_step_attribution.nim"
+  # The C ABI's view of the paths.dat layout question: meta.dat bit 4 decides,
+  # `ct_reader_column_aware_paths_suspected` reports a record set that also
+  # decodes as Layout A, and `ct_reader_open_assume_column_aware_paths` is the
+  # caller's opt-in recovery — which refuses by name rather than falling back.
+  # Same FFI-`include` compile requirements as the tests above.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_reader_ffi_column_aware_paths.nim"
+  # The C ABI's step-location accessors — what codetracer's db-backend turns
+  # into DAP stackTrace frames — refuse a line-only position their address
+  # space cannot address instead of clamping it into a file that exists, and
+  # still answer every position this repository's writer produces.
+  # Same FFI-`include` compile requirements as the tests above.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_reader_ffi_line_only_position_space.nim"
+  # The C ABI's door to the per-file line-count table. Every non-Nim recorder
+  # drives this writer through the C entry points, so a mandatory-count
+  # contract that only the Nim API enforces is not enforced at all: the
+  # implicit path registration `trace_writer_register_step` performs has no
+  # count, and must be refused by name rather than silently dropping the step.
+  # Same FFI-`include` compile requirements as the tests above.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_line_count_table.nim"
+  # The C ABI's in-memory constructors: an embedder with no filesystem gets a
+  # container's BYTES rather than a file. Carries its own positive control (the
+  # file arm, in the same directory) and its own mutation control (one extra
+  # step), which is what showed that a container's LENGTH cannot tell two
+  # traces apart. Same FFI-`include` compile requirements as the tests above.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_in_memory.nim"
+  # The C ABI lets a caller PIN the recording identity instead of having one
+  # minted. Carries its own control — a writer that does not call the setter
+  # gets a different, valid id — without which the positive assertion cannot
+  # tell a working setter from a no-op. Same FFI-`include` compile requirements
+  # as the tests above.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_recording_id.nim"
+  # The C ABI builds for a target with no filesystem, and `ctHasFilesystem`
+  # removes EXACTLY the two entry points that name a file. Re-runs the compiler
+  # over src/ with `--os:any --cpu:wasm32 --compileOnly` and reads the emitted
+  # C, so it needs no cross toolchain.
+  exec "nim c -r -d:release -p:src tests/test_freestanding_writer_surface.nim"
 
 task regenerateFixtures, "Regenerate .expected golden fixture files":
   exec "nim c -r tests/generate_golden_fixtures.nim"
