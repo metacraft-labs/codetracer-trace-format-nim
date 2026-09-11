@@ -89,11 +89,30 @@ const
   TagStepValues = 0'u8
     ## Value-stream event tag 0 (``trace-events.md`` §"Value Stream Events").
 
+  TagAssignment* = 9'u8
+    ## Value-stream event tag 9 (``trace-events.md`` §"Value Stream Events"):
+    ## ``Assignment {to: varint, pass_by: u8, from: length-prefixed CBOR RValue}``.
+    ##
+    ## Emitted by ``trace_writer_register_assignment`` and appended AFTER the
+    ## tag-0 ``StepValues`` event of the step the assignment belongs to.  The
+    ## encoding is byte-identical to the canonical Rust
+    ## ``ValueStreamEvent::Assignment`` in
+    ## ``codetracer-trace-format/codetracer_trace_writer/src/value_stream.rs``
+    ## (``TAG_ASSIGNMENT``), which is what lets the Rust
+    ## ``ValueRecordEntry::decode`` read back what this writer produced.
+
 type
   VariableValue* = object
     varnameId*: uint64
     typeId*: uint64
     data*: seq[byte]  ## CBOR-encoded value bytes
+
+  AssignmentEventEntry* = object
+    ## One decoded tag-9 ``Assignment`` value-stream event.
+    varnameId*: uint64   ## interned varname id of the assignment TARGET
+    passBy*: uint8       ## 0 = PassBy::Value, 1 = PassBy::Reference
+    rvalueCbor*: seq[byte]
+      ## serde-CBOR ``RValue`` describing the right-hand side, stored verbatim
 
   ValueStreamWriter* = object
     dataFile: CtfsInternalFile
@@ -159,20 +178,48 @@ proc decodeCborTopLevelTypeId(data: openArray[byte]): uint64 =
 # Per-record encode/decode (SPEC tag-0 StepValues, parallel-indexed by step)
 # ---------------------------------------------------------------------------
 
-proc encodeRecord(values: openArray[VariableValue], outBuf: var seq[byte]) =
-  ## Encode one step's variable values as a SPEC value record.  A value-less
-  ## step encodes to ZERO bytes (an empty record), matching the spec's "empty
-  ## record for value-less steps".  Otherwise emit a single tag-0 StepValues
-  ## event: ``u8 0x00, varint count, count × (varint name_id, varint len, data)``
-  ## — byte-identical to the Rust ``ValueStreamEvent::StepValues`` encoding.
-  if values.len == 0:
-    return
-  outBuf.add(TagStepValues)
-  encodeVarint(uint64(values.len), outBuf)
-  for v in values:
-    encodeVarint(v.varnameId, outBuf)
-    encodeVarint(uint64(v.data.len), outBuf)
-    outBuf.add(v.data)
+proc encodeAssignmentEvent*(varnameId: uint64, passBy: uint8,
+    rvalueCbor: openArray[byte], outBuf: var seq[byte]) =
+  ## Encode one tag-9 ``Assignment`` value-stream event into ``outBuf``:
+  ## ``u8 0x09, varint to, u8 pass_by, varint from_len, from_bytes`` — the
+  ## byte-for-byte layout the Rust ``ValueStreamEvent::Assignment`` encoder
+  ## produces and its decoder expects.  ``rvalueCbor`` is the serde-CBOR
+  ## encoding of the ``RValue`` (adjacently tagged, see ``cbor.nim``'s
+  ## ``encodeCborRValue``); this writer stores it verbatim so no re-encoding
+  ## can drift the two implementations apart.
+  outBuf.add(TagAssignment)
+  encodeVarint(varnameId, outBuf)
+  outBuf.add(passBy)
+  encodeVarint(uint64(rvalueCbor.len), outBuf)
+  for b in rvalueCbor:
+    outBuf.add(b)
+
+proc encodeRecord(values: openArray[VariableValue],
+    extraEvents: openArray[byte], outBuf: var seq[byte]) =
+  ## Encode one step's variable values as a SPEC value record.  A step with no
+  ## values AND no extra events encodes to ZERO bytes (an empty record),
+  ## matching the spec's "empty record for value-less steps".  Otherwise emit a
+  ## single tag-0 StepValues event: ``u8 0x00, varint count, count × (varint
+  ## name_id, varint len, data)`` — byte-identical to the Rust
+  ## ``ValueStreamEvent::StepValues`` encoding — followed by ``extraEvents``
+  ## verbatim.
+  ##
+  ## ``extraEvents`` is a already-encoded concatenation of further tagged
+  ## value-stream events (today only tag-9 ``Assignment``).  A record is
+  ## defined by the spec as "the concatenation of zero-or-more tagged
+  ## value-stream events", so appending them after the StepValues event is the
+  ## canonical placement, and the reader walks events until the record's byte
+  ## length is exhausted.
+  if values.len > 0:
+    outBuf.add(TagStepValues)
+    encodeVarint(uint64(values.len), outBuf)
+    for v in values:
+      encodeVarint(v.varnameId, outBuf)
+      encodeVarint(uint64(v.data.len), outBuf)
+      outBuf.add(v.data)
+  if extraEvents.len > 0:
+    for b in extraEvents:
+      outBuf.add(b)
 
 proc decodeRecord(data: openArray[byte]): Result[seq[VariableValue], string] =
   ## Decode one SPEC value record (a concatenation of tagged events) back into
@@ -202,10 +249,74 @@ proc decodeRecord(data: openArray[byte]): Result[seq[VariableValue], string] =
           varnameId: vnId,
           typeId: decodeCborTopLevelTypeId(d),
           data: d))
+    of TagAssignment:
+      # Assignment provenance rides in the same record as the step's values
+      # (spec §"Value Stream Events" tag 9).  ``readStepValues`` answers
+      # "which variables are visible at step N", so the assignment is walked
+      # over rather than reported here — but it MUST be walked accurately,
+      # because the remaining events of the record follow it.  Use
+      # ``decodeRecordAssignments`` to read them.
+      discard ?decodeVarint(data, pos)           # to
+      if pos >= data.len:
+        return err("truncated pass_by in Assignment value-stream event")
+      inc pos                                    # pass_by
+      let fromLen = int(?decodeVarint(data, pos))
+      if pos + fromLen > data.len:
+        return err("truncated RValue payload in Assignment value-stream event")
+      pos += fromLen
+    else:
+      # Deliberately an ERROR, not a skip: a value-stream event is not
+      # self-delimiting, so an unknown tag cannot be walked over without
+      # guessing its length, and a guess would mis-frame every event after it.
+      # The consequence to know about: a reader built BEFORE a tag existed
+      # refuses every record carrying one. That is how a stale `ct-print`
+      # reports "(none)" for a step whose values are present on disk — rebuild
+      # it (`just build` in codetracer-trace-format-nim) rather than reaching
+      # for the writer.
+      return err("unsupported value-stream event tag " & $tag &
+        " in Nim value record (this reader predates the tag; rebuild ct-print " &
+        "from codetracer-trace-format-nim)")
+  ok(values)
+
+proc decodeRecordAssignments*(data: openArray[byte]):
+    Result[seq[AssignmentEventEntry], string] =
+  ## Decode the tag-9 ``Assignment`` events of one SPEC value record, in
+  ## stream order.  Tag-0 ``StepValues`` events are walked over.  This is the
+  ## read-back counterpart of ``encodeAssignmentEvent`` and exists so the Nim
+  ## side can verify what it wrote without going through the Rust reader.
+  var pos = 0
+  var found: seq[AssignmentEventEntry] = @[]
+  while pos < data.len:
+    let tag = data[pos]
+    inc pos
+    case tag
+    of TagStepValues:
+      let count = int(?decodeVarint(data, pos))
+      for _ in 0 ..< count:
+        discard ?decodeVarint(data, pos)         # name_id
+        let dLen = int(?decodeVarint(data, pos))
+        if pos + dLen > data.len:
+          return err("truncated value data in StepValues record")
+        pos += dLen
+    of TagAssignment:
+      let vnId = ?decodeVarint(data, pos)
+      if pos >= data.len:
+        return err("truncated pass_by in Assignment value-stream event")
+      let passBy = data[pos]
+      inc pos
+      let fromLen = int(?decodeVarint(data, pos))
+      if pos + fromLen > data.len:
+        return err("truncated RValue payload in Assignment value-stream event")
+      var blob = newSeq[byte](fromLen)
+      for j in 0 ..< fromLen:
+        blob[j] = data[pos + j]
+      pos += fromLen
+      found.add(AssignmentEventEntry(
+        varnameId: vnId, passBy: passBy, rvalueCbor: blob))
     else:
       return err("unsupported value-stream event tag " & $tag &
         " in Nim value record")
-  ok(values)
+  ok(found)
 
 # ---------------------------------------------------------------------------
 # Writer (SPEC chunked layout)
@@ -291,12 +402,17 @@ proc flushChunk(ctfs: var Ctfs, w: var ValueStreamWriter): Result[void, string] 
   ok()
 
 proc writeStepValues*(ctfs: var Ctfs, w: var ValueStreamWriter,
-    values: openArray[VariableValue]): Result[void, string] =
+    values: openArray[VariableValue],
+    extraEvents: openArray[byte] = []): Result[void, string] =
   ## Write all variable values for one step.  Call exactly once per step event,
   ## in step order — this preserves the parallel-index invariant (record N ↔
   ## step N).  For steps with no values pass an empty array (an empty record).
+  ##
+  ## ``extraEvents`` carries already-encoded tagged value-stream events (today
+  ## only tag-9 ``Assignment``, built by ``encodeAssignmentEvent``) that belong
+  ## to the same step; they are appended after the tag-0 StepValues event.
   var rec: seq[byte] = @[]
-  encodeRecord(values, rec)
+  encodeRecord(values, extraEvents, rec)
   # Length-prefix the record within the chunk so the reader can index it.
   encodeVarint(uint64(rec.len), w.buffer)
   w.buffer.add(rec)
@@ -489,3 +605,33 @@ proc readStepValues*(r: var ValueStreamReader,
   if within >= r.cachedRecords.len:
     return err("value record " & $within & " missing in chunk " & $chunkNumber)
   decodeRecord(r.cachedRecords[within])
+
+proc readStepAssignments*(r: var ValueStreamReader,
+    stepIndex: uint64): Result[seq[AssignmentEventEntry], string] =
+  ## Read the tag-9 ``Assignment`` events recorded for a given step
+  ## (record N ↔ step N).  Legacy ``.off`` VRT bundles never carried them, so
+  ## they report an empty sequence rather than an error.
+  if r.legacy:
+    return ok(newSeq[AssignmentEventEntry]())
+
+  if stepIndex >= r.totalRecordsVal:
+    return err("value step index " & $stepIndex & " out of range (count " &
+      $r.totalRecordsVal & ")")
+  let chunkNumber = int(stepIndex div uint64(r.chunkSize))
+  let within = int(stepIndex mod uint64(r.chunkSize))
+
+  if r.cachedChunkIdx != chunkNumber:
+    let startOff = int(r.offsets[chunkNumber])
+    let endOff =
+      if chunkNumber + 1 < r.offsets.len: int(r.offsets[chunkNumber + 1])
+      else: r.data.len
+    if startOff > endOff or endOff > r.data.len:
+      return err("value chunk offsets out of range")
+    let recs = ?decompressChunkRecords(
+      r.data.toOpenArray(startOff, endOff - 1))
+    r.cachedRecords = recs
+    r.cachedChunkIdx = chunkNumber
+
+  if within >= r.cachedRecords.len:
+    return err("value record " & $within & " missing in chunk " & $chunkNumber)
+  decodeRecordAssignments(r.cachedRecords[within])

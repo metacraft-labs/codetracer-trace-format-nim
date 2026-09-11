@@ -14,6 +14,7 @@ when defined(nimPreviewSlimSystem):
 ## (so the reconstructed ``typeId`` round-trips), and exercise empty records,
 ## multi-chunk streams, and the parallel-index invariant (record N ↔ step N).
 
+import std/strutils
 import results
 import codetracer_ctfs/container
 import codetracer_ctfs/variable_record_table
@@ -250,8 +251,175 @@ proc test_value_stream_legacy_back_compat() {.raises: [].} =
 
   echo "PASS: test_value_stream_legacy_back_compat"
 
+# ---------------------------------------------------------------------------
+# test_value_stream_assignment_events — tag-9 Assignment rides in the same
+# record as the step's values, and both sides read back exactly
+# ---------------------------------------------------------------------------
+
+proc test_value_stream_assignment_events() {.raises: [].} =
+  ## The tag-9 ``Assignment`` event (``trace-events.md`` §"Value Stream
+  ## Events") shares a record with the step's tag-0 ``StepValues`` event, so
+  ## every combination has to read back correctly through BOTH accessors:
+  ## ``readStepValues`` must return the values and walk the assignments over,
+  ## ``readStepAssignments`` must return the assignments and walk the values
+  ## over, and neither may lose framing when the record carries both.
+  ##
+  ## The byte layout is asserted literally as well, because "byte-identical to
+  ## the canonical Rust ``ValueStreamEvent::Assignment`` encoder" is the whole
+  ## reason the Rust reader can read what this writer produces — and a
+  ## round-trip through one implementation cannot notice the two drifting
+  ## together.
+  doAssert TagAssignment == 9'u8,
+    "the Assignment tag is fixed by the spec at 9, got " & $TagAssignment
+
+  # --- the wire layout, spelled out ---------------------------------------
+  # u8 0x09, varint to, u8 pass_by, varint from_len, from_bytes
+  block:
+    var buf: seq[byte] = @[]
+    encodeAssignmentEvent(300'u64, 1'u8, [0xAA'u8, 0xBB'u8], buf)
+    var expected: seq[byte] = @[9'u8]
+    encodeVarint(300'u64, expected)
+    expected.add(1'u8)
+    encodeVarint(2'u64, expected)
+    expected.add(0xAA'u8)
+    expected.add(0xBB'u8)
+    doAssert buf == expected,
+      "encodeAssignmentEvent layout drifted: got " & $buf & " expected " &
+        $expected
+
+  # --- four record shapes, written in order --------------------------------
+  # 0: values only        1: assignments only
+  # 2: both               3: neither (an empty record)
+  var rng = initRng(4242)
+  let step0Values = makeValues(rng, 3)
+  let step2Values = makeValues(rng, 2)
+
+  # (varnameId, passBy, rvalue bytes) for every assignment we write.
+  let step1Assignments = @[
+    (11'u64, 0'u8, @[1'u8, 2'u8, 3'u8]),
+    (12'u64, 1'u8, @[4'u8])]
+  let step2Assignments = @[
+    (99'u64, 1'u8, @[7'u8, 8'u8])]
+
+  proc encodeAll(entries: seq[(uint64, uint8, seq[byte])]): seq[byte] =
+    var buf: seq[byte] = @[]
+    for e in entries:
+      encodeAssignmentEvent(e[0], e[1], e[2], buf)
+    buf
+
+  var ctfs = createCtfs()
+  let writerRes = initValueStreamWriter(ctfs, chunkSize = 2)
+  doAssert writerRes.isOk, "initValueStreamWriter failed: " & writerRes.error
+  var writer = writerRes.get()
+
+  let w0 = writeStepValues(ctfs, writer, step0Values)
+  doAssert w0.isOk, "step 0 write failed: " & w0.error
+  let w1 = writeStepValues(ctfs, writer, [], encodeAll(step1Assignments))
+  doAssert w1.isOk, "step 1 write failed: " & w1.error
+  let w2 = writeStepValues(ctfs, writer, step2Values, encodeAll(step2Assignments))
+  doAssert w2.isOk, "step 2 write failed: " & w2.error
+  let w3 = writeStepValues(ctfs, writer, [])
+  doAssert w3.isOk, "step 3 write failed: " & w3.error
+  let fr = value_stream.flush(ctfs, writer)
+  doAssert fr.isOk, "flush failed: " & fr.error
+
+  let readerRes = initValueStreamReader(ctfs.toBytes())
+  doAssert readerRes.isOk, "initValueStreamReader failed: " & readerRes.error
+  var reader = readerRes.get()
+  doAssert reader.count == 4'u64,
+    "record count mismatch: got " & $reader.count & " expected 4"
+
+  proc assignmentsAt(r: var ValueStreamReader, idx: uint64):
+      seq[AssignmentEventEntry] =
+    let got = readStepAssignments(r, idx)
+    doAssert got.isOk,
+      "readStepAssignments failed at " & $idx & ": " & got.error
+    got.get()
+
+  proc valuesAt(r: var ValueStreamReader, idx: uint64): seq[VariableValue] =
+    let got = readStepValues(r, idx)
+    doAssert got.isOk, "readStepValues failed at " & $idx & ": " & got.error
+    got.get()
+
+  proc assertAssignments(got: seq[AssignmentEventEntry],
+      expected: seq[(uint64, uint8, seq[byte])], ctx: string) =
+    doAssert got.len == expected.len,
+      ctx & ": assignment count mismatch, got " & $got.len & " expected " &
+        $expected.len
+    for i in 0 ..< got.len:
+      doAssert got[i].varnameId == expected[i][0],
+        ctx & " #" & $i & ": target mismatch"
+      doAssert got[i].passBy == expected[i][1],
+        ctx & " #" & $i & ": pass_by mismatch"
+      doAssert got[i].rvalueCbor == expected[i][2],
+        ctx & " #" & $i & ": rvalue payload mismatch"
+
+  # Step 0 — values only.  The assignment accessor must report NONE, which is
+  # the control that keeps "step 1 has two" from passing for free.
+  assertEqualVals(valuesAt(reader, 0'u64), step0Values, "step 0")
+  assertAssignments(assignmentsAt(reader, 0'u64), @[], "step 0")
+
+  # Step 1 — assignments only.  `readStepValues` must not error on the tag it
+  # is walking over, and must report no values.
+  doAssert valuesAt(reader, 1'u64).len == 0,
+    "step 1 carries no StepValues event and must report no values"
+  assertAssignments(assignmentsAt(reader, 1'u64), step1Assignments, "step 1")
+
+  # Step 2 — BOTH in one record.  This is the framing case: each accessor has
+  # to walk the other's event accurately to reach the end of the record.
+  assertEqualVals(valuesAt(reader, 2'u64), step2Values, "step 2")
+  assertAssignments(assignmentsAt(reader, 2'u64), step2Assignments, "step 2")
+
+  # Step 3 — neither.
+  doAssert valuesAt(reader, 3'u64).len == 0, "step 3 must report no values"
+  assertAssignments(assignmentsAt(reader, 3'u64), @[], "step 3")
+
+  echo "PASS: test_value_stream_assignment_events"
+
+# ---------------------------------------------------------------------------
+# test_value_stream_unknown_tag_is_refused_by_name — the forward-compat rule
+# ---------------------------------------------------------------------------
+
+proc test_value_stream_unknown_tag_is_refused_by_name() {.raises: [].} =
+  ## A value-stream event is NOT self-delimiting, so a reader that meets a tag
+  ## it does not know cannot walk past it and must refuse the whole record
+  ## rather than guess a length and mis-frame everything after it.
+  ##
+  ## That refusal is a forward-compatibility hazard with a specific symptom —
+  ## a binary older than a tag reports a step as having no variables — so the
+  ## message has to NAME the remedy.  Asserted here because a reader that
+  ## failed silently, or with a message that did not mention rebuilding, would
+  ## send the next reader to the wrong layer entirely.
+  var ctfs = createCtfs()
+  let writerRes = initValueStreamWriter(ctfs, chunkSize = 4)
+  doAssert writerRes.isOk, "initValueStreamWriter failed: " & writerRes.error
+  var writer = writerRes.get()
+
+  # A record carrying one event with a tag no reader knows.  `0x7F` is not
+  # assigned by `trace-events.md` §"Value Stream Events" (0-9 are).
+  let unknown: seq[byte] = @[0x7F'u8, 0x01'u8]
+  let w = writeStepValues(ctfs, writer, [], unknown)
+  doAssert w.isOk, "write failed: " & w.error
+  let fr = value_stream.flush(ctfs, writer)
+  doAssert fr.isOk, "flush failed: " & fr.error
+
+  let readerRes = initValueStreamReader(ctfs.toBytes())
+  doAssert readerRes.isOk, "initValueStreamReader failed: " & readerRes.error
+  var reader = readerRes.get()
+
+  let got = readStepValues(reader, 0'u64)
+  doAssert got.isErr, "an unknown value-stream tag must be REFUSED, not skipped"
+  doAssert got.error.contains("127"),
+    "the refusal must name the tag it could not walk: " & got.error
+  doAssert got.error.contains("rebuild ct-print"),
+    "the refusal must name the remedy (rebuilding a stale reader): " & got.error
+
+  echo "PASS: test_value_stream_unknown_tag_is_refused_by_name"
+
 # Run all tests
 test_value_stream_write_read()
 test_value_stream_empty_record()
 test_value_stream_many_variables()
 test_value_stream_legacy_back_compat()
+test_value_stream_assignment_events()
+test_value_stream_unknown_tag_is_refused_by_name()

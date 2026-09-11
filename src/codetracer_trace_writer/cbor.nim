@@ -1015,7 +1015,7 @@ proc encodeCborAssignmentRecord*(enc: var CborEncoder, a: AssignmentRecord) {.in
   enc.writePrecomputed(CborKeyFrom)
   enc.encodeCborRValue(a.frm)
 
-proc decodeCborRValue(dec: var CborDecoder): Result[RValue, string] =
+proc decodeCborRValue*(dec: var CborDecoder): Result[RValue, string] =
   discard ?dec.readMapHeader()
   let kindKey = ?dec.readTextString()
   if kindKey != "kind":

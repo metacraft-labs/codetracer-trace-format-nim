@@ -1150,8 +1150,13 @@ proc registerVarname*(w: var MultiStreamTraceWriter,
 
 proc registerStep*(w: var MultiStreamTraceWriter, pathId: uint64,
     line: uint64,
-    values: openArray[VariableValue]): Result[void, string] =
+    values: openArray[VariableValue],
+    extraValueEvents: openArray[byte] = []): Result[void, string] =
   ## Register a step event with its variable values.
+  ##
+  ## ``extraValueEvents`` carries already-encoded non-``StepValues``
+  ## value-stream events (today only tag-9 ``Assignment``) belonging to this
+  ## step; they are appended to the step's value record.
   ## Automatically uses DeltaStep encoding when the new global line index
   ## is within a small delta of the previous one.
   if w.closed:
@@ -1183,7 +1188,8 @@ proc registerStep*(w: var MultiStreamTraceWriter, pathId: uint64,
     return err("failed to write step event: " & evRes.error)
 
   # Write values parallel to this step
-  let valRes = w.container.writeStepValues(w.valueWriter, values)
+  let valRes = w.container.writeStepValues(w.valueWriter, values,
+    extraValueEvents)
   if valRes.isErr:
     return err("failed to write step values: " & valRes.error)
 
@@ -1208,7 +1214,8 @@ proc registerStepWithColumn*(w: var MultiStreamTraceWriter,
     pathId: uint64,
     line: uint64,
     columnDelta: int64,
-    values: openArray[VariableValue]): Result[void, string] =
+    values: openArray[VariableValue],
+    extraValueEvents: openArray[byte] = []): Result[void, string] =
   ## Register a step at (pathId, line, column) as a SINGLE wire event.
   ##
   ## ``columnDelta`` is the column offset *from column 1* on the
@@ -1259,7 +1266,8 @@ proc registerStepWithColumn*(w: var MultiStreamTraceWriter,
   if evRes.isErr:
     return err("failed to write step event: " & evRes.error)
 
-  let valRes = w.container.writeStepValues(w.valueWriter, values)
+  let valRes = w.container.writeStepValues(w.valueWriter, values,
+    extraValueEvents)
   if valRes.isErr:
     return err("failed to write step values: " & valRes.error)
 
@@ -1281,7 +1289,8 @@ proc registerStepWithColumn*(w: var MultiStreamTraceWriter,
 
 proc registerColumnStep*(w: var MultiStreamTraceWriter,
     columnDelta: int64,
-    values: openArray[VariableValue]): Result[void, string] =
+    values: openArray[VariableValue],
+    extraValueEvents: openArray[byte] = []): Result[void, string] =
   ## Emit a column-only step (sekDeltaColumn, tag 0x07) that advances
   ## the cursor's column within the current line.  ``columnDelta`` is a
   ## signed zigzag varint on the wire; magnitudes ≤ ±63 cost two bytes
@@ -1310,7 +1319,8 @@ proc registerColumnStep*(w: var MultiStreamTraceWriter,
   if evRes.isErr:
     return err("failed to write delta-column event: " & evRes.error)
 
-  let valRes = w.container.writeStepValues(w.valueWriter, values)
+  let valRes = w.container.writeStepValues(w.valueWriter, values,
+    extraValueEvents)
   if valRes.isErr:
     return err("failed to write step values: " & valRes.error)
 

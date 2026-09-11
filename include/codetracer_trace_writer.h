@@ -310,6 +310,24 @@ void trace_writer_register_variable_cbor(trace_writer_t handle,
     const uint8_t* cbor_data,
     size_t cbor_len);
 
+/* Record `target_name = <rvalue>` on the step currently being buffered.
+ *
+ * `rvalue_cbor` / `rvalue_cbor_len` carry the serde-CBOR encoding of
+ * `codetracer_trace_types::RValue` (adjacently tagged: `{"kind":…,"data":…}`).
+ * `pass_by` is the `PassBy` discriminant in declaration order:
+ * 0 = Value, 1 = Reference.
+ *
+ * The record reaches the trace as a tag-9 `Assignment` value-stream event
+ * (trace-events.md §"Value Stream Events") inside the step's value record.
+ *
+ * Returns 0 on success, 1 on failure (see trace_writer_last_error).
+ */
+int trace_writer_register_assignment(trace_writer_t handle,
+    const char* target_name,
+    uint8_t pass_by,
+    const uint8_t* rvalue_cbor,
+    size_t rvalue_cbor_len);
+
 void trace_writer_register_return_cbor(trace_writer_t handle,
     const uint8_t* cbor_data,
     size_t cbor_len);

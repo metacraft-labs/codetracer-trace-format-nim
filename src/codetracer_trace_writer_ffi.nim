@@ -49,6 +49,7 @@ import codetracer_trace_writer/meta_dat
 import codetracer_trace_writer/multi_stream_writer
 import codetracer_trace_writer/interning_table
 import codetracer_trace_writer/value_stream
+import codetracer_trace_writer/cbor
 import codetracer_trace_writer/call_stream
 import codetracer_trace_writer/io_event_stream
 import codetracer_trace_writer/span_stream
@@ -151,6 +152,15 @@ type
     pendingStepLine: uint64
     pendingColumnDelta: int64
     pendingValues: seq[VariableValue]
+
+    # Assignment provenance accumulated for the pending step, already
+    # encoded as tag-9 value-stream events (``trace-events.md`` §"Value
+    # Stream Events").  Flushed together with ``pendingValues`` so the
+    # assignment lands in the SAME value record as the step whose
+    # execution performed it, and follows the same carry-forward rules —
+    # dropping it here is what made every JS recording report
+    # ``assign=N`` discarded records.
+    pendingAssignments: seq[byte]
 
     # Pending call arguments for multi-stream mode:
     # The recorder calls trace_writer_register_call_arg once per arg
@@ -776,16 +786,18 @@ proc flushPendingStep(handle: TraceWriterHandle,
       handle.pendingStepPathId,
       handle.pendingStepLine,
       handle.pendingColumnDelta,
-      handle.pendingValues)
+      handle.pendingValues,
+      handle.pendingAssignments)
     if res.isErr:
       setError(res.error)
       return 1.cint
     handle.pendingValues.setLen(0)
+    handle.pendingAssignments.setLen(0)
     handle.hasPendingStep = false
     handle.pendingColumnDelta = 0
     return 0.cint
 
-  if handle.pendingValues.len > 0:
+  if handle.pendingValues.len > 0 or handle.pendingAssignments.len > 0:
     # Variables registered after the last step was already flushed
     # strand the values in ``pendingValues`` with no step to attach
     # to.  Neither mode may DROP them (spec: a variable registered
@@ -831,16 +843,19 @@ proc flushPendingStep(handle: TraceWriterHandle,
     if handle.msWriter.columnAwareSteps:
       if orphanPathId != high(uint64):
         let res = handle.msWriter.registerStep(
-          orphanPathId, orphanLine, handle.pendingValues)
+          orphanPathId, orphanLine, handle.pendingValues,
+          handle.pendingAssignments)
         if res.isErr:
           setError(res.error)
           return 1.cint
       elif handle.msWriter.stepCount > 0:
-        let res = handle.msWriter.registerColumnStep(0'i64, handle.pendingValues)
+        let res = handle.msWriter.registerColumnStep(0'i64, handle.pendingValues,
+          handle.pendingAssignments)
         if res.isErr:
           setError(res.error)
           return 1.cint
       handle.pendingValues.setLen(0)
+      handle.pendingAssignments.setLen(0)
     # else: line-only — leave pendingValues intact to carry forward to
     # the next step; do NOT clear/drop them.
   0.cint
@@ -1404,6 +1419,81 @@ proc trace_writer_register_variable_cbor(
     rawStr: "<cbor:" & $cbor_len & ">",
     rawTypeId: TypeId(0),
   ))
+
+proc trace_writer_register_assignment(
+    handle: TraceWriterHandle,
+    target_name: cstring,
+    pass_by: uint8,
+    rvalue_cbor: ptr uint8,
+    rvalue_cbor_len: csize_t,
+): cint {.exportc, cdecl, dynlib.} =
+  ## Record an ASSIGNMENT: ``target_name = <rvalue>``, where ``rvalue_cbor`` is
+  ## the serde-CBOR encoding of the Rust ``RValue`` (adjacently tagged —
+  ## ``{"kind": …, "data": …}``; see ``cbor.nim``'s ``encodeCborRValue`` and
+  ## ``codetracer_trace_types::RValue``'s `# Serialization` note).
+  ##
+  ## ``pass_by`` is the ``PassBy`` discriminant in declaration order:
+  ## ``0 = Value``, ``1 = Reference``.
+  ##
+  ## The assignment attaches to the step currently being buffered, exactly as
+  ## ``trace_writer_register_variable_*`` values do, and reaches the trace as a
+  ## tag-9 ``Assignment`` value-stream event (``trace-events.md`` §"Value Stream
+  ## Events") in that step's value record.  The RValue bytes are stored
+  ## VERBATIM so the Nim writer and the canonical Rust
+  ## ``ValueStreamEvent::Assignment`` encoder cannot drift apart.
+  ##
+  ## Before this entry point existed the Rust wrapper's ``NimTraceWriter::assign``
+  ## had nothing to call and counted every assignment as a discarded record —
+  ## every JavaScript recording closed with
+  ## ``WARNING: this trace is INCOMPLETE … assign=N``.
+  ##
+  ## Returns 0 on success, 1 on failure (see ``trace_writer_last_error``).
+  if handle.isNil:
+    return 1.cint
+
+  let name = toNimStr(target_name)
+  var rvalue = newSeq[byte](int(rvalue_cbor_len))
+  if not rvalue_cbor.isNil and rvalue_cbor_len > 0.csize_t:
+    copyMem(addr rvalue[0], rvalue_cbor, int(rvalue_cbor_len))
+
+  if handle.useMultiStream:
+    if not handle.msWriterReady:
+      setError("trace_writer_register_assignment: writer is not ready")
+      return 1.cint
+    let vnIdRes = handle.msWriter.registerVarname(name)
+    if vnIdRes.isErr:
+      setError("trace_writer_register_assignment: " & vnIdRes.error)
+      return 1.cint
+    encodeAssignmentEvent(vnIdRes.get(), pass_by, rvalue,
+      handle.pendingAssignments)
+    return 0.cint
+
+  # Legacy single-stream path.  It carries the full `AssignmentRecord` in the
+  # event stream, so the CBOR RValue is decoded back into the typed record
+  # rather than stored opaquely.  The target is named by a preceding
+  # `VariableName` event and referenced by id 0 — the same (degraded)
+  # convention `trace_writer_register_variable_cbor`'s legacy arm uses, since
+  # this path keeps no varname table.
+  var dec = CborDecoder.init(rvalue)
+  let rvRes = dec.decodeCborRValue()
+  if rvRes.isErr:
+    setError("trace_writer_register_assignment: undecodable RValue CBOR: " &
+      rvRes.error)
+    return 1.cint
+  discard handle.writer.writeEvent(TraceLowLevelEvent(
+    kind: tleVariableName,
+    varName: name,
+  ))
+  let wRes = handle.writer.writeEvent(TraceLowLevelEvent(
+    kind: tleAssignment,
+    assignment: AssignmentRecord(
+      to: VariableId(0),
+      passBy: (if pass_by == 0'u8: pbValue else: pbReference),
+      frm: rvRes.get())))
+  if wRes.isErr:
+    setError("trace_writer_register_assignment: " & wRes.error)
+    return 1.cint
+  0.cint
 
 proc trace_writer_register_return_cbor(
     handle: TraceWriterHandle,
