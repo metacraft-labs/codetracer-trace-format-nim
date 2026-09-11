@@ -243,6 +243,14 @@ const testSpecs: seq[TestSpec] = @[
   # build of the writer from a DIFFERENT revision, which is not a node this
   # graph can express.
   TestSpec(source: "tests/test_gdh2_reload_marker.nim", binary: "build/test-bin/test_gdh2_reload_marker"),
+  # GDH-M6 review — the C header declares every `trace_writer_*` export, or
+  # names it on a backlog. Modelled here (unlike
+  # `test_freestanding_writer_surface`, which re-invokes the compiler at RUN
+  # time and so is not a node this graph can express) because it only reads
+  # two files off disk: `src/codetracer_trace_writer_ffi.nim` and
+  # `include/codetracer_trace_writer.h`. Both are already `extraInputs` of the
+  # library edge, so its inputs are the ones that should invalidate it.
+  TestSpec(source: "tests/test_c_header_declares_the_writer_abi.nim", binary: "build/test-bin/test_c_header_declares_the_writer_abi"),
 ]
 
 package codetracer_trace_format_nim:

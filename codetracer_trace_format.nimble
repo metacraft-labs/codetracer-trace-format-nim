@@ -247,6 +247,14 @@ task test, "Run all tests":
   # over src/ with `--os:any --cpu:wasm32 --compileOnly` and reads the emitted
   # C, so it needs no cross toolchain.
   exec "nim c -r -d:release -p:src tests/test_freestanding_writer_surface.nim"
+  # Every `trace_writer_*` entry point the FFI exports is DECLARED in the C
+  # header hosts vendor, or is on a named backlog. "Exported but undeclared"
+  # breaks no build and fails no test — it just silently removes a capability
+  # from every caller — and it has now landed three times (GDH-M3 twice,
+  # GDH-M6's `trace_writer_set_recording_id` once, the last of which made
+  # byte-identical GDScript recordings impossible for as long as nobody
+  # looked). Reads the real FFI source and the real header; no toolchain.
+  exec "nim c -r -d:release -p:src tests/test_c_header_declares_the_writer_abi.nim"
 
 task regenerateFixtures, "Regenerate .expected golden fixture files":
   exec "nim c -r tests/generate_golden_fixtures.nim"
