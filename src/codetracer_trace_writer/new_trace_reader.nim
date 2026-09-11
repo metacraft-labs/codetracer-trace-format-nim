@@ -466,10 +466,21 @@ proc parseLineCountPathRecords(pathReader: InterningTableReader):
     counts[i] = count
   ok((payloads, counts))
 
-proc path*(r: NewTraceReader, id: uint64): Result[string, string]
+proc path*(r: NewTraceReader, id: uint64): Result[string, string] {.gcsafe.}
   ## Forward declaration — the ordinal pass below reads every record's
   ## payload through the SAME accessor a consumer does, so the two can
   ## never disagree about what a record's string is.
+  ##
+  ## `{.gcsafe.}` is declared here rather than inferred because Nim infers
+  ## GC-safety from a proc's BODY, and a forward declaration has none at the
+  ## point its callers are analysed: everything that reaches `path` through
+  ## this declaration — `computePathVersionOrdinals`, and therefore
+  ## `openNewTraceFromBytes` and `openNewTrace` — was silently inferred
+  ## GC-UNSAFE, which made the whole reader unusable from a `{.gcsafe.}` proc
+  ## type. `path` touches no globals (only the `NewTraceReader` it is given),
+  ## so the annotation states a fact rather than waiving a check: the compiler
+  ## still verifies the definition below against it and rejects the body if it
+  ## ever does reach mutable global state.
 
 proc computePathVersionOrdinals(r: var NewTraceReader): Result[void, string] =
   ## GDH-M1 — assign every ``paths.dat`` entry its 0-based version
