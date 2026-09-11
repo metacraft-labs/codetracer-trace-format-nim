@@ -35,6 +35,35 @@ WORK="${GDH3_WORK:-$(mktemp -d)}"
 mkdir -p "$WORK"
 TIMEOUT="${GDH3_TIMEOUT:-300}"
 NIMFLAGS=(-d:release -p:src --hints:off --warnings:off)
+# The same two flags, kept separately because `build_lib` spells its own nim
+# invocation out rather than reusing NIMFLAGS.
+ZSTDFLAGS=()
+CFLAGS_EXTRA=()
+
+# zstd is linked by the container layer. The dev shell puts it on the default
+# search path; outside it, GDH3_ZSTD_INC / GDH3_ZSTD_LIB point at it. Missing
+# headers must FAIL the script, not silently skip the arms.
+#
+# Added 2026-09-11 during the GDH-M7 review, to close an asymmetry that cost
+# the previous two readers time: `run_gdh1_gates.sh` and `run_gdh2_gates.sh`
+# have carried GDH{1,2}_ZSTD_INC / _LIB for exactly this since they were
+# written, and this script had NEITHER. Run bare outside the dev shell it dies
+# with `fatal error: zstd.h: No such file or directory` and the message
+# `DRIVER-FAIL: the static library does not build`, which is accurate but says
+# nothing about the remedy; run under `direnv exec` it dies with `.envrc is
+# blocked`. The only way in was plain CPATH / LIBRARY_PATH, discovered rather
+# than documented. Both of those still work — this adds the hook its siblings
+# already had, so the three drivers are reached the same way.
+if [[ -n "${GDH3_ZSTD_INC:-}" ]]; then
+  ZSTDFLAGS+=("--passC:-I${GDH3_ZSTD_INC}")
+  CFLAGS_EXTRA+=("-I${GDH3_ZSTD_INC}")
+fi
+if [[ -n "${GDH3_ZSTD_LIB:-}" ]]; then
+  ZSTDFLAGS+=("--passL:-L${GDH3_ZSTD_LIB} -lzstd")
+  CFLAGS_EXTRA+=("-L${GDH3_ZSTD_LIB}")
+fi
+NIMFLAGS+=("${ZSTDFLAGS[@]+"${ZSTDFLAGS[@]}"}")
+
 HEADER=include/codetracer_trace_writer.h
 CSRC=tests/test_gdh3_fork_path_ids.c
 LIB=libcodetracer_trace_writer.a
@@ -96,6 +125,7 @@ build_lib() {  # build_lib <tag> [extra defines...]
     --nimMainPrefix:codetracerTraceWriter --passC:"-fPIC" -p:src \
     --hints:off --warnings:off \
     --nimcache:"$WORK/nc-lib-$tag" \
+    "${ZSTDFLAGS[@]+"${ZSTDFLAGS[@]}"}" \
     "$@" -o:"$WORK/lib-$tag.a" src/codetracer_trace_writer_ffi.nim \
     >"$WORK/lib-$tag.build.log" 2>&1
 }
@@ -103,7 +133,8 @@ build_lib() {  # build_lib <tag> [extra defines...]
 build_c() {  # build_c <outbin> <lib> [extra cflags...]
   local out="$1"; shift
   local lib="$1"; shift
-  gcc -o "$out" "$CSRC" "$lib" -lzstd -lm -I include "$@" \
+  gcc -o "$out" "$CSRC" "$lib" -lzstd -lm -I include \
+    "${CFLAGS_EXTRA[@]+"${CFLAGS_EXTRA[@]}"}" "$@" \
     >"$out.build.log" 2>&1
 }
 
