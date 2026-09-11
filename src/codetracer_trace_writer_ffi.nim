@@ -2381,6 +2381,23 @@ template gdh3Arm(name: untyped): bool =
   ## stray ``-d:`` can arm a mutation in a shipped build.
   when defined(gdh3FalsifierArms): defined(name) else: false
 
+when defined(gdh6FalsifierArms):
+  {.warning: "gdh6FalsifierArms: source-reload C ABI fault injection is COMPILED IN. This build must never be shipped or measured as a green result.".}
+
+template gdh6Arm(name: untyped): bool =
+  ## True iff the named GDH-M6 falsifier arm is armed — the master switch
+  ## ``-d:gdh6FalsifierArms`` AND the arm's own define.  Two defines rather
+  ## than one so no single stray ``-d:`` can arm a mutation in a shipped
+  ## build, and so a build carrying one warns about itself.
+  when defined(gdh6FalsifierArms): defined(name) else: false
+
+proc activeGdh6FalsifierArm*(): string =
+  ## The name of the armed mutation, or "" when none is.  A gate calls this
+  ## to prove its own green run measured the real implementation rather than
+  ## a mutant.
+  if gdh6Arm(gdh6FalsifyDiscardReloadResult): "gdh6FalsifyDiscardReloadResult"
+  else: ""
+
 const CtTwInvalidPathId = high(uint64)
   ## The failure return of the two entry points below.  A path id is an
   ## index into ``paths.dat``, so ``UINT64_MAX`` is not a value either
@@ -2554,6 +2571,127 @@ proc trace_writer_register_source_view(
     setError(res.error)
     return -1'i64
   int64(res.get())
+
+# ---------------------------------------------------------------------------
+# Source-reload markers (GDH-M6 — design §6.3)
+#
+# ``registerSourceReload`` landed in GDH-M2 on the Nim side only
+# (``multi_stream_writer.nim``), and every other occurrence of
+# ``sekSourceReload`` outside the writer is in a READER.  The consequence was
+# concrete: the Godot fork vendors this FFI's header, so the ONE host that has
+# a reload to record could not emit a marker at all, and GDH-M5 had to block
+# ``gdh5_reload_is_refused_while_a_step_is_pending`` for want of a container
+# to inspect.
+#
+# The entry point reports refusal the way GDH-M3's five do — a failure
+# INDICATION *and* a ``trace_writer_last_error`` naming the reason — because
+# the defect GDH-M3 found three times is a void C wrapper that discards a
+# ``Result``.  ``registerSourceReload`` returns ``Result[uint64, string]`` and
+# has six distinct refusals (empty change list, unregistered old/new id,
+# ``old == new``, ``generation < 2``, closed writer); a wrapper that dropped
+# them would leave a host silently marker-less, which is precisely the state
+# GDH-M0 measured.
+# ---------------------------------------------------------------------------
+
+type
+  CtTwSourceReloadChange {.packed.} = object
+    ## The C-visible mirror of ``SourceReloadChange``.  Three ``uint64``s
+    ## with no padding, so the layout is the same on every ABI this
+    ## library is linked into and a caller can build the array as a plain
+    ## C struct literal.
+    old_path_id: uint64
+    new_path_id: uint64
+    generation: uint64
+
+const CtTwInvalidReloadOrdinal = 0'u64
+  ## The failure return.  ``reload_ordinal`` is 1-based and monotonic
+  ## (``multi_stream_writer.nim``'s ``w.sourceReloads + 1``), so 0 is not a
+  ## value a successful call can produce.  Named rather than written as a
+  ## literal so the header's ``CT_TW_INVALID_RELOAD_ORDINAL`` and this
+  ## constant move together.
+
+proc trace_writer_register_source_reload(
+    handle: TraceWriterHandle,
+    changed: ptr UncheckedArray[CtTwSourceReloadChange],
+    changed_count: csize_t,
+    in_flight_frames: uint64,
+): uint64 {.exportc, cdecl, dynlib.} =
+  ## Emit a ``TagSourceReload`` marker at the current point in the
+  ## execution stream and return its 1-based ``reload_ordinal`` (design
+  ## §6.3.1).
+  ##
+  ## This is what makes a reload DISCOVERABLE in the container rather than
+  ## inferable from the path indices.  Every field is required to be
+  ## meaningful and the writer refuses the ones that are not:
+  ##
+  ## * ``changed_count`` must be non-zero — a marker that records a reload
+  ##   without recording what it changed cannot be told apart from one
+  ##   whose files were lost;
+  ## * each ``old_path_id`` / ``new_path_id`` must already be registered
+  ##   and must DIFFER — equal ids mean the reload minted no new index,
+  ##   i.e. the post-reload steps are about to be attributed to the
+  ##   pre-reload version, which is the mis-attribution GDH-M0 measured;
+  ## * ``generation`` must be >= 2 — generation 1 is the content the
+  ##   process started with (design §4.3), so a literal 1 is a protocol
+  ##   error rather than a plausible value.
+  ##
+  ## Returns ``CT_TW_INVALID_RELOAD_ORDINAL`` (0) on failure, with
+  ## ``trace_writer_last_error`` set to the writer's own message.  The
+  ## error buffer is CLEARED on entry, so a non-empty buffer after this
+  ## call is always this call's message and never a stale one — the same
+  ## contract ``trace_writer_register_path_version`` carries.
+  trace_writer_clear_last_error()
+  if handle.isNil:
+    setError("trace_writer_register_source_reload: NULL handle")
+    return CtTwInvalidReloadOrdinal
+  if not handle.useMultiStream:
+    setError("trace_writer_register_source_reload: the legacy " &
+      "single-stream backend has no execution stream to annotate")
+    return CtTwInvalidReloadOrdinal
+  if not handle.msWriterReady:
+    setError("trace_writer_register_source_reload: writer not ready " &
+      "(call trace_writer_begin_events first)")
+    return CtTwInvalidReloadOrdinal
+  if changed.isNil or changed_count == 0:
+    # Refused HERE as well as in the writer, because a NULL pointer with a
+    # non-zero count would be dereferenced below.  The message names the
+    # same thing the writer's does so a caller sees one vocabulary.
+    setError("trace_writer_register_source_reload: no changed files. A " &
+      "marker that records a reload without recording what it changed " &
+      "cannot be told apart from one whose files were lost")
+    return CtTwInvalidReloadOrdinal
+  var changes = newSeq[SourceReloadChange](int(changed_count))
+  for i in 0 ..< int(changed_count):
+    changes[i] = SourceReloadChange(
+      oldPathId: changed[i].old_path_id,
+      newPathId: changed[i].new_path_id,
+      generation: changed[i].generation)
+  let res = handle.msWriter.registerSourceReload(changes, in_flight_frames)
+  # FALSIFIER (``gdh6FalsifyDiscardReloadResult``,
+  # gdh6_reload_is_discoverable_end_to_end): discard the writer's Result and
+  # answer with a plausible ordinal.  This is GDH-M3's measured defect —
+  # three void C wrappers that returned silently on a refused registration —
+  # transplanted onto the one entry point whose refusals a host has no other
+  # way to see.  The gate must catch it on ``last_error`` being EMPTY after a
+  # call the writer refused, not on the return value alone.
+  when gdh6Arm(gdh6FalsifyDiscardReloadResult):
+    return 1'u64
+  if res.isErr:
+    setError(res.error)
+    return CtTwInvalidReloadOrdinal
+  res.get()
+
+proc trace_writer_source_reload_count(
+    handle: TraceWriterHandle,
+): uint64 {.exportc, cdecl, dynlib.} =
+  ## Markers emitted on this writer so far.  Exposed so a host can assert
+  ## the writer agrees with the container it produced without parsing it,
+  ## and so a host that emitted nothing cannot report that it did.
+  ## Answers 0 for a NULL / non-multi-stream / not-ready handle, which is
+  ## the truthful count in each of those cases.
+  if handle.isNil or not handle.useMultiStream or not handle.msWriterReady:
+    return 0'u64
+  handle.msWriter.sourceReloadCount()
 
 # ---------------------------------------------------------------------------
 # Request / interval spans (RS-M1)
