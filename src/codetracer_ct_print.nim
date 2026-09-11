@@ -130,6 +130,50 @@ proc precomputeStepGlis(reader: var NewTraceReader): seq[uint64] =
   if fetched.isErr or fetched.get() != n:
     return @[]
 
+var valueDecodeFailures = 0
+  ## How many steps this run could not decode a value record for.  Module-level
+  ## so the warning below is emitted once instead of once per step.
+
+proc valuesForStep*(reader: var NewTraceReader, stepIdx: uint64):
+    Result[seq[VariableValue], string] =
+  ## A step's decoded variable values, REPORTING a decode failure instead of
+  ## rendering the step as though it had none.
+  ##
+  ## A value record is a concatenation of tagged events, and a value-stream
+  ## event is **not self-delimiting** — a reader that meets a tag it does not
+  ## know cannot walk past it without guessing a length, so
+  ## ``value_stream.nim``'s ``decodeRecord`` fails the whole record instead
+  ## (deliberately; a guess would mis-frame every event after it).
+  ##
+  ## The consequence is a forward-compatibility hazard: a ``ct-print`` built
+  ## before a tag existed refuses every record carrying one.  Every call site
+  ## in this file used to be a bare ``if vals.isOk:`` with no ``else``, so that
+  ## refusal printed the step with **no variables at all** and said nothing —
+  ## indistinguishable from a step that genuinely has none.  Measured when
+  ## tag-9 ``Assignment`` landed: on one 486-step JavaScript recording a
+  ## ct-print from before the tag printed 1618 lines where the current one
+  ## prints 1956, with zero diagnostics.  The record was intact on disk the
+  ## whole time.
+  ##
+  ## Rebuilding ct-print from this repo (``just build``) is the fix; the point
+  ## of this proc is that the reader is TOLD to, rather than shown a smaller
+  ## trace.
+  ##
+  ## The failure is reported and then reported AS an empty value set — the
+  ## rendering stays exactly as permissive as it was, so no output that used to
+  ## be produced stops being produced.  Only the silence changes.
+  let vals = reader.values(stepIdx)
+  if vals.isOk:
+    return vals
+  inc valueDecodeFailures
+  if valueDecodeFailures == 1:
+    stderr.writeLine("ct-print: WARNING: step " & $stepIdx &
+      ": this step's value record did not decode, so the step is printed " &
+      "with NO variables even though the record is present in the " &
+      "container: " & vals.error &
+      "  (further occurrences are suppressed)")
+  ok(newSeq[VariableValue]())
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -587,7 +631,7 @@ proc printJsonV4(reader: var NewTraceReader) =
   let scForValues = reader.stepCount()
   if scForValues.isOk:
     for i in 0'u64 ..< scForValues.get():
-      let vals = reader.values(i)
+      let vals = reader.valuesForStep(i)
       if vals.isOk:
         for v in vals.get():
           var valObj = newJObject()
@@ -686,7 +730,7 @@ proc stepEventToJson(reader: var NewTraceReader, gli: GlobalLineIndex,
   nodes.add(stepObj)
 
   # Values for this step
-  let vals = reader.values(stepIdx)
+  let vals = reader.valuesForStep(stepIdx)
   if vals.isOk:
     for v in vals.get():
       var valObj = newJObject()
@@ -1189,7 +1233,7 @@ proc buildFullDocument(reader: var NewTraceReader,
           stepObj["depth"] = newJInt(int64(cs.depth))
         # Variable values (decoded)
         var valsArr = newJArray()
-        let vals = reader.values(stepIdx)
+        let vals = reader.valuesForStep(stepIdx)
         if vals.isOk:
           for v in vals.get():
             var vObj = newJObject()
@@ -1669,7 +1713,7 @@ proc printTextV4(reader: var NewTraceReader) =
         " (" & funcStr & ")"
 
     # Print values
-    let vals = reader.values(stepIdx)
+    let vals = reader.valuesForStep(stepIdx)
     if vals.isOk:
       for v in vals.get():
         var vnStr = "?"
@@ -1763,7 +1807,7 @@ proc followV4(filePath: string, pollMs: int) =
           if fn.isOk:
             stepObj["function"] = newJString(fn.get())
 
-        let vals = reader.values(stepIdx)
+        let vals = reader.valuesForStep(stepIdx)
         if vals.isOk and vals.get().len > 0:
           var valArr = newJArray()
           for v in vals.get():
