@@ -51,19 +51,41 @@ proc buildCowImage(entries: seq[(uint64, seq[byte])]): Result[seq[byte], string]
   ## live in page-aligned payload bytes appended after the B-tree page image.
   ## Rust opens the index through `CowNamespaceReader`, then resolves the
   ## descriptor into the payload region.
+  #
+  # BULK LOAD, not per-key insert. `entries` arrives sorted by key and
+  # de-duplicated (`finalize` builds it from a `Table`'s keys, sorted), which is
+  # exactly `bulkLoad`'s contract, and it builds the tree bottom-up in one pass
+  # with a single commit. The per-key `insertAndCommit` this started as is
+  # copy-on-write: it publishes a commit per key and copies the spine down on
+  # each one, so every superseded page stays in the image. Measured on this
+  # builder, per distinct line:
+  #
+  #     n        per-key image / RSS      bulk-loaded image / RSS
+  #     1 000    7 368 KiB /   51 MiB        36 KiB /  2 MiB
+  #    50 000  543 352 KiB / 4377 MiB     1 336 KiB / 28 MiB
+  #
+  # i.e. ~7.5 KiB of superseded pages per key rather than a flat ~27 B, and the
+  # gap widens with the key count. `linehits.tc` is written once at finalize
+  # over a known set, so the constructor form is the right one. `bulkLoad`
+  # re-validates the ordering and returns an `Err` rather than mis-building if a
+  # caller ever breaks it.
   var sizingTree = initCowBTree(cltTypeB, skipSubBlocks = true)
   let zeroDesc = descriptor(0, 0)
+  var sizingEntries: seq[(uint64, seq[byte])] = @[]
   for (key, _) in entries:
-    discard ?sizingTree.insertAndCommit(key, zeroDesc)
+    sizingEntries.add((key, zeroDesc))
+  discard ?sizingTree.bulkLoad(sizingEntries)
   let payloadBase = uint64(sizingTree.serialize().len)
 
   var payload: seq[byte] = @[]
-  var finalTree = initCowBTree(cltTypeB, skipSubBlocks = true)
+  var finalEntries: seq[(uint64, seq[byte])] = @[]
   for (key, data) in entries:
     let off = payloadBase + uint64(payload.len)
     payload.add(data)
-    discard ?finalTree.insertAndCommit(key, descriptor(off, uint64(data.len)))
+    finalEntries.add((key, descriptor(off, uint64(data.len))))
 
+  var finalTree = initCowBTree(cltTypeB, skipSubBlocks = true)
+  discard ?finalTree.bulkLoad(finalEntries)
   var image = finalTree.serialize()
   image.add(payload)
   while image.len mod PageSize != 0:

@@ -274,6 +274,55 @@ proc bench_linehits_100k_steps() =
   echo "PASS: bench_linehits_100k_steps"
 
 # ---------------------------------------------------------------------------
+# Test: the namespace image stays proportional to the line count
+# ---------------------------------------------------------------------------
+
+proc test_linehits_image_is_proportional_to_line_count() =
+  ## A SPACE gate, because correctness cannot see this defect.
+  ##
+  ## `buildCowImage` is a two-pass construction over a known, sorted, unique key
+  ## set, and it must build each B-tree with `bulkLoad`. Built instead with a
+  ## per-key `insertAndCommit`, every key publishes a copy-on-write commit and
+  ## leaves its superseded spine pages in the image: the tree carried ~7.5 KiB
+  ## per line rather than ~27 B, and 50k lines cost 543 MiB of image and 4.4 GiB
+  ## of RSS instead of 1.3 MiB and 28 MiB. Every correctness test above passed
+  ## in both states, which is exactly why this one measures bytes.
+  ##
+  ## A ladder, not a single point: the failure mode is that cost per key GROWS
+  ## with the key count. Deliberately a SPACE assertion and not a timing one —
+  ## image size is a deterministic function of the input, so unlike this repo's
+  ## throughput gates it cannot flake on a busy host.
+  ##
+  ## This matters most in column-aware mode, where a key is an addressable
+  ## (file, line, column) position rather than a line, so the key count is a
+  ## large multiple of the source's line count.
+  for n in [1_000, 10_000]:
+    var b = initLinehitsBuilder()
+    for i in 0 ..< n:
+      b.recordHit(uint64(i), uint64(i) * 2)
+    let finRes = b.finalize()
+    doAssert finRes.isOk, "finalize failed: " & finRes.error
+    let img = b.serializeCowNamespace()
+    doAssert img.isOk, "serialize failed: " & img.error
+    let bytesPerKey = img.get().len div n
+
+    # A varint step-id plus a 16-byte descriptor per line is ~19 B; the B-tree
+    # pages and the page-aligned tail put the bulk-loaded figure at ~27-36 B.
+    # 512 B leaves ample room for packing changes while still sitting ~15x
+    # below the ~7.5 KiB the per-key build produced.
+    doAssert bytesPerKey < 512,
+      "linehits image is " & $bytesPerKey & " bytes/key at n=" & $n &
+      " — expected < 512; the CoW B-tree is being built per-key rather than " &
+      "bulk-loaded"
+
+    # Content still round-trips at scale.
+    let hits = b.lookupHits(uint64(n div 2))
+    doAssert hits.isOk, "lookup failed: " & hits.error
+    doAssert hits.get() == @[uint64(n div 2) * 2]
+
+  echo "PASS: test_linehits_image_is_proportional_to_line_count"
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -283,6 +332,7 @@ when isMainModule:
   test_linehits_lookup_before_finalize()
   test_linehits_via_multi_stream_writer()
   test_writer_without_linehits()
+  test_linehits_image_is_proportional_to_line_count()
   bench_linehits_builder_overhead()
   bench_linehits_100k_steps()
   echo "All linehits builder tests passed."
