@@ -2,7 +2,7 @@
 magic: c0de72ace2
 version: 4
 encryption: emNone
-max_shards: 1
+max_shards: 0
 block_size: 4096
 max_root_entries: 31
 

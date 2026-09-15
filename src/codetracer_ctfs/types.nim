@@ -13,7 +13,12 @@ const
   CtfsVersion*: uint8 = 4
   CtfsVersionV3*: uint8 = 3  ## Previous version, accepted by v4 readers
   CtfsVersionV2*: uint8 = 2  ## Legacy version, accepted by v4 readers
-  DefaultMaxShards*: uint8 = 1  ## Default max_shards value
+  DefaultMaxShards*: uint8 = 0
+    ## `ctfs-container.md`: a container that is not sharded writes `0`, and `1`
+    ## is not a synonym for it. This wrote `1` while the Rust writer wrote `0`
+    ## for containers that were otherwise the same, which is how a field with
+    ## two spellings of one state presents: neither writer was wrong against the
+    ## text as it stood, so the text was pinned and both now write `0`.
   DefaultBlockSize*: uint32 = 4096
   DefaultMaxRootEntries*: uint32 = 31
   HeaderSize* = 8

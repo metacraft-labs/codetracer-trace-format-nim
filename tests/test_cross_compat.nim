@@ -125,13 +125,18 @@ proc test_ctfs_magic_version_blocksize() =
   doAssert data[3] == 0xAC'u8, "magic[3] mismatch"
   doAssert data[4] == 0xE2'u8, "magic[4] mismatch"
 
-  # Version: 3
-  # Rust: pub const CTFS_VERSION: u8 = 3;
+  # Version 4, the value `ctfs-container.md` section 1 states.
   doAssert data[5] == 4'u8, "version should be 4, got: " & $data[5]
 
-  # V4 layout: byte 6 = encryption (0 = None), byte 7 = max_shards (1 = default)
+  # V4 layout: byte 6 = encryption, byte 7 = max_shards.
+  #
+  # `max_shards` is 0 and not 1: the spec pins `0` for a container that is not
+  # sharded and says `1` is not a synonym for it. This asserted 1 while the Rust
+  # writer wrote 0 for a container otherwise identical -- which is what a field
+  # with two spellings of one state looks like from inside a cross-compatibility
+  # test that was comparing the two implementations byte for byte and passing.
   doAssert data[6] == 0'u8, "encryption should be 0 (None), got: " & $data[6]
-  doAssert data[7] == 1'u8, "max_shards should be 1, got: " & $data[7]
+  doAssert data[7] == 0'u8, "max_shards should be 0 (not sharded), got: " & $data[7]
 
   # Block size at offset 8: 4096 as u32 LE
   # Rust: pub const DEFAULT_BLOCK_SIZE: u32 = 4096;
