@@ -2289,6 +2289,22 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   # than refused. Doing it now is safe in the way doing it early was not: no
   # further step can arrive to contradict an empty per-line length table,
   # because the writer is closing.
+  #
+  # THE LINE SPACE IS BUILT HERE AND IS NOT `w.gli`. In a column-aware trace
+  # `w.gli` is the BYTE-OFFSET position space the step stream addresses through,
+  # and using it gave a function in the second file address 8 where the Rust
+  # writer gave 100000. A per-file line count of `DefaultLinesPerFile` where the
+  # trace records no real one is the same convention the Rust writer's
+  # `LinePositionSpace` uses, and both constants are 100,000.
+  var lineCounts: seq[uint64] = @[]
+  let pathCount = w.interningPtr[].paths.count()
+  for i in 0 ..< int(pathCount):
+    if w.lineCountTable and i < w.pathLineCounts.len and w.pathLineCounts[i] > 0:
+      lineCounts.add(w.pathLineCounts[i])
+    else:
+      lineCounts.add(DefaultLinesPerFile)
+  var lineSpace = buildGlobalLineIndex(lineCounts)
+
   for pf in w.pendingFuncs:
     var pathId: uint64 = 0
     if pf.path.len > 0:
@@ -2303,9 +2319,7 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
     # address carried by STEP records and says nothing about `funcs.dat`, and a
     # declaration site is a line rather than a cursor position — there is no
     # column at which a function is declared.
-    if w.gliDirty:
-      w.rebuildGli()
-    let gli = w.gli.globalIndex(int(pathId), max(pf.line, 1))
+    let gli = lineSpace.globalIndex(int(pathId), max(pf.line, 1))
     let rec = encodeFuncRecord(gli, pf.name)
     discard ?w.container.appendRecord(w.interningPtr[].funcs, rec)
   w.pendingFuncs.setLen(0)
