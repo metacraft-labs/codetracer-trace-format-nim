@@ -133,37 +133,37 @@ proc precomputeStepGlis(reader: var NewTraceReader): seq[uint64] =
 var valueDecodeFailures = 0
   ## How many steps this run could not decode a value record for.  Module-level
   ## so the warning below is emitted once instead of once per step.
+var warnedSkippedTags: seq[uint8] = @[]
+  ## Distinct unknown value-stream event tags >= 10 that have already been warned about.
 
 proc valuesForStep*(reader: var NewTraceReader, stepIdx: uint64):
     Result[seq[VariableValue], string] =
   ## A step's decoded variable values, REPORTING a decode failure instead of
   ## rendering the step as though it had none.
   ##
-  ## A value record is a concatenation of tagged events, and a value-stream
-  ## event is **not self-delimiting** — a reader that meets a tag it does not
-  ## know cannot walk past it without guessing a length, so
-  ## ``value_stream.nim``'s ``decodeRecord`` fails the whole record instead
-  ## (deliberately; a guess would mis-frame every event after it).
+  ## Forward-compatibility (HX-S-5 / HX-OQ-8):
+  ## Tags >= 10 carry a self-delimiting length prefix.  When an unknown tag
+  ## >= 10 is encountered, it is skipped while preserving known variable values
+  ## at this step.  A one-shot warning naming the skipped tag and count is
+  ## emitted to stderr so the skip is not silent.
   ##
-  ## The consequence is a forward-compatibility hazard: a ``ct-print`` built
-  ## before a tag existed refuses every record carrying one.  Every call site
-  ## in this file used to be a bare ``if vals.isOk:`` with no ``else``, so that
-  ## refusal printed the step with **no variables at all** and said nothing —
-  ## indistinguishable from a step that genuinely has none.  Measured when
-  ## tag-9 ``Assignment`` landed: on one 486-step JavaScript recording a
-  ## ct-print from before the tag printed 1618 lines where the current one
-  ## prints 1956, with zero diagnostics.  The record was intact on disk the
-  ## whole time.
-  ##
-  ## Rebuilding ct-print from this repo (``just build``) is the fix; the point
-  ## of this proc is that the reader is TOLD to, rather than shown a smaller
-  ## trace.
-  ##
-  ## The failure is reported and then reported AS an empty value set — the
-  ## rendering stays exactly as permissive as it was, so no output that used to
-  ## be produced stops being produced.  Only the silence changes.
+  ## Legacy / malformed records with unknown tags < 10 or truncated payloads
+  ## continue to fail the record, emitting a one-shot warning and rendering
+  ## the step with no variables.
   let vals = reader.values(stepIdx)
   if vals.isOk:
+    let skipped = reader.lastSkippedValueTags()
+    for tag in skipped:
+      if tag notin warnedSkippedTags:
+        warnedSkippedTags.add(tag)
+        var countInStep = 0
+        for t in skipped:
+          if t == tag: inc countInStep
+        when not defined(silentSkipForwardCompat):
+          stderr.writeLine("ct-print: WARNING: step " & $stepIdx &
+            ": unknown value-stream event tag " & $tag &
+            " skipped (" & $countInStep & " skipped; self-delimiting length prefix preserved visible variables; " &
+            "further occurrences suppressed)")
     return vals
   inc valueDecodeFailures
   if valueDecodeFailures == 1:
@@ -173,6 +173,7 @@ proc valuesForStep*(reader: var NewTraceReader, stepIdx: uint64):
       "container: " & vals.error &
       "  (further occurrences are suppressed)")
   ok(newSeq[VariableValue]())
+
 
 # ---------------------------------------------------------------------------
 # Helpers

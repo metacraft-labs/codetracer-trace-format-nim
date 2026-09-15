@@ -133,6 +133,9 @@ type
     # Cache for last decompressed SPEC chunk: the decoded per-record byte slices.
     cachedChunkIdx: int        ## -1 means no cache
     cachedRecords: seq[seq[byte]]
+    lastSkippedTags*: seq[uint8]  ## tags >= 10 skipped in the most recent readStepValues / readStepAssignments
+    skippedTags*: seq[uint8]      ## distinct tags >= 10 skipped across all reads
+    skippedTagCounts*: seq[(uint8, int)] ## cumulative count per tag
 
 # ---------------------------------------------------------------------------
 # type_id reconstruction helper
@@ -194,6 +197,15 @@ proc encodeAssignmentEvent*(varnameId: uint64, passBy: uint8,
   for b in rvalueCbor:
     outBuf.add(b)
 
+proc encodeLengthPrefixedEvent*(tag: uint8, payload: openArray[byte],
+    outBuf: var seq[byte]) =
+  ## Encode one forward-compatible self-delimiting value-stream event (tag >= 10):
+  ## ``u8 tag, varint payload_len, payload_bytes``.
+  outBuf.add(tag)
+  encodeVarint(uint64(payload.len), outBuf)
+  for b in payload:
+    outBuf.add(b)
+
 proc encodeRecord(values: openArray[VariableValue],
     extraEvents: openArray[byte], outBuf: var seq[byte]) =
   ## Encode one step's variable values as a SPEC value record.  A step with no
@@ -205,8 +217,8 @@ proc encodeRecord(values: openArray[VariableValue],
   ## verbatim.
   ##
   ## ``extraEvents`` is a already-encoded concatenation of further tagged
-  ## value-stream events (today only tag-9 ``Assignment``).  A record is
-  ## defined by the spec as "the concatenation of zero-or-more tagged
+  ## value-stream events (tag-9 ``Assignment``, or forward-compatible tag >= 10).
+  ## A record is defined by the spec as "the concatenation of zero-or-more tagged
   ## value-stream events", so appending them after the StepValues event is the
   ## canonical placement, and the reader walks events until the record's byte
   ## length is exhausted.
@@ -221,11 +233,18 @@ proc encodeRecord(values: openArray[VariableValue],
     for b in extraEvents:
       outBuf.add(b)
 
-proc decodeRecord(data: openArray[byte]): Result[seq[VariableValue], string] =
+proc decodeRecord*(data: openArray[byte],
+    skippedTags: var seq[uint8]): Result[seq[VariableValue], string] =
   ## Decode one SPEC value record (a concatenation of tagged events) back into
   ## the Nim ``VariableValue`` list.  The production writer only emits tag-0
   ## ``StepValues``; other tags are walked-and-skipped so the parallel index
   ## stays aligned even if a future record carries additional event kinds.
+  ##
+  ## Forward-compatibility (HX-S-5 / HX-OQ-8):
+  ## Tags >= 10 are self-delimited by a varint length prefix following the tag.
+  ## Unknown tags >= 10 are skipped and their tags recorded in ``skippedTags``,
+  ## preserving known variable values in the record.
+  ## Unknown tags < 10 are refused by name.
   if data.len == 0:
     return ok(newSeq[VariableValue]())
   var pos = 0
@@ -265,25 +284,38 @@ proc decodeRecord(data: openArray[byte]): Result[seq[VariableValue], string] =
         return err("truncated RValue payload in Assignment value-stream event")
       pos += fromLen
     else:
-      # Deliberately an ERROR, not a skip: a value-stream event is not
-      # self-delimiting, so an unknown tag cannot be walked over without
-      # guessing its length, and a guess would mis-frame every event after it.
-      # The consequence to know about: a reader built BEFORE a tag existed
-      # refuses every record carrying one. That is how a stale `ct-print`
-      # reports "(none)" for a step whose values are present on disk — rebuild
-      # it (`just build` in codetracer-trace-format-nim) rather than reaching
-      # for the writer.
-      return err("unsupported value-stream event tag " & $tag &
-        " in Nim value record (this reader predates the tag; rebuild ct-print " &
-        "from codetracer-trace-format-nim)")
+      when defined(oldReaderPreForwardCompat):
+        return err("unsupported value-stream event tag " & $tag &
+          " in Nim value record (this reader predates the tag; rebuild ct-print " &
+          "from codetracer-trace-format-nim)")
+      else:
+        if tag >= 10:
+          let payloadLen = int(?decodeVarint(data, pos))
+          if pos + payloadLen > data.len:
+            return err("truncated payload in value-stream event tag " & $tag &
+              " (expected " & $payloadLen & " bytes, only " & $(data.len - pos) & " remain)")
+          pos += payloadLen
+          skippedTags.add(tag)
+        else:
+          return err("unsupported value-stream event tag " & $tag &
+            " in Nim value record (this reader predates the tag; rebuild ct-print " &
+            "from codetracer-trace-format-nim)")
   ok(values)
 
-proc decodeRecordAssignments*(data: openArray[byte]):
-    Result[seq[AssignmentEventEntry], string] =
+proc decodeRecord*(data: openArray[byte]): Result[seq[VariableValue], string] =
+  var dummy: seq[uint8] = @[]
+  decodeRecord(data, dummy)
+
+proc decodeRecordAssignments*(data: openArray[byte],
+    skippedTags: var seq[uint8]): Result[seq[AssignmentEventEntry], string] =
   ## Decode the tag-9 ``Assignment`` events of one SPEC value record, in
   ## stream order.  Tag-0 ``StepValues`` events are walked over.  This is the
   ## read-back counterpart of ``encodeAssignmentEvent`` and exists so the Nim
   ## side can verify what it wrote without going through the Rust reader.
+  ##
+  ## Forward-compatibility (HX-S-5 / HX-OQ-8):
+  ## Tags >= 10 are self-delimited by a varint length prefix following the tag.
+  ## Unknown tags >= 10 are skipped and their tags recorded in ``skippedTags``.
   var pos = 0
   var found: seq[AssignmentEventEntry] = @[]
   while pos < data.len:
@@ -314,9 +346,27 @@ proc decodeRecordAssignments*(data: openArray[byte]):
       found.add(AssignmentEventEntry(
         varnameId: vnId, passBy: passBy, rvalueCbor: blob))
     else:
-      return err("unsupported value-stream event tag " & $tag &
-        " in Nim value record")
+      when defined(oldReaderPreForwardCompat):
+        return err("unsupported value-stream event tag " & $tag &
+          " in Nim value record")
+      else:
+        if tag >= 10:
+          let payloadLen = int(?decodeVarint(data, pos))
+          if pos + payloadLen > data.len:
+            return err("truncated payload in value-stream event tag " & $tag &
+              " (expected " & $payloadLen & " bytes, only " & $(data.len - pos) & " remain)")
+          pos += payloadLen
+          skippedTags.add(tag)
+        else:
+          return err("unsupported value-stream event tag " & $tag &
+            " in Nim value record")
   ok(found)
+
+proc decodeRecordAssignments*(data: openArray[byte]):
+    Result[seq[AssignmentEventEntry], string] =
+  var dummy: seq[uint8] = @[]
+  decodeRecordAssignments(data, dummy)
+
 
 # ---------------------------------------------------------------------------
 # Writer (SPEC chunked layout)
@@ -604,13 +654,29 @@ proc readStepValues*(r: var ValueStreamReader,
 
   if within >= r.cachedRecords.len:
     return err("value record " & $within & " missing in chunk " & $chunkNumber)
-  decodeRecord(r.cachedRecords[within])
+  var skipped: seq[uint8] = @[]
+  let res = decodeRecord(r.cachedRecords[within], skipped)
+  if skipped.len > 0:
+    r.lastSkippedTags = skipped
+    for t in skipped:
+      if t notin r.skippedTags:
+        r.skippedTags.add(t)
+      var found = false
+      for i in 0 ..< r.skippedTagCounts.len:
+        if r.skippedTagCounts[i][0] == t:
+          inc r.skippedTagCounts[i][1]
+          found = true
+          break
+      if not found:
+        r.skippedTagCounts.add((t, 1))
+  res
 
 proc readStepAssignments*(r: var ValueStreamReader,
     stepIndex: uint64): Result[seq[AssignmentEventEntry], string] =
   ## Read the tag-9 ``Assignment`` events recorded for a given step
   ## (record N ↔ step N).  Legacy ``.off`` VRT bundles never carried them, so
   ## they report an empty sequence rather than an error.
+  r.lastSkippedTags.setLen(0)
   if r.legacy:
     return ok(newSeq[AssignmentEventEntry]())
 
@@ -634,4 +700,29 @@ proc readStepAssignments*(r: var ValueStreamReader,
 
   if within >= r.cachedRecords.len:
     return err("value record " & $within & " missing in chunk " & $chunkNumber)
-  decodeRecordAssignments(r.cachedRecords[within])
+  var skipped: seq[uint8] = @[]
+  let res = decodeRecordAssignments(r.cachedRecords[within], skipped)
+  if skipped.len > 0:
+    r.lastSkippedTags = skipped
+    for t in skipped:
+      if t notin r.skippedTags:
+        r.skippedTags.add(t)
+      var found = false
+      for i in 0 ..< r.skippedTagCounts.len:
+        if r.skippedTagCounts[i][0] == t:
+          inc r.skippedTagCounts[i][1]
+          found = true
+          break
+      if not found:
+        r.skippedTagCounts.add((t, 1))
+  res
+
+proc lastSkippedTags*(r: ValueStreamReader): seq[uint8] =
+  r.lastSkippedTags
+
+proc skippedTags*(r: ValueStreamReader): seq[uint8] =
+  r.skippedTags
+
+proc skippedTagCounts*(r: ValueStreamReader): seq[(uint8, int)] =
+  r.skippedTagCounts
+

@@ -1461,6 +1461,25 @@ proc valueCount*(r: var NewTraceReader): Result[uint64, string] =
   ?r.ensureValueReader()
   ok(r.valueReader.count())
 
+proc lastSkippedValueTags*(r: NewTraceReader): seq[uint8] =
+  if r.valueLoaded:
+    r.valueReader.lastSkippedTags
+  else:
+    @[]
+
+proc skippedValueTags*(r: NewTraceReader): seq[uint8] =
+  if r.valueLoaded:
+    r.valueReader.skippedTags
+  else:
+    @[]
+
+proc skippedValueTagCounts*(r: NewTraceReader): seq[(uint8, int)] =
+  if r.valueLoaded:
+    r.valueReader.skippedTagCounts
+  else:
+    @[]
+
+
 # ---------------------------------------------------------------------------
 # Call access (lazy init)
 # ---------------------------------------------------------------------------

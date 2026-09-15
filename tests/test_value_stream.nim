@@ -381,23 +381,20 @@ proc test_value_stream_assignment_events() {.raises: [].} =
 # ---------------------------------------------------------------------------
 
 proc test_value_stream_unknown_tag_is_refused_by_name() {.raises: [].} =
-  ## A value-stream event is NOT self-delimiting, so a reader that meets a tag
-  ## it does not know cannot walk past it and must refuse the whole record
-  ## rather than guess a length and mis-frame everything after it.
+  ## Value-stream event tags < 10 are NOT self-delimiting, so a reader that
+  ## meets an unhandled tag < 10 cannot walk past it and must refuse the whole
+  ## record rather than guess a length and mis-frame everything after it.
   ##
   ## That refusal is a forward-compatibility hazard with a specific symptom —
   ## a binary older than a tag reports a step as having no variables — so the
-  ## message has to NAME the remedy.  Asserted here because a reader that
-  ## failed silently, or with a message that did not mention rebuilding, would
-  ## send the next reader to the wrong layer entirely.
+  ## message has to NAME the remedy.
   var ctfs = createCtfs()
   let writerRes = initValueStreamWriter(ctfs, chunkSize = 4)
   doAssert writerRes.isOk, "initValueStreamWriter failed: " & writerRes.error
   var writer = writerRes.get()
 
-  # A record carrying one event with a tag no reader knows.  `0x7F` is not
-  # assigned by `trace-events.md` §"Value Stream Events" (0-9 are).
-  let unknown: seq[byte] = @[0x7F'u8, 0x01'u8]
+  # A record carrying an unhandled tag < 10 (e.g. tag 5).
+  let unknown: seq[byte] = @[0x05'u8, 0x01'u8]
   let w = writeStepValues(ctfs, writer, [], unknown)
   doAssert w.isOk, "write failed: " & w.error
   let fr = value_stream.flush(ctfs, writer)
@@ -408,13 +405,83 @@ proc test_value_stream_unknown_tag_is_refused_by_name() {.raises: [].} =
   var reader = readerRes.get()
 
   let got = readStepValues(reader, 0'u64)
-  doAssert got.isErr, "an unknown value-stream tag must be REFUSED, not skipped"
-  doAssert got.error.contains("127"),
+  doAssert got.isErr, "an unknown value-stream tag < 10 must be REFUSED, not skipped"
+  doAssert got.error.contains("5"),
     "the refusal must name the tag it could not walk: " & got.error
   doAssert got.error.contains("rebuild ct-print"),
     "the refusal must name the remedy (rebuilding a stale reader): " & got.error
 
   echo "PASS: test_value_stream_unknown_tag_is_refused_by_name"
+
+# ---------------------------------------------------------------------------
+# test_value_stream_forward_compat_tag_skipped — HX-S-5 / HX-OQ-8
+# ---------------------------------------------------------------------------
+
+proc test_value_stream_forward_compat_tag_skipped() {.raises: [].} =
+  ## Under HX-S-5 / HX-OQ-8, value-stream event tags >= 10 are self-delimited
+  ## by a varint length prefix.  An unknown tag >= 10 is skipped cleanly,
+  ## preserving the step's visible variable values (StepValues).
+  var rng = initRng(7777)
+  let testValues = makeValues(rng, 2)
+
+  var ctfs = createCtfs()
+  let writerRes = initValueStreamWriter(ctfs, chunkSize = 4)
+  doAssert writerRes.isOk, "initValueStreamWriter failed: " & writerRes.error
+  var writer = writerRes.get()
+
+  # Encode a forward-compatible unknown event tag 10 with a 4-byte payload.
+  var extra: seq[byte] = @[]
+  encodeLengthPrefixedEvent(10'u8, [0xDE'u8, 0xAD'u8, 0xBE'u8, 0xEF'u8], extra)
+
+  # Write step 0 with visible values AND the unknown tag 10 event.
+  let w = writeStepValues(ctfs, writer, testValues, extra)
+  doAssert w.isOk, "write failed: " & w.error
+  let fr = value_stream.flush(ctfs, writer)
+  doAssert fr.isOk, "flush failed: " & fr.error
+
+  let readerRes = initValueStreamReader(ctfs.toBytes())
+  doAssert readerRes.isOk, "initValueStreamReader failed: " & readerRes.error
+  var reader = readerRes.get()
+
+  let got = readStepValues(reader, 0'u64)
+  doAssert got.isOk, "tag >= 10 must be SKIPPED, not refused: " & (if got.isErr: got.error else: "")
+  assertEqualVals(got.get(), testValues, "forward-compat step 0 values preserved")
+
+  # Verify the reader recorded the skipped tag.
+  doAssert reader.lastSkippedTags == @[10'u8],
+    "lastSkippedTags must record skipped tag 10, got: " & $reader.lastSkippedTags
+  doAssert reader.skippedTags == @[10'u8],
+    "skippedTags must record skipped tag 10, got: " & $reader.skippedTags
+  doAssert reader.skippedTagCounts == @[(10'u8, 1)],
+    "skippedTagCounts mismatch: " & $reader.skippedTagCounts
+
+  echo "PASS: test_value_stream_forward_compat_tag_skipped"
+
+proc test_value_stream_forward_compat_truncated_payload_refused() {.raises: [].} =
+  ## If a tag >= 10 specifies a length prefix that extends beyond the record,
+  ## the reader must report a truncation error rather than panic or overrun.
+  var ctfs = createCtfs()
+  let writerRes = initValueStreamWriter(ctfs, chunkSize = 4)
+  doAssert writerRes.isOk, "initValueStreamWriter failed: " & writerRes.error
+  var writer = writerRes.get()
+
+  # Tag 127 with declared payload length of 10 bytes, but only 2 bytes provided.
+  let truncated: seq[byte] = @[127'u8, 10'u8, 0xAA'u8, 0xBB'u8]
+  let w = writeStepValues(ctfs, writer, [], truncated)
+  doAssert w.isOk, "write failed: " & w.error
+  let fr = value_stream.flush(ctfs, writer)
+  doAssert fr.isOk, "flush failed: " & fr.error
+
+  let readerRes = initValueStreamReader(ctfs.toBytes())
+  doAssert readerRes.isOk, "initValueStreamReader failed: " & readerRes.error
+  var reader = readerRes.get()
+
+  let got = readStepValues(reader, 0'u64)
+  doAssert got.isErr, "truncated tag >= 10 must be refused with truncation error"
+  doAssert got.error.contains("truncated payload in value-stream event tag 127"),
+    "error must describe truncation: " & got.error
+
+  echo "PASS: test_value_stream_forward_compat_truncated_payload_refused"
 
 # Run all tests
 test_value_stream_write_read()
@@ -423,3 +490,6 @@ test_value_stream_many_variables()
 test_value_stream_legacy_back_compat()
 test_value_stream_assignment_events()
 test_value_stream_unknown_tag_is_refused_by_name()
+test_value_stream_forward_compat_tag_skipped()
+test_value_stream_forward_compat_truncated_payload_refused()
+
