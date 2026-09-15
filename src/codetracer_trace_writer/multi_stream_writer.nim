@@ -2293,7 +2293,19 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
     var pathId: uint64 = 0
     if pf.path.len > 0:
       pathId = ?w.container.ensureQualifiedPathId(w.interningPtr[], w.qualifier, pf.path)
-    let gli = w.toGlobalLineIndex(pathId, max(pf.line, 1))
+    # A LINE ADDRESS, NOT THE COLUMN-AWARE POSITION ADDRESS, and the difference
+    # is not academic: `toGlobalLineIndex` returns a byte offset in a
+    # column-aware trace, so using it here gave a function in the second file
+    # address 8 where the Rust writer gave 100000, for the same function in the
+    # same trace.
+    #
+    # `internal-files.md` settles it: the column extension re-interprets the
+    # address carried by STEP records and says nothing about `funcs.dat`, and a
+    # declaration site is a line rather than a cursor position — there is no
+    # column at which a function is declared.
+    if w.gliDirty:
+      w.rebuildGli()
+    let gli = w.gli.globalIndex(int(pathId), max(pf.line, 1))
     let rec = encodeFuncRecord(gli, pf.name)
     discard ?w.container.appendRecord(w.interningPtr[].funcs, rec)
   w.pendingFuncs.setLen(0)
