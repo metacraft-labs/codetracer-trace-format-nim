@@ -322,9 +322,17 @@ proc readRawById*(r: InterningTableReader,
 # `specific_info` is the CBOR of `TypeSpecificInfo`, matching the Rust writer;
 # `None` is the four-character text string, five bytes.
 
-const TypeSpecificInfoNoneCbor* = [0x64'u8, 0x4e, 0x6f, 0x6e, 0x65]
-  ## CBOR of `TypeSpecificInfo::None` — text(4) "None". Serde encodes a unit
-  ## enum variant as its name, and the Rust writer stores exactly this.
+const TypeSpecificInfoNoneCbor* = [
+  0xa1'u8, 0x64, 0x6b, 0x69, 0x6e, 0x64, 0x64, 0x4e, 0x6f, 0x6e, 0x65]
+  ## CBOR of `TypeSpecificInfo::None`, byte for byte as the Rust writer stores
+  ## it: `map(1) { "kind": "None" }`.
+  ##
+  ## NOT the bare text string `"None"`, which is what a unit enum variant looks
+  ## like under serde's DEFAULT externally-tagged representation and was the
+  ## first guess here. `TypeSpecificInfo` is tagged with a `kind` field, so the
+  ## unit variant is a single-entry map. The differential is what settled it —
+  ## the two writers' `types.dat` agreed on the kind byte, the length and the
+  ## name, and differed only in this trailer.
 
 proc encodeFuncRecord*(globalLineIndex: uint64, name: string): seq[byte] =
   ## `funcs.dat` record: `global_line_index: varint, name_len: varint, name`.

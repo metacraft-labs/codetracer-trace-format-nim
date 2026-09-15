@@ -420,6 +420,35 @@ void trace_writer_register_variable_raw(trace_writer_t handle,
                                         int type_kind,
                                         const char* type_name);
 
+/* Register a variable whose type is ALREADY interned.
+ *
+ * The `_by_type_id` forms exist because a caller may hold a type ID and no
+ * name. Every entry above takes a type NAME and interns it internally, which is
+ * fine for a recorder that names its types and impossible for one that does
+ * not: `codetracer_trace_types::ValueRecord::{Int,Float,Bool}` carries an ID
+ * and nothing else. Faced with that, a caller's only other option is to invent
+ * a name, and an invented name interns a type the recorder never declared.
+ *
+ * A type ID that was never returned by `trace_writer_ensure_type_id` is
+ * REFUSED: the call records nothing and `trace_writer_last_error` names the id
+ * and says it was never registered. These entry points return void, so that is
+ * the only channel they have — and a silent return would make a refused
+ * registration indistinguishable from a successful one.
+ */
+void trace_writer_register_return_int_by_type_id(trace_writer_t handle,
+                                                 int64_t value,
+                                                 size_t type_id);
+
+void trace_writer_register_variable_int_by_type_id(trace_writer_t handle,
+                                                   const char* name,
+                                                   int64_t value,
+                                                   size_t type_id);
+
+void trace_writer_register_variable_raw_by_type_id(trace_writer_t handle,
+                                                   const char* name,
+                                                   const char* value_repr,
+                                                   size_t type_id);
+
 void trace_writer_register_variable_cbor(trace_writer_t handle,
     const char* name,
     const uint8_t* cbor_data,

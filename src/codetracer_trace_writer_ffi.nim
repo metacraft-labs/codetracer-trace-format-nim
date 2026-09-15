@@ -1245,16 +1245,40 @@ proc trace_writer_register_return(handle: TraceWriterHandle) {.exportc, cdecl, d
     return
   discard handle.writer.writeReturn()
 
-proc trace_writer_register_return_int(
-    handle: TraceWriterHandle,
-    value: int64,
-    type_kind: FfiTypeKind,
-    type_name: cstring,
-) {.exportc, cdecl, dynlib.} =
-  ## Register a function return with an integer return value.
-  if handle.isNil:
-    return
-  let typeId = trace_writer_ensure_type_id(handle, type_kind, type_name)
+# ---------------------------------------------------------------------------
+# Registering a variable whose type is already interned
+# ---------------------------------------------------------------------------
+#
+# THE ABI HAD NO WAY TO SAY "THIS VALUE HAS TYPE ID N", and that gap had a
+# visible cost. Every entry point below took a type NAME and interned it
+# internally, while a Rust `ValueRecord::{Int,Float,Bool}` carries a type ID and
+# no name at all. A caller holding an id and facing an ABI that wants a name has
+# no honest move, so `codetracer_trace_writer_nim`'s wrapper SYNTHESISED one —
+# `format!("type_{}", type_id.0)` — and the container interned a type the
+# recorder never declared.
+#
+# The id-taking entries below close that gap. They are ADDITIONS: every
+# name-taking entry keeps its signature and its behaviour, because a caller that
+# genuinely has a name should still be able to pass one.
+#
+# A DANGLING ID IS REFUSED BY NAME. These entry points return void, so
+# `trace_writer_last_error` is the only channel they have; a silent return would
+# make a refused registration indistinguishable from a successful one, which is
+# this codebase's most expensive recurring defect.
+
+proc typeIdIsRegistered(handle: TraceWriterHandle, typeId: csize_t): bool =
+  typeId < csize_t(handle.types.len)
+
+proc danglingTypeId(handle: TraceWriterHandle, typeId: csize_t, what: string): bool =
+  ## True when the id is dangling, having set the error message.
+  if handle.typeIdIsRegistered(typeId):
+    return false
+  setError($what & ": type id " & $typeId & " was never registered. " &
+    "Call trace_writer_ensure_type_id first; " & $handle.types.len &
+    " type(s) are registered on this writer.")
+  true
+
+proc registerReturnIntById(handle: TraceWriterHandle, value: int64, typeId: csize_t) =
 
   if handle.useMultiStream:
     # Encode the return value as CBOR bytes using the streaming encoder
@@ -1275,6 +1299,31 @@ proc trace_writer_register_return_int(
       ),
     ),
   ))
+
+proc trace_writer_register_return_int(
+    handle: TraceWriterHandle,
+    value: int64,
+    type_kind: FfiTypeKind,
+    type_name: cstring,
+) {.exportc, cdecl, dynlib.} =
+  ## Register an integer return value, interning `type_name`.
+  if handle.isNil:
+    return
+  registerReturnIntById(handle, value,
+    trace_writer_ensure_type_id(handle, type_kind, type_name))
+
+proc trace_writer_register_return_int_by_type_id(
+    handle: TraceWriterHandle,
+    value: int64,
+    type_id: csize_t,
+) {.exportc, cdecl, dynlib.} =
+  ## Register an integer return value whose type is ALREADY interned.
+  ## A dangling id is refused — see the block above `typeIdIsRegistered`.
+  if handle.isNil:
+    return
+  if handle.danglingTypeId(type_id, "trace_writer_register_return_int_by_type_id"):
+    return
+  registerReturnIntById(handle, value, type_id)
 
 proc trace_writer_register_return_raw(
     handle: TraceWriterHandle,
@@ -1306,17 +1355,8 @@ proc trace_writer_register_return_raw(
     ),
   ))
 
-proc trace_writer_register_variable_int(
-    handle: TraceWriterHandle,
-    name: cstring,
-    value: int64,
-    type_kind: FfiTypeKind,
-    type_name: cstring,
-) {.exportc, cdecl, dynlib.} =
-  ## Register a variable with an integer value.
-  if handle.isNil:
-    return
-  let typeId = trace_writer_ensure_type_id(handle, type_kind, type_name)
+proc registerVariableIntById(
+    handle: TraceWriterHandle, name: cstring, value: int64, typeId: csize_t) =
 
   if handle.useMultiStream:
     # Intern the variable name
@@ -1345,17 +1385,34 @@ proc trace_writer_register_variable_int(
     intTypeId: TypeId(typeId),
   ))
 
-proc trace_writer_register_variable_raw(
+proc trace_writer_register_variable_int(
     handle: TraceWriterHandle,
     name: cstring,
-    value_repr: cstring,
+    value: int64,
     type_kind: FfiTypeKind,
     type_name: cstring,
 ) {.exportc, cdecl, dynlib.} =
-  ## Register a variable with a string (raw) value representation.
+  ## Register a variable with an integer value, interning `type_name`.
   if handle.isNil:
     return
-  let typeId = trace_writer_ensure_type_id(handle, type_kind, type_name)
+  registerVariableIntById(handle, name, value,
+    trace_writer_ensure_type_id(handle, type_kind, type_name))
+
+proc trace_writer_register_variable_int_by_type_id(
+    handle: TraceWriterHandle,
+    name: cstring,
+    value: int64,
+    type_id: csize_t,
+) {.exportc, cdecl, dynlib.} =
+  ## Register a variable with an integer value whose type is ALREADY interned.
+  if handle.isNil:
+    return
+  if handle.danglingTypeId(type_id, "trace_writer_register_variable_int_by_type_id"):
+    return
+  registerVariableIntById(handle, name, value, type_id)
+
+proc registerVariableRawById(
+    handle: TraceWriterHandle, name: cstring, value_repr: cstring, typeId: csize_t) =
 
   if handle.useMultiStream:
     # Intern the variable name
@@ -1383,6 +1440,32 @@ proc trace_writer_register_variable_raw(
     rawStr: toNimStr(value_repr),
     rawTypeId: TypeId(typeId),
   ))
+
+proc trace_writer_register_variable_raw(
+    handle: TraceWriterHandle,
+    name: cstring,
+    value_repr: cstring,
+    type_kind: FfiTypeKind,
+    type_name: cstring,
+) {.exportc, cdecl, dynlib.} =
+  ## Register a variable with a raw value representation, interning `type_name`.
+  if handle.isNil:
+    return
+  registerVariableRawById(handle, name, value_repr,
+    trace_writer_ensure_type_id(handle, type_kind, type_name))
+
+proc trace_writer_register_variable_raw_by_type_id(
+    handle: TraceWriterHandle,
+    name: cstring,
+    value_repr: cstring,
+    type_id: csize_t,
+) {.exportc, cdecl, dynlib.} =
+  ## Register a variable with a raw value whose type is ALREADY interned.
+  if handle.isNil:
+    return
+  if handle.danglingTypeId(type_id, "trace_writer_register_variable_raw_by_type_id"):
+    return
+  registerVariableRawById(handle, name, value_repr, type_id)
 
 proc trace_writer_register_variable_cbor(
     handle: TraceWriterHandle,
