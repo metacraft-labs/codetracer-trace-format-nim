@@ -353,21 +353,21 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
   doAssert funcsReader.isOk, "funcs reader failed: " & funcsReader.error
   let fr = funcsReader.get()
   doAssert fr.count() == 3, "funcs count mismatch: " & $fr.count()
-  let f0 = fr.readById(0)
-  doAssert f0.isOk and f0.get() == "main", "func0 mismatch"
-  let f1 = fr.readById(1)
-  doAssert f1.isOk and f1.get() == "add", "func1 mismatch"
-  let f2 = fr.readById(2)
-  doAssert f2.isOk and f2.get() == "divide", "func2 mismatch"
+  let f0 = fr.readFuncById(0)
+  doAssert f0.isOk and f0.get().name == "main", "func0 mismatch"
+  let f1 = fr.readFuncById(1)
+  doAssert f1.isOk and f1.get().name == "add", "func1 mismatch"
+  let f2 = fr.readFuncById(2)
+  doAssert f2.isOk and f2.get().name == "divide", "func2 mismatch"
 
   let typesReader = initInterningTableReader(ctfsBytes, "types")
   doAssert typesReader.isOk, "types reader failed: " & typesReader.error
   let tr = typesReader.get()
   doAssert tr.count() == 2, "types count mismatch: " & $tr.count()
-  let t0 = tr.readById(0)
-  doAssert t0.isOk and t0.get() == "int", "type0 mismatch"
-  let t1 = tr.readById(1)
-  doAssert t1.isOk and t1.get() == "str", "type1 mismatch"
+  let t0 = tr.readTypeById(0)
+  doAssert t0.isOk and t0.get().langType == "int", "type0 mismatch"
+  let t1 = tr.readTypeById(1)
+  doAssert t1.isOk and t1.get().langType == "str", "type1 mismatch"
 
   let varnamesReader = initInterningTableReader(ctfsBytes, "varnames")
   doAssert varnamesReader.isOk, "varnames reader failed: " & varnamesReader.error

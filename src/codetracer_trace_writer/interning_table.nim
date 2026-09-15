@@ -300,6 +300,112 @@ proc readRawById*(r: InterningTableReader,
   ## raw bytes as a Latin-1 string, mangling the trailing varints).
   r.table.read(id)
 
+# ---------------------------------------------------------------------------
+# Spec record shapes for `funcs.dat` and `types.dat`
+# ---------------------------------------------------------------------------
+#
+# TWO OF THE FOUR TABLES ARE NOT BARE BYTES, and this module used to treat all
+# four as if they were. `internal-files.md` gives the four record shapes:
+#
+#   | paths.dat    | raw bytes (path) (+ line-count / Layout A table)  |
+#   | varnames.dat | raw bytes (name)                                  |
+#   | types.dat    | kind: u8, lang_type_len: varint, lang_type, specific_info |
+#   | funcs.dat    | global_line_index: varint, name_len: varint, name |
+#
+# Paths and varnames are raw bytes, so the generic table above is right for
+# them. Functions and types are structured, and writing them through the same
+# generic path produced records a conforming reader misreads: the Rust writer
+# emits the spec shape, and reading it as bare bytes yields the varint bytes as
+# part of the name — measured, as a `functions` array entry beginning `\xa6\x8d`
+# before `token::transfer`, which is not even valid UTF-8.
+#
+# `specific_info` is the CBOR of `TypeSpecificInfo`, matching the Rust writer;
+# `None` is the four-character text string, five bytes.
+
+const TypeSpecificInfoNoneCbor* = [0x64'u8, 0x4e, 0x6f, 0x6e, 0x65]
+  ## CBOR of `TypeSpecificInfo::None` — text(4) "None". Serde encodes a unit
+  ## enum variant as its name, and the Rust writer stores exactly this.
+
+proc encodeFuncRecord*(globalLineIndex: uint64, name: string): seq[byte] =
+  ## `funcs.dat` record: `global_line_index: varint, name_len: varint, name`.
+  result = @[]
+  encodeVarint(globalLineIndex, result)
+  encodeVarint(uint64(name.len), result)
+  for ch in name:
+    result.add(byte(ch))
+
+proc decodeFuncRecord*(data: openArray[byte]):
+    Result[tuple[globalLineIndex: uint64, name: string], string] =
+  ## Inverse of `encodeFuncRecord`. Refuses a truncated record by name rather
+  ## than returning a short string, because a silently short function name is
+  ## indistinguishable from a real one.
+  var pos = 0
+  let gli = ?decodeVarint(data, pos)
+  let nameLen = ?decodeVarint(data, pos)
+  if uint64(data.len - pos) < nameLen:
+    return err("funcs.dat record is truncated: declares a " & $nameLen &
+      "-byte name with only " & $(data.len - pos) & " bytes left")
+  var name = newString(int(nameLen))
+  for i in 0 ..< int(nameLen):
+    name[i] = char(data[pos + i])
+  ok((globalLineIndex: gli, name: name))
+
+proc encodeTypeRecord*(kind: uint8, langType: string,
+    specificInfo: openArray[byte] = TypeSpecificInfoNoneCbor): seq[byte] =
+  ## `types.dat` record: `kind: u8, lang_type_len: varint, lang_type,
+  ## specific_info`.
+  result = @[kind]
+  encodeVarint(uint64(langType.len), result)
+  for ch in langType:
+    result.add(byte(ch))
+  for b in specificInfo:
+    result.add(b)
+
+proc decodeTypeRecord*(data: openArray[byte]):
+    Result[tuple[kind: uint8, langType: string], string] =
+  ## Inverse of `encodeTypeRecord`, for the two leading fields. The trailing
+  ## `specific_info` blob is left to the caller: nothing in this library needs
+  ## it decoded, and decoding CBOR here would pull a dependency into a module
+  ## that is compiled for freestanding targets.
+  if data.len < 1:
+    return err("types.dat record is empty: it must carry at least the kind byte")
+  var pos = 1
+  let langLen = ?decodeVarint(data, pos)
+  if uint64(data.len - pos) < langLen:
+    return err("types.dat record is truncated: declares a " & $langLen &
+      "-byte lang_type with only " & $(data.len - pos) & " bytes left")
+  var lang = newString(int(langLen))
+  for i in 0 ..< int(langLen):
+    lang[i] = char(data[pos + i])
+  ok((kind: data[0], langType: lang))
+
+proc appendRecord*(ctfs: var Ctfs, it: var InterningTableWriter,
+    record: openArray[byte]): Result[uint64, string] =
+  ## Append a pre-encoded record and return its id, WITHOUT the string-keyed
+  ## dedup the bare tables use.
+  ##
+  ## Dedup for the structured tables is the caller's, because their identity is
+  ## not the payload: two functions with the same name at different declaration
+  ## sites are two records, and the FFI keys its id space on the name alone. A
+  ## payload-keyed dedup here would silently merge or split those.
+  let id = it.nextId
+  it.nextId += 1
+  var bytes = newSeq[byte](record.len)
+  for i in 0 ..< record.len:
+    bytes[i] = record[i]
+  ?ctfs.append(it.table, bytes)
+  ok(id)
+
+proc readFuncById*(r: InterningTableReader, id: uint64):
+    Result[tuple[globalLineIndex: uint64, name: string], string] =
+  ## Read a `funcs.dat` record in its spec shape.
+  decodeFuncRecord(?r.table.read(id))
+
+proc readTypeById*(r: InterningTableReader, id: uint64):
+    Result[tuple[kind: uint8, langType: string], string] =
+  ## Read a `types.dat` record in its spec shape.
+  decodeTypeRecord(?r.table.read(id))
+
 proc splitInterningPayload*(payload: string): tuple[qualifier, name: string] =
   ## Split a stored interning payload back into ``(qualifier, name)``.
   ##
@@ -358,11 +464,35 @@ proc ensurePathIdColumnAware*(ctfs: var Ctfs, t: var TraceInterningTables,
   ## on-disk layout.
   ctfs.ensurePathIdColumnAware(t.paths, path, lineLengths)
 
-proc ensureFunctionId*(ctfs: var Ctfs, t: var TraceInterningTables, name: string): Result[uint64, string] =
-  ctfs.ensureId(t.funcs, name)
+proc ensureStructuredId*(ctfs: var Ctfs, it: var InterningTableWriter,
+    key: string, record: openArray[byte]): Result[uint64, string] =
+  ## Intern a STRUCTURED record under a string key.
+  ##
+  ## The bare tables key their dedup on the payload because for them the payload
+  ## IS the key. `funcs.dat` and `types.dat` records are not: the same name can
+  ## encode to different bytes depending on the declaration site or the kind, so
+  ## the key is passed separately and the record is appended as given.
+  let existing = it.lookup.getOrDefault(key, high(uint64))
+  if existing != high(uint64):
+    return ok(existing)
+  let id = ?ctfs.appendRecord(it, record)
+  it.lookup[key] = id
+  ok(id)
 
-proc ensureTypeId*(ctfs: var Ctfs, t: var TraceInterningTables, name: string): Result[uint64, string] =
-  ctfs.ensureId(t.types, name)
+proc ensureFunctionId*(ctfs: var Ctfs, t: var TraceInterningTables, name: string): Result[uint64, string] =
+  ## Intern a function with no declaration site.
+  ##
+  ## Writes the SPEC record shape (`internal-files.md:46`) with a
+  ## `global_line_index` of 0 — the address of line 1 of the first file, which
+  ## is what an unspecified site resolves to. A caller that knows the site uses
+  ## `MultiStreamTraceWriter.registerFunctionAt`, which computes the real
+  ## address at close.
+  ctfs.ensureStructuredId(t.funcs, name, encodeFuncRecord(0, name))
+
+proc ensureTypeId*(ctfs: var Ctfs, t: var TraceInterningTables, name: string,
+    kind: uint8 = 0): Result[uint64, string] =
+  ## Intern a type in the SPEC record shape (`internal-files.md:45`).
+  ctfs.ensureStructuredId(t.types, name, encodeTypeRecord(kind, name))
 
 proc ensureVarnameId*(ctfs: var Ctfs, t: var TraceInterningTables, name: string): Result[uint64, string] =
   ctfs.ensureId(t.varnames, name)
@@ -393,11 +523,13 @@ proc appendQualifiedPathWithLineCount*(ctfs: var Ctfs,
 
 proc ensureQualifiedFunctionId*(ctfs: var Ctfs, t: var TraceInterningTables,
     qualifier, name: string): Result[uint64, string] =
-  ctfs.ensureQualifiedId(t.funcs, qualifier, name)
+  let key = qualifiedPayload(qualifier, name)
+  ctfs.ensureStructuredId(t.funcs, key, encodeFuncRecord(0, key))
 
 proc ensureQualifiedTypeId*(ctfs: var Ctfs, t: var TraceInterningTables,
     qualifier, name: string): Result[uint64, string] =
-  ctfs.ensureQualifiedId(t.types, qualifier, name)
+  let key = qualifiedPayload(qualifier, name)
+  ctfs.ensureStructuredId(t.types, key, encodeTypeRecord(0, key))
 
 proc ensureQualifiedVarnameId*(ctfs: var Ctfs, t: var TraceInterningTables,
     qualifier, name: string): Result[uint64, string] =

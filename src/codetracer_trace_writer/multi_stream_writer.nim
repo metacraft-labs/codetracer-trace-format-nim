@@ -209,6 +209,38 @@ type
       ## empty seq for files whose line_lengths the caller didn't
       ## supply.  Ignored when ``columnAwareSteps`` is false.
     pathLineCounts: seq[uint64]
+    pendingFuncs: seq[tuple[path: string, line: uint64, name: string]]
+      ## `funcs.dat` records, held until `close`.
+      ##
+      ## THE TABLE IS DEFERRED BECAUSE ITS RECORD NEEDS AN ADDRESS THAT DOES NOT
+      ## EXIST YET. `internal-files.md:46` gives the record as
+      ## `global_line_index: varint, name_len: varint, name`, and that address is
+      ## the declaration site's position in the trace's global space — which is
+      ## only computable once the path is interned and, for a line-count or
+      ## column-aware trace, once its size is known. At `registerFunction` time
+      ## neither is guaranteed.
+      ##
+      ## The alternative was to intern the path here, and it is DISQUALIFIED by
+      ## measurement rather than taste: `registerPath` would intern it with an
+      ## EMPTY per-line length table, and this table is write-once, so the real
+      ## lengths arriving later could not correct it. That silently corrupts
+      ## column-aware addressing for the file.
+      ##
+      ## Deferring costs bounded writer memory and nothing else. Interning
+      ## tables are NOT streamed: `trace-events.md:109` lists them as
+      ## "Loaded at startup", `internal-files.md:49` as "loaded at reader startup
+      ## (typically 1-5 MB total)". A reader reads them whole before anything
+      ## else, so holding them until close does not weaken the streaming property
+      ## that `steps.dat`, `values.dat`, `calls.dat` and `events.dat` rely on.
+      ## At 64 bytes of path, 32 of name and 8 of line, 10,000 functions is about
+      ## 1 MB and 100,000 about 10 MB — the same order as the table the reader
+      ## loads regardless.
+    funcIds: Table[string, uint64]
+      ## Name -> id for the deferred table, keeping the id space name-keyed as
+      ## the C ABI's `trace_writer_ensure_function_id` requires.
+    typeIds: Table[string, uint64]
+      ## Name -> id for `types.dat`, which is written eagerly but no longer
+      ## through the generic table's payload-keyed dedup.
       ## Per-path line counts, used in line-only mode to size each file's
       ## slot in the global position space at exactly the number of lines
       ## the file has.  Parallel to ``paths``.  Populated only when
@@ -1129,15 +1161,47 @@ proc registerSourceView*(w: var MultiStreamTraceWriter,
 # Function / Type / Varname registration (interning)
 # ---------------------------------------------------------------------------
 
+proc registerFunctionAt*(w: var MultiStreamTraceWriter,
+    path: string, line: uint64, name: string): Result[uint64, string] =
+  ## Register a function at its declaration site and return its interned ID.
+  ##
+  ## The record is BUFFERED, not written: see `pendingFuncs` for why the address
+  ## it needs cannot be computed here. The id is allocated immediately, so a
+  ## caller can reference the function straight away.
+  let key = qualifiedPayload(w.qualifier, name)
+  let existing = w.funcIds.getOrDefault(key, high(uint64))
+  if existing != high(uint64):
+    return ok(existing)
+  let id = uint64(w.pendingFuncs.len)
+  w.pendingFuncs.add((path: path, line: line, name: key))
+  w.funcIds[key] = id
+  ok(id)
+
 proc registerFunction*(w: var MultiStreamTraceWriter,
     name: string): Result[uint64, string] =
-  ## Register a function name and return its interned ID.
-  w.container.ensureQualifiedFunctionId(w.interningPtr[], w.qualifier, name)
+  ## Register a function by name alone, with no declaration site.
+  ##
+  ## Kept for callers that have no path or line to give. The record still
+  ## carries a `global_line_index` because the spec's shape has no optional
+  ## field; it is the address of line 1 of the first file, which is what an
+  ## unspecified site resolves to.
+  w.registerFunctionAt("", 1, name)
 
 proc registerType*(w: var MultiStreamTraceWriter,
-    name: string): Result[uint64, string] =
-  ## Register a type name and return its interned ID.
-  w.container.ensureQualifiedTypeId(w.interningPtr[], w.qualifier, name)
+    name: string, kind: uint8 = 0): Result[uint64, string] =
+  ## Register a type and return its interned ID.
+  ##
+  ## Written in the spec's record shape (`kind`, `lang_type`, `specific_info`)
+  ## rather than as bare name bytes. Unlike functions this needs nothing that is
+  ## not available now, so it is not deferred.
+  let key = qualifiedPayload(w.qualifier, name)
+  let existing = w.typeIds.getOrDefault(key, high(uint64))
+  if existing != high(uint64):
+    return ok(existing)
+  let rec = encodeTypeRecord(kind, key)
+  let id = ?w.container.appendRecord(w.interningPtr[].types, rec)
+  w.typeIds[key] = id
+  ok(id)
 
 proc registerVarname*(w: var MultiStreamTraceWriter,
     name: string): Result[uint64, string] =
@@ -2214,6 +2278,25 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   ## un-popped frames.
   if w.closed:
     return ok()
+
+  # FLUSH THE DEFERRED `funcs.dat` FIRST, while the container is still open and
+  # every path this trace will ever register is already interned. That is the
+  # whole point of deferring: the record's `global_line_index` is computable now
+  # and was not computable when the function was registered.
+  #
+  # A declaration path that was never interned is a real possibility — a
+  # function in a file no step ever visited — and it is interned HERE rather
+  # than refused. Doing it now is safe in the way doing it early was not: no
+  # further step can arrive to contradict an empty per-line length table,
+  # because the writer is closing.
+  for pf in w.pendingFuncs:
+    var pathId: uint64 = 0
+    if pf.path.len > 0:
+      pathId = ?w.container.ensureQualifiedPathId(w.interningPtr[], w.qualifier, pf.path)
+    let gli = w.toGlobalLineIndex(pathId, max(pf.line, 1))
+    let rec = encodeFuncRecord(gli, pf.name)
+    discard ?w.container.appendRecord(w.interningPtr[].funcs, rec)
+  w.pendingFuncs.setLen(0)
 
   # Finalize linehits if enabled
   if w.linehitsBuilder.isSome:

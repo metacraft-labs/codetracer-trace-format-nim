@@ -94,19 +94,24 @@ proc test_interning_table_roundtrip() {.raises: [].} =
     doAssert readRes.get() == expected,
       "path mismatch at " & $i & ": got '" & readRes.get() & "' expected '" & expected & "'"
 
-  # Read back functions
+  # Read back functions.
+  #
+  # THROUGH `readFuncById`, NOT `readById`: `internal-files.md:46` gives a
+  # `funcs.dat` record as `global_line_index: varint, name_len: varint, name`,
+  # so reading it as bare bytes returns the varints as leading characters — the
+  # defect that made a Rust-written container print ' main'.
   for i in 0 ..< funcNames.len:
-    let readRes = funcsReader.readById(uint64(i))
-    doAssert readRes.isOk, "readById failed for func " & $i & ": " & readRes.error
-    doAssert readRes.get() == funcNames[i],
-      "func mismatch at " & $i & ": got '" & readRes.get() & "'"
+    let readRes = funcsReader.readFuncById(uint64(i))
+    doAssert readRes.isOk, "readFuncById failed for func " & $i & ": " & readRes.error
+    doAssert readRes.get().name == funcNames[i],
+      "func mismatch at " & $i & ": got '" & readRes.get().name & "'"
 
-  # Read back types
+  # Read back types, structured for the same reason (`internal-files.md:45`).
   for i in 0 ..< typeNames.len:
-    let readRes = typesReader.readById(uint64(i))
+    let readRes = typesReader.readTypeById(uint64(i))
     doAssert readRes.isOk
-    doAssert readRes.get() == typeNames[i],
-      "type mismatch at " & $i & ": got '" & readRes.get() & "'"
+    doAssert readRes.get().langType == typeNames[i],
+      "type mismatch at " & $i & ": got '" & readRes.get().langType & "'"
 
   # Read back varnames
   for i in 0 ..< varNames.len:

@@ -793,10 +793,29 @@ proc path*(r: NewTraceReader, id: uint64): Result[string, string] =
     r.pathReader.readById(id)  # error path — preserve the original error
 
 proc function*(r: NewTraceReader, id: uint64): Result[string, string] =
-  r.funcReader.readById(id)
+  ## THE RECORD IS STRUCTURED, NOT BARE BYTES. `internal-files.md:46` gives a
+  ## `funcs.dat` record as `global_line_index: varint, name_len: varint, name`.
+  ## Reading it with `readById` returns the varints as leading characters of the
+  ## name — which is what this did, and what made a Rust-written container print
+  ## a function called `\xa6\x8dtoken::transfer`.
+  ok((?r.funcReader.readFuncById(id)).name)
+
+proc functionRecord*(r: NewTraceReader, id: uint64):
+    Result[tuple[globalLineIndex: uint64, name: string], string] =
+  ## The whole record, for a caller that wants the declaration site as well as
+  ## the name.
+  r.funcReader.readFuncById(id)
 
 proc typeName*(r: NewTraceReader, id: uint64): Result[string, string] =
-  r.typeReader.readById(id)
+  ## Structured for the same reason as `function`: `internal-files.md:45` gives
+  ## a `types.dat` record as `kind: u8, lang_type_len: varint, lang_type,
+  ## specific_info`.
+  ok((?r.typeReader.readTypeById(id)).langType)
+
+proc typeRecord*(r: NewTraceReader, id: uint64):
+    Result[tuple[kind: uint8, langType: string], string] =
+  ## The kind alongside the name.
+  r.typeReader.readTypeById(id)
 
 proc varname*(r: NewTraceReader, id: uint64): Result[string, string] =
   r.varnameReader.readById(id)

@@ -1107,9 +1107,12 @@ proc trace_writer_ensure_function_id(
   handle.functionIndex[key] = id
 
   if handle.useMultiStream:
-    # Intern the function name in the multi-stream interning table
+    # Intern the function WITH its declaration site. `funcs.dat`'s record
+    # carries a `global_line_index` (internal-files.md:46), so the path and line
+    # this call already receives are no longer dropped here; the writer buffers
+    # them and computes the address at close, when the path table is complete.
     if handle.msWriterReady:
-      discard handle.msWriter.registerFunction(n)
+      discard handle.msWriter.registerFunctionAt(p, uint64(max(line, 1)), n)
   else:
     # Emit function event: use pathId 0 for now (callers should register paths first)
     # In practice recorders call ensure_function_id with the path they already registered
@@ -1140,7 +1143,7 @@ proc trace_writer_ensure_type_id(
   if handle.useMultiStream:
     # Intern the type name in the multi-stream interning table
     if handle.msWriterReady:
-      discard handle.msWriter.registerType(lt)
+      discard handle.msWriter.registerType(lt, uint8(ord(tk)))
   else:
     # Emit type event
     discard handle.writer.writeEvent(TraceLowLevelEvent(
