@@ -2531,6 +2531,17 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
     # reader, marks the bundle as SPEC-framed (vs the legacy Nim-v4 .off VRT
     # framing that never set it).
     hasIoEventStream = true,
+    # M23d: the writer ALWAYS creates the four interning tables —
+    # `initTraceInterningTables` builds paths/funcs/types/varnames eagerly for
+    # every trace — so bit 12 is additive and unconditional like the four stream
+    # bits above.
+    #
+    # It was simply never passed, so every container this writer has produced
+    # emitted all four tables and then declared it had none. That is worse than
+    # a missing capability: a reader honouring the flag skips tables that are
+    # right there, and the two writers' `meta.flags` differed on this one bit
+    # while agreeing on the other eleven.
+    hasInterningTables = true,
     # RS-M1: unlike the four stream bits above, bit 13 is stamped ONLY when a
     # span was actually registered.  See `hasSpans` for why this one is
     # conditional: bit 13 is rejecting, not additive, at the reader.
