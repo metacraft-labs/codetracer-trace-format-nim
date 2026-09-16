@@ -269,6 +269,53 @@ proc test_orphan_without_a_known_location_still_reaches_the_stream() =
   echo "PASS: no-location orphan values still reach the value stream"
   ct_reader_close(r)
 
+proc test_the_terminus_does_not_change_the_step_count() =
+  ## A recording has exactly N + 1 steps for a recorder that emitted N — the
+  ## entry step `start` adds, and nothing else (spec §"The entry step is part
+  ## of `start`"). Saving values staged at the very end must not change that.
+  ##
+  ## This is the shape a converter produces when it emits no steps of its own:
+  ## `start` records the entry step, calls and returns come and go, and the
+  ## last thing before close is a value. The terminus used to reuse the last
+  ## step's position for one MORE record, so such a recording came out two
+  ## steps long. The count then depended on whether a value happened to be
+  ## staged at the end, which no recorder author can foresee, and step-count
+  ## assertions across four recorder repositories failed on it.
+  let outDir = getTempDir() / "ct_terminus_step_count"
+  let ctPath = outDir / "terminus.ct"
+  let handle = newColumnAwareHandle(outDir, "terminus")
+  let path = cstring(AppPath)
+
+  let fid = trace_writer_ensure_function_id(
+    handle, cstring("only"), path, ListUsersDefLine)
+
+  # `start` emits the entry step. The recorder emits none of its own.
+  trace_writer_start(handle, path, 1'i64)
+  trace_writer_register_call(handle, fid)
+  trace_writer_register_return(handle)
+  # Staged after the last return, with no step to follow it.
+  trace_writer_register_variable_int(
+    handle, cstring("trailing"), 99'i64, ffiTkInt, cstring("int"))
+
+  doAssert trace_writer_close(handle) == 0,
+    "close failed: " & $trace_writer_last_error()
+  trace_writer_free(handle)
+
+  let r = ct_reader_open(cstring(ctPath))
+  doAssert r != nil, "ct_reader_open failed: " & $trace_writer_last_error()
+
+  doAssert ct_reader_step_count(r) == 1'u64,
+    "the recorder emitted 0 steps, so the recording has exactly 1 — the " &
+    "entry step `start` emits. Saving the trailing value must not add " &
+    "another; got " & $ct_reader_step_count(r)
+
+  let steps = stepsCarrying(r, "trailing")
+  doAssert steps == @[0'u64],
+    "'trailing' must be on the one step there is, step 0; it is on " & $steps
+
+  echo "PASS: the terminus does not change the step count"
+
 test_orphan_call_args_land_on_the_callee_def_line()
 test_orphan_without_a_known_location_still_reaches_the_stream()
+test_the_terminus_does_not_change_the_step_count()
 echo "ALL PASS: test_orphan_call_args_step_location"

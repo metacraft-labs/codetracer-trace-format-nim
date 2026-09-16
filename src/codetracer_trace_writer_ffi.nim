@@ -354,6 +354,10 @@ proc trace_writer_new(
   )
   return state
 
+proc flushTrailingValues(handle: TraceWriterHandle): cint
+  ## Forward-declared for the same reason as `flushPendingStep`: `free`
+  ## finalizes through the same terminus `close` does.
+
 proc flushPendingStep(handle: TraceWriterHandle): cint
   ## Forward-declared: `trace_writer_free` finalizes through the same path
   ## `trace_writer_close` does, and it is defined above it.
@@ -378,6 +382,15 @@ proc trace_writer_free(handle: TraceWriterHandle) {.exportc, cdecl, dynlib.} =
         if flushRc != 0:
           setError("trace_writer_free: failed to flush the pending step: " &
             lastError)
+        # The same terminus `close` runs. A caller that releases the handle
+        # without closing it first — which is what a wrapper's destructor does
+        # when `close()` was never called — finalizes the container through
+        # here, and skipping this dropped every value staged after the last
+        # step with nothing to report it.
+        let trailingRc = flushTrailingValues(handle)
+        if trailingRc != 0:
+          setError("trace_writer_free: failed to record the trailing " &
+            "values: " & lastError)
       # close() is idempotent — safe to call even if already closed
       let closeRes = handle.msWriter.close()
       if closeRes.isErr:
@@ -3264,22 +3277,26 @@ proc ct_spans_json(path: cstring, settled: cint,
 proc flushTrailingValues(handle: TraceWriterHandle): cint =
   ## Give carry-forward a terminus.
   ##
-  ## Values staged between steps are deliberately held for the NEXT step rather
-  ## than forced into an invented one, so a recorder that reports a call's
-  ## arguments before it reports a position still gets them recorded at the
-  ## place they belong. At close there is no next step, and holding them then
-  ## means dropping them: the container finalizes, `values.dat` has exactly one
-  ## record per step and every one of them decodes, and the ones that should
-  ## have carried the trailing values are simply empty. Nothing fails, and
-  ## nothing says the recording is short.
+  ## Values staged between steps are held for the NEXT step rather than forced
+  ## into an invented one, so a recorder that reports a call's arguments before
+  ## it reports a position still gets them recorded where they belong. At close
+  ## there is no next step, and holding them then means dropping them: the
+  ## container finalizes, `values.dat` has exactly one record per step, every
+  ## one decodes, and the ones that should have carried the trailing values are
+  ## simply empty. Nothing fails, and nothing says the recording is short.
   ##
-  ## So the last step's position is reused for one final record. That does add
-  ## a step, which is why it is done HERE and not between steps — mid-stream
-  ## the next real step is a better home, and inventing one there would inflate
-  ## every recording. At close the choice is a step or the data.
+  ## So they go onto the LAST step, by rewriting its value record. They belong
+  ## to it — it is the step that was current when they were staged — and the
+  ## recording keeps exactly the N + 1 steps the spec promises for a recorder
+  ## that emitted N (§"Where the recording ends with values still staged").
+  ## Reusing the last step's position for one additional record instead made
+  ## the step count depend on whether a value happened to be staged at the end,
+  ## which the recorder cannot predict; four recorder repositories had failing
+  ## step-count assertions traceable to it.
   ##
   ## A writer holding values with no step ever recorded has nowhere truthful to
-  ## put them, so that is refused by name rather than guessed at.
+  ## put them, so that is refused by name rather than guessed at. `start` emits
+  ## the entry step, so this is only reachable when the recording never began.
   if handle.pendingValues.len == 0 and handle.pendingExtraValueEvents.len == 0:
     return 0.cint
   if handle.msWriter.stepCount == 0:
@@ -3288,8 +3305,7 @@ proc flushTrailingValues(handle: TraceWriterHandle): cint =
       "staged, but no step was ever recorded, so there is no position to " &
       "attach them to. Register a step before closing, or do not stage them.")
     return 1.cint
-  let res = handle.msWriter.registerStep(
-    handle.pendingStepPathId, handle.pendingStepLine,
+  let res = handle.msWriter.amendLastStepValues(
     handle.pendingValues, handle.pendingExtraValueEvents)
   if res.isErr:
     setError("close: could not record the trailing values: " & res.error)

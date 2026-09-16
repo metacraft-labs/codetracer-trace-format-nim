@@ -153,6 +153,18 @@ type
     recordCount: int           ## records in the current chunk buffer
     totalRecords: uint64
     dataOffset: uint64         ## running byte offset in values.dat
+    lastRecordStart: int
+      ## Offset in ``buffer`` of the most recently written record, or -1 when
+      ## no record has been written into the current chunk.
+      ##
+      ## The most recent record stays amendable, which is what lets a writer
+      ## attach values staged after it to the step it belongs to instead of
+      ## emitting a second step to carry them (spec §"Where the recording ends
+      ## with values still staged": the terminus must not change the step
+      ## count, because a recording has exactly N + 1 steps). Keeping it
+      ## amendable is why the chunk is flushed BEFORE the next record is
+      ## appended rather than after the current one — same chunk contents,
+      ## but the record just written is always still here.
 
   ValueStreamReader* = object
     data: seq[byte]            ## raw values.dat content (SPEC mode)
@@ -499,6 +511,7 @@ proc initValueStreamWriter*(ctfs: var Ctfs,
     recordCount: 0,
     totalRecords: 0,
     dataOffset: 0,
+    lastRecordStart: -1,
   )
 
   # Index header: just the u32 chunk_size (SPEC layout — no total_events).
@@ -555,6 +568,9 @@ proc flushChunk(ctfs: var Ctfs, w: var ValueStreamWriter): Result[void, string] 
   w.dataOffset += uint64(compressedSize)
   w.buffer.setLen(0)
   w.recordCount = 0
+  # The amendable record went out with the chunk. A later amend refuses by
+  # name rather than rewriting whatever byte range happens to be at offset 0.
+  w.lastRecordStart = -1
   ok()
 
 proc writeStepValues*(ctfs: var Ctfs, w: var ValueStreamWriter,
@@ -567,16 +583,48 @@ proc writeStepValues*(ctfs: var Ctfs, w: var ValueStreamWriter,
   ## ``extraEvents`` carries already-encoded tagged value-stream events (today
   ## only tag-9 ``Assignment``, built by ``encodeAssignmentEvent``) that belong
   ## to the same step; they are appended after the tag-0 StepValues event.
+  # Flush the full chunk BEFORE appending, so the record written below is
+  # still in ``buffer`` when this returns. See ``lastRecordStart``.
+  if w.recordCount >= w.chunkSize:
+    let flushed = flushChunk(ctfs, w)
+    if flushed.isErr:
+      return flushed
+
   var rec: seq[byte] = @[]
   encodeRecord(values, extraEvents, rec)
   # Length-prefix the record within the chunk so the reader can index it.
+  w.lastRecordStart = w.buffer.len
   encodeVarint(uint64(rec.len), w.buffer)
   w.buffer.add(rec)
   inc w.recordCount
   inc w.totalRecords
+  ok()
 
-  if w.recordCount >= w.chunkSize:
-    return flushChunk(ctfs, w)
+proc rewriteLastStepValues*(w: var ValueStreamWriter,
+    values: openArray[VariableValue],
+    extraEvents: openArray[byte] = []): Result[void, string] =
+  ## Replace the most recently written record with one encoding ``values`` and
+  ## ``extraEvents``.
+  ##
+  ## This is how values staged after the last step reach the trace: they are
+  ## merged with that step's own values by the caller (which is the party that
+  ## still has them) and the record is written again. The step count does not
+  ## move, which is the point — the alternative a writer reaches for is a second
+  ## step at the last recorded position, and that makes a recording N + 2 steps
+  ## long whenever a value happened to be staged at the end.
+  ##
+  ## Refuses rather than guesses when there is no record to amend.
+  if w.lastRecordStart < 0:
+    return err("rewriteLastStepValues: no value record has been written into " &
+      "the current chunk, so there is nothing to amend")
+  if w.lastRecordStart > w.buffer.len:
+    return err("rewriteLastStepValues: recorded record offset " &
+      $w.lastRecordStart & " is past the buffer end " & $w.buffer.len)
+  var rec: seq[byte] = @[]
+  encodeRecord(values, extraEvents, rec)
+  w.buffer.setLen(w.lastRecordStart)
+  encodeVarint(uint64(rec.len), w.buffer)
+  w.buffer.add(rec)
   ok()
 
 proc flush*(ctfs: var Ctfs, w: var ValueStreamWriter): Result[void, string] =

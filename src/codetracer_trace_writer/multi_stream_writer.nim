@@ -395,6 +395,16 @@ type
       ## becomes the on-disk record index.  Empty until a recorder
       ## opts in via ``registerSourceView``.
 
+    lastStepValues: seq[VariableValue]
+    lastStepExtraValueEvents: seq[byte]
+      ## What the most recently written value record holds.
+      ##
+      ## Kept so ``amendLastStepValues`` can rewrite that record with its own
+      ## contents plus whatever was staged after it. Values staged after the
+      ## last step belong to that step and must not cost the recording an
+      ## extra one (spec §"Where the recording ends with values still
+      ## staged"), and the record is re-encoded whole rather than patched.
+
     columnsDroppedForPaths*: seq[uint64]
       ## Path ids for which a column was offered and dropped because the
       ## file has no per-line table, and so no column axis to place one on
@@ -1273,6 +1283,8 @@ proc registerStep*(w: var MultiStreamTraceWriter, pathId: uint64,
     return err("failed to write step event: " & evRes.error)
 
   # Write values parallel to this step
+  w.lastStepValues = @values
+  w.lastStepExtraValueEvents = @extraValueEvents
   let valRes = w.container.writeStepValues(w.valueWriter, values,
     extraValueEvents)
   if valRes.isErr:
@@ -1293,6 +1305,39 @@ proc registerStep*(w: var MultiStreamTraceWriter, pathId: uint64,
   w.lastPathId = pathId
   w.lastLine = line
   w.stepCount += 1
+  ok()
+
+proc amendLastStepValues*(w: var MultiStreamTraceWriter,
+    values: openArray[VariableValue],
+    extraValueEvents: openArray[byte] = []): Result[void, string] =
+  ## Add ``values`` / ``extraValueEvents`` to the most recent step's value
+  ## record, leaving the step count alone.
+  ##
+  ## This is where values staged after the last step go. The step they belong
+  ## to is the one that was current when they were staged, and a recording has
+  ## exactly N + 1 steps for a recorder that emitted N — so a terminus that
+  ## emits a second step at the last recorded position makes the total depend
+  ## on whether a value happened to be staged at the end, which no recorder
+  ## author can predict (spec §"Where the recording ends with values still
+  ## staged").
+  ##
+  ## The record is re-encoded from what it held plus what is being added,
+  ## rather than patched in place, so the count prefix and the framing come out
+  ## of the same encoder that wrote it.
+  if w.closed:
+    return err("writer is closed")
+  if w.stepCount == 0:
+    return err("amendLastStepValues: no step has been recorded, so there is " &
+      "no value record to amend")
+  var merged = w.lastStepValues
+  for v in values:
+    merged.add(v)
+  var mergedExtra = w.lastStepExtraValueEvents
+  for b in extraValueEvents:
+    mergedExtra.add(b)
+  ? value_stream.rewriteLastStepValues(w.valueWriter, merged, mergedExtra)
+  w.lastStepValues = merged
+  w.lastStepExtraValueEvents = mergedExtra
   ok()
 
 proc noteColumnWithoutAxis(w: var MultiStreamTraceWriter, pathId: uint64) =
@@ -1383,6 +1428,8 @@ proc registerStepWithColumn*(w: var MultiStreamTraceWriter,
   if evRes.isErr:
     return err("failed to write step event: " & evRes.error)
 
+  w.lastStepValues = @values
+  w.lastStepExtraValueEvents = @extraValueEvents
   let valRes = w.container.writeStepValues(w.valueWriter, values,
     extraValueEvents)
   if valRes.isErr:
@@ -1452,6 +1499,8 @@ proc registerColumnStep*(w: var MultiStreamTraceWriter,
   if evRes.isErr:
     return err("failed to write delta-column event: " & evRes.error)
 
+  w.lastStepValues = @values
+  w.lastStepExtraValueEvents = @extraValueEvents
   let valRes = w.container.writeStepValues(w.valueWriter, values,
     extraValueEvents)
   if valRes.isErr:
@@ -2116,6 +2165,8 @@ proc registerRaise*(w: var MultiStreamTraceWriter, exceptionTypeId: uint64,
     return err("failed to write raise event: " & res.error)
 
   # Write empty values to keep streams in sync
+  w.lastStepValues = @[]
+  w.lastStepExtraValueEvents = @[]
   let valRes = w.container.writeStepValues(w.valueWriter, @[])
   if valRes.isErr:
     return err("failed to write raise values: " & valRes.error)
@@ -2136,6 +2187,8 @@ proc registerCatch*(w: var MultiStreamTraceWriter,
     return err("failed to write catch event: " & res.error)
 
   # Write empty values to keep streams in sync
+  w.lastStepValues = @[]
+  w.lastStepExtraValueEvents = @[]
   let valRes = w.container.writeStepValues(w.valueWriter, @[])
   if valRes.isErr:
     return err("failed to write catch values: " & valRes.error)
@@ -2217,6 +2270,8 @@ proc registerSourceReload*(w: var MultiStreamTraceWriter,
     let zeroRes = w.container.writeEvent(w.execWriter, zeroEv)
     if zeroRes.isErr:
       return err("failed to write source_reload event: " & zeroRes.error)
+    w.lastStepValues = @[]
+    w.lastStepExtraValueEvents = @[]
     let zeroVal = w.container.writeStepValues(w.valueWriter, @[])
     if zeroVal.isErr:
       return err("failed to write source_reload values: " & zeroVal.error)
@@ -2262,6 +2317,8 @@ proc registerSourceReload*(w: var MultiStreamTraceWriter,
 
   # Keep the value stream in lock-step, exactly as raise / catch / the
   # thread events do.
+  w.lastStepValues = @[]
+  w.lastStepExtraValueEvents = @[]
   let valRes = w.container.writeStepValues(w.valueWriter, @[])
   if valRes.isErr:
     return err("failed to write source_reload values: " & valRes.error)
@@ -2287,6 +2344,8 @@ proc registerThreadSwitch*(w: var MultiStreamTraceWriter,
   if res.isErr:
     return err("failed to write thread_switch event: " & res.error)
 
+  w.lastStepValues = @[]
+  w.lastStepExtraValueEvents = @[]
   let valRes = w.container.writeStepValues(w.valueWriter, @[])
   if valRes.isErr:
     return err("failed to write thread_switch values: " & valRes.error)
@@ -2306,6 +2365,8 @@ proc registerThreadStart*(w: var MultiStreamTraceWriter,
   if res.isErr:
     return err("failed to write thread_start event: " & res.error)
 
+  w.lastStepValues = @[]
+  w.lastStepExtraValueEvents = @[]
   let valRes = w.container.writeStepValues(w.valueWriter, @[])
   if valRes.isErr:
     return err("failed to write thread_start values: " & valRes.error)
@@ -2325,6 +2386,8 @@ proc registerThreadExit*(w: var MultiStreamTraceWriter,
   if res.isErr:
     return err("failed to write thread_exit event: " & res.error)
 
+  w.lastStepValues = @[]
+  w.lastStepExtraValueEvents = @[]
   let valRes = w.container.writeStepValues(w.valueWriter, @[])
   if valRes.isErr:
     return err("failed to write thread_exit values: " & valRes.error)

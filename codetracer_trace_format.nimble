@@ -185,7 +185,7 @@ task test, "Run all tests":
   exec "nim c -r -p:src tests/test_split_trace.nim"
   exec "nim c -r -p:src tests/test_trace_storage_config.nim"
   exec "nim c -r -p:src tests/test_path_filter.nim"
-  exec "nim c -r -d:release -p:src tests/test_ct_print_events_log_fallback.nim"
+  exec "nim c -r -d:release -p:src -p:tests tests/test_ct_print_events_log_fallback.nim"
   # A Rust-written `events.log` carries an 8-byte stream header this repo's
   # legacy reader used to mistake for a chunk header, making every such
   # container unreadable by `ct-print`.
@@ -219,7 +219,7 @@ task test, "Run all tests":
   # compares them on a container whose calls share an exit step, which is the
   # only shape where the ordering is decided by the assembler rather than by
   # the step index.
-  exec "nim c -r -d:release -p:src tests/test_ct_print_agreement.nim"
+  exec "nim c -r -d:release -p:src -p:tests tests/test_ct_print_agreement.nim"
   # #601: an I/O event must be attributed to the step of the line that wrote
   # it. The FFI buffers one step, so `stepCount - 1` named the PREVIOUS step
   # and the flow view rendered program output one source line too high.
