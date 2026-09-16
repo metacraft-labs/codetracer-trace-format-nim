@@ -51,11 +51,7 @@ import codetracer_trace_writer/multi_stream_writer
 import codetracer_trace_writer/value_stream
 import codetracer_trace_types
 import codetracer_ctfs/container
-
-const
-  repoRoot = currentSourcePath().parentDir.parentDir
-  ctPrintSrc = repoRoot / "src" / "codetracer_ct_print.nim"
-  ctPrintBin = "/tmp/ctprint_build/ct-print"
+import ct_print_binary
 
 # ---------------------------------------------------------------------------
 # Bundle builders — the SAME logical recording in each on-disk layout.
@@ -177,48 +173,6 @@ proc graftEntryInto(srcPath, outPath, entryName: string) =
 # ---------------------------------------------------------------------------
 # ct-print binary
 # ---------------------------------------------------------------------------
-
-proc newestSourceTime(): Time =
-  ## The modification time of the most recently changed file under `src/`.
-  ##
-  ## ct-print is a thin front end over the reader library: nearly everything
-  ## it can get wrong lives in a module OTHER than `codetracer_ct_print.nim`.
-  ## Dating the cached binary against that one file only therefore answers
-  ## "fresh" for a binary built before a reader change, and the test then
-  ## measures a ct-print that no longer exists in the tree — reporting a pass
-  ## or a failure that belongs to the previous build.
-  result = getLastModificationTime(ctPrintSrc)
-  for path in walkDirRec(repoRoot / "src"):
-    if path.endsWith(".nim"):
-      let t = getLastModificationTime(path)
-      if t > result:
-        result = t
-
-proc ensureCtPrint() =
-  ## Compile ct-print into `ctPrintBin` when missing or stale. The libzstd
-  ## flags mirror the documented build recipe; pkg-config resolves them.
-  ##
-  ## `ctPrintBin` is a fixed path outside the repository, so it survives
-  ## between runs and between branches; the staleness test is what keeps that
-  ## cache honest, and it has to cover everything the binary links — the entry
-  ## point's own timestamp misses changes in the reader and binding modules it
-  ## imports.
-  if fileExists(ctPrintBin) and
-     getLastModificationTime(ctPrintBin) >= newestSourceTime():
-    return
-  createDir(ctPrintBin.parentDir)
-  var zstdFlags = ""
-  when not defined(windows):
-    let (cflags, c1) = execCmdEx("pkg-config --cflags libzstd")
-    let (lflags, c2) = execCmdEx("pkg-config --libs libzstd")
-    doAssert c1 == 0 and c2 == 0, "pkg-config libzstd failed"
-    zstdFlags = "--passC:" & quoteShell(cflags.strip()) & " " &
-      "--passL:" & quoteShell(lflags.strip()) & " "
-  let cmd = "nim c -d:release --mm:arc -p:src " & zstdFlags &
-    "--hints:off --warnings:off " &
-    "-o:" & quoteShell(ctPrintBin) & " " & quoteShell(ctPrintSrc)
-  let (output, code) = execCmdEx(cmd)
-  doAssert code == 0, "failed to build ct-print:\n" & output
 
 proc jsonEvents(bundle: string): string =
   let (output, code) = execCmdEx(

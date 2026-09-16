@@ -16,7 +16,7 @@
       "has_step_stream": true,
       "has_value_stream": true,
       "has_io_event_stream": true,
-      "has_interning_tables": false,
+      "has_interning_tables": true,
       "has_correlation_index": false,
       "has_line_count_table": false,
       "has_source_reload": false
