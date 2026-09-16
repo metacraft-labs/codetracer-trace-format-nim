@@ -472,6 +472,24 @@ int trace_writer_register_assignment(trace_writer_t handle,
     const uint8_t* rvalue_cbor,
     size_t rvalue_cbor_len);
 
+/* Record a SCOPE EXIT on the step currently being buffered: the `count`
+ * variables named by `names` are going out of scope together.
+ *
+ * The record reaches the trace as a tag-3 `DropVariables` value-stream event
+ * (trace-events.md §"Value Stream Events": `count: varint, ids: [varint]`)
+ * inside the step's value record.  The ids are interned varname ids, resolved
+ * through the same varnames.dat table as the step's values.
+ *
+ * The names go in as ONE event rather than `count` single drops because which
+ * variables left together is what makes a drop a scope boundary.  A `count`
+ * of 0 is accepted and records an empty drop; `names` may be NULL only then.
+ *
+ * Returns 0 on success, 1 on failure (see trace_writer_last_error).
+ */
+int trace_writer_register_drop_variables(trace_writer_t handle,
+    const char* const* names,
+    size_t count);
+
 void trace_writer_register_return_cbor(trace_writer_t handle,
     const uint8_t* cbor_data,
     size_t cbor_len);

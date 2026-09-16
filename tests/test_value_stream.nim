@@ -377,6 +377,153 @@ proc test_value_stream_assignment_events() {.raises: [].} =
   echo "PASS: test_value_stream_assignment_events"
 
 # ---------------------------------------------------------------------------
+# test_value_stream_drop_variables_events — tag-3 DropVariables, and the
+# three-way framing that proves every accessor walks the others' events
+# ---------------------------------------------------------------------------
+
+proc test_value_stream_drop_variables_events() {.raises: [].} =
+  ## `trace-events.md` §"Value Stream Events" gives tag 3 as
+  ## ``DropVariables {count: varint, ids: [varint]}`` — "Drop multiple
+  ## variables (end of scope)".  This asserts that shape FIELD BY FIELD against
+  ## the spec rather than against whatever the encoder happens to emit: a
+  ## round-trip through one implementation cannot notice the encoder and the
+  ## decoder drifting together, which is exactly how a wire format silently
+  ## forks.
+  ##
+  ## The framing half matters more than the layout half.  A record is "the
+  ## concatenation of zero-or-more tagged value-stream events", and tags below
+  ## 10 are NOT self-delimiting — so an accessor that does not walk tag 3
+  ## accurately mis-frames every event after it.  The three-event record below
+  ## is the case that catches that, and it is the reason this test writes
+  ## values, a drop, and an assignment into ONE record.
+  doAssert TagDropVariables == 3'u8,
+    "the DropVariables tag is fixed by the spec at 3, got " & $TagDropVariables
+
+  # --- the wire layout, spelled out ---------------------------------------
+  # u8 0x03, varint count, count × varint variable_id
+  block:
+    var buf: seq[byte] = @[]
+    encodeDropVariablesEvent([7'u64, 300'u64], buf)
+    var expected: seq[byte] = @[3'u8]
+    encodeVarint(2'u64, expected)      # count
+    encodeVarint(7'u64, expected)      # ids[0]
+    encodeVarint(300'u64, expected)    # ids[1] — multi-byte varint
+    doAssert buf == expected,
+      "encodeDropVariablesEvent layout drifted: got " & $buf & " expected " &
+        $expected
+
+  # An empty drop still encodes as a well-formed event (tag + zero count), so
+  # a decoder walking it advances by exactly two bytes.
+  block:
+    var buf: seq[byte] = @[]
+    encodeDropVariablesEvent([], buf)
+    doAssert buf == @[3'u8, 0'u8],
+      "an empty DropVariables must encode as tag + count 0, got " & $buf
+
+  # --- record shapes -------------------------------------------------------
+  # 0: values only   1: drops only   2: values + drop + assignment   3: neither
+  var rng = initRng(31337)
+  let step0Values = makeValues(rng, 2)
+  let step2Values = makeValues(rng, 3)
+
+  # Two separate scope exits in one record: which ids left TOGETHER is what
+  # makes a drop a scope boundary, so they must not be flattened into one.
+  let step1Drops = @[@[4'u64, 5'u64], @[9'u64]]
+  let step2Drops = @[@[21'u64]]
+
+  proc encodeDrops(groups: seq[seq[uint64]]): seq[byte] =
+    var buf: seq[byte] = @[]
+    for g in groups:
+      encodeDropVariablesEvent(g, buf)
+    buf
+
+  var ctfs = createCtfs()
+  let writerRes = initValueStreamWriter(ctfs, chunkSize = 2)
+  doAssert writerRes.isOk, "initValueStreamWriter failed: " & writerRes.error
+  var writer = writerRes.get()
+
+  let w0 = writeStepValues(ctfs, writer, step0Values)
+  doAssert w0.isOk, "step 0 write failed: " & w0.error
+  let w1 = writeStepValues(ctfs, writer, [], encodeDrops(step1Drops))
+  doAssert w1.isOk, "step 1 write failed: " & w1.error
+  # Step 2 carries a drop AND an assignment after its values — tag 0, then
+  # tag 3, then tag 9, in one record.
+  var step2Extra = encodeDrops(step2Drops)
+  encodeAssignmentEvent(77'u64, 1'u8, [0xDE'u8, 0xAD'u8], step2Extra)
+  let w2 = writeStepValues(ctfs, writer, step2Values, step2Extra)
+  doAssert w2.isOk, "step 2 write failed: " & w2.error
+  let w3 = writeStepValues(ctfs, writer, [])
+  doAssert w3.isOk, "step 3 write failed: " & w3.error
+  let fr = value_stream.flush(ctfs, writer)
+  doAssert fr.isOk, "flush failed: " & fr.error
+
+  let readerRes = initValueStreamReader(ctfs.toBytes())
+  doAssert readerRes.isOk, "initValueStreamReader failed: " & readerRes.error
+  var reader = readerRes.get()
+  doAssert reader.count == 4'u64,
+    "record count mismatch: got " & $reader.count & " expected 4"
+
+  proc dropsAt(r: var ValueStreamReader, idx: uint64): seq[seq[uint64]] =
+    let got = readStepDropVariables(r, idx)
+    doAssert got.isOk,
+      "readStepDropVariables failed at " & $idx & ": " & got.error
+    got.get()
+
+  proc valuesAt(r: var ValueStreamReader, idx: uint64): seq[VariableValue] =
+    let got = readStepValues(r, idx)
+    doAssert got.isOk, "readStepValues failed at " & $idx & ": " & got.error
+    got.get()
+
+  proc assignmentsAt(r: var ValueStreamReader, idx: uint64):
+      seq[AssignmentEventEntry] =
+    let got = readStepAssignments(r, idx)
+    doAssert got.isOk,
+      "readStepAssignments failed at " & $idx & ": " & got.error
+    got.get()
+
+  proc assertDrops(got, expected: seq[seq[uint64]], ctx: string) =
+    doAssert got.len == expected.len,
+      ctx & ": drop-event count mismatch, got " & $got.len & " expected " &
+        $expected.len
+    for i in 0 ..< got.len:
+      doAssert got[i] == expected[i],
+        ctx & " #" & $i & ": dropped ids mismatch, got " & $got[i] &
+          " expected " & $expected[i]
+
+  # Step 0 — values only.  The drop accessor reporting NONE is the control
+  # that keeps "step 1 has two" from passing for free.
+  assertEqualVals(valuesAt(reader, 0'u64), step0Values, "step 0")
+  assertDrops(dropsAt(reader, 0'u64), @[], "step 0")
+
+  # Step 1 — drops only.  `readStepValues` must walk the tag it does not
+  # report and reach the end of the record without erroring.
+  doAssert valuesAt(reader, 1'u64).len == 0,
+    "step 1 carries no StepValues event and must report no values"
+  assertDrops(dropsAt(reader, 1'u64), step1Drops, "step 1")
+
+  # Step 2 — the three-way framing case.  Each accessor has to walk the other
+  # TWO events accurately to reach the end of the record, so a mis-framed
+  # tag 3 surfaces here as a wrong assignment or a lost value, not just as a
+  # wrong drop.
+  assertEqualVals(valuesAt(reader, 2'u64), step2Values, "step 2")
+  assertDrops(dropsAt(reader, 2'u64), step2Drops, "step 2")
+  let step2Assignments = assignmentsAt(reader, 2'u64)
+  doAssert step2Assignments.len == 1,
+    "step 2 carries one assignment after its drop, got " &
+      $step2Assignments.len
+  doAssert step2Assignments[0].varnameId == 77'u64,
+    "step 2 assignment target mismatch — the tag-3 walk mis-framed the tag-9 " &
+      "event that follows it"
+  doAssert step2Assignments[0].rvalueCbor == @[0xDE'u8, 0xAD'u8],
+    "step 2 assignment payload mismatch after the tag-3 walk"
+
+  # Step 3 — neither.
+  doAssert valuesAt(reader, 3'u64).len == 0, "step 3 must report no values"
+  assertDrops(dropsAt(reader, 3'u64), @[], "step 3")
+
+  echo "PASS: test_value_stream_drop_variables_events"
+
+# ---------------------------------------------------------------------------
 # test_value_stream_unknown_tag_is_refused_by_name — the forward-compat rule
 # ---------------------------------------------------------------------------
 
@@ -489,6 +636,7 @@ test_value_stream_empty_record()
 test_value_stream_many_variables()
 test_value_stream_legacy_back_compat()
 test_value_stream_assignment_events()
+test_value_stream_drop_variables_events()
 test_value_stream_unknown_tag_is_refused_by_name()
 test_value_stream_forward_compat_tag_skipped()
 test_value_stream_forward_compat_truncated_payload_refused()

@@ -153,14 +153,15 @@ type
     pendingColumnDelta: int64
     pendingValues: seq[VariableValue]
 
-    # Assignment provenance accumulated for the pending step, already
-    # encoded as tag-9 value-stream events (``trace-events.md`` §"Value
-    # Stream Events").  Flushed together with ``pendingValues`` so the
-    # assignment lands in the SAME value record as the step whose
-    # execution performed it, and follows the same carry-forward rules —
-    # dropping it here is what made every JS recording report
-    # ``assign=N`` discarded records.
-    pendingAssignments: seq[byte]
+    # Non-``StepValues`` value-stream events accumulated for the pending
+    # step, already encoded (``trace-events.md`` §"Value Stream Events"):
+    # tag-3 ``DropVariables`` scope exits and tag-9 ``Assignment``
+    # provenance, in the order the recorder produced them.  Flushed
+    # together with ``pendingValues`` so they land in the SAME value record
+    # as the step whose execution produced them, and follow the same
+    # carry-forward rules — dropping them here is what made every JS
+    # recording report ``assign=N`` discarded records.
+    pendingExtraValueEvents: seq[byte]
 
     # Pending call arguments for multi-stream mode:
     # The recorder calls trace_writer_register_call_arg once per arg
@@ -787,17 +788,17 @@ proc flushPendingStep(handle: TraceWriterHandle,
       handle.pendingStepLine,
       handle.pendingColumnDelta,
       handle.pendingValues,
-      handle.pendingAssignments)
+      handle.pendingExtraValueEvents)
     if res.isErr:
       setError(res.error)
       return 1.cint
     handle.pendingValues.setLen(0)
-    handle.pendingAssignments.setLen(0)
+    handle.pendingExtraValueEvents.setLen(0)
     handle.hasPendingStep = false
     handle.pendingColumnDelta = 0
     return 0.cint
 
-  if handle.pendingValues.len > 0 or handle.pendingAssignments.len > 0:
+  if handle.pendingValues.len > 0 or handle.pendingExtraValueEvents.len > 0:
     # Variables registered after the last step was already flushed
     # strand the values in ``pendingValues`` with no step to attach
     # to.  Neither mode may DROP them (spec: a variable registered
@@ -844,18 +845,18 @@ proc flushPendingStep(handle: TraceWriterHandle,
       if orphanPathId != high(uint64):
         let res = handle.msWriter.registerStep(
           orphanPathId, orphanLine, handle.pendingValues,
-          handle.pendingAssignments)
+          handle.pendingExtraValueEvents)
         if res.isErr:
           setError(res.error)
           return 1.cint
       elif handle.msWriter.stepCount > 0:
         let res = handle.msWriter.registerColumnStep(0'i64, handle.pendingValues,
-          handle.pendingAssignments)
+          handle.pendingExtraValueEvents)
         if res.isErr:
           setError(res.error)
           return 1.cint
       handle.pendingValues.setLen(0)
-      handle.pendingAssignments.setLen(0)
+      handle.pendingExtraValueEvents.setLen(0)
     # else: line-only — leave pendingValues intact to carry forward to
     # the next step; do NOT clear/drop them.
   0.cint
@@ -1551,7 +1552,7 @@ proc trace_writer_register_assignment(
       setError("trace_writer_register_assignment: " & vnIdRes.error)
       return 1.cint
     encodeAssignmentEvent(vnIdRes.get(), pass_by, rvalue,
-      handle.pendingAssignments)
+      handle.pendingExtraValueEvents)
     return 0.cint
 
   # Legacy single-stream path.  It carries the full `AssignmentRecord` in the
@@ -1578,6 +1579,76 @@ proc trace_writer_register_assignment(
       frm: rvRes.get())))
   if wRes.isErr:
     setError("trace_writer_register_assignment: " & wRes.error)
+    return 1.cint
+  0.cint
+
+proc trace_writer_register_drop_variables(
+    handle: TraceWriterHandle,
+    names: ptr UncheckedArray[cstring],
+    count: csize_t,
+): cint {.exportc, cdecl, dynlib.} =
+  ## Record a SCOPE EXIT: the ``count`` variables named by ``names`` are going
+  ## out of scope together.
+  ##
+  ## The drop attaches to the step currently being buffered, exactly as
+  ## ``trace_writer_register_variable_*`` values do, and reaches the trace as a
+  ## tag-3 ``DropVariables`` value-stream event (``trace-events.md`` §"Value
+  ## Stream Events": ``count: varint, ids: [varint]``) in that step's value
+  ## record.  The ids are interned varname ids, resolved through the same
+  ## ``varnames.dat`` table as the step's values, so a reader needs no separate
+  ## mapping to name a dropped variable.
+  ##
+  ## The names are recorded as ONE event rather than ``count`` single drops
+  ## because which variables left together is what makes a drop a scope
+  ## boundary; splitting them would describe the same variables leaving
+  ## independently, which is a different fact about the program.
+  ##
+  ## A zero ``count`` is accepted and records an empty drop — a scope that
+  ## bound nothing still ended, and refusing it would push the caller into
+  ## deciding whether an empty scope is worth reporting.
+  ##
+  ## Returns 0 on success, 1 on failure (see ``trace_writer_last_error``).
+  if handle.isNil:
+    return 1.cint
+  if names.isNil and count > 0.csize_t:
+    setError("trace_writer_register_drop_variables: names is NULL but count is " &
+      $count)
+    return 1.cint
+
+  var collected = newSeq[string](int(count))
+  for i in 0 ..< int(count):
+    collected[i] = toNimStr(names[i])
+
+  if handle.useMultiStream:
+    if not handle.msWriterReady:
+      setError("trace_writer_register_drop_variables: writer is not ready")
+      return 1.cint
+    var ids = newSeq[uint64](collected.len)
+    for i, n in collected:
+      let vnIdRes = handle.msWriter.registerVarname(n)
+      if vnIdRes.isErr:
+        setError("trace_writer_register_drop_variables: " & vnIdRes.error)
+        return 1.cint
+      ids[i] = vnIdRes.get()
+    encodeDropVariablesEvent(ids, handle.pendingExtraValueEvents)
+    return 0.cint
+
+  # Legacy single-stream path.  It keeps no varname table, so each name is
+  # announced by its own preceding `VariableName` event and the drop refers to
+  # them positionally as ids 0..count-1 — the same (degraded) convention
+  # `trace_writer_register_assignment` uses for its single target.
+  var legacyIds = newSeq[VariableId](collected.len)
+  for i, n in collected:
+    discard handle.writer.writeEvent(TraceLowLevelEvent(
+      kind: tleVariableName,
+      varName: n,
+    ))
+    legacyIds[i] = VariableId(i)
+  let dRes = handle.writer.writeEvent(TraceLowLevelEvent(
+    kind: tleDropVariables,
+    dropVarIds: legacyIds))
+  if dRes.isErr:
+    setError("trace_writer_register_drop_variables: " & dRes.error)
     return 1.cint
   0.cint
 
