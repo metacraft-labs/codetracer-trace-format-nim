@@ -39,7 +39,12 @@ proc test_column_aware_round_trip() {.raises: [].} =
   # Opt into column-aware mode *before* any step is written.
   w.enableColumnAwareSteps()
 
-  let p0 = w.registerPath("/src/main.py")
+  # WITH per-line lengths. A column-aware trace addresses a position as a
+  # byte offset within a file's slot, and a file registered without that table
+  # is sized by the line-only fallback instead — one address per line — so a
+  # column delta on it would name a later LINE rather than a column. The
+  # writer refuses that now; this fixture supplies the table it always needed.
+  let p0 = w.registerPath("/src/main.py", @[20'u32, 20, 20, 20])
   doAssert p0.isOk
 
   # First step must be absolute (registerStep) to define the running
@@ -332,7 +337,9 @@ proc test_step_record_column_field() {.raises: [].} =
   doAssert writerRes.isOk
   var w = writerRes.get()
   w.enableColumnAwareSteps()
-  doAssert w.registerPath("/src/main.py").isOk
+  # With per-line lengths: a column delta is only addressable in a file whose
+  # slot is sized by its own line table (see `test_column_aware_round_trip`).
+  doAssert w.registerPath("/src/main.py", @[20'u32, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20]).isOk
   doAssert w.registerStep(0, 10, @[]).isOk         # AbsoluteStep, line=10
   doAssert w.registerColumnStep(5, @[]).isOk        # DeltaColumn(+5)
   doAssert w.registerStep(0, 11, @[]).isOk         # DeltaStep (small delta)

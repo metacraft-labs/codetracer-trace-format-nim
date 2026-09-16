@@ -1382,6 +1382,22 @@ proc registerColumnStep*(w: var MultiStreamTraceWriter,
   if w.stepCount == 0:
     return err("registerColumnStep cannot be the first step — emit an " &
       "AbsoluteStep (registerStep) first so the cursor position is defined")
+  # A file with no per-line table has no column axis to move along. Its slot in
+  # the position space is sized by the line-only fallback
+  # (``DefaultLinesPerFile``), so one address IS one line — and a column delta
+  # added to that address does not name a column, it names a LATER LINE. A
+  # reader decoding it gets `line + column - 1` and no way to tell.
+  #
+  # Refused rather than folded in, because the folded form is indistinguishable
+  # from a real step at that later line. Measured in the Solana recorder, whose
+  # DWARF source paths do not resolve on the recording machine, so every file
+  # went untabled and every step after the first reported the wrong line.
+  if int(w.lastPathId) >= w.pathLineLengths.len or
+     w.pathLineLengths[int(w.lastPathId)].len == 0:
+    return err("registerColumnStep: file " & $w.lastPathId & " has no " &
+      "per-line length table, so its positions are line-only and a column " &
+      "delta would decode as a different line. Register the path with its " &
+      "per-line counts, or emit line-only steps for it.")
 
   # In column-aware mode `global_position_index` is one-dimensional, so
   # a column delta is also a position delta.  The exec-stream writer
