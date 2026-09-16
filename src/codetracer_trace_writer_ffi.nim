@@ -904,6 +904,32 @@ proc trace_writer_start(
       setError(pathIdRes.error)
       return
     let pathId = pathIdRes.get()
+
+    # THE `<toplevel>` FRAME, before the entry step.
+    #
+    # `trace-events.md` §"Recorder Integration — Starting a Recording" gives
+    # `start` three effects in this order: the `<toplevel>` function record,
+    # its opening call with no arguments, and the entry step. This entry point
+    # used to emit only the third, so a recording made through it had no root
+    # to hang the call tree from — readers root the tree at call_key 0 — while
+    # the same `start` on the pure-Rust writer emitted all three. Two writers
+    # behind one method name, disagreeing about what calling it does.
+    #
+    # Registering it HERE rather than leaving it to each recorder is what makes
+    # the two agree: a recorder should not have to know which backend it was
+    # handed in order to produce a well-formed call tree.
+    let fnIdRes = handle.msWriter.registerFunctionAt(p, uint64(max(line, 1)),
+      TopLevelFunctionName)
+    if fnIdRes.isErr:
+      setError("trace_writer_start: could not register <toplevel>: " & fnIdRes.error)
+      return
+    let fnId = fnIdRes.get()
+    let callRes = handle.msWriter.registerCall(fnId, @[])
+    if callRes.isErr:
+      setError("trace_writer_start: could not open the <toplevel> call: " &
+        callRes.error)
+      return
+
     # Buffer this as the first pending step
     handle.pendingStepPathId = pathId
     handle.pendingStepLine = uint64(line)
@@ -1114,18 +1140,39 @@ proc trace_writer_ensure_function_id(
   if existing != high(csize_t):
     return existing
 
+  if handle.useMultiStream:
+    # THE INTERNED ID IS THE ID, for the same reason it is for types: a private
+    # counter here and the `funcs.dat` counter are two id spaces, and they agree
+    # only while nothing advances one without the other. `start` registering
+    # `<toplevel>` directly on the writer does exactly that, so a private
+    # counter would hand out an id one too low for every function after it —
+    # and calls would be attributed to the function next door.
+    #
+    # Intern WITH the declaration site: `funcs.dat`'s record carries a
+    # `global_line_index` (internal-files.md:46), so the path and line this call
+    # receives are not dropped; the writer buffers them and computes the address
+    # at close, when the path table is complete.
+    if not handle.msWriterReady:
+      setError("trace_writer_ensure_function_id: writer is not ready")
+      return high(csize_t)
+    let internedRes = handle.msWriter.registerFunctionAt(p, uint64(max(line, 1)), n)
+    if internedRes.isErr:
+      setError("trace_writer_ensure_function_id: " & internedRes.error)
+      return high(csize_t)
+    let interned = csize_t(internedRes.get())
+    handle.functionIndex[key] = interned
+    # `handle.functions` is indexed BY id (register_call reads it to resolve a
+    # callee's definition site), so grow it to fit rather than appending.
+    if handle.functions.len <= int(interned):
+      handle.functions.setLen(int(interned) + 1)
+    handle.functions[int(interned)] = FunctionEntry(name: n, path: p, line: line)
+    return interned
+
   let id = csize_t(handle.functions.len)
   handle.functions.add(FunctionEntry(name: n, path: p, line: line))
   handle.functionIndex[key] = id
 
-  if handle.useMultiStream:
-    # Intern the function WITH its declaration site. `funcs.dat`'s record
-    # carries a `global_line_index` (internal-files.md:46), so the path and line
-    # this call already receives are no longer dropped here; the writer buffers
-    # them and computes the address at close, when the path table is complete.
-    if handle.msWriterReady:
-      discard handle.msWriter.registerFunctionAt(p, uint64(max(line, 1)), n)
-  else:
+  block:
     # Emit function event: use pathId 0 for now (callers should register paths first)
     # In practice recorders call ensure_function_id with the path they already registered
     discard handle.writer.writeFunction(0'u64, line, n)

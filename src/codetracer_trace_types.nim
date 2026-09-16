@@ -49,6 +49,13 @@ proc `$`*(v: Place): string {.borrow.}
 
 const
   NoneTypeId*: TypeId = TypeId(0)
+  TopLevelFunctionName* = "<toplevel>"
+    ## The name `start` interns for the call tree's root, spelled exactly as
+    ## `trace-events.md` §"Recorder Integration — Starting a Recording" gives
+    ## it. It is not a placeholder for the entry function's own name: a
+    ## recording of a program whose entry point is `main` carries BOTH a
+    ## `<toplevel>` frame at depth 0 and a `main` frame at depth 1.
+
   TopLevelFunctionId*: FunctionId = FunctionId(0)
   NoKey*: CallKey = CallKey(-1)
 
