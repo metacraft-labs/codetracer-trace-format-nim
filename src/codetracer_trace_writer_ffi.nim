@@ -1137,15 +1137,35 @@ proc trace_writer_ensure_type_id(
   if existing != high(csize_t):
     return existing
 
+  if handle.useMultiStream:
+    # THE INTERNED ID IS THE ID. It used to be discarded and a private counter
+    # returned in its place, which meant two id spaces: this one advanced once
+    # per distinct (kind, lang_type), and `types.dat` advanced once per record
+    # it actually appended. They agreed only while nothing made them disagree.
+    # Values carry the id returned from here and a reader resolves it against
+    # `types.dat`, so any drift renamed a value's type to whichever record
+    # happened to sit at that index.
+    if not handle.msWriterReady:
+      setError("trace_writer_ensure_type_id: writer is not ready")
+      return high(csize_t)
+    let internedRes = handle.msWriter.registerType(lt, uint8(ord(tk)))
+    if internedRes.isErr:
+      setError("trace_writer_ensure_type_id: " & internedRes.error)
+      return high(csize_t)
+    let interned = csize_t(internedRes.get())
+    handle.typeIndex[key] = interned
+    # Mirror the entry so `typeIdIsRegistered` can answer for this id. The
+    # table is indexed BY id, so it is grown to fit rather than appended to.
+    if handle.types.len <= int(interned):
+      handle.types.setLen(int(interned) + 1)
+    handle.types[int(interned)] = TypeEntry(kind: tk, langType: lt)
+    return interned
+
   let id = csize_t(handle.types.len)
   handle.types.add(TypeEntry(kind: tk, langType: lt))
   handle.typeIndex[key] = id
 
-  if handle.useMultiStream:
-    # Intern the type name in the multi-stream interning table
-    if handle.msWriterReady:
-      discard handle.msWriter.registerType(lt, uint8(ord(tk)))
-  else:
+  block:
     # Emit type event
     discard handle.writer.writeEvent(TraceLowLevelEvent(
       kind: tleType,

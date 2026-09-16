@@ -1194,11 +1194,19 @@ proc registerType*(w: var MultiStreamTraceWriter,
   ## Written in the spec's record shape (`kind`, `lang_type`, `specific_info`)
   ## rather than as bare name bytes. Unlike functions this needs nothing that is
   ## not available now, so it is not deferred.
-  let key = qualifiedPayload(w.qualifier, name)
+  # The dedup key carries the KIND as well as the name, because the record
+  # does. `types.dat` stores `kind, lang_type, specific_info`, so two types
+  # sharing a name under different kinds — a language with both a `map` struct
+  # and a `map` sequence, say — are two distinct records and must not collapse
+  # onto one id. Keying on the name alone silently returned the first one's id
+  # for the second, and every value written under it then resolved, at read
+  # time, to a type it was never given.
+  let payload = qualifiedPayload(w.qualifier, name)
+  let key = $kind & "\x1F" & payload
   let existing = w.typeIds.getOrDefault(key, high(uint64))
   if existing != high(uint64):
     return ok(existing)
-  let rec = encodeTypeRecord(kind, key)
+  let rec = encodeTypeRecord(kind, payload)
   let id = ?w.container.appendRecord(w.interningPtr[].types, rec)
   w.typeIds[key] = id
   ok(id)
