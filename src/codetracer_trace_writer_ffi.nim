@@ -1652,6 +1652,55 @@ proc trace_writer_register_drop_variables(
     return 1.cint
   0.cint
 
+proc trace_writer_register_drop_variable(
+    handle: TraceWriterHandle,
+    name: cstring,
+): cint {.exportc, cdecl, dynlib.} =
+  ## Record that ONE variable, ``name``, has ended its life.
+  ##
+  ## The drop attaches to the step currently being buffered and reaches the
+  ## trace as a tag-2 ``DropVariable`` value-stream event (``trace-events.md``
+  ## §"Value Stream Events": ``variable_id: varint``) in that step's value
+  ## record.  The id is an interned varname id, resolved through the same
+  ## ``varnames.dat`` table as the step's values.
+  ##
+  ## This is NOT ``trace_writer_register_drop_variables`` with a count of one.
+  ## Tag 2 says a variable ended; tag 3 says a SCOPE ended and took its
+  ## bindings with it.  Reporting a lone drop as a one-variable scope exit
+  ## asserts a program structure that was never there, so the two have separate
+  ## entry points rather than one with an arity that silently changes meaning.
+  ##
+  ## Returns 0 on success, 1 on failure (see ``trace_writer_last_error``).
+  if handle.isNil:
+    return 1.cint
+  let n = toNimStr(name)
+
+  if handle.useMultiStream:
+    if not handle.msWriterReady:
+      setError("trace_writer_register_drop_variable: writer is not ready")
+      return 1.cint
+    let vnIdRes = handle.msWriter.registerVarname(n)
+    if vnIdRes.isErr:
+      setError("trace_writer_register_drop_variable: " & vnIdRes.error)
+      return 1.cint
+    encodeDropVariableEvent(vnIdRes.get(), handle.pendingExtraValueEvents)
+    return 0.cint
+
+  # Legacy single-stream path.  It keeps no varname table, so the name is
+  # announced by its own preceding `VariableName` event and the drop refers to
+  # it as id 0 — the same (degraded) convention the other legacy arms use.
+  discard handle.writer.writeEvent(TraceLowLevelEvent(
+    kind: tleVariableName,
+    varName: n,
+  ))
+  let dRes = handle.writer.writeEvent(TraceLowLevelEvent(
+    kind: tleDropVariable,
+    dropVarId: VariableId(0)))
+  if dRes.isErr:
+    setError("trace_writer_register_drop_variable: " & dRes.error)
+    return 1.cint
+  0.cint
+
 proc trace_writer_register_return_cbor(
     handle: TraceWriterHandle,
     cbor_data: ptr uint8,

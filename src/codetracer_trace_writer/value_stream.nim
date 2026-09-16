@@ -28,15 +28,21 @@
 ## Per-record wire format (one record per step):
 ##   A record is the concatenation of zero-or-more tagged value-stream events
 ##   (``trace-events.md`` §"Value Stream Events").  The Nim production writer
-##   emits three of them (or NOTHING for a value-less step — an empty record):
+##   emits four of them (or NOTHING for a value-less step — an empty record):
 ##     Tag 0  StepValues    : u8 tag(0x00), varint count,
 ##                            count × (varint name_id, varint value_len,
 ##                                     value bytes (CBOR ValueRecord))
+##     Tag 2  DropVariable  : u8 tag(0x02), varint variable_id
 ##     Tag 3  DropVariables : u8 tag(0x03), varint count, count × varint id
 ##     Tag 9  Assignment    : u8 tag(0x09), varint to, u8 pass_by,
 ##                            varint from_len, from bytes (CBOR RValue)
-##   Tag 0 comes first when present; the other two follow it, in the order the
+##   Tag 0 comes first when present; the others follow it, in the order the
 ##   recorder produced them.
+##
+##   Tags below 10 are NOT self-delimiting — their length is implied by their
+##   field layout — so a reader must know every one of them to walk a record
+##   at all.  ``decodeRecordEvents`` is the single place that knows; the
+##   per-kind accessors filter its output rather than re-walking the bytes.
 ##   A value-less step is an EMPTY record (zero bytes) — its length prefix is a
 ##   single ``0x00``.  This is the spec's "empty record for value-less steps".
 ##
@@ -92,6 +98,15 @@ const
 
   TagStepValues = 0'u8
     ## Value-stream event tag 0 (``trace-events.md`` §"Value Stream Events").
+
+  TagDropVariable* = 2'u8
+    ## Value-stream event tag 2 (``trace-events.md`` §"Value Stream Events"):
+    ## ``DropVariable {variable_id: varint}`` — "Drop a single variable".
+    ##
+    ## Distinct from tag 3 in what it claims, not merely in arity: tag 2 is one
+    ## variable ending its life, tag 3 is a scope ending and taking its
+    ## bindings with it.  A recorder that reports a lone drop as a
+    ## one-variable tag 3 asserts a scope boundary the program never had.
 
   TagDropVariables* = 3'u8
     ## Value-stream event tag 3 (``trace-events.md`` §"Value Stream Events"):
@@ -213,6 +228,18 @@ proc encodeAssignmentEvent*(varnameId: uint64, passBy: uint8,
   for b in rvalueCbor:
     outBuf.add(b)
 
+proc encodeDropVariableEvent*(variableId: uint64, outBuf: var seq[byte]) =
+  ## Encode one tag-2 ``DropVariable`` value-stream event into ``outBuf``:
+  ## ``u8 0x02, varint variable_id`` — the byte-for-byte layout
+  ## `trace-events.md` §"Value Stream Events" gives for tag 2
+  ## (``variable_id: varint``) and the one the Rust
+  ## ``ValueStreamEvent::DropVariable`` encoder produces.
+  ##
+  ## The id is an interned varname id, resolved through the same
+  ## ``varnames.dat`` table as the ``StepValues`` pairs in the same record.
+  outBuf.add(TagDropVariable)
+  encodeVarint(variableId, outBuf)
+
 proc encodeDropVariablesEvent*(variableIds: openArray[uint64],
     outBuf: var seq[byte]) =
   ## Encode one tag-3 ``DropVariables`` value-stream event into ``outBuf``:
@@ -265,31 +292,56 @@ proc encodeRecord(values: openArray[VariableValue],
     for b in extraEvents:
       outBuf.add(b)
 
-proc decodeRecord*(data: openArray[byte],
-    skippedTags: var seq[uint8]): Result[seq[VariableValue], string] =
-  ## Decode one SPEC value record (a concatenation of tagged events) back into
-  ## the Nim ``VariableValue`` list.  Only tag-0 ``StepValues`` contributes
-  ## values; tag-3 ``DropVariables`` and tag-9 ``Assignment`` are walked over
-  ## (see ``decodeRecordDropVariables`` / ``decodeRecordAssignments`` to read
-  ## them), so the parallel index stays aligned whichever events a record
-  ## carries.
+type
+  ValueEventKind* = enum
+    ## Which tagged value-stream event a decoded record entry is.
+    veStepValues
+    veDropVariable
+    veDropVariables
+    veAssignment
+
+  DecodedValueEvent* = object
+    ## One decoded tagged value-stream event, in the order it appeared in the
+    ## record.  Unknown self-delimiting tags (>= 10) are not represented here:
+    ## they are walked over and reported through ``skippedTags`` instead,
+    ## because this reader has no way to say what they meant.
+    case kind*: ValueEventKind
+    of veStepValues:
+      values*: seq[VariableValue]
+    of veDropVariable:
+      droppedId*: uint64
+    of veDropVariables:
+      droppedIds*: seq[uint64]
+    of veAssignment:
+      assignment*: AssignmentEventEntry
+
+proc decodeRecordEvents*(data: openArray[byte],
+    skippedTags: var seq[uint8]): Result[seq[DecodedValueEvent], string] =
+  ## Decode one SPEC value record — "the concatenation of zero-or-more tagged
+  ## value-stream events" — into those events, in wire order.
+  ##
+  ## THIS IS THE ONLY WALKER.  Every accessor below filters its result rather
+  ## than walking the bytes itself, because tags below 10 are NOT
+  ## self-delimiting: a reader that does not know a tag's field layout cannot
+  ## skip it, so each walker has to handle EVERY tag correctly just to reach
+  ## the events it does care about.  Independent walkers made that a promise
+  ## repeated once per accessor, and one of them getting a tag wrong mis-frames
+  ## the whole rest of the record with nothing to show for it.
   ##
   ## Forward-compatibility (HX-S-5 / HX-OQ-8):
-  ## Tags >= 10 are self-delimited by a varint length prefix following the tag.
-  ## Unknown tags >= 10 are skipped and their tags recorded in ``skippedTags``,
-  ## preserving known variable values in the record.
-  ## Unknown tags < 10 are refused by name.
-  if data.len == 0:
-    return ok(newSeq[VariableValue]())
+  ## Tags >= 10 are self-delimited by a varint length prefix following the tag,
+  ## so they can be skipped without knowing their layout; their tags are
+  ## recorded in ``skippedTags``.  Unknown tags < 10 are refused by name.
   var pos = 0
-  var values: seq[VariableValue] = @[]
+  var events: seq[DecodedValueEvent] = @[]
   while pos < data.len:
     let tag = data[pos]
     inc pos
     case tag
     of TagStepValues:
       let count = int(?decodeVarint(data, pos))
-      for _ in 0 ..< count:
+      var values = newSeq[VariableValue](count)
+      for i in 0 ..< count:
         let vnId = ?decodeVarint(data, pos)
         let dLen = int(?decodeVarint(data, pos))
         if pos + dLen > data.len:
@@ -298,36 +350,36 @@ proc decodeRecord*(data: openArray[byte],
         for j in 0 ..< dLen:
           d[j] = data[pos + j]
         pos += dLen
-        values.add(VariableValue(
+        values[i] = VariableValue(
           varnameId: vnId,
           typeId: decodeCborTopLevelTypeId(d),
-          data: d))
+          data: d)
+      events.add(DecodedValueEvent(kind: veStepValues, values: values))
+    of TagDropVariable:
+      let id = ?decodeVarint(data, pos)
+      events.add(DecodedValueEvent(kind: veDropVariable, droppedId: id))
     of TagDropVariables:
-      # A scope exit rides in the same record as the step's values (spec
-      # §"Value Stream Events" tag 3).  ``readStepValues`` answers "which
-      # variables are visible at step N", and a drop names variables that
-      # are going out of scope rather than one that is visible, so it is
-      # walked over rather than reported here — but it MUST be walked
-      # accurately, because the remaining events of the record follow it.
-      # Use ``decodeRecordDropVariables`` to read them.
       let count = int(?decodeVarint(data, pos))
-      for _ in 0 ..< count:
-        discard ?decodeVarint(data, pos)         # variable_id
+      var ids = newSeq[uint64](count)
+      for i in 0 ..< count:
+        ids[i] = ?decodeVarint(data, pos)
+      events.add(DecodedValueEvent(kind: veDropVariables, droppedIds: ids))
     of TagAssignment:
-      # Assignment provenance rides in the same record as the step's values
-      # (spec §"Value Stream Events" tag 9).  ``readStepValues`` answers
-      # "which variables are visible at step N", so the assignment is walked
-      # over rather than reported here — but it MUST be walked accurately,
-      # because the remaining events of the record follow it.  Use
-      # ``decodeRecordAssignments`` to read them.
-      discard ?decodeVarint(data, pos)           # to
+      let vnId = ?decodeVarint(data, pos)
       if pos >= data.len:
         return err("truncated pass_by in Assignment value-stream event")
-      inc pos                                    # pass_by
+      let passBy = data[pos]
+      inc pos
       let fromLen = int(?decodeVarint(data, pos))
       if pos + fromLen > data.len:
         return err("truncated RValue payload in Assignment value-stream event")
+      var blob = newSeq[byte](fromLen)
+      for j in 0 ..< fromLen:
+        blob[j] = data[pos + j]
       pos += fromLen
+      events.add(DecodedValueEvent(kind: veAssignment,
+        assignment: AssignmentEventEntry(
+          varnameId: vnId, passBy: passBy, rvalueCbor: blob)))
     else:
       when defined(oldReaderPreForwardCompat):
         return err("unsupported value-stream event tag " & $tag &
@@ -345,6 +397,22 @@ proc decodeRecord*(data: openArray[byte],
           return err("unsupported value-stream event tag " & $tag &
             " in Nim value record (this reader predates the tag; rebuild ct-print " &
             "from codetracer-trace-format-nim)")
+  ok(events)
+
+proc decodeRecordEvents*(data: openArray[byte]):
+    Result[seq[DecodedValueEvent], string] =
+  var dummy: seq[uint8] = @[]
+  decodeRecordEvents(data, dummy)
+
+proc decodeRecord*(data: openArray[byte],
+    skippedTags: var seq[uint8]): Result[seq[VariableValue], string] =
+  ## The variable values of one record: its tag-0 ``StepValues`` events,
+  ## concatenated.  A record that carries none — whether it is empty or holds
+  ## only other event kinds — yields an empty sequence.
+  var values: seq[VariableValue] = @[]
+  for ev in ?decodeRecordEvents(data, skippedTags):
+    if ev.kind == veStepValues:
+      values.add(ev.values)
   ok(values)
 
 proc decodeRecord*(data: openArray[byte]): Result[seq[VariableValue], string] =
@@ -353,62 +421,11 @@ proc decodeRecord*(data: openArray[byte]): Result[seq[VariableValue], string] =
 
 proc decodeRecordAssignments*(data: openArray[byte],
     skippedTags: var seq[uint8]): Result[seq[AssignmentEventEntry], string] =
-  ## Decode the tag-9 ``Assignment`` events of one SPEC value record, in
-  ## stream order.  Tag-0 ``StepValues`` events are walked over.  This is the
-  ## read-back counterpart of ``encodeAssignmentEvent`` and exists so the Nim
-  ## side can verify what it wrote without going through the Rust reader.
-  ##
-  ## Forward-compatibility (HX-S-5 / HX-OQ-8):
-  ## Tags >= 10 are self-delimited by a varint length prefix following the tag.
-  ## Unknown tags >= 10 are skipped and their tags recorded in ``skippedTags``.
-  var pos = 0
+  ## The tag-9 ``Assignment`` events of one record, in wire order.
   var found: seq[AssignmentEventEntry] = @[]
-  while pos < data.len:
-    let tag = data[pos]
-    inc pos
-    case tag
-    of TagStepValues:
-      let count = int(?decodeVarint(data, pos))
-      for _ in 0 ..< count:
-        discard ?decodeVarint(data, pos)         # name_id
-        let dLen = int(?decodeVarint(data, pos))
-        if pos + dLen > data.len:
-          return err("truncated value data in StepValues record")
-        pos += dLen
-    of TagDropVariables:
-      let count = int(?decodeVarint(data, pos))
-      for _ in 0 ..< count:
-        discard ?decodeVarint(data, pos)         # variable_id
-    of TagAssignment:
-      let vnId = ?decodeVarint(data, pos)
-      if pos >= data.len:
-        return err("truncated pass_by in Assignment value-stream event")
-      let passBy = data[pos]
-      inc pos
-      let fromLen = int(?decodeVarint(data, pos))
-      if pos + fromLen > data.len:
-        return err("truncated RValue payload in Assignment value-stream event")
-      var blob = newSeq[byte](fromLen)
-      for j in 0 ..< fromLen:
-        blob[j] = data[pos + j]
-      pos += fromLen
-      found.add(AssignmentEventEntry(
-        varnameId: vnId, passBy: passBy, rvalueCbor: blob))
-    else:
-      when defined(oldReaderPreForwardCompat):
-        return err("unsupported value-stream event tag " & $tag &
-          " in Nim value record")
-      else:
-        if tag >= 10:
-          let payloadLen = int(?decodeVarint(data, pos))
-          if pos + payloadLen > data.len:
-            return err("truncated payload in value-stream event tag " & $tag &
-              " (expected " & $payloadLen & " bytes, only " & $(data.len - pos) & " remain)")
-          pos += payloadLen
-          skippedTags.add(tag)
-        else:
-          return err("unsupported value-stream event tag " & $tag &
-            " in Nim value record")
+  for ev in ?decodeRecordEvents(data, skippedTags):
+    if ev.kind == veAssignment:
+      found.add(ev.assignment)
   ok(found)
 
 proc decodeRecordAssignments*(data: openArray[byte]):
@@ -418,70 +435,43 @@ proc decodeRecordAssignments*(data: openArray[byte]):
 
 proc decodeRecordDropVariables*(data: openArray[byte],
     skippedTags: var seq[uint8]): Result[seq[seq[uint64]], string] =
-  ## Decode the tag-3 ``DropVariables`` events of one SPEC value record, in
-  ## stream order, as one ``seq[uint64]`` of interned varname ids per event.
-  ## Tag-0 ``StepValues`` and tag-9 ``Assignment`` events are walked over.
-  ## This is the read-back counterpart of ``encodeDropVariablesEvent`` and
-  ## exists so the Nim side can verify what it wrote without going through the
-  ## Rust reader.
+  ## The tag-3 ``DropVariables`` events of one record, one ``seq[uint64]`` of
+  ## interned varname ids per event.
   ##
   ## Each event is reported separately rather than flattened: a record may
   ## carry more than one scope exit, and which ids left together is what makes
   ## a drop a scope boundary rather than a list of unrelated variables.
-  ##
-  ## Forward-compatibility (HX-S-5 / HX-OQ-8):
-  ## Tags >= 10 are self-delimited by a varint length prefix following the tag.
-  ## Unknown tags >= 10 are skipped and their tags recorded in ``skippedTags``.
-  var pos = 0
   var found: seq[seq[uint64]] = @[]
-  while pos < data.len:
-    let tag = data[pos]
-    inc pos
-    case tag
-    of TagStepValues:
-      let count = int(?decodeVarint(data, pos))
-      for _ in 0 ..< count:
-        discard ?decodeVarint(data, pos)         # name_id
-        let dLen = int(?decodeVarint(data, pos))
-        if pos + dLen > data.len:
-          return err("truncated value data in StepValues record")
-        pos += dLen
-    of TagDropVariables:
-      let count = int(?decodeVarint(data, pos))
-      var ids = newSeq[uint64](count)
-      for i in 0 ..< count:
-        ids[i] = ?decodeVarint(data, pos)
-      found.add(ids)
-    of TagAssignment:
-      discard ?decodeVarint(data, pos)           # to
-      if pos >= data.len:
-        return err("truncated pass_by in Assignment value-stream event")
-      inc pos                                    # pass_by
-      let fromLen = int(?decodeVarint(data, pos))
-      if pos + fromLen > data.len:
-        return err("truncated RValue payload in Assignment value-stream event")
-      pos += fromLen
-    else:
-      when defined(oldReaderPreForwardCompat):
-        return err("unsupported value-stream event tag " & $tag &
-          " in Nim value record")
-      else:
-        if tag >= 10:
-          let payloadLen = int(?decodeVarint(data, pos))
-          if pos + payloadLen > data.len:
-            return err("truncated payload in value-stream event tag " & $tag &
-              " (expected " & $payloadLen & " bytes, only " & $(data.len - pos) & " remain)")
-          pos += payloadLen
-          skippedTags.add(tag)
-        else:
-          return err("unsupported value-stream event tag " & $tag &
-            " in Nim value record")
+  for ev in ?decodeRecordEvents(data, skippedTags):
+    if ev.kind == veDropVariables:
+      found.add(ev.droppedIds)
   ok(found)
 
 proc decodeRecordDropVariables*(data: openArray[byte]):
     Result[seq[seq[uint64]], string] =
   var dummy: seq[uint8] = @[]
   decodeRecordDropVariables(data, dummy)
+
+proc decodeRecordDropVariable*(data: openArray[byte],
+    skippedTags: var seq[uint8]): Result[seq[uint64], string] =
+  ## The tag-2 ``DropVariable`` events of one record — one interned varname id
+  ## each, in wire order.
+  ##
+  ## Reported separately from ``decodeRecordDropVariables`` because the two
+  ## tags state different things: tag 2 is one variable ending its life, tag 3
+  ## is a scope ending and taking its bindings with it.  Folding a tag-2 event
+  ## into the plural accessor would report a lone drop as a one-variable scope
+  ## exit, which is a claim about program structure that was never made.
+  var found: seq[uint64] = @[]
+  for ev in ?decodeRecordEvents(data, skippedTags):
+    if ev.kind == veDropVariable:
+      found.add(ev.droppedId)
+  ok(found)
+
+proc decodeRecordDropVariable*(data: openArray[byte]):
+    Result[seq[uint64], string] =
+  var dummy: seq[uint8] = @[]
+  decodeRecordDropVariable(data, dummy)
 
 
 # ---------------------------------------------------------------------------
@@ -805,6 +795,22 @@ proc readStepValues*(r: var ValueStreamReader,
   let within = ?r.cacheRecordFor(stepIndex)
   var skipped: seq[uint8] = @[]
   let res = decodeRecord(r.cachedRecords[within], skipped)
+  r.noteSkippedTags(skipped)
+  res
+
+proc readStepDropVariable*(r: var ValueStreamReader,
+    stepIndex: uint64): Result[seq[uint64], string] =
+  ## Read the tag-2 ``DropVariable`` events recorded for a given step
+  ## (record N ↔ step N), one interned varname id each.  Legacy ``.off`` VRT
+  ## bundles never carried them, so they report an empty sequence rather than
+  ## an error.
+  r.lastSkippedTags.setLen(0)
+  if r.legacy:
+    return ok(newSeq[uint64]())
+
+  let within = ?r.cacheRecordFor(stepIndex)
+  var skipped: seq[uint8] = @[]
+  let res = decodeRecordDropVariable(r.cachedRecords[within], skipped)
   r.noteSkippedTags(skipped)
   res
 

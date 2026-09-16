@@ -490,6 +490,22 @@ int trace_writer_register_drop_variables(trace_writer_t handle,
     const char* const* names,
     size_t count);
 
+/* Record that ONE variable has ended its life, on the step currently being
+ * buffered.
+ *
+ * The record reaches the trace as a tag-2 `DropVariable` value-stream event
+ * (trace-events.md §"Value Stream Events": `variable_id: varint`).
+ *
+ * This is NOT the call above with a count of one.  Tag 2 says a variable
+ * ended; tag 3 says a SCOPE ended and took its bindings with it.  Reporting a
+ * lone drop as a one-variable scope exit asserts a program structure that was
+ * never there, so the two have separate entry points.
+ *
+ * Returns 0 on success, 1 on failure (see trace_writer_last_error).
+ */
+int trace_writer_register_drop_variable(trace_writer_t handle,
+    const char* name);
+
 void trace_writer_register_return_cbor(trace_writer_t handle,
     const uint8_t* cbor_data,
     size_t cbor_len);

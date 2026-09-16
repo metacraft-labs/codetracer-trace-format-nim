@@ -524,6 +524,99 @@ proc test_value_stream_drop_variables_events() {.raises: [].} =
   echo "PASS: test_value_stream_drop_variables_events"
 
 # ---------------------------------------------------------------------------
+# test_value_stream_drop_variable_events — tag-2 DropVariable, and that it is
+# never confused with its plural neighbour
+# ---------------------------------------------------------------------------
+
+proc test_value_stream_drop_variable_events() {.raises: [].} =
+  ## `trace-events.md` §"Value Stream Events" gives tag 2 as
+  ## ``DropVariable {variable_id: varint}`` — "Drop a single variable".
+  ##
+  ## The interesting case is not tag 2 alone but tag 2 NEXT TO tag 3.  The two
+  ## are adjacent in the tag space and adjacent in meaning, and the failure
+  ## that matters is not a crash — it is one being reported as the other, so a
+  ## lone variable ending its life reads as a scope boundary that the program
+  ## never had.  Each accessor must therefore see ONLY its own tag, in a record
+  ## that carries both.
+  doAssert TagDropVariable == 2'u8,
+    "the DropVariable tag is fixed by the spec at 2, got " & $TagDropVariable
+
+  # --- the wire layout, spelled out ---------------------------------------
+  # u8 0x02, varint variable_id
+  block:
+    var buf: seq[byte] = @[]
+    encodeDropVariableEvent(300'u64, buf)
+    var expected: seq[byte] = @[2'u8]
+    encodeVarint(300'u64, expected)    # multi-byte varint
+    doAssert buf == expected,
+      "encodeDropVariableEvent layout drifted: got " & $buf & " expected " &
+        $expected
+
+  # A single drop and a two-variable scope exit, in ONE record, with values
+  # and an assignment around them — every tag the writer emits, at once.
+  var rng = initRng(909090)
+  let stepValues = makeValues(rng, 2)
+
+  var extra: seq[byte] = @[]
+  encodeDropVariableEvent(41'u64, extra)
+  encodeDropVariablesEvent([50'u64, 51'u64], extra)
+  encodeDropVariableEvent(42'u64, extra)
+  encodeAssignmentEvent(60'u64, 0'u8, [0x01'u8], extra)
+
+  var ctfs = createCtfs()
+  let writerRes = initValueStreamWriter(ctfs, chunkSize = 2)
+  doAssert writerRes.isOk, "initValueStreamWriter failed: " & writerRes.error
+  var writer = writerRes.get()
+
+  let w0 = writeStepValues(ctfs, writer, stepValues, extra)
+  doAssert w0.isOk, "step 0 write failed: " & w0.error
+  let w1 = writeStepValues(ctfs, writer, [])
+  doAssert w1.isOk, "step 1 write failed: " & w1.error
+  let fr = value_stream.flush(ctfs, writer)
+  doAssert fr.isOk, "flush failed: " & fr.error
+
+  let readerRes = initValueStreamReader(ctfs.toBytes())
+  doAssert readerRes.isOk, "initValueStreamReader failed: " & readerRes.error
+  var reader = readerRes.get()
+
+  # Tag 2 must report BOTH singular drops and NEITHER of the plural event's
+  # ids — that is the confusion this test exists to catch.
+  let singular = readStepDropVariable(reader, 0'u64)
+  doAssert singular.isOk, "readStepDropVariable failed: " & singular.error
+  doAssert singular.get() == @[41'u64, 42'u64],
+    "tag-2 accessor must report exactly the singular drops, in wire order; got " &
+      $singular.get()
+
+  # Tag 3 must report the scope exit and NOT the two singular drops.
+  let plural = readStepDropVariables(reader, 0'u64)
+  doAssert plural.isOk, "readStepDropVariables failed: " & plural.error
+  doAssert plural.get() == @[@[50'u64, 51'u64]],
+    "tag-3 accessor must report exactly the scope exit, not the singular " &
+      "drops beside it; got " & $plural.get()
+
+  # The neighbours still frame correctly with two new tags between them.
+  let vals = readStepValues(reader, 0'u64)
+  doAssert vals.isOk, "readStepValues failed: " & vals.error
+  assertEqualVals(vals.get(), stepValues, "step 0")
+
+  let assigns = readStepAssignments(reader, 0'u64)
+  doAssert assigns.isOk, "readStepAssignments failed: " & assigns.error
+  doAssert assigns.get().len == 1 and assigns.get()[0].varnameId == 60'u64,
+    "the assignment after two drop kinds must still frame correctly; got " &
+      $assigns.get().len & " assignment(s)"
+
+  # A record with neither drop kind reports neither — the control that stops
+  # the assertions above passing for free.
+  let noneSingular = readStepDropVariable(reader, 1'u64)
+  doAssert noneSingular.isOk and noneSingular.get().len == 0,
+    "step 1 carries no tag-2 event and must report none"
+  let nonePlural = readStepDropVariables(reader, 1'u64)
+  doAssert nonePlural.isOk and nonePlural.get().len == 0,
+    "step 1 carries no tag-3 event and must report none"
+
+  echo "PASS: test_value_stream_drop_variable_events"
+
+# ---------------------------------------------------------------------------
 # test_value_stream_unknown_tag_is_refused_by_name — the forward-compat rule
 # ---------------------------------------------------------------------------
 
@@ -637,6 +730,7 @@ test_value_stream_many_variables()
 test_value_stream_legacy_back_compat()
 test_value_stream_assignment_events()
 test_value_stream_drop_variables_events()
+test_value_stream_drop_variable_events()
 test_value_stream_unknown_tag_is_refused_by_name()
 test_value_stream_forward_compat_tag_skipped()
 test_value_stream_forward_compat_truncated_payload_refused()
