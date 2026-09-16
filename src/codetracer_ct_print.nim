@@ -2004,7 +2004,27 @@ proc detectAutoKind(filePath: string): (AutoDetectKind, string) =
   let infoR = detectNativeBundle(data)
   if infoR.isErr:
     if infoR.error.startsWith("meta.dat missing"):
-      return (adkV4MultiStream, "")
+      # A bundle with no `meta.dat` was handed to the v4 reader on the stated
+      # understanding that it "reports the absence with its own message". It
+      # does not: it opens on anything carrying the magic and prints an empty
+      # program with zero counts, exit 0.
+      #
+      # That was survivable only while the v4 path was selected by the ABSENCE
+      # of `events.log`, because a legacy bundle still had one to be absent.
+      # No writer emits that stream now, so absence stopped distinguishing
+      # anything and every truncated or malformed file became "a v4 recording
+      # with nothing in it". Measured on a 512-byte head of a real container.
+      #
+      # `steps.dat` is the stream the v4 path actually reads, so it is the
+      # positive test: no `meta.dat` AND no `steps.dat` is a broken bundle.
+      # A presence test on `steps.dat` is NOT enough and was tried: block 0
+      # holds the file ENTRIES, so a 512-byte head of a real container still
+      # lists them — the entries are there and nothing they point at is. What
+      # separates a bundle from its own truncated head is `meta.dat`, which
+      # every writer emits and which `detectNativeBundle` has just failed to
+      # find.
+      return (adkCtfsCorrupt,
+        "meta.dat is missing — the bundle is truncated, or it is not a trace container")
     return (adkCtfsCorrupt, infoR.error)
   if isNativeBundle(data):
     return (adkNative, "")
@@ -2145,13 +2165,29 @@ proc main() =
     if not ctfs_container.hasCtfsMagic(layoutBytes):
       break decideLayout  # non-CTFS ⇒ legacy v2/v3 reader handles it below
     let hasEventsLog = ctfs_container.hasInternalFile(layoutBytes, "events.log")
-    # Divert to the legacy reader whenever a combined ``events.log`` is present.
-    # The v4 split readers are matched only to the production Nim writer's
-    # ``events.log``-free split bundles; a bundle WITH ``events.log`` is a
-    # secondary Rust-writer combined bundle whose split streams are not v4-
-    # readable for steps/values/events, so we read its ``events.log`` instead.
+    let hasSteps = ctfs_container.hasInternalFile(layoutBytes, "steps.dat")
+    # Divert to the legacy reader whenever a combined ``events.log`` is present:
+    # a bundle carrying one is read through it, as before.
     if hasEventsLog:
       preferSplit = false
+    # AND REFUSE A CONTAINER THAT CARRIES NEITHER, rather than reading it as a
+    # v4 recording that happens to be empty.
+    #
+    # Choosing the split reader by the ABSENCE of ``events.log`` worked only
+    # while some writer still emitted that stream to be absent from. None does
+    # now, so absence stopped distinguishing anything: a truncated stub, a
+    # zero-filled file, any garbage past the magic — all of it classified as v4
+    # and printed as an empty program with zero counts, exit 0. Measured on a
+    # 512-byte head of a real container, which this tool used to refuse.
+    #
+    # ``steps.dat`` is what the v4 path actually reads, so requiring it is a
+    # POSITIVE test and cannot answer "v4" for a file that contains nothing.
+    if not hasEventsLog and not hasSteps:
+      stderr.writeLine("ct-print: " & filePath &
+        " carries neither `events.log` (the legacy combined stream) nor " &
+        "`steps.dat` (the v4 execution stream). It is truncated, or it is not " &
+        "a trace container.")
+      quit(1)
 
   # Try v4 multi-stream reader first (unless the layout check above selected
   # the legacy combined-stream reader for an events.log-only bundle).

@@ -262,14 +262,33 @@ proc openTrace*(path: string): Result[TraceReader, string] =
   mr4[0] = data[12]; mr4[1] = data[13]; mr4[2] = data[14]; mr4[3] = data[15]
   let maxEntries = fromBytesLE(uint32, mr4)
 
-  # Detect v4 (multi-stream) by absence of events.log.  v3 traces always
-  # contain events.log; v4 traces never do (they use per-kind streams).
+  # DETECT v4 POSITIVELY, BY `steps.dat`. This used to infer it from the ABSENCE
+  # of `events.log`, which worked only while some writer still emitted that
+  # stream to be absent from. No writer does now, and an inference from absence
+  # over a file that contains NOTHING answers "v4" — so a truncated stub, a
+  # zero-filled file or any other garbage classified as a v4 recording with no
+  # events, and `ct-print` reported an empty program and zero counts with exit
+  # 0. Measured on a 512-byte head of a real container, which this reader used
+  # to refuse.
   #
-  # The question is whether the *entry* is there, not whether it resolves: a
-  # v3 trace whose `events.log` mapping root was lost to a torn write still
-  # has the entry, and classifying it v4 would silently answer "this recording
-  # has no events" instead of reporting the damage.
-  let isV4 = not findInternalFileEntry(data, "events.log", maxEntries).found
+  # A positive test cannot do that: `steps.dat` is the stream the v4 path
+  # actually reads, and a file that does not carry it is not a v4 recording
+  # whatever else is true of it.
+  #
+  # The old comment's point still stands and is kept: the question is whether
+  # the ENTRY is there, not whether it resolves. A v3 trace whose `events.log`
+  # mapping root was lost to a torn write still has the entry, and classifying
+  # that as v4 would answer "no events" instead of reporting the damage — so a
+  # container carrying BOTH entries is read as v3, as before.
+  # A container with NEITHER stream is not refused here, and that is deliberate:
+  # a metadata-only container — `meta.dat` and paths, no events — is a legitimate
+  # thing to open for its metadata, and `test_meta_dat` writes one. Refusing it
+  # here broke that. The refusal belongs where a caller asks to DECODE a
+  # recording, which is `ct-print`'s archetype detector, and it keys on
+  # `meta.dat` rather than on the streams for the reason recorded there.
+  let hasEvents = findInternalFileEntry(data, "events.log", maxEntries).found
+  let hasSteps = findInternalFileEntry(data, "steps.dat", maxEntries).found
+  let isV4 = hasSteps and not hasEvents
 
   var reader = TraceReader(
     ctfsData: data,
