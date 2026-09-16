@@ -2332,7 +2332,21 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   for pf in w.pendingFuncs:
     var pathId: uint64 = 0
     if pf.path.len > 0:
-      pathId = ?w.container.ensureQualifiedPathId(w.interningPtr[], w.qualifier, pf.path)
+      # THE SAME ROUTE `registerPath` TAKES. A column-aware trace writes
+      # `paths.dat` in Layout A, so interning a declaration site's path through
+      # the bare encoder here appends a bare record to a Layout A table — and a
+      # reader decoding it reads the path's own bytes as line lengths and fails
+      # on the first that comes out negative. It only ever bit when a function
+      # was registered at a path nothing else had interned, which is why it sat
+      # here unnoticed.
+      pathId =
+        if w.columnAwareSteps:
+          ?w.container.ensurePathIdColumnAware(w.interningPtr[], pf.path, [])
+        elif w.lineCountTable:
+          ?w.container.ensureQualifiedPathIdWithLineCount(
+            w.interningPtr[], w.qualifier, pf.path, 0)
+        else:
+          ?w.container.ensureQualifiedPathId(w.interningPtr[], w.qualifier, pf.path)
     # A LINE ADDRESS, NOT THE COLUMN-AWARE POSITION ADDRESS, and the difference
     # is not academic: `toGlobalLineIndex` returns a byte offset in a
     # column-aware trace, so using it here gave a function in the second file
