@@ -291,7 +291,13 @@ task buildStaticLib, "Build static library (C FFI)":
   # this lib can be embedded next to another Nim-compiled artifact (the MCR
   # emulator) without a duplicate-`NimMain` link error. It MUST match the
   # `proc codetracerTraceWriterNimMain` importc in codetracer_trace_writer_ffi.nim.
-  exec "nim c --app:staticlib --mm:arc --noMain -d:release --nimMainPrefix:codetracerTraceWriter --passC:\"-fPIC\" -p:src -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim"
+  when hostOS == "windows":
+    # The Godot/CodeTracer Windows build is MSVC, so the embedded archive must
+    # use the same compiler, CRT, and .lib format. Run from a VS developer
+    # environment; zstd_bindings.nim selects C:\zstd for this compiler.
+    exec "nim c --cc:vcc --app:staticlib --mm:arc --noMain -d:release --nimMainPrefix:codetracerTraceWriter -p:src -o:codetracer_trace_writer.lib src/codetracer_trace_writer_ffi.nim"
+  else:
+    exec "nim c --app:staticlib --mm:arc --noMain -d:release --nimMainPrefix:codetracerTraceWriter --passC:\"-fPIC\" -p:src -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim"
 
 task buildSharedLib, "Build shared library (C FFI)":
   # See buildStaticLib for why --nimMainPrefix is required.

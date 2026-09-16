@@ -106,7 +106,13 @@ extern ct_crossing_stack_t* ct_crossing_stacks[CT_CROSSING_MAX_THREADS];
  * (given a thread's TLS base) to read that thread's current stack without the
  * registry.  Mirrors `ct_shadow_sp`.
  */
-extern __thread ct_crossing_stack_t* ct_crossing_sp;
+#if defined(_MSC_VER)
+#define CT_CROSSING_THREAD_LOCAL __declspec(thread)
+#else
+#define CT_CROSSING_THREAD_LOCAL __thread
+#endif
+
+extern CT_CROSSING_THREAD_LOCAL ct_crossing_stack_t* ct_crossing_sp;
 
 /**
  * Open a crossing on the calling thread: first touch initializes this thread's

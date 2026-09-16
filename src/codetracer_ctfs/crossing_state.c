@@ -18,6 +18,10 @@
 #include "codetracer_crossing_state.h"
 #include <string.h>
 
+#if defined(_MSC_VER)
+#include <windows.h>
+#endif
+
 #if defined(__GNUC__)
 #define CT_CROSSING_NOINSTR __attribute__((no_instrument_function))
 #else
@@ -31,11 +35,11 @@ ct_crossing_stack_t* ct_crossing_stacks[CT_CROSSING_MAX_THREADS] = {0};
 
 /* ─── Per-thread TLS ────────────────────────────────────────────────── */
 
-__thread ct_crossing_stack_t* ct_crossing_sp = 0;
+CT_CROSSING_THREAD_LOCAL ct_crossing_stack_t* ct_crossing_sp = 0;
 
 /* Backing storage for this thread's stack; one per thread on first use. */
-static __thread ct_crossing_stack_t tls_stack;
-static __thread int tls_initialized = 0;
+static CT_CROSSING_THREAD_LOCAL ct_crossing_stack_t tls_stack;
+static CT_CROSSING_THREAD_LOCAL int tls_initialized = 0;
 
 /* ─── Thread initialization ─────────────────────────────────────────── */
 
@@ -50,10 +54,20 @@ static void ct_crossing_init_thread(void) {
 
     /* Register in the global array (lock-free: atomic increment claims a slot,
      * release store publishes the pointer). */
-    int idx = __atomic_fetch_add(&ct_crossing_stack_count, 1, __ATOMIC_SEQ_CST);
+    int idx;
+#if defined(_MSC_VER)
+    idx = (int)InterlockedIncrement((volatile LONG*)&ct_crossing_stack_count) - 1;
+#else
+    idx = __atomic_fetch_add(&ct_crossing_stack_count, 1, __ATOMIC_SEQ_CST);
+#endif
     if (idx < CT_CROSSING_MAX_THREADS) {
         tls_stack.thread_id = (uint64_t)idx;
+#if defined(_MSC_VER)
+        InterlockedExchangePointer(
+            (void* volatile*)&ct_crossing_stacks[idx], &tls_stack);
+#else
         __atomic_store_n(&ct_crossing_stacks[idx], &tls_stack, __ATOMIC_RELEASE);
+#endif
     }
 
     ct_crossing_sp = &tls_stack;
