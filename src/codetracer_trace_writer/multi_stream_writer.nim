@@ -395,6 +395,19 @@ type
       ## becomes the on-disk record index.  Empty until a recorder
       ## opts in via ``registerSourceView``.
 
+    columnsDroppedForPaths*: seq[uint64]
+      ## Path ids for which a column was offered and dropped because the
+      ## file has no per-line table, and so no column axis to place one on
+      ## (spec §"A column needs a file with a column axis").
+      ##
+      ## This is the writer's diagnostic channel for that refusal. It is a
+      ## channel rather than an error because the step itself is kept: the
+      ## caller is told which files lost their columns without losing the
+      ## positions. One entry per path, not per step — a recorder whose
+      ## source paths do not resolve on the recording machine offers a
+      ## column on every step of every file, and a per-step record would be
+      ## as long as the trace.
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -1282,6 +1295,14 @@ proc registerStep*(w: var MultiStreamTraceWriter, pathId: uint64,
   w.stepCount += 1
   ok()
 
+proc noteColumnWithoutAxis(w: var MultiStreamTraceWriter, pathId: uint64) =
+  ## Record, once per path, that a column was dropped for want of a per-line
+  ## table.  See ``columnsDroppedForPaths``.
+  for existing in w.columnsDroppedForPaths:
+    if existing == pathId:
+      return
+  w.columnsDroppedForPaths.add(pathId)
+
 proc registerStepWithColumn*(w: var MultiStreamTraceWriter,
     pathId: uint64,
     line: uint64,
@@ -1320,8 +1341,32 @@ proc registerStepWithColumn*(w: var MultiStreamTraceWriter,
       "(call enableColumnAwareSteps first)")
   ? w.checkLineWithinFile(pathId, line)
 
+  # A file with no per-line table has no column axis. Its slot in the position
+  # space is sized by the line-only fallback, so one address IS one line, and a
+  # column delta added to that address names a LATER LINE rather than a column
+  # — read back as `line + column - 1`, with nothing to say the position was
+  # ever about a column.
+  #
+  # The step is KEPT and the column is dropped, which is what the spec requires
+  # of a column arriving as part of a step (trace-events.md §"A column needs a
+  # file with a column axis"): the line is a position the recorder did observe,
+  # and losing a step is far harder to notice than losing a column. The bare
+  # cursor move in ``registerColumnStep`` has no step to keep and refuses
+  # instead.
+  #
+  # This is the entry point the canonical recorder wrapper drives — it buffers
+  # the column onto a pending step and flushes both through here as one event —
+  # so a guard present only on ``registerColumnStep`` left the defect live on
+  # the path every recorder actually takes.
+  var effectiveDelta = columnDelta
+  if columnDelta != 0 and
+     (int(pathId) >= w.pathLineLengths.len or
+      w.pathLineLengths[int(pathId)].len == 0):
+    w.noteColumnWithoutAxis(pathId)
+    effectiveDelta = 0
+
   let baseGli = w.toGlobalLineIndex(pathId, line)
-  let combinedGli = uint64(int64(baseGli) + columnDelta)
+  let combinedGli = uint64(int64(baseGli) + effectiveDelta)
 
   var ev: StepEvent
   if w.stepCount == 0:

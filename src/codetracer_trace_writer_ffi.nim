@@ -234,12 +234,6 @@ type
     # accounting code.
     variables: seq[string]
     variableIndex: Table[string, csize_t]
-    # Mirror of the multi-stream writer's interned path list, so the FFI
-    # can answer "is this path ALREADY registered, and under which id?"
-    # without calling ``registerPath`` (which would intern it with an
-    # empty line-length table and permanently cost the file its column
-    # resolution).  See ``registeredPathId``.
-    pathIdIndex: Table[string, uint64]
 
   TraceWriterHandle = ptr TraceWriterState
 
@@ -360,9 +354,7 @@ proc trace_writer_new(
   )
   return state
 
-proc flushPendingStep(handle: TraceWriterHandle,
-    orphanPathId: uint64 = high(uint64),
-    orphanLine: uint64 = 0'u64): cint
+proc flushPendingStep(handle: TraceWriterHandle): cint
   ## Forward-declared: `trace_writer_free` finalizes through the same path
   ## `trace_writer_close` does, and it is defined above it.
 
@@ -725,31 +717,7 @@ proc trace_writer_finish_paths(handle: TraceWriterHandle): cint {.exportc, cdecl
 # Multi-stream helpers
 # ---------------------------------------------------------------------------
 
-proc registeredPathId(handle: TraceWriterHandle, path: string): uint64 =
-  ## Return the writer's interned path id for ``path``, or
-  ## ``high(uint64)`` when the path has NOT been registered yet.
-  ##
-  ## Deliberately a LOOKUP and never a registration: calling
-  ## ``msWriter.registerPath`` here would intern the path with an EMPTY
-  ## per-line length table, and ``registerPath`` only records
-  ## ``pathLineLengths`` on the interning call that first creates the id.
-  ## A later ``trace_writer_register_path_with_line_lengths`` for the same
-  ## file would then be a no-op and the file would silently lose column
-  ## resolution for the whole trace.  Callers that cannot resolve a path
-  ## must fall back rather than register it early.
-  ##
-  ## ``handle.pathIdIndex`` mirrors ``msWriter.paths`` (which the writer
-  ## only ever appends to), so the sync loop below is amortised O(1).
-  if not handle.useMultiStream or not handle.msWriterReady:
-    return high(uint64)
-  if handle.pathIdIndex.len < handle.msWriter.paths.len:
-    for i in handle.pathIdIndex.len ..< handle.msWriter.paths.len:
-      handle.pathIdIndex[handle.msWriter.paths[i]] = uint64(i)
-  handle.pathIdIndex.getOrDefault(path, high(uint64))
-
-proc flushPendingStep(handle: TraceWriterHandle,
-    orphanPathId: uint64 = high(uint64),
-    orphanLine: uint64 = 0'u64): cint =
+proc flushPendingStep(handle: TraceWriterHandle): cint =
   ## Flush the buffered pending step and its accumulated variable values
   ## to the multi-stream writer.  Handles two cases:
   ##
@@ -764,22 +732,14 @@ proc flushPendingStep(handle: TraceWriterHandle,
   ##    line-granular step-over readers see ONE step at the
   ##    (line, column) the caller requested and
   ##    ``variables_at(step_id)`` finds the accumulated values.
-  ## 2. No pending step but a non-empty ``pendingValues`` queue
-  ##    (M-leo regression: variables were registered after the last
-  ##    step was already flushed; the values would otherwise be
-  ##    silently dropped on close / return).  Emit a synthetic step so
-  ##    the values still reach the value stream parallel to the exec
-  ##    stream.
-  ##
-  ## ``orphanPathId`` / ``orphanLine`` are the TRUTHFUL source location
-  ## of the orphan values, threaded in by the call site that knows it
-  ## (currently ``trace_writer_register_call``, which resolves the
-  ## callee's definition site from the function registry).  When
-  ## supplied — ``orphanPathId != high(uint64)`` — the synthetic step is
-  ## emitted at that location.  When absent the synthetic step falls
-  ## back to a zero-delta column step, which INHERITS the position of
-  ## whatever step was emitted last; see the branch's comment for why
-  ## that fallback is not good enough on its own.
+  ## 2. No pending step, and values staged anyway — the gap. They are
+  ##    LEFT in ``pendingValues`` to attach to the next step this
+  ##    writer emits, which is where the spec puts them
+  ##    (``trace-events.md`` §"Recorder Integration — Staging Values":
+  ##    values staged while no step is open MUST attach to the next
+  ##    step, and the writer MUST NOT emit a step of its own to carry
+  ##    them). ``flushTrailingValues`` is the terminus for a recording
+  ##    that ends before another step arrives.
   ##
   ## Returns 0 on success, 1 on error.
   if handle.hasPendingStep:
@@ -798,78 +758,40 @@ proc flushPendingStep(handle: TraceWriterHandle,
     handle.pendingColumnDelta = 0
     return 0.cint
 
-  if handle.pendingValues.len > 0 or handle.pendingExtraValueEvents.len > 0:
-    # Variables registered after the last step was already flushed
-    # strand the values in ``pendingValues`` with no step to attach
-    # to.  Neither mode may DROP them (spec: a variable registered
-    # for a step must not be lost; a value known only after a call
-    # returns attaches to the binding's step).  The two step models
-    # preserve them differently:
-    #
-    # * Column-aware traces (``columnAwareSteps``): emit a synthetic
-    #   step so the orphan values surface in the value stream parallel
-    #   to the exec stream (the M-leo fix from 92fce3a).
-    #
-    #   The synthetic step needs a POSITION.  A zero-delta
-    #   ``registerColumnStep`` gives it the position of the previously
-    #   emitted step, which is only truthful when the orphan values
-    #   belong to the unit that step is in.  They frequently do not:
-    #   ``NimTraceWriter::arg`` registers a callee's arguments as step
-    #   variables just BEFORE ``register_call``, at a moment when the
-    #   caller's own step has already been flushed (by the previous
-    #   ``register_return``).  In a recorded Flask session the previously
-    #   emitted step is then the PREVIOUS request's ``after_request``
-    #   hook return, so a parameterised route's first recorded event
-    #   (which is what a span's ``start_step`` binds to) reported a line
-    #   belonging to a different request entirely, and the Request Panel
-    #   seeked there.
-    #
-    #   So prefer the location the CALL SITE threaded in
-    #   (``orphanPathId`` / ``orphanLine`` — the callee's definition
-    #   site, which is where those argument values are actually in
-    #   scope) and emit a real line step there.  Only when no location
-    #   is available do we fall back to the zero-delta column step,
-    #   which still requires at least one prior step to anchor against.
-    #
-    # * Line-only traces (``not columnAwareSteps`` — e.g. ton,
-    #   cardano, circom): CARRY the orphan values forward in
-    #   ``pendingValues`` (the pre-92fce3a behavior) so they attach to
-    #   the NEXT ``register_step`` flush.  This is exactly how
-    #   ``var X = call()`` bindings — whose value is known only after
-    #   the callee's own ``register_step`` already flushed the pending
-    #   step — reach the trace.  92fce3a made this branch
-    #   column-aware-only, which silently dropped these values for
-    #   line-only recorders; carrying them forward restores them
-    #   without touching the column-aware wire output.
-    if handle.msWriter.columnAwareSteps:
-      # CLEARED ONLY IF SOMETHING TOOK THEM. Both arms below can decline:
-      # the first needs a resolvable definition site, the second needs a
-      # step to hang a column on. When neither applies — the shape a
-      # recorder produces when its first event is a call, before any
-      # position is known — clearing regardless dropped the values with
-      # nothing written anywhere and nothing said. They are carried
-      # forward instead, which is what the line-only arm already does.
-      var carried = false
-      if orphanPathId != high(uint64):
-        let res = handle.msWriter.registerStep(
-          orphanPathId, orphanLine, handle.pendingValues,
-          handle.pendingExtraValueEvents)
-        if res.isErr:
-          setError(res.error)
-          return 1.cint
-        carried = true
-      elif handle.msWriter.stepCount > 0:
-        let res = handle.msWriter.registerColumnStep(0'i64, handle.pendingValues,
-          handle.pendingExtraValueEvents)
-        if res.isErr:
-          setError(res.error)
-          return 1.cint
-        carried = true
-      if carried:
-        handle.pendingValues.setLen(0)
-        handle.pendingExtraValueEvents.setLen(0)
-    # else: line-only — leave pendingValues intact to carry forward to
-    # the next step; do NOT clear/drop them.
+  # Values staged while no step is open — the gap — are LEFT staged, in
+  # both step models. They attach to the next step this writer emits, which
+  # is the first step at which they are visible and the only position in the
+  # trace that is both truthful and predictable
+  # (``trace-events.md`` §"Recorder Integration — Staging Values").
+  #
+  # Two shapes put values here, and both are normal rather than exceptional:
+  # a binding whose value is only known once a call has returned (``let x =
+  # f()`` arrives as call / step / return / variable, and the return already
+  # flushed the step), and a call's arguments, which ``NimTraceWriter::arg``
+  # stages as step variables before ``register_call``.
+  #
+  # Previously the column-aware model diverged here and synthesized a step to
+  # carry them: a real line step at the callee's declaration site when the
+  # call site could name one, and otherwise a zero-delta ``registerColumnStep``.
+  # Both were wrong in the way the spec section now names.
+  #
+  # * The ``DeltaColumn`` is a column nudge on the preceding step, not a
+  #   logical step — ``logicalStepCount`` excludes it. The value record written
+  #   parallel to it sits at an exec index no logical step occupies, so no
+  #   step's ``StepValues`` ever reports those values again. The container
+  #   finalizes, decodes cleanly, and is short, with nothing in it to say so.
+  # * The declaration-site step is a position the program never executed. It
+  #   also made the step count unpredictable: whether the extra step appears
+  #   depends on whether a value happened to be staged at that instant, which
+  #   no recorder author can foresee.
+  #
+  # It also removed a way to lose a whole recording: ``registerColumnStep``
+  # refuses a file with no per-line table, so on a column-aware trace that
+  # touched such a file this returned 1, ``trace_writer_close`` propagated it,
+  # and the container was never finalized.
+  #
+  # ``flushTrailingValues`` is the terminus for a recording that ends with
+  # values still staged.
   0.cint
 
 # ---------------------------------------------------------------------------
@@ -1280,32 +1202,15 @@ proc trace_writer_register_call(
   ##
   ## Recorders stage each argument through a helper that ALSO registers
   ## it as a step variable (``NimTraceWriter::arg``), so by the time we
-  ## get here ``pendingValues`` may hold the callee's arguments.  When
-  ## the caller's own step has already been flushed (the usual shape:
-  ## the previous event was a ``register_return``) those values are
-  ## orphaned, and ``flushPendingStep`` has to invent a step for them.
-  ## Resolve the callee's DEFINITION site from the function registry and
-  ## thread it in, so that invented step carries the location where
-  ## those arguments are actually in scope instead of inheriting the
-  ## position of the last unrelated step emitted.
+  ## get here ``pendingValues`` may hold the callee's arguments, with the
+  ## caller's own step already flushed by the preceding ``register_return``.
+  ## Those values stay staged and attach to the callee's first body step,
+  ## where the arguments are in scope — see ``flushPendingStep``.
   if handle.isNil:
     return
   if handle.useMultiStream:
-    var orphanPathId = high(uint64)
-    var orphanLine = 0'u64
-    if not handle.hasPendingStep and handle.pendingValues.len > 0 and
-        int(function_id) < handle.functions.len:
-      let fn = handle.functions[int(function_id)]
-      if fn.path.len > 0 and fn.line > 0:
-        # LOOKUP only — never register.  An unregistered path means we
-        # cannot name a truthful position yet, so we let the fallback
-        # run rather than intern the path without its line lengths.
-        let pathId = registeredPathId(handle, fn.path)
-        if pathId != high(uint64):
-          orphanPathId = pathId
-          orphanLine = uint64(fn.line)
     if handle.msWriter.stepCount > 0:
-      discard flushPendingStep(handle, orphanPathId, orphanLine)
+      discard flushPendingStep(handle)
     discard handle.msWriter.registerCall(uint64(function_id),
         handle.pendingCallArgs)
     handle.pendingCallArgs.setLen(0)
@@ -2501,17 +2406,22 @@ proc trace_writer_register_delta_column(
     handle.pendingColumnDelta += column_delta
     return
 
-  # No pending line step — the recorder is updating column after
-  # the previous step was already flushed.  Emit a stand-alone
-  # column step right now with whatever values have accumulated
-  # since the last flush.  Matches the legacy column-step
-  # semantics so the same call sequences keep working.
+  # No pending line step — the recorder is updating the column after the
+  # previous step was already flushed.  Emit a stand-alone column step now,
+  # carrying whatever has accumulated since the last flush.  Matches the
+  # legacy column-step semantics so the same call sequences keep working.
+  #
+  # Both staging buffers go in and both are cleared.  Passing only
+  # ``pendingValues`` left any ``Assignment`` / ``DropVariable(s)`` events
+  # staged at this moment behind, to be picked up by whichever later flush
+  # happened to run — attributing them to a step they did not belong to.
   let res = handle.msWriter.registerColumnStep(
-    column_delta, handle.pendingValues)
+    column_delta, handle.pendingValues, handle.pendingExtraValueEvents)
   if res.isErr:
     setError(res.error)
     return
   handle.pendingValues.setLen(0)
+  handle.pendingExtraValueEvents.setLen(0)
 
 proc trace_writer_register_path_with_line_lengths(
     handle: TraceWriterHandle,

@@ -1,6 +1,5 @@
-## Regression: the synthetic step the FFI invents for ORPHAN call
-## arguments must carry a truthful source location instead of inheriting
-## the position of the last unrelated step.
+## A call's arguments surface at the callee's definition line, not at a
+## position inherited from a different logical unit.
 ##
 ## Shape (exactly what the Python recorder emits for a Flask app with a
 ## parameterised route such as ``/api/users/<int:user_id>``):
@@ -12,36 +11,37 @@
 ##   * At that moment the caller's own pending step has already been
 ##     flushed — the previous FFI event was the preceding request's
 ##     ``after_request`` hook ``register_return``.  So the argument
-##     values land in the orphan ``pendingValues`` queue with no step to
-##     attach to.
-##   * ``flushPendingStep``'s orphan branch then invents a step for
-##     them.  It used to invent a ZERO-DELTA ``registerColumnStep``,
-##     which inherits the position of the last emitted step — i.e. the
-##     PREVIOUS REQUEST's hook return line, in a different logical unit
-##     entirely.
+##     values are staged in the GAP, with no step open to attach to.
+##   * They stay staged and attach to the next step the writer emits,
+##     which is the callee's first body step — the location where those
+##     argument values are in scope (spec §"Recorder Integration —
+##     Staging Values").
 ##
-## That synthetic step is the first recorded event of the new request,
-## so it is what a ``web-request`` span's ``start_step`` binds to.
-## Double-clicking such a request in the Request Panel therefore seeked
-## to a stale line belonging to the previous request.
+## That step is the first recorded event of the new request, so it is
+## what a ``web-request`` span's ``start_step`` binds to. Getting it
+## wrong seeks the Request Panel into the previous request.
 ##
-## The fix threads the callee's DEFINITION site (resolved from the FFI's
-## function registry) from ``trace_writer_register_call`` into
-## ``flushPendingStep``, which emits the synthetic step there — the
-## location where those argument values are actually in scope.
+## The writer used to invent a step for these values instead of waiting
+## for one: a zero-delta ``registerColumnStep``, which inherits the
+## position of the last emitted step — the PREVIOUS REQUEST's hook
+## return line — and, being a column nudge rather than a logical step,
+## put the values at an index no step occupies. A later revision
+## invented a real line step at the callee's declaration site instead,
+## which reported a truthful line at the cost of a step the program
+## never executed and a step count no recorder could predict. Neither is
+## needed: the callee's own first body step is already there, one event
+## later.
 ##
-## Falsifiability: restore the unconditional
-## ``registerColumnStep(0'i64, ...)`` in the orphan branch and
+## Falsifiability: park the gap-staged values on a zero-delta
+## ``registerColumnStep`` again and
 ## ``test_orphan_call_args_land_on_the_callee_def_line`` fails, naming
 ## the stale line it landed on.
 ##
-## The sibling guarantees this branch must keep are asserted elsewhere
-## and deliberately not re-litigated here:
-## ``tests/test_line_only_orphan_carry_forward.nim`` (line-only traces
-## carry orphan values forward rather than dropping them) — plus
+## The sibling guarantee is asserted in
+## ``tests/test_line_only_orphan_carry_forward.nim`` (carry-forward must
+## not drop the values) and, for the case where no step ever follows, by
 ## ``test_orphan_without_a_known_location_still_reaches_the_stream``
-## below, which pins the no-location fallback so the M-leo "never drop
-## orphan values" guarantee survives the new early-return path.
+## below.
 
 # Include the FFI module so we can drive the C entry points directly.
 # Mirrors tests/test_line_only_orphan_carry_forward.nim.
@@ -201,13 +201,13 @@ proc test_orphan_call_args_land_on_the_callee_def_line() =
     "stream — the M-leo guarantee (orphan values must not be dropped) " &
     "regressed"
 
-  let synthetic = userIdSteps[0]
-  let line = lineOf(r, synthetic)
+  let carrier = userIdSteps[0]
+  let line = lineOf(r, carrier)
   doAssert line == uint64(GetUserDefLine),
-    "the synthetic step invented for the orphaned call arguments of " &
-    "get_user (step " & $synthetic & ", the first recorded event of " &
-    "the parameterised route's request and therefore the step a " &
-    "web-request span's start_step binds to) reports line " & $line &
+    "the step carrying get_user's staged call arguments (step " &
+    $carrier & ", the first recorded event of the parameterised " &
+    "route's request and therefore the step a web-request span's " &
+    "start_step binds to) reports line " & $line &
     ", not the callee's definition line " & $GetUserDefLine & ". " &
     (if line == uint64(HookReturnLine):
        "Line " & $HookReturnLine & " is the PREVIOUS request's " &
@@ -224,19 +224,23 @@ proc test_orphan_call_args_land_on_the_callee_def_line() =
   doAssert responseSteps.len > 0, "orphaned argument 'response' was dropped"
   let responseLine = lineOf(r, responseSteps[0])
   doAssert responseLine == uint64(PublishRouteDefLine),
-    "the synthetic step for publish_route's orphaned 'response' " &
-    "argument reports line " & $responseLine & ", not the callee's " &
-    "definition line " & $PublishRouteDefLine
+    "the step carrying publish_route's staged 'response' argument " &
+    "reports line " & $responseLine & ", not the callee's definition " &
+    "line " & $PublishRouteDefLine
 
   echo "PASS: orphaned call arguments land on the callee's definition line"
   ct_reader_close(r)
 
 proc test_orphan_without_a_known_location_still_reaches_the_stream() =
-  ## The no-location fallback (M-leo, 92fce3a): when the orphan values
-  ## are NOT call arguments there is no callee to name, so the synthetic
-  ## step is still a zero-delta column step — but the values must reach
-  ## the value stream, exactly as before.  This pins the fallback so the
-  ## new early-return in the orphan branch cannot start dropping values.
+  ## Carry-forward needs a terminus. When a recording ends with values
+  ## still staged and no further step coming, they must not be discarded
+  ## (spec §"Where the recording ends with values still staged"); the
+  ## close path is what saves them.
+  ##
+  ## Asserted on the POSITION rather than the step count, because the two
+  ## reference writers differ on whether saving them costs an extra step
+  ## — see the spec's Known Issues. Both put the values at the last
+  ## recorded position, which is the property that matters here.
   let outDir = getTempDir() / "ct_orphan_without_location"
   let ctPath = outDir / "no_location.ct"
   let handle = newColumnAwareHandle(outDir, "no_location")
@@ -255,9 +259,13 @@ proc test_orphan_without_a_known_location_still_reaches_the_stream() =
 
   let r = ct_reader_open(cstring(ctPath))
   doAssert r != nil, "ct_reader_open failed: " & $trace_writer_last_error()
-  doAssert stepsCarrying(r, "late").len > 0,
-    "the no-location orphan drain dropped 'late' — the M-leo guarantee " &
-    "(orphan values must never be lost) regressed"
+  let lateSteps = stepsCarrying(r, "late")
+  doAssert lateSteps.len > 0,
+    "the close path dropped 'late' — values still staged when a " &
+    "recording ends must not be discarded"
+  doAssert lineOf(r, lateSteps[0]) == 10'u64,
+    "'late' must surface at the last recorded position, line 10; it is " &
+    "on a step at line " & $lineOf(r, lateSteps[0])
   echo "PASS: no-location orphan values still reach the value stream"
   ct_reader_close(r)
 

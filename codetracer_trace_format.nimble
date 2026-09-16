@@ -202,10 +202,24 @@ task test, "Run all tests":
   # `include`s codetracer_trace_writer_ffi, so it needs --mm:arc and the
   # --nimMainPrefix the FFI's NimMain importc expects (see buildStaticLib).
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_line_only_orphan_carry_forward.nim"
-  # The synthetic step invented for ORPHAN call arguments must carry the
-  # callee's definition line, not inherit the previous step's position.
+  # A call's staged arguments must surface at the callee's definition line,
+  # not at a position inherited from a different logical unit.
   # Same FFI-`include` compile requirements as the test above.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_orphan_call_args_step_location.nim"
+  # A variable registered after a column nudge must land on the step that
+  # nudge belongs to, and a column offered for a file with no per-line table
+  # must not move the step to another line. This file existed for months
+  # without being listed here, so it went on describing a pipeline that had
+  # moved on and nothing contradicted it.
+  # Same FFI-`include` compile requirements as the tests above.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_pending_value_after_delta_column.nim"
+  # `ct-print --full` has ONE implementation, and its call_exit order obeys
+  # the format's rule. The shipped binary and the in-process builder the test
+  # corpus links were two near-copies that drifted for three months; this
+  # compares them on a container whose calls share an exit step, which is the
+  # only shape where the ordering is decided by the assembler rather than by
+  # the step index.
+  exec "nim c -r -d:release -p:src tests/test_ct_print_agreement.nim"
   # #601: an I/O event must be attributed to the step of the line that wrote
   # it. The FFI buffers one step, so `stepCount - 1` named the PREVIOUS step
   # and the flow view rendered program output one source line too high.
