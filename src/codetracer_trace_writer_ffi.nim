@@ -842,6 +842,14 @@ proc flushPendingStep(handle: TraceWriterHandle,
     #   line-only recorders; carrying them forward restores them
     #   without touching the column-aware wire output.
     if handle.msWriter.columnAwareSteps:
+      # CLEARED ONLY IF SOMETHING TOOK THEM. Both arms below can decline:
+      # the first needs a resolvable definition site, the second needs a
+      # step to hang a column on. When neither applies — the shape a
+      # recorder produces when its first event is a call, before any
+      # position is known — clearing regardless dropped the values with
+      # nothing written anywhere and nothing said. They are carried
+      # forward instead, which is what the line-only arm already does.
+      var carried = false
       if orphanPathId != high(uint64):
         let res = handle.msWriter.registerStep(
           orphanPathId, orphanLine, handle.pendingValues,
@@ -849,14 +857,17 @@ proc flushPendingStep(handle: TraceWriterHandle,
         if res.isErr:
           setError(res.error)
           return 1.cint
+        carried = true
       elif handle.msWriter.stepCount > 0:
         let res = handle.msWriter.registerColumnStep(0'i64, handle.pendingValues,
           handle.pendingExtraValueEvents)
         if res.isErr:
           setError(res.error)
           return 1.cint
-      handle.pendingValues.setLen(0)
-      handle.pendingExtraValueEvents.setLen(0)
+        carried = true
+      if carried:
+        handle.pendingValues.setLen(0)
+        handle.pendingExtraValueEvents.setLen(0)
     # else: line-only — leave pendingValues intact to carry forward to
     # the next step; do NOT clear/drop them.
   0.cint
@@ -3293,6 +3304,43 @@ proc ct_spans_json(path: cstring, settled: cint,
 # Close
 # ---------------------------------------------------------------------------
 
+proc flushTrailingValues(handle: TraceWriterHandle): cint =
+  ## Give carry-forward a terminus.
+  ##
+  ## Values staged between steps are deliberately held for the NEXT step rather
+  ## than forced into an invented one, so a recorder that reports a call's
+  ## arguments before it reports a position still gets them recorded at the
+  ## place they belong. At close there is no next step, and holding them then
+  ## means dropping them: the container finalizes, `values.dat` has exactly one
+  ## record per step and every one of them decodes, and the ones that should
+  ## have carried the trailing values are simply empty. Nothing fails, and
+  ## nothing says the recording is short.
+  ##
+  ## So the last step's position is reused for one final record. That does add
+  ## a step, which is why it is done HERE and not between steps — mid-stream
+  ## the next real step is a better home, and inventing one there would inflate
+  ## every recording. At close the choice is a step or the data.
+  ##
+  ## A writer holding values with no step ever recorded has nowhere truthful to
+  ## put them, so that is refused by name rather than guessed at.
+  if handle.pendingValues.len == 0 and handle.pendingExtraValueEvents.len == 0:
+    return 0.cint
+  if handle.msWriter.stepCount == 0:
+    setError("close: " & $handle.pendingValues.len & " value(s) and " &
+      $handle.pendingExtraValueEvents.len & " value-stream event byte(s) are " &
+      "staged, but no step was ever recorded, so there is no position to " &
+      "attach them to. Register a step before closing, or do not stage them.")
+    return 1.cint
+  let res = handle.msWriter.registerStep(
+    handle.pendingStepPathId, handle.pendingStepLine,
+    handle.pendingValues, handle.pendingExtraValueEvents)
+  if res.isErr:
+    setError("close: could not record the trailing values: " & res.error)
+    return 1.cint
+  handle.pendingValues.setLen(0)
+  handle.pendingExtraValueEvents.setLen(0)
+  0.cint
+
 proc trace_writer_close(handle: TraceWriterHandle): cint {.exportc, cdecl, dynlib.} =
   ## Close the trace writer and flush all remaining data.
   ## Returns 0 on success, non-zero on failure.
@@ -3308,6 +3356,10 @@ proc trace_writer_close(handle: TraceWriterHandle): cint {.exportc, cdecl, dynli
     let flushRc = flushPendingStep(handle)
     if flushRc != 0:
       return flushRc
+    # …and anything carry-forward is still holding, which has no next step now.
+    let trailRc = flushTrailingValues(handle)
+    if trailRc != 0:
+      return trailRc
     let closeRes = handle.msWriter.close()
     if closeRes.isErr:
       setError(closeRes.error)
