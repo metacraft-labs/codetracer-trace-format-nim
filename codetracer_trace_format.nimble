@@ -220,6 +220,15 @@ task test, "Run all tests":
   # only shape where the ordering is decided by the assembler rather than by
   # the step index.
   exec "nim c -r -d:release -p:src -p:tests tests/test_ct_print_agreement.nim"
+  # The reader C FFI exports. Like the two tests above it `include`s the FFI
+  # module, so it needs --mm:arc and the --nimMainPrefix. It had never been
+  # listed here either: its fixture declared a container it had not written,
+  # every value lookup was refused, and the refusal was turned into an empty
+  # string that the assertions read as "no values".
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_reader_ffi.nim"
+  # Every test file is reachable from this task. Two were not, for months
+  # each, and both described behaviour that had moved on without them.
+  exec "nim c -r -d:release -p:src tests/test_every_test_is_listed.nim"
   # #601: an I/O event must be attributed to the step of the line that wrote
   # it. The FFI buffers one step, so `stepCount - 1` named the PREVIOUS step
   # and the flow view rendered program output one source line too high.

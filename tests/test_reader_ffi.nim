@@ -17,6 +17,9 @@ import std/strutils
 import codetracer_ctfs/container
 import codetracer_trace_writer/interning_table
 import codetracer_trace_writer/exec_stream
+import codetracer_trace_writer/value_stream
+import codetracer_trace_writer/io_event_stream
+import codetracer_trace_writer/cbor
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -26,6 +29,34 @@ proc toBytes(s: string): seq[byte] =
   result = newSeq[byte](s.len)
   for i in 0 ..< s.len:
     result[i] = byte(s[i])
+
+proc cborOf(v: ValueRecord): seq[byte] =
+  ## A value-stream payload is a CBOR `ValueRecord`, not the decimal text of
+  ## the number. The fixture stored the text, so the type id every reader
+  ## derives from the payload came back 0 whatever the fixture had asked for,
+  ## and a value's byte length was the only thing left to assert about it.
+  var enc = CborEncoder.init()
+  enc.encodeCborValueRecord(v)
+  enc.getBytes()
+
+proc decodedValue(data: ptr uint8, length: csize_t): ValueRecord =
+  ## Decode a payload the reader handed back, so a test can say WHICH value it
+  ## found rather than how many bytes it occupied.
+  doAssert not data.isNil and length > 0.csize_t, "empty value payload"
+  var bytes = newSeq[byte](int(length))
+  copyMem(addr bytes[0], data, int(length))
+  var dec = CborDecoder.init(bytes)
+  let res = dec.decodeCborValueRecord()
+  # `.error` is deliberately not read here: this file `include`s the FFI
+  # module, whose `{.push raises: [].}` makes the accessor's defect path
+  # unavailable. The payload bytes say as much about a decode failure.
+  doAssert res.isOk,
+    "value payload did not decode as a CBOR ValueRecord; bytes: " & $bytes
+  res.unsafeGet()
+
+const
+  IntTypeId = TypeId(0)
+  StrTypeId = TypeId(1)
 
 proc readFfiString(buf: ptr uint8, length: csize_t): string =
   if buf.isNil or length == 0.csize_t:
@@ -48,8 +79,16 @@ proc ffiGetMeta(h: pointer,
 
 proc ffiGetJson(h: pointer, key: uint64,
     getter: proc(h: pointer, key: uint64, outLen: ptr csize_t): ptr uint8 {.cdecl.}): string =
+  ## A reader FFI getter returns NULL and sets the thread-local error when it
+  ## cannot answer. Turning that into the empty string makes a REFUSAL
+  ## indistinguishable from a record that legitimately holds nothing, and every
+  ## assertion downstream then reads as though the container were merely empty.
+  ## The refusal is raised by name instead.
   var outLen: csize_t
   let buf = getter(h, key, addr outLen)
+  doAssert not buf.isNil,
+    "reader FFI getter refused key " & $key & ": " &
+    $trace_writer_last_error()
   readFfiString(buf, outLen)
 
 # ---------------------------------------------------------------------------
@@ -63,8 +102,14 @@ proc writeTestTrace(path: string) =
   doAssert metaFileRes.isOk
   var metaFile = metaFileRes.get()
   let meta = TraceMetadata(recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb", program: "test_ffi_prog", args: @["--test"], workdir: "/tmp/ffi")
+  # ``hasValueStream`` is what routes the reader to the SPEC ``values.dat`` /
+  # ``values.idx`` layout this fixture writes; a clear flag selects the legacy
+  # ``values.off`` VariableRecordTable, which nothing here produces. The
+  # fixture declared a container it had not written, and every value lookup
+  # was refused for a file that was never going to exist.
   let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/main.py", "/src/util.py"],
-    recorderId = "ffi-test", hasStepStream = true)
+    recorderId = "ffi-test", hasStepStream = true, hasValueStream = true,
+    hasCallStream = true, hasIoEventStream = true, hasInterningTables = true)
   doAssert metaWr.isOk
 
   let tabRes = initTraceInterningTables(ctfs)
@@ -100,13 +145,18 @@ proc writeTestTrace(path: string) =
   # address 0 — the in-file offset is 0-based (`global_line_index`).
   doAssert ctfs.writeEvent(execW, StepEvent(kind: sekAbsoluteStep, globalLineIndex: 0)).isOk
   doAssert ctfs.writeStepValues(valW, @[
-    VariableValue(varnameId: 0, typeId: 0, data: "42".toBytes),
-    VariableValue(varnameId: 1, typeId: 1, data: "hello".toBytes)]).isOk
+    VariableValue(varnameId: 0, typeId: 0,
+      data: cborOf(ValueRecord(kind: vrkInt, intVal: 42, intTypeId: IntTypeId))),
+    VariableValue(varnameId: 1, typeId: 1,
+      data: cborOf(ValueRecord(kind: vrkString, text: "hello",
+        strTypeId: StrTypeId)))]).isOk
 
   # Step 1: delta step +1
   doAssert ctfs.writeEvent(execW, StepEvent(kind: sekDeltaStep, lineDelta: 1)).isOk
   doAssert ctfs.writeStepValues(valW, @[
-    VariableValue(varnameId: 0, typeId: 0, data: "43".toBytes)]).isOk
+    VariableValue(varnameId: 0, typeId: 0,
+      data: cborOf(ValueRecord(kind: vrkInt, intVal: 43,
+        intTypeId: IntTypeId)))]).isOk
 
   # Step 2: delta step +2
   doAssert ctfs.writeEvent(execW, StepEvent(kind: sekDeltaStep, lineDelta: 2)).isOk
@@ -121,8 +171,12 @@ proc writeTestTrace(path: string) =
   # Call 1: helper() covering step 1
   doAssert ctfs.writeCall(callW, call_stream.CallRecord(
     functionId: 1, parentCallKey: 0, entryStep: 1, exitStep: 1,
-    depth: 1, args: @[CallArg(varnameId: 0, value: "42".toBytes)],
-    returnValue: "43".toBytes,
+    depth: 1,
+    args: @[CallArg(varnameId: 0,
+      value: cborOf(ValueRecord(kind: vrkInt, intVal: 42,
+        intTypeId: IntTypeId)))],
+    returnValue: cborOf(ValueRecord(kind: vrkInt, intVal: 43,
+      intTypeId: IntTypeId)),
     exception: @[], children: @[])).isOk
 
   # CTFS-M20: finalize the call stream (flush last chunk + write calls.idx).
@@ -132,7 +186,10 @@ proc writeTestTrace(path: string) =
   doAssert ctfs.writeEvent(ioW, IOEvent(
     kind: ioStdout, stepId: 1, data: "output\n".toBytes)).isOk
 
+  # Every stream the fixture wrote has to be finalized, not just the exec one.
   doAssert ctfs.flush(execW).isOk
+  doAssert value_stream.flush(ctfs, valW).isOk
+  doAssert io_event_stream.flush(ctfs, ioW).isOk
 
   let ctfsBytes = ctfs.toBytes()
   ctfs.closeCtfs()
@@ -319,17 +376,30 @@ proc test_reader_ffi_structured_accessors() =
   var dataPtr: ptr uint8
   var dataLen: csize_t
 
+  # The value each id RESOLVES to, not the number of bytes it occupies. A
+  # length is right for a payload of the wrong type, for the wrong variable,
+  # and for a value that decodes to nothing.
   doAssert ct_reader_step_value(h, 0, 0, addr varnameId, addr typeId, addr dataPtr, addr dataLen) == 0
   doAssert varnameId == 0, "val 0,0 varnameId: " & $varnameId
+  doAssert ffiGetStr(h, varnameId, ct_reader_varname) == "x",
+    "val 0,0 must be the variable named 'x'"
   doAssert typeId == 0, "val 0,0 typeId: " & $typeId
-  doAssert dataLen == 2.csize_t, "val 0,0 dataLen: " & $dataLen  # "42"
+  block:
+    let v = decodedValue(dataPtr, dataLen)
+    doAssert v.kind == vrkInt and v.intVal == 42,
+      "val 0,0 must decode as Int 42; got " & $v
   if not dataPtr.isNil:
     ct_free_buffer(dataPtr)
 
   doAssert ct_reader_step_value(h, 0, 1, addr varnameId, addr typeId, addr dataPtr, addr dataLen) == 0
   doAssert varnameId == 1, "val 0,1 varnameId: " & $varnameId
+  doAssert ffiGetStr(h, varnameId, ct_reader_varname) == "y",
+    "val 0,1 must be the variable named 'y'"
   doAssert typeId == 1, "val 0,1 typeId: " & $typeId
-  doAssert dataLen == 5.csize_t, "val 0,1 dataLen: " & $dataLen  # "hello"
+  block:
+    let v = decodedValue(dataPtr, dataLen)
+    doAssert v.kind == vrkString and v.text == "hello",
+      "val 0,1 must decode as String \"hello\"; got " & $v
   if not dataPtr.isNil:
     ct_free_buffer(dataPtr)
 
