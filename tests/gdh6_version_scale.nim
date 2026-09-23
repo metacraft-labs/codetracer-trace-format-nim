@@ -3,7 +3,7 @@
 ## Not a test: a MEASUREMENT, run by hand to close the open question, and kept
 ## so the number can be re-measured rather than remembered.  It is deliberately
 ## absent from the nimble `test` task — it measures the host, and a threshold
-## over it would be a flake (see this repo's CLAUDE.md on `bench` vs `test`).
+## over it would be a flake (see this repo's AGENTS.md on `bench` vs `test`).
 ##
 ## Build & run:
 ##   nim c -d:release --mm:arc -p:src -o:/tmp/gdh6_scale \
