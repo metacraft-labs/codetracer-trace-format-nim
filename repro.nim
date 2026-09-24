@@ -27,12 +27,10 @@
 ##     two-edge template from ``reprobuild-specs/Package-Model.md``
 ##     §"The test template"), collected into ``test-builds`` / ``test``.
 ##
-## **Toolchain.** This repo has NO ``flake.nix`` of its own — its
-## ``nim`` / ``nimble`` / ``libzstd`` / ``pkg-config`` toolchain is supplied
-## by the sibling Rust ``codetracer-trace-format`` repo's dev shell (which a
-## downstream recorder's flake also mirrors). ``defaultToolProvisioning
-## "path"`` therefore selects the weak-local PATH resolver: the nix dev
-## shell puts the toolchain floor on ``PATH`` and ``PKG_CONFIG_PATH``.
+## **Toolchain.** The repository's own flake supplies ``nim``, ``nimble``,
+## ``libzstd`` and ``pkg-config``. The repro dev environment activates that
+## flake on Nix hosts; ``defaultToolProvisioning "path"`` consumes its tools
+## without changing the existing native build graph.
 ##
 ## **libzstd.** ``test_ct_print_events_log_fallback`` compiles ct-print at
 ## runtime. On POSIX it supplies ``pkg-config --cflags/--libs libzstd``; the
@@ -63,6 +61,7 @@
 ## portable on hosts that put libpcre on the default search path.
 
 import repro_project_dsl
+import repro_dsl_stdlib/foreign_env
 
 # ``ct_test_nim_unittest`` supplies ``buildNimUnittest.build(...)`` (the
 # per-test compile edge) and ``edge.testBinary.run(...)`` (the execute
@@ -264,6 +263,10 @@ package codetracer_trace_format_nim:
     "nim >=2.2 <3.0"
     "nimble"
     "gcc >=12"
+
+  devEnv:
+    when not defined(windows):
+      useFlakeDevShell()
 
   # The importable ``src/`` surface (``--path:src``): the CTFS container,
   # the trace reader/writer, the multi-stream writer, and the FFI entry
