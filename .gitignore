@@ -3,6 +3,9 @@
 *.so
 *.dylib
 nimcache/
+# Per-checkout nimcache (config.nims): every Nim compile in this checkout
+# keeps its intermediate files here, never in the shared ~/.cache/nim.
+.nimcache/
 # Project-local NIMBLE_DIR seeded by the dev shell from the pinned flake
 # inputs (stew / results / unittest2 + the package index).
 .nimble/
@@ -77,6 +80,7 @@ tests/generate_ct_print_fixture
 tests/test_path_filter
 tests/test_split_trace
 tests/test_trace_storage_config
+tests/test_nimcache_is_worktree_local
 ct-space
 # Windows builds the ct-print / ct-space utilities with a .exe suffix.
 ct-print.exe
