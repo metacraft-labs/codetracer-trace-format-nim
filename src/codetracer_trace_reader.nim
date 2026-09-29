@@ -67,6 +67,19 @@ type
     events*: seq[TraceLowLevelEvent]
     eventCount*: int
     isV4*: bool                  ## true if this is a multi-stream v4 trace
+    acceptShiftedGlobalIndex: bool
+      ## What `openTrace` was given, kept because `readEvents` needs it.
+      ##
+      ## A v4-stream container is opened a SECOND time inside
+      ## `readEventsV4`, through `openNewTraceFromBytes`, and that open reads
+      ## `meta.dat` again.  Without this field the second open ran at the
+      ## default — so `openTrace(p, acceptShiftedGlobalIndex = true)`
+      ## succeeded and `readEvents` then returned the very refusal the caller
+      ## had opted out of, but only for a container that carries `steps.dat`
+      ## and no `events.log`.  A v3-stamped container on the combined
+      ## `events.log` path was unaffected, which is exactly the "works or not
+      ## depending on how the recording happened to be written" answer
+      ## `openTrace`'s own note says this parameter exists to avoid.
 
 # ---------------------------------------------------------------------------
 # Internal helpers: CTFS file reading
@@ -314,6 +327,7 @@ proc openTrace*(path: string;
     events: @[],
     eventCount: 0,
     isV4: isV4,
+    acceptShiftedGlobalIndex: acceptShiftedGlobalIndex,
   )
 
   # `meta.dat` is the metadata document.  The legacy `meta.json` + `paths.json`
@@ -385,8 +399,13 @@ proc readEventsV4(reader: var TraceReader): Result[void, string] =
   ##        d. If n is the exitStep of any pending call records,
   ##           emit tleReturn (innermost-first / LIFO — deeper exits first).
   ##   4. tleEvent for each IO event (in stream order).
-  let trRes = openNewTraceFromBytes(reader.ctfsData, reader.blockSize,
-                                    reader.maxRootEntries)
+  # `acceptShiftedGlobalIndex` IS FORWARDED, because this is a SECOND open of
+  # the same container and it reads `meta.dat` again. `openTrace` already
+  # decided the question; re-asking it at the default here made the opt-in
+  # depend on which streams the recording happens to carry.
+  let trRes = openNewTraceFromBytes(
+    reader.ctfsData, reader.blockSize, reader.maxRootEntries,
+    acceptShiftedGlobalIndex = reader.acceptShiftedGlobalIndex)
   if trRes.isErr:
     return err("failed to open v4 trace: " & trRes.error)
   var nr = trRes.get()

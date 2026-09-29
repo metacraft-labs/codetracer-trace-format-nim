@@ -46,6 +46,14 @@
 ##      parsed `meta.dat` and DISCARDED the error, so a bumped version
 ##      alone would have opened a v3 container with a zeroed `meta` and
 ##      read it one line high anyway.
+##   2b. The OPT-OUT reaches BOTH readers, and reaches the whole of the one
+##      it enters by: `openTrace(p, acceptShiftedGlobalIndex = true)` opens
+##      a v3 container AND `readEvents` then decodes it, because a
+##      v4-stream container is opened a second time inside `readEventsV4`.
+##      That second open used to run at the default, so the opt-in worked
+##      on a combined-`events.log` container and not on a `steps.dat` one —
+##      an answer that depends on how the recording happened to be written,
+##      which `openTrace`'s own note says the parameter exists to avoid.
 ##   3. The C ABI's `ct_reader_open` — the door `codetracer/src/db-backend`
 ##      comes through — returns nil and leaves the reason in
 ##      `trace_writer_last_error`.
@@ -72,6 +80,10 @@ include codetracer_trace_writer_ffi
 {.pop.}
 
 import std/strutils
+# The OTHER reader. `openTrace` is the entry point the combined-`events.log`
+# archetype takes and it opens a v4-stream container a second time internally,
+# which is the seam `test_the_optin_reaches_the_events_reader` is about.
+import codetracer_trace_reader as legacy_reader
 
 const
   PathA = "/src/app.rb"
@@ -279,6 +291,58 @@ proc test_open_refuses_v3_and_accepts_v4() =
 
   echo "PASS: test_open_refuses_v3_and_accepts_v4"
 
+proc test_the_optin_reaches_the_events_reader() =
+  ## `acceptShiftedGlobalIndex` has to survive the SECOND open, or it works
+  ## only for containers written one of the two ways.
+  ##
+  ## `codetracer_trace_reader.openTrace` takes the parameter and reads
+  ## `meta.dat` with it — and then `readEvents` opens the same bytes AGAIN
+  ## through `openNewTraceFromBytes` whenever the container carries
+  ## `steps.dat` and no `events.log`. That second open used to run at the
+  ## default, so the sequence a consumer actually performs —
+  ## `openTrace(p, acceptShiftedGlobalIndex = true)` then `readEvents` —
+  ## returned the refusal the caller had just opted out of, while the same
+  ## call on a combined-`events.log` container succeeded. `openTrace`'s own
+  ## note says that shape of answer is what the parameter exists to avoid.
+  ##
+  ## Asserted as the PAIR, because either half alone passes with the defect
+  ## present: the open succeeds on its own, and the default still refuses.
+  ## The container is this repository's writer's own, so it is a v4-stream
+  ## container and the arm has a subject — `isV4` is asserted rather than
+  ## assumed for exactly that reason.
+  let v3 = TmpDir / "optin_events.ct"
+  writeV3Container(v3)
+
+  # `.unsafeError` rather than `.error`, here and below: `error` on a
+  # `Result[TraceReader, string]` instantiates a defect message over the
+  # reader, and `$` on it is not side-effect free, which this module's
+  # `raises`/`sideEffect` regime refuses at compile time. `unsafeError` is
+  # only read after `isErr`, which is where it is safe by construction.
+  block defaultStillRefuses:
+    let opened = legacy_reader.openTrace(v3)
+    doAssert opened.isErr, "openTrace opened a v3 container by default"
+    doAssert "global line index" in opened.unsafeError,
+      "openTrace must propagate the named refusal, got: " &
+      opened.unsafeError
+
+  block theOptInOpensAndREADS:
+    let opened = legacy_reader.openTrace(v3, acceptShiftedGlobalIndex = true)
+    doAssert opened.isOk,
+      "openTrace must honour acceptShiftedGlobalIndex: " &
+      (if opened.isErr: opened.unsafeError else: "")
+    var reader = opened.get()
+    doAssert reader.isV4,
+      "this writer produces a steps.dat container; without one the arm has " &
+      "no subject and the second open is never reached"
+    let ev = legacy_reader.readEvents(reader)
+    doAssert ev.isOk,
+      "readEvents must not re-ask a question openTrace already answered. " &
+      "Got: " & ev.error
+    doAssert reader.eventCount > 0,
+      "the events reader returned success with nothing decoded"
+
+  echo "PASS: test_the_optin_reaches_the_events_reader"
+
 proc test_ffi_reader_open_refuses_v3_and_accepts_v4() =
   ## The C ABI is how `codetracer/src/db-backend` opens a trace, so the
   ## refusal has to survive the boundary rather than stop at the Nim API.
@@ -385,6 +449,7 @@ when isMainModule:
   test_v3_container_carries_the_superseded_addresses()
   test_read_meta_dat_refuses_v3_by_name()
   test_open_refuses_v3_and_accepts_v4()
+  test_the_optin_reaches_the_events_reader()
   test_ffi_reader_open_refuses_v3_and_accepts_v4()
   test_current_container_reads_back_at_the_recorded_lines()
   test_without_the_gate_the_v3_container_reads_one_line_high()
