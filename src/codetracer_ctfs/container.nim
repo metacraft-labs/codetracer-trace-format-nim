@@ -24,8 +24,12 @@ proc createCtfs*(
   c.maxRootEntries = maxRootEntries
   c.encryption = encryption
   c.maxShards = maxShards
-  c.data = newSeq[byte](int(blockSize))
-  c.nextFreeBlock = 1  # Block 0 is the root block
+  # `ctfs-container.md` §1: the root region is `root_blocks` contiguous blocks
+  # from block 0 — one whenever the declared entries fit block 0, more when
+  # they overflow it — and data allocation begins after it.
+  let rootBlocks = rootBlockCount(blockSize, maxRootEntries, maxShards)
+  c.data = newSeq[byte](int(rootBlocks) * int(blockSize))
+  c.nextFreeBlock = rootBlocks
 
   # Write header (8 bytes)
   c.data[0] = CtfsMagic[0]
@@ -76,10 +80,10 @@ proc addFile*(c: var Ctfs, name: string): Result[CtfsInternalFile, string] =
       let mapBlock = c.allocBlock()
       c.zeroBlock(mapBlock)
       writeU64LE(c.data, off + 8, mapBlock)
-      # When streaming, flush the root block (block 0) so the new file entry
-      # and mapping block pointer are visible to concurrent readers.
+      # When streaming, flush the root region so the new file entry and
+      # mapping block pointer are visible to concurrent readers.
       if c.streaming:
-        c.flushBlock(0)
+        c.flushRootBlocks()
         c.flushBlock(mapBlock)
       return ok(CtfsInternalFile(entryIndex: i, writePos: 0, dataBlockCount: 0))
 
@@ -113,10 +117,15 @@ proc writeToFile*(c: var Ctfs, f: var CtfsInternalFile,
   # The entry's mapping root, checked before any walk: a zero here is the state
   # a crash between publishing an entry's size and publishing its mapping root
   # leaves, and the walk below would read its pointers out of block 0.
-  if mapBlock == 0'u64 or mapBlock >= c.nextFreeBlock:
+  # The root region is every block before `rootBlockCount` (block 0 alone
+  # unless the entry array overflows it, `ctfs-container.md` §1), and no
+  # member's block may lie inside it.
+  let rootBlocks = c.rootBlockCount()
+  if mapBlock < rootBlocks or mapBlock >= c.nextFreeBlock:
     return err("internal file entry " & $f.entryIndex & " has mapping root block " &
       $mapBlock & ", which is outside the container's " & $c.nextFreeBlock &
-      " allocated blocks; refusing to write through it")
+      " allocated blocks or inside its " & $rootBlocks &
+      "-block root region; refusing to write through it")
 
   var written = 0
   while written < data.len:
@@ -165,6 +174,11 @@ proc writeToFile*(c: var Ctfs, f: var CtfsInternalFile,
         " of internal file entry " & $f.entryIndex &
         ": its mapping does not resolve, and block 0 is the container header " &
         "and root directory — refusing to write there")
+    if dataBlock < rootBlocks:
+      return err("data block " & $fileBlockIdx & " of internal file entry " &
+        $f.entryIndex & " resolves to block " & $dataBlock & ", inside the " &
+        "container's " & $rootBlocks & "-block root directory; refusing to " &
+        "write there")
     if dataBlock >= c.nextFreeBlock:
       return err("data block " & $fileBlockIdx & " of internal file entry " &
         $f.entryIndex & " resolves to block " & $dataBlock &
@@ -249,7 +263,7 @@ proc truncateFileContent*(c: var Ctfs, f: CtfsInternalFile):
   writeU64LE(c.data, entryOff + 8, mapBlock)
   writeU64LE(c.data, entryOff, 0)
   if c.streaming:
-    c.flushBlock(0)
+    c.flushRootBlocks()
     c.flushBlock(mapBlock)
   ok(CtfsInternalFile(entryIndex: f.entryIndex, writePos: 0, dataBlockCount: 0))
 
@@ -276,7 +290,7 @@ proc syncRootBlock*(c: var Ctfs) =
   ## the runtime's buffer, so a reader in this process — a test decoding the
   ## trace it has just written — reads the pre-close image back.
   if c.streaming:
-    c.flushBlock(0)
+    c.flushRootBlocks()
     try:
       c.streamFile.flushFile()
     except IOError, OSError:

@@ -74,8 +74,34 @@ proc usableEntries*(c: Ctfs): uint64 =
   c.entriesPerBlock() - 1
 
 proc fileEntryOffset*(c: Ctfs, index: int): int =
-  ## Byte offset of a file entry in block 0.
+  ## Byte offset of a file entry from the start of the container.  The entry
+  ## array starts in block 0 and, when it is larger than block 0, continues
+  ## into the blocks after it (`rootBlockCount`), so this is a plain byte
+  ## offset and may lie past the end of block 0.
   HeaderSize + ExtHeaderSize + index * FileEntrySize
+
+proc rootBlockCount*(blockSize: uint32, maxRootEntries: uint32,
+                     maxShards: uint8): uint64 =
+  ## `ctfs-container.md` §1: the number of contiguous blocks, starting at
+  ## block 0, that hold the header, the free-list roots and the file-entry
+  ## array.
+  ##
+  ##     R           = 7 * max_shards * 6
+  ##     root_blocks = ceil((16 + R + max_root_entries * 24) / block_size)
+  ##
+  ## Data block allocation begins at block `root_blocks`.  It is 1 whenever
+  ## the entries fit block 0 (every container written before the overflow was
+  ## implemented) and for `max_root_entries = 0` (auto-fill of block 0).
+  ## 0 for a zero block size, which no reader accepts.
+  if blockSize == 0'u32:
+    return 0
+  let rootBytes = uint64(HeaderSize + ExtHeaderSize) +
+    7'u64 * uint64(maxShards) * 6'u64 +
+    uint64(maxRootEntries) * uint64(FileEntrySize)
+  max(1'u64, (rootBytes + uint64(blockSize) - 1) div uint64(blockSize))
+
+proc rootBlockCount*(c: Ctfs): uint64 =
+  rootBlockCount(c.blockSize, c.maxRootEntries, c.maxShards)
 
 proc readU64LE*(data: openArray[byte], offset: int): uint64 =
   var arr: array[8, byte]
