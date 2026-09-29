@@ -504,6 +504,22 @@ type
       ## header.  Distinguishes "no provenance recorded" (false) from
       ## "provenance recorded but empty" (true with empty
       ## `filterProvenance`).
+    shiftedGlobalIndex*: bool
+      ## THIS CONTAINER'S SCHEMA VERSION PREDATES THE GLOBAL-LINE-INDEX
+      ## CORRECTION, and it was read anyway because the CALLER said to.
+      ##
+      ## True only on a container ``readMetaDat`` accepted through
+      ## ``acceptShiftedGlobalIndex`` — see that parameter for what a caller is
+      ## asserting when it passes it, and for why the reader cannot decide this
+      ## from the bytes. Every ordinary read leaves it false, because every
+      ## ordinary read refuses such a container.
+      ##
+      ## Carried so a consumer can LABEL what it derived. A sidecar computed
+      ## from a container read this way rests on the caller's external evidence
+      ## and not on the container's own word, and the difference has to survive
+      ## into whatever the consumer writes — otherwise the two are
+      ## indistinguishable afterwards, which is the property the version field
+      ## exists to provide and the one this container does not have.
     hasColumnAwareSteps*: bool
       ## True iff FlagHasColumnAwareSteps was set on the meta.dat header.
       ## Readers must surface column data from sekDeltaColumn / column-aware
@@ -857,9 +873,67 @@ proc readString(data: openArray[byte], pos: var int): Result[string, string] =
   pos += sLen
   ok(s)
 
-proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
+proc shiftedGlobalIndexRefusal*(version: uint16): string =
+  ## The refusal, as one sentence in one place.
+  ##
+  ## Exported because a consumer matching on it — `blocktracer`'s
+  ## `chain-health.mjs` does, by name — is matching on a diagnosis, and a
+  ## diagnosis that exists as two string literals is two diagnoses.
+  "meta.dat: schema version " & $version &
+  " predates the global line index correction, and this trace cannot " &
+  "be read. Writers at that version packed a line-only step position " &
+  "as prefixSum[path_id] + line; version " & $MetaDatVersion &
+  " packs prefixSum[path_id] + (line - 1). Both land inside the " &
+  "trace's address space, so a step read under the current decode " &
+  "would come back one line high rather than fail, and the container " &
+  "records nothing else that tells the two apart. Re-record the trace " &
+  "with a current recorder, re-stamp its version if you have evidence " &
+  "the writer already used the corrected packing, or open it with " &
+  "acceptShiftedGlobalIndex if you hold that evidence. Spec: " &
+  "codetracer-trace-format-spec/internal-files.md \"Global Line Index\""
+
+proc readMetaDat*(data: openArray[byte];
+                  acceptShiftedGlobalIndex = false):
+                 Result[MetaDatContents, string] =
   ## Parse binary meta.dat from raw bytes.
   ## Validates magic and version, returns MetaDatContents or an error.
+  ##
+  ## ## ``acceptShiftedGlobalIndex`` — WHAT A CALLER IS ASSERTING
+  ##
+  ## "I hold evidence, from outside this container, that its writer already
+  ## used the corrected line-only packing." Nothing less will do, and the
+  ## reader cannot supply it: the v4 note in the version history above shows
+  ## why a shim is impossible in principle, and three candidate in-container
+  ## discriminators were tried against a real pre-correction corpus and all
+  ## three failed:
+  ##
+  ##   * **The flags.** ``FlagHasColumnAwareSteps`` does not immunise a
+  ##     container. On a trace whose per-file line lengths are all one the
+  ##     byte-offset space DEGENERATES to the line space, so the correction
+  ##     applies to both decoders. Measured: setting bit 4 on a line-only v3
+  ##     container and re-reading gives positions identical to the line-only
+  ##     read, 0 disagreements over 108 steps.
+  ##   * **A per-value signature.** "Some step decodes to line 1 of a file" is
+  ##     sound — the superseded packing cannot produce it, since that would
+  ##     need line 0 — but it does not fire: 0 of the 21 distinct source lines
+  ##     on each of two real containers is line 1.
+  ##   * **The declaration sites.** A function's own line looked like an
+  ##     independent witness, and is not: ``NewTraceReader.functionRecord``
+  ##     returns a ``globalLineIndex``, so a declaration site is packed through
+  ##     the very index it would have to corroborate.
+  ##
+  ## So the decision belongs to whoever HAS the evidence. The shape follows
+  ## ``openNewTraceFromBytes``'s ``assumeColumnAwarePaths``, which already
+  ## hands one ``meta.dat`` reading back to a caller with independent grounds,
+  ## and for the same reason: the reader keeps refusing by default, and a
+  ## caller that overrides it says so at the call site rather than by editing a
+  ## constant.
+  ##
+  ## What it is NOT: a way to read a container whose packing is unknown. A
+  ## caller with no evidence that passes this gets silently wrong lines, which
+  ## is exactly what the refusal exists to prevent — which is why the accepted
+  ## container is stamped ``shiftedGlobalIndex`` so whatever is derived from it
+  ## can carry the qualification.
   if data.len < 8:
     return err("meta.dat too short: need at least 8 bytes, got " & $data.len)
 
@@ -869,7 +943,8 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
     return err("meta.dat: bad magic bytes")
 
   let version = readU16LE(data, 4)
-  if version <= LastShiftedGlobalIndexVersion:
+  let preCorrection = version <= LastShiftedGlobalIndexVersion
+  if preCorrection and not acceptShiftedGlobalIndex:
     # Refused by name, not by the generic version mismatch below, because
     # the consequence of reading one anyway is not a parse failure — it is
     # a plausible wrong answer at every step.  See the v4 note in the
@@ -878,17 +953,15 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
     # gate is on the schema version, so it also refuses a v3 container that
     # holds no steps at all (a ct-mcr recording, say). Saying "its steps
     # were packed as" would be a claim about such a trace that is not true.
-    return err("meta.dat: schema version " & $version &
-      " predates the global line index correction, and this trace cannot " &
-      "be read. Writers at that version packed a line-only step position " &
-      "as prefixSum[path_id] + line; version " & $MetaDatVersion &
-      " packs prefixSum[path_id] + (line - 1). Both land inside the " &
-      "trace's address space, so a step read under the current decode " &
-      "would come back one line high rather than fail, and the container " &
-      "records nothing else that tells the two apart. Re-record the trace " &
-      "with a current recorder. Spec: " &
-      "codetracer-trace-format-spec/internal-files.md \"Global Line Index\"")
-  var versionSupported = false
+    return err(shiftedGlobalIndexRefusal(version))
+  # ONLY THE VERSION IMMEDIATELY BELOW THE CORRECTION may be opened by an
+  # opt-in, and the narrowness is not caution for its own sake: a v3 header is
+  # a v4 header byte for byte — the v4 bump changed an ENCODE, not a layout,
+  # and the ``flags_ext`` word arrived at v5 — so the parse below is already
+  # correct for it. Nothing says a version 2 or below header is this shape, and
+  # "the caller has evidence about the packing" is not evidence about a layout.
+  var versionSupported = acceptShiftedGlobalIndex and
+                         version == LastShiftedGlobalIndexVersion
   for v in SupportedMetaDatVersions:
     if version == v:
       versionSupported = true
@@ -969,6 +1042,10 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
   var pos = headerEnd
 
   var contents = MetaDatContents(version: version)
+  # See the field's own comment: what a consumer needs in order to LABEL a
+  # derivation taken from a container the caller vouched for rather than the
+  # container itself.
+  contents.shiftedGlobalIndex = preCorrection
   contents.flagsExt = flagsExt
   contents.hasSourceReload = (flagsExt and FlagExtHasSourceReload) != 0
   contents.hasColumnAwareSteps = (flags and FlagHasColumnAwareSteps) != 0

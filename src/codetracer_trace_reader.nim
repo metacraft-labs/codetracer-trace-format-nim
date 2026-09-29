@@ -236,8 +236,23 @@ proc bytesToString(data: seq[byte]): string =
 # Public API
 # ---------------------------------------------------------------------------
 
-proc openTrace*(path: string): Result[TraceReader, string] =
+proc openTrace*(path: string;
+                acceptShiftedGlobalIndex = false): Result[TraceReader, string] =
   ## Open a .ct file and parse its contents (metadata and paths).
+  ##
+  ## ``acceptShiftedGlobalIndex`` is `meta_dat.readMetaDat`'s parameter,
+  ## forwarded — see it for what a caller asserts by passing it, and for the
+  ## three in-container discriminators that were measured and found unable to
+  ## decide it. Default false, so every existing caller of this proc keeps
+  ## refusing a pre-correction container exactly as it did.
+  ##
+  ## It is threaded HERE as well as through `openNewTraceFromBytes` because the
+  ## two readers split on which streams a container carries, not on anything a
+  ## caller controls: a bundle with a combined `events.log` is read by this one
+  ## and a split `steps.dat` bundle by the other. A flag on only one of them
+  ## would work or not work depending on how the recording happened to be
+  ## written, which is exactly the kind of answer this repository refuses to
+  ## give.
   let readRes = readCtfsFromFile(path)
   if readRes.isErr:
     return err("failed to read file: " & readRes.error)
@@ -316,7 +331,8 @@ proc openTrace*(path: string): Result[TraceReader, string] =
   if metaDatRes.isErr:
     return err("meta.dat is present in this container but its blocks are " &
                "not: " & metaDatRes.error)
-  let parsed = readMetaDat(metaDatRes.get())
+  let parsed = readMetaDat(metaDatRes.get(),
+                           acceptShiftedGlobalIndex = acceptShiftedGlobalIndex)
   if parsed.isErr:
     return err("meta.dat present but corrupt: " & parsed.error)
   let contents = parsed.get()

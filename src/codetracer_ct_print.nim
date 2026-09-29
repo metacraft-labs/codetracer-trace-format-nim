@@ -1147,6 +1147,22 @@ Usage:
                                           machine-readable output.
   ct-print --follow <file.ct>            Tail the trace as it is written
                                           (NDJSON output).
+  ct-print --accept-shifted-global-index <f.ct>
+                                         Open a container whose meta.dat
+                                          schema version predates the global
+                                          line index correction. REFUSED by
+                                          default, because such a container's
+                                          line-only step positions come back
+                                          ONE LINE HIGH under the current
+                                          decode — silently, with nothing in
+                                          the bytes to tell the two packings
+                                          apart. Pass it only when you have
+                                          established from OUTSIDE the
+                                          container (against the recording's
+                                          own source text) that its writer
+                                          already used the corrected packing.
+                                          Without that evidence this produces
+                                          wrong lines rather than an error.
   ct-print --strip-paths --full <f.ct>   Replace absolute workdir/tmp prefixes
                                           with placeholders for diff-stable
                                           snapshots across machines.
@@ -1265,6 +1281,25 @@ proc main() =
   var stripPaths = false
   var jsonOut = false
   var nativeMode = "auto"  # "auto" | "force" | "off"
+  # ── `--accept-shifted-global-index` ────────────────────────────────────────
+  #
+  # OFF BY DEFAULT, AND IT HAS TO BE. A container at a schema version below the
+  # global-line-index correction is refused by name, because reading one anyway
+  # yields a plausible wrong LINE at every step rather than a failure, and the
+  # container records nothing that tells the two packings apart (see
+  # `meta_dat.readMetaDat`, which lists the three in-container discriminators
+  # that were tried against a real pre-correction corpus and all three failed).
+  #
+  # What this flag is FOR: an operator who has established, from OUTSIDE the
+  # container, that its writer already used the corrected packing — by checking
+  # the decoded positions against the recording's own source text, which is the
+  # only evidence there is. That operator can then regenerate the derived
+  # sidecars instead of being told the corpus is unreadable.
+  #
+  # Passing it without that evidence gets silently wrong lines. The flag is
+  # spelled out in full rather than given a short form for exactly that reason:
+  # it should be inconvenient to type and impossible to type by accident.
+  var acceptShiftedGli = false
 
   for kind, key, val in getopt():
     case kind
@@ -1283,6 +1318,7 @@ proc main() =
       of "follow": follow = true
       of "strip-paths": stripPaths = true
       of "json-out": jsonOut = true
+      of "accept-shifted-global-index": acceptShiftedGli = true
       of "native": nativeMode = "force"
       of "no-native": nativeMode = "off"
       of "help", "h": printHelp(); return
@@ -1419,7 +1455,8 @@ proc main() =
   # Try v4 multi-stream reader first (unless the layout check above selected
   # the legacy combined-stream reader for an events.log-only bundle).
   let newReaderRes =
-    if preferSplit: openNewTrace(filePath)
+    if preferSplit:
+      openNewTrace(filePath, acceptShiftedGlobalIndex = acceptShiftedGli)
     else: Result[NewTraceReader, string].err("events.log-only: use legacy reader")
   if newReaderRes.isOk:
     if follow:
@@ -1438,7 +1475,8 @@ proc main() =
     return
 
   # Fall back to old v2/v3 reader
-  let readerRes = openTrace(filePath)
+  let readerRes = openTrace(filePath,
+                            acceptShiftedGlobalIndex = acceptShiftedGli)
   if readerRes.isErr:
     quit("Error: " & readerRes.unsafeError)
   var reader = readerRes.get()

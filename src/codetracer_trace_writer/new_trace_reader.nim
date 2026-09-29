@@ -517,8 +517,13 @@ proc computePathVersionOrdinals(r: var NewTraceReader): Result[void, string] =
 proc openNewTraceFromBytes*(data: seq[byte],
     blockSize: uint32 = DefaultBlockSize,
     maxEntries: uint32 = DefaultMaxRootEntries,
-    assumeColumnAwarePaths: bool = false): Result[NewTraceReader, string] =
+    assumeColumnAwarePaths: bool = false;
+    acceptShiftedGlobalIndex: bool = false): Result[NewTraceReader, string] =
   ## Open a trace from in-memory bytes. Used for testing.
+  ##
+  ## ``acceptShiftedGlobalIndex`` is `readMetaDat`'s parameter, forwarded — see
+  ## it for what a caller asserts by passing it and why the reader cannot
+  ## decide it.
   ##
   ## ``assumeColumnAwarePaths`` overrides the ``meta.dat`` bit 4
   ## declaration for the ``paths.dat`` record layout only.  Pass it when
@@ -551,7 +556,11 @@ proc openNewTraceFromBytes*(data: seq[byte],
   # without meta.dat is now read entirely from the binary tables.
   let metaDataRes = readInternalFile(data, "meta.dat", blockSize, maxEntries)
   if metaDataRes.isOk:
-    let metaRes = readMetaDat(metaDataRes.get())
+    # ``acceptShiftedGlobalIndex`` is forwarded and not decided here, for
+    # ``assumeColumnAwarePaths``'s reason one parameter up: the evidence is the
+    # caller's, so the override is the caller's. See ``readMetaDat``.
+    let metaRes = readMetaDat(metaDataRes.get(),
+                              acceptShiftedGlobalIndex = acceptShiftedGlobalIndex)
     if metaRes.isErr:
       return err("meta.dat present but not readable: " & metaRes.error)
     reader.meta = metaRes.get()
@@ -719,12 +728,14 @@ when ctHasFilesystem:
   # filesystem surface of the reader.
 
   proc openNewTrace*(path: string,
-      assumeColumnAwarePaths: bool = false): Result[NewTraceReader, string] =
+      assumeColumnAwarePaths: bool = false;
+      acceptShiftedGlobalIndex: bool = false): Result[NewTraceReader, string] =
     ## Open a multi-stream trace file from disk.
     ## Loads meta.dat and interning tables at startup.
     ## All other streams are loaded lazily on first access.
     ##
-    ## See `openNewTraceFromBytes` for ``assumeColumnAwarePaths``.
+    ## See `openNewTraceFromBytes` for ``assumeColumnAwarePaths`` and
+    ## `readMetaDat` for ``acceptShiftedGlobalIndex``.
 
     if not fileExists(path):
       return err("file not found: " & path)
@@ -739,7 +750,8 @@ when ctHasFilesystem:
     except:
       return err("failed to read file: " & path)
 
-    openNewTraceFromBytes(data, assumeColumnAwarePaths = assumeColumnAwarePaths)
+    openNewTraceFromBytes(data, assumeColumnAwarePaths = assumeColumnAwarePaths,
+                          acceptShiftedGlobalIndex = acceptShiftedGlobalIndex)
 
   proc refresh*(r: var NewTraceReader, path: string): Result[void, string] =
     ## Re-read a growing CTFS container into this handle and invalidate every
