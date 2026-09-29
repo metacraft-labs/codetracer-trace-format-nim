@@ -908,11 +908,30 @@ proc readMetaDat*(data: openArray[byte];
   ## three failed:
   ##
   ##   * **The flags.** ``FlagHasColumnAwareSteps`` does not immunise a
-  ##     container. On a trace whose per-file line lengths are all one the
-  ##     byte-offset space DEGENERATES to the line space, so the correction
-  ##     applies to both decoders. Measured: setting bit 4 on a line-only v3
-  ##     container and re-reading gives positions identical to the line-only
-  ##     read, 0 disagreements over 108 steps.
+  ##     container. Measured: setting bit 4 on a line-only v3 container and
+  ##     re-reading gives positions identical to the line-only read, 0
+  ##     disagreements over 108 steps.
+  ##     THE MECHANISM FIRST WRITTEN HERE WAS WRONG, and it is corrected rather
+  ##     than deleted because the wrong one reads as an independent result. It
+  ##     said the byte-offset space "DEGENERATES to the line space" on a trace
+  ##     whose per-file line lengths are all one. That is not what those two
+  ##     reads had in common. Re-measured in both directions — bit 4 SET on a
+  ##     line-only container, and bit 4 CLEARED on a genuinely column-aware one
+  ##     — the `ct-print --events` output is byte-identical each time, and the
+  ##     reason is that both containers carry a combined ``events.log``. That
+  ##     archetype's ``Step`` record is a written ``(path_id, line)`` pair
+  ##     (``split_binary.decodeEvent`` tag 0), so no global index is inverted on
+  ##     the way out and bit 4 cannot move the answer either way. An experiment
+  ##     on such a container therefore cannot show that bit 4 immunises
+  ##     anything, which is the conclusion that matters and the one that stands.
+  ##
+  ##     AND THE SAME FACT BOUNDS THIS WHOLE REFUSAL, which is worth knowing
+  ##     before reaching for the opt-in. The gate is on the SCHEMA VERSION, so
+  ##     it also refuses every v3-stamped ``events.log`` container — whose steps
+  ##     were never packed through a global line index and so cannot come back
+  ##     one line high. The hazard the refusal describes is real only for the
+  ##     split-stream archetype (``steps.dat``), which is the one
+  ##     ``NewTraceReader`` inverts addresses for.
   ##   * **A per-value signature.** "Some step decodes to line 1 of a file" is
   ##     sound — the superseded packing cannot produce it, since that would
   ##     need line 0 — but it does not fire: 0 of the 21 distinct source lines
