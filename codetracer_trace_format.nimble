@@ -148,6 +148,9 @@ task test, "Run all tests":
   # DeltaColumn round-trip, Layout A paths.dat, the position decoder, and the
   # meta.dat unknown-flag-bit rejection that keeps the extension clean.
   exec "nim c -r -d:release -p:src tests/test_column_aware_steps.nim"
+  # A function declared in a file no step visited is written at close, with its
+  # path in the space its address is computed in (and in meta.dat's list).
+  exec "nim c -r -d:release -p:src tests/test_function_in_a_file_with_no_steps.nim"
   # A column-aware trace may table some of its files and not others, and the
   # two kinds of file take different amounts of the position space. Writer
   # and reader size them by one rule; sizing an untabled file 0 in the reader
