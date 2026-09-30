@@ -261,6 +261,14 @@ task test, "Run all tests":
   # count, and must be refused by name rather than silently dropping the step.
   # Same FFI-`include` compile requirements as the tests above.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_line_count_table.nim"
+  # A path or variable name registered through the C ABI is interned when it
+  # is registered, as the native API interns it, not when a record first
+  # refers to it. Same FFI-`include` compile requirements as the tests above.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_register_path_and_varname.nim"
+  # Values staged when a recording ends go to the last STEP's value record,
+  # not to a thread-switch record after it, even across a value-chunk boundary.
+  # Same FFI-`include` compile requirements as the tests above.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_trailing_values_attach_to_the_last_step.nim"
   # A reload marker written through the C ABI follows the step registered
   # before it (the pending step is flushed first). Same FFI-`include` compile
   # requirements as the tests above.

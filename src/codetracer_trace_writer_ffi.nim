@@ -2905,6 +2905,73 @@ proc trace_writer_current_path_id(
     return CtTwInvalidPathId
   found.get()
 
+proc trace_writer_register_path(
+    handle: TraceWriterHandle,
+    path: cstring,
+): uint64 {.exportc, cdecl, dynlib, ffiGuardFail(high(uint64)).} =
+  ## Intern ``path`` in ``paths.dat`` now and return its id — the id a step
+  ## at ``path`` registered afterwards is attributed to.
+  ##
+  ## This is ``registerPath`` on the C ABI. A path is interned when it is
+  ## registered, whether or not a step ever refers to it, so the ids follow
+  ## the caller's registrations rather than the order in which steps first
+  ## reach each file. Registering a path twice returns the id it already has.
+  ##
+  ## Under the line-count table a path registered here has no count to
+  ## record, so an unseen one is refused, exactly as the implicit
+  ## registration ``trace_writer_register_step`` performs is; register it
+  ## with ``trace_writer_register_path_with_line_count`` instead.
+  ##
+  ## Returns ``CT_TW_INVALID_PATH_ID`` (``UINT64_MAX``) on failure, with
+  ## ``trace_writer_last_error`` set.
+  trace_writer_clear_last_error()
+  if handle.isNil:
+    setError("trace_writer_register_path: NULL handle")
+    return CtTwInvalidPathId
+  if not handle.useMultiStream:
+    setError("trace_writer_register_path: the legacy single-stream " &
+      "backend has no paths.dat to intern into")
+    return CtTwInvalidPathId
+  if not handle.msWriterReady:
+    setError("trace_writer_register_path: writer not ready " &
+      "(call trace_writer_begin_events first)")
+    return CtTwInvalidPathId
+  let idRes = handle.msWriter.pathIdForStep(toNimStr(path))
+  if idRes.isErr:
+    setError("trace_writer_register_path: " & idRes.error)
+    return CtTwInvalidPathId
+  idRes.get()
+
+proc trace_writer_register_variable_name(
+    handle: TraceWriterHandle,
+    name: cstring,
+): uint64 {.exportc, cdecl, dynlib, ffiGuardFail(high(uint64)).} =
+  ## Intern ``name`` in ``varnames.dat`` now and return its id — the id a
+  ## value registered under ``name`` afterwards carries.
+  ##
+  ## This is ``registerVarname`` on the C ABI: a name is interned when it is
+  ## registered, whether or not a value is ever given under it. Registering a
+  ## name twice returns the id it already has.
+  ##
+  ## Returns ``UINT64_MAX`` on failure, with ``trace_writer_last_error`` set.
+  trace_writer_clear_last_error()
+  if handle.isNil:
+    setError("trace_writer_register_variable_name: NULL handle")
+    return high(uint64)
+  if not handle.useMultiStream:
+    setError("trace_writer_register_variable_name: the legacy " &
+      "single-stream backend has no varnames.dat to intern into")
+    return high(uint64)
+  if not handle.msWriterReady:
+    setError("trace_writer_register_variable_name: writer not ready " &
+      "(call trace_writer_begin_events first)")
+    return high(uint64)
+  let idRes = handle.msWriter.registerVarname(toNimStr(name))
+  if idRes.isErr:
+    setError("trace_writer_register_variable_name: " & idRes.error)
+    return high(uint64)
+  idRes.get()
+
 proc trace_writer_register_source_view(
     handle: TraceWriterHandle,
     path_id: uint64,

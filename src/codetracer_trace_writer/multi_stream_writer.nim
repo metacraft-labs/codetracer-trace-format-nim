@@ -2184,9 +2184,9 @@ proc registerRaise*(w: var MultiStreamTraceWriter, exceptionTypeId: uint64,
     return err("failed to write raise event: " & res.error)
 
   # Write empty values to keep streams in sync
-  w.lastStepValues = @[]
-  w.lastStepExtraValueEvents = @[]
-  let valRes = w.container.writeStepValues(w.valueWriter, @[])
+  # Not a step: its record stays empty, and the last step's record stays
+  # the one values staged at the end are amended into.
+  let valRes = w.container.writeStepValues(w.valueWriter, @[], isStep = false)
   if valRes.isErr:
     return err("failed to write raise values: " & valRes.error)
 
@@ -2206,9 +2206,9 @@ proc registerCatch*(w: var MultiStreamTraceWriter,
     return err("failed to write catch event: " & res.error)
 
   # Write empty values to keep streams in sync
-  w.lastStepValues = @[]
-  w.lastStepExtraValueEvents = @[]
-  let valRes = w.container.writeStepValues(w.valueWriter, @[])
+  # Not a step: its record stays empty, and the last step's record stays
+  # the one values staged at the end are amended into.
+  let valRes = w.container.writeStepValues(w.valueWriter, @[], isStep = false)
   if valRes.isErr:
     return err("failed to write catch values: " & valRes.error)
 
@@ -2289,9 +2289,9 @@ proc registerSourceReload*(w: var MultiStreamTraceWriter,
     let zeroRes = w.container.writeEvent(w.execWriter, zeroEv)
     if zeroRes.isErr:
       return err("failed to write source_reload event: " & zeroRes.error)
-    w.lastStepValues = @[]
-    w.lastStepExtraValueEvents = @[]
-    let zeroVal = w.container.writeStepValues(w.valueWriter, @[])
+    # Not a step: its record stays empty, and the last step's record stays
+    # the one values staged at the end are amended into.
+    let zeroVal = w.container.writeStepValues(w.valueWriter, @[], isStep = false)
     if zeroVal.isErr:
       return err("failed to write source_reload values: " & zeroVal.error)
     w.sourceReloads = zeroOrdinal
@@ -2336,9 +2336,9 @@ proc registerSourceReload*(w: var MultiStreamTraceWriter,
 
   # Keep the value stream in lock-step, exactly as raise / catch / the
   # thread events do.
-  w.lastStepValues = @[]
-  w.lastStepExtraValueEvents = @[]
-  let valRes = w.container.writeStepValues(w.valueWriter, @[])
+  # Not a step: its record stays empty, and the last step's record stays
+  # the one values staged at the end are amended into.
+  let valRes = w.container.writeStepValues(w.valueWriter, @[], isStep = false)
   if valRes.isErr:
     return err("failed to write source_reload values: " & valRes.error)
 
@@ -2363,9 +2363,9 @@ proc registerThreadSwitch*(w: var MultiStreamTraceWriter,
   if res.isErr:
     return err("failed to write thread_switch event: " & res.error)
 
-  w.lastStepValues = @[]
-  w.lastStepExtraValueEvents = @[]
-  let valRes = w.container.writeStepValues(w.valueWriter, @[])
+  # Not a step: its record stays empty, and the last step's record stays
+  # the one values staged at the end are amended into.
+  let valRes = w.container.writeStepValues(w.valueWriter, @[], isStep = false)
   if valRes.isErr:
     return err("failed to write thread_switch values: " & valRes.error)
 
@@ -2384,9 +2384,9 @@ proc registerThreadStart*(w: var MultiStreamTraceWriter,
   if res.isErr:
     return err("failed to write thread_start event: " & res.error)
 
-  w.lastStepValues = @[]
-  w.lastStepExtraValueEvents = @[]
-  let valRes = w.container.writeStepValues(w.valueWriter, @[])
+  # Not a step: its record stays empty, and the last step's record stays
+  # the one values staged at the end are amended into.
+  let valRes = w.container.writeStepValues(w.valueWriter, @[], isStep = false)
   if valRes.isErr:
     return err("failed to write thread_start values: " & valRes.error)
 
@@ -2405,9 +2405,9 @@ proc registerThreadExit*(w: var MultiStreamTraceWriter,
   if res.isErr:
     return err("failed to write thread_exit event: " & res.error)
 
-  w.lastStepValues = @[]
-  w.lastStepExtraValueEvents = @[]
-  let valRes = w.container.writeStepValues(w.valueWriter, @[])
+  # Not a step: its record stays empty, and the last step's record stays
+  # the one values staged at the end are amended into.
+  let valRes = w.container.writeStepValues(w.valueWriter, @[], isStep = false)
   if valRes.isErr:
     return err("failed to write thread_exit values: " & valRes.error)
 

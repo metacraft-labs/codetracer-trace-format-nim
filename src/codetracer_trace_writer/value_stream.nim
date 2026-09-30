@@ -153,18 +153,29 @@ type
     recordCount: int           ## records in the current chunk buffer
     totalRecords: uint64
     dataOffset: uint64         ## running byte offset in values.dat
-    lastRecordStart: int
-      ## Offset in ``buffer`` of the most recently written record, or -1 when
-      ## no record has been written into the current chunk.
+    held: seq[seq[byte]]
+      ## Full chunks, oldest first, that are not written yet because the last
+      ## STEP's record is in one of them or in ``buffer`` after them. Only
+      ## records that are not steps (thread, raise/catch, reload records)
+      ## follow that step's record, so this is bounded by how many of those a
+      ## recording emits between two steps.
+    chunksWritten: int         ## chunks compressed into values.dat so far
+    lastStepChunk: int
+      ## Ordinal of the chunk holding the most recent step's record (the
+      ## chunk it is in counts ``chunksWritten`` + position in ``held``, and
+      ## ``buffer`` comes after ``held``), or -1 when no step has been written.
+    lastStepRecordStart: int
+      ## Offset of that record within its chunk's bytes.
       ##
-      ## The most recent record stays amendable, which is what lets a writer
-      ## attach values staged after it to the step it belongs to instead of
-      ## emitting a second step to carry them (spec §"Where the recording ends
-      ## with values still staged": the terminus must not change the step
-      ## count, because a recording has exactly N + 1 steps). Keeping it
-      ## amendable is why the chunk is flushed BEFORE the next record is
-      ## appended rather than after the current one — same chunk contents,
-      ## but the record just written is always still here.
+      ## The most recent STEP's record stays amendable, which is what lets a
+      ## writer attach values staged after it to the step they belong to
+      ## instead of emitting a second step to carry them (spec §"Where the
+      ## recording ends with values still staged": the terminus must not
+      ## change the step count, because a recording has exactly N + 1 steps).
+      ## Records that are not steps can follow it — a thread switch, say — and
+      ## the values do not belong to those, whose records no step reads; so
+      ## the step's chunk, and every chunk after it, is held back from
+      ## compression until a later step makes it final.
 
   ValueStreamReader* = object
     data: seq[byte]            ## raw values.dat content (SPEC mode)
@@ -511,7 +522,10 @@ proc initValueStreamWriter*(ctfs: var Ctfs,
     recordCount: 0,
     totalRecords: 0,
     dataOffset: 0,
-    lastRecordStart: -1,
+    held: @[],
+    chunksWritten: 0,
+    lastStepChunk: -1,
+    lastStepRecordStart: -1,
   )
 
   # Index header: just the u32 chunk_size (SPEC layout — no total_events).
@@ -526,17 +540,15 @@ proc initValueStreamWriter*(ctfs: var Ctfs,
 
   ok(writer)
 
-proc flushChunk(ctfs: var Ctfs, w: var ValueStreamWriter): Result[void, string] =
-  ## Compress the buffered records into one chunk, append to values.dat, and
-  ## record the chunk's byte offset in values.idx.
-  if w.recordCount == 0:
-    return ok()
-
-  let bound = ZSTD_compressBound(csize_t(w.buffer.len))
+proc writeChunk(ctfs: var Ctfs, w: var ValueStreamWriter,
+    chunk: openArray[byte]): Result[void, string] =
+  ## Compress one chunk's records, append it to values.dat, and record its
+  ## byte offset in values.idx.
+  let bound = ZSTD_compressBound(csize_t(chunk.len))
   var compressed = newSeq[byte](int(bound))
   let compressedSize = ZSTD_compress(
     addr compressed[0], csize_t(bound),
-    addr w.buffer[0], csize_t(w.buffer.len),
+    unsafeAddr chunk[0], csize_t(chunk.len),
     cint(ValuesCompressionLevel))
   if ZSTD_isError(compressedSize) != 0:
     return err("zstd compress failed for value chunk: " &
@@ -566,34 +578,70 @@ proc flushChunk(ctfs: var Ctfs, w: var ValueStreamWriter): Result[void, string] 
   ctfs.syncEntry(w.indexFile)
 
   w.dataOffset += uint64(compressedSize)
+  inc w.chunksWritten
+  ok()
+
+proc writeHeld(ctfs: var Ctfs, w: var ValueStreamWriter): Result[void, string] =
+  ## Write every held chunk, oldest first.
+  for chunk in w.held:
+    ? writeChunk(ctfs, w, chunk)
+  w.held.setLen(0)
+  ok()
+
+proc rotateChunk(ctfs: var Ctfs, w: var ValueStreamWriter): Result[void, string] =
+  ## The current chunk is full: start a new one. It is written now unless the
+  ## last step's record is in it (or in a held chunk before it), in which case
+  ## it is held until a later step makes that record final.
+  let currentChunk = w.chunksWritten + w.held.len
+  if w.lastStepChunk >= w.chunksWritten and w.lastStepChunk <= currentChunk:
+    w.held.add(w.buffer)
+  else:
+    ? writeChunk(ctfs, w, w.buffer)
+  w.buffer = @[]
+  w.recordCount = 0
+  ok()
+
+proc flushChunk(ctfs: var Ctfs, w: var ValueStreamWriter): Result[void, string] =
+  ## Write every held chunk and the current one. Called when the stream ends:
+  ## nothing after this can amend a record.
+  ? writeHeld(ctfs, w)
+  if w.recordCount > 0:
+    ? writeChunk(ctfs, w, w.buffer)
   w.buffer.setLen(0)
   w.recordCount = 0
-  # The amendable record went out with the chunk. A later amend refuses by
-  # name rather than rewriting whatever byte range happens to be at offset 0.
-  w.lastRecordStart = -1
+  w.lastStepChunk = -1
+  w.lastStepRecordStart = -1
   ok()
 
 proc writeStepValues*(ctfs: var Ctfs, w: var ValueStreamWriter,
     values: openArray[VariableValue],
-    extraEvents: openArray[byte] = []): Result[void, string] =
-  ## Write all variable values for one step.  Call exactly once per step event,
-  ## in step order — this preserves the parallel-index invariant (record N ↔
-  ## step N).  For steps with no values pass an empty array (an empty record).
+    extraEvents: openArray[byte] = [],
+    isStep = true): Result[void, string] =
+  ## Write the value record of one exec record.  Call exactly once per exec
+  ## record, in order — this preserves the parallel-index invariant (record N
+  ## ↔ exec record N).  For a record with no values pass an empty array.
+  ##
+  ## ``isStep`` is false for an exec record that is not a step (a thread
+  ## record, raise/catch, a reload marker): its record is always empty, and it
+  ## does not become the record ``rewriteLastStepValues`` amends.
   ##
   ## ``extraEvents`` carries already-encoded tagged value-stream events (today
   ## only tag-9 ``Assignment``, built by ``encodeAssignmentEvent``) that belong
   ## to the same step; they are appended after the tag-0 StepValues event.
-  # Flush the full chunk BEFORE appending, so the record written below is
-  # still in ``buffer`` when this returns. See ``lastRecordStart``.
+  # Start a new chunk BEFORE appending, so a full chunk that holds the last
+  # step's record is still amendable when this returns.
   if w.recordCount >= w.chunkSize:
-    let flushed = flushChunk(ctfs, w)
-    if flushed.isErr:
-      return flushed
+    ? rotateChunk(ctfs, w)
+
+  if isStep:
+    # A new step: every earlier record is final, so the held chunks can go.
+    ? writeHeld(ctfs, w)
+    w.lastStepChunk = w.chunksWritten
+    w.lastStepRecordStart = w.buffer.len
 
   var rec: seq[byte] = @[]
   encodeRecord(values, extraEvents, rec)
   # Length-prefix the record within the chunk so the reader can index it.
-  w.lastRecordStart = w.buffer.len
   encodeVarint(uint64(rec.len), w.buffer)
   w.buffer.add(rec)
   inc w.recordCount
@@ -603,8 +651,9 @@ proc writeStepValues*(ctfs: var Ctfs, w: var ValueStreamWriter,
 proc rewriteLastStepValues*(w: var ValueStreamWriter,
     values: openArray[VariableValue],
     extraEvents: openArray[byte] = []): Result[void, string] =
-  ## Replace the most recently written record with one encoding ``values`` and
-  ## ``extraEvents``.
+  ## Replace the most recent STEP's record with one encoding ``values`` and
+  ## ``extraEvents``; records written after it (thread and other non-step
+  ## records) are kept as they are.
   ##
   ## This is how values staged after the last step reach the trace: they are
   ## merged with that step's own values by the caller (which is the party that
@@ -614,17 +663,35 @@ proc rewriteLastStepValues*(w: var ValueStreamWriter,
   ## long whenever a value happened to be staged at the end.
   ##
   ## Refuses rather than guesses when there is no record to amend.
-  if w.lastRecordStart < 0:
-    return err("rewriteLastStepValues: no value record has been written into " &
-      "the current chunk, so there is nothing to amend")
-  if w.lastRecordStart > w.buffer.len:
-    return err("rewriteLastStepValues: recorded record offset " &
-      $w.lastRecordStart & " is past the buffer end " & $w.buffer.len)
-  var rec: seq[byte] = @[]
-  encodeRecord(values, extraEvents, rec)
-  w.buffer.setLen(w.lastRecordStart)
-  encodeVarint(uint64(rec.len), w.buffer)
-  w.buffer.add(rec)
+  if w.lastStepChunk < w.chunksWritten:
+    return err("rewriteLastStepValues: no step's value record is still " &
+      "amendable, so there is nothing to amend")
+  let pos = w.lastStepChunk - w.chunksWritten
+  template splice(chunk: var seq[byte]) =
+    let start = w.lastStepRecordStart
+    if start < 0 or start >= chunk.len:
+      return err("rewriteLastStepValues: recorded record offset " & $start &
+        " is outside its chunk of " & $chunk.len & " bytes")
+    var p = start
+    var oldLen = 0'u64
+    var shift = 0
+    while true:
+      let b = chunk[p]
+      oldLen = oldLen or (uint64(b and 0x7F) shl shift)
+      inc p
+      if (b and 0x80) == 0: break
+      shift += 7
+    let oldEnd = p + int(oldLen)
+    var rec: seq[byte] = @[]
+    encodeRecord(values, extraEvents, rec)
+    var replacement: seq[byte] = @[]
+    encodeVarint(uint64(rec.len), replacement)
+    replacement.add(rec)
+    chunk = chunk[0 ..< start] & replacement & chunk[oldEnd ..< chunk.len]
+  if pos < w.held.len:
+    splice(w.held[pos])
+  else:
+    splice(w.buffer)
   ok()
 
 proc flush*(ctfs: var Ctfs, w: var ValueStreamWriter): Result[void, string] =
