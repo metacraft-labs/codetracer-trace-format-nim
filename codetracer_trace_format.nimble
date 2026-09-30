@@ -10,6 +10,14 @@ requires "nim >= 2.2.0"
 requires "stew >= 0.1.0"
 requires "results"
 
+# Every library a foreign host links is built with -d:useMalloc. Nim's own
+# allocator is thread-local: memory a host's worker thread allocated through the
+# writer is freed by whichever thread closes it, and if the worker has exited by
+# then its heap is gone and the free crashes in `rawDealloc` (the Godot fork's
+# atexit close, SIGSEGV 3/3). The C allocator has no per-thread ownership.
+# `testFfiThreads` holds every build to it.
+const hostLibFlags = "--mm:arc --noMain -d:release -d:useMalloc --nimMainPrefix:codetracerTraceWriter"
+
 task test, "Run all tests":
   exec "nim c -r tests/test_nimcache_is_worktree_local.nim"
   exec "nim c -r tests/test_base40.nim"
@@ -310,6 +318,28 @@ task test, "Run all tests":
 task regenerateFixtures, "Regenerate .expected golden fixture files":
   exec "nim c -r tests/generate_golden_fixtures.nim"
 
+task testFfiThreads, "C host: write on a worker thread, close on main after it exits":
+  # Builds the archive twice — with the host-library flags and without
+  # -d:useMalloc — and requires the host test to PASS against the first and
+  # CRASH against the second: a pass on both would mean the test no longer
+  # reaches the defect the flag exists for.
+  when hostOS == "windows":
+    echo "SKIP: testFfiThreads uses pthreads and mmap"
+  else:
+    let dir = "build/ffi-threads"
+    mkDir(dir)
+    exec "nim c --app:staticlib " & hostLibFlags & " --passC:\"-fPIC\" -p:src --nimcache:" & dir & "/nc-malloc -o:" & dir & "/lib-malloc.a src/codetracer_trace_writer_ffi.nim"
+    exec "nim c --app:staticlib --mm:arc --noMain -d:release --nimMainPrefix:codetracerTraceWriter --passC:\"-fPIC\" -p:src --nimcache:" & dir & "/nc-nimalloc -o:" & dir & "/lib-nimalloc.a src/codetracer_trace_writer_ffi.nim"
+    let extra = when hostOS == "macosx": " -framework Security -framework CoreFoundation" else: ""
+    for v in ["malloc", "nimalloc"]:
+      exec "gcc -o " & dir & "/host-" & v & " tests/test_ffi_worker_thread_exit.c " & dir & "/lib-" & v & ".a -lzstd -lm -lpthread -I include" & extra
+    exec dir & "/host-malloc"
+    let (_, code) = gorgeEx(dir & "/host-nimalloc")
+    if code == 0:
+      raise newException(AssertionDefect, "the worker-thread host PASSED against an archive " &
+        "built without -d:useMalloc: the test no longer reaches the cross-thread free it guards")
+    echo "PASS: without -d:useMalloc the host crashes (exit " & $code & "), with it the host passes"
+
 task bench, "Run benchmarks":
   exec "nim c -d:release -r tests/bench_seekable_zstd.nim"
   exec "nim c -d:release -r tests/bench_split_binary.nim"
@@ -335,6 +365,7 @@ task buildCtSpace, "Build ct-space utility":
 task testReader, "Run trace reader tests":
   exec "nim c -r -p:src tests/test_trace_reader.nim"
 
+
 task buildStaticLib, "Build static library (C FFI)":
   # --passC:"-fPIC" is required so the static lib can be linked into shared
   # objects (e.g. Python's .so extension via maturin/PyO3).
@@ -346,20 +377,20 @@ task buildStaticLib, "Build static library (C FFI)":
     # The Godot/CodeTracer Windows build is MSVC, so the embedded archive must
     # use the same compiler, CRT, and .lib format. Run from a VS developer
     # environment; zstd_bindings.nim selects C:\zstd for this compiler.
-    exec "nim c --cc:vcc --app:staticlib --mm:arc --noMain -d:release --nimMainPrefix:codetracerTraceWriter -p:src -o:codetracer_trace_writer.lib src/codetracer_trace_writer_ffi.nim"
+    exec "nim c --cc:vcc --app:staticlib " & hostLibFlags & " -p:src -o:codetracer_trace_writer.lib src/codetracer_trace_writer_ffi.nim"
   else:
-    exec "nim c --app:staticlib --mm:arc --noMain -d:release --nimMainPrefix:codetracerTraceWriter --passC:\"-fPIC\" -p:src -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim"
+    exec "nim c --app:staticlib " & hostLibFlags & " --passC:\"-fPIC\" -p:src -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim"
 
 task buildSharedLib, "Build shared library (C FFI)":
   # See buildStaticLib for why --nimMainPrefix is required.
-  exec "nim c --app:lib --mm:arc --noMain -d:release --nimMainPrefix:codetracerTraceWriter -p:src -o:libcodetracer_trace_writer.so src/codetracer_trace_writer_ffi.nim"
+  exec "nim c --app:lib " & hostLibFlags & " -p:src -o:libcodetracer_trace_writer.so src/codetracer_trace_writer_ffi.nim"
 
 task testFfi, "Build and run C FFI test":
   # --nimMainPrefix keeps the Nim runtime entry points uniquely named so
   # this lib can be embedded next to another Nim-compiled artifact (the MCR
   # emulator) without a duplicate-`NimMain` link error. It MUST match the
   # `proc codetracerTraceWriterNimMain` importc in codetracer_trace_writer_ffi.nim.
-  exec "nim c --app:staticlib --mm:arc --noMain -d:release --nimMainPrefix:codetracerTraceWriter --passC:\"-fPIC\" -p:src -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim"
+  exec "nim c --app:staticlib " & hostLibFlags & " --passC:\"-fPIC\" -p:src -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim"
   # MT1: the three replay-observation chokepoints must be exported symbols so a
   # replay-time observer (MCR) can interpose on them — guard it explicitly.
   exec "bash tests/check_chokepoint_symbols.sh libcodetracer_trace_writer.a"

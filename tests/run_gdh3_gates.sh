@@ -121,7 +121,7 @@ echo
 # ---------------------------------------------------------------------------
 build_lib() {  # build_lib <tag> [extra defines...]
   local tag="$1"; shift
-  nim c --app:staticlib --mm:arc --noMain -d:release \
+  nim c --app:staticlib --mm:arc --noMain -d:release -d:useMalloc \
     --nimMainPrefix:codetracerTraceWriter --passC:"-fPIC" -p:src \
     --hints:off --warnings:off \
     --nimcache:"$WORK/nc-lib-$tag" \
