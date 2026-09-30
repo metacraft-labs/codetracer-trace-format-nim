@@ -1408,8 +1408,14 @@ proc trace_writer_register_call(
   if handle.isNil:
     return
   if handle.useMultiStream:
-    if handle.msWriter.stepCount > 0:
-      discard flushPendingStep(handle)
+    # The pending step is written BEFORE the call opens, always: it is the
+    # caller's step, and the call's `first_step_id` is the first step of its
+    # own body (`trace-events.md` §"Call Stream Records"). Flushing only once
+    # some step had been flushed left the `start` entry step — and, without
+    # `start`, the caller's first step — pending across the call, and made it
+    # the callee's first step. A refused flush is reported by
+    # `flushPendingStep` itself and latched by the entry-point guard.
+    discard flushPendingStep(handle)
     failIfErr handle.msWriter.registerCall(uint64(function_id),
         handle.pendingCallArgs)
     handle.pendingCallArgs.setLen(0)
