@@ -224,6 +224,8 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_replication.nim", binary: "build/test-bin/test_replication"),
   # Additional in-tree unit tests that run clean headless.
   TestSpec(source: "tests/test_column_aware_steps.nim", binary: "build/test-bin/test_column_aware_steps"),
+  TestSpec(source: "tests/test_function_in_a_file_with_no_steps.nim", binary: "build/test-bin/test_function_in_a_file_with_no_steps"),
+  TestSpec(source: "tests/test_name_only_funcs_refusal.nim", binary: "build/test-bin/test_name_only_funcs_refusal"),
   TestSpec(source: "tests/test_ct_print_full.nim", binary: "build/test-bin/test_ct_print_full"),
   TestSpec(source: "tests/test_ct_print_native.nim", binary: "build/test-bin/test_ct_print_native"),
   TestSpec(source: "tests/test_managed_sender.nim", binary: "build/test-bin/test_managed_sender"),

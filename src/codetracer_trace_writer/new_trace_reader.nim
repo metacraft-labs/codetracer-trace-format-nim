@@ -804,30 +804,61 @@ proc path*(r: NewTraceReader, id: uint64): Result[string, string] =
   else:
     r.pathReader.readById(id)  # error path — preserve the original error
 
+proc bareRecordDiagnosis(r: NewTraceReader, table: string, id: uint64,
+    decodeError: string): string =
+  ## The refusal for a `funcs.dat` / `types.dat` record that does not decode as
+  ## the spec's structured record. Under `meta.dat` bit 12 clear the likely
+  ## cause is known: the Nim writer wrote BARE NAMES into both tables until
+  ## b891a0f (2026-09-15), at schema versions 4 and 5 — so the container is not
+  ## an old version, and a version check cannot say what is wrong with it. The
+  ## structured decode's own message ("truncated: declares an N-byte name")
+  ## describes neither the record nor the remedy.
+  if r.meta.hasInterningTables:
+    return decodeError
+  table & " record " & $id & " is not the spec's structured record " &
+    "(internal-files.md \"Interning Tables\"); in a container with meta.dat " &
+    "bit 12 clear it is a bare name, the shape the Nim writer wrote before " &
+    "b891a0f (2026-09-15). Such a container does not conform to the spec " &
+    "at any schema version and is not read; re-record it with a current " &
+    "recorder. (Decoding it as a structured record reported: " &
+    decodeError & ")"
+
 proc function*(r: NewTraceReader, id: uint64): Result[string, string] =
   ## THE RECORD IS STRUCTURED, NOT BARE BYTES. `internal-files.md:46` gives a
   ## `funcs.dat` record as `global_line_index: varint, name_len: varint, name`.
   ## Reading it with `readById` returns the varints as leading characters of the
   ## name — which is what this did, and what made a Rust-written container print
   ## a function called `\xa6\x8dtoken::transfer`.
-  ok((?r.funcReader.readFuncById(id)).name)
+  let rec = r.funcReader.readFuncById(id)
+  if rec.isErr:
+    return err(r.bareRecordDiagnosis("funcs.dat", id, rec.error))
+  ok(rec.get().name)
 
 proc functionRecord*(r: NewTraceReader, id: uint64):
     Result[tuple[globalLineIndex: uint64, name: string], string] =
   ## The whole record, for a caller that wants the declaration site as well as
   ## the name.
-  r.funcReader.readFuncById(id)
+  let rec = r.funcReader.readFuncById(id)
+  if rec.isErr:
+    return err(r.bareRecordDiagnosis("funcs.dat", id, rec.error))
+  rec
 
 proc typeName*(r: NewTraceReader, id: uint64): Result[string, string] =
   ## Structured for the same reason as `function`: `internal-files.md:45` gives
   ## a `types.dat` record as `kind: u8, lang_type_len: varint, lang_type,
   ## specific_info`.
-  ok((?r.typeReader.readTypeById(id)).langType)
+  let rec = r.typeReader.readTypeById(id)
+  if rec.isErr:
+    return err(r.bareRecordDiagnosis("types.dat", id, rec.error))
+  ok(rec.get().langType)
 
 proc typeRecord*(r: NewTraceReader, id: uint64):
     Result[tuple[kind: uint8, langType: string], string] =
   ## The kind alongside the name.
-  r.typeReader.readTypeById(id)
+  let rec = r.typeReader.readTypeById(id)
+  if rec.isErr:
+    return err(r.bareRecordDiagnosis("types.dat", id, rec.error))
+  rec
 
 proc varname*(r: NewTraceReader, id: uint64): Result[string, string] =
   r.varnameReader.readById(id)

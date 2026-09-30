@@ -304,6 +304,34 @@ uint64_t trace_writer_register_path_version(trace_writer_t handle,
 uint64_t trace_writer_current_path_id(trace_writer_t handle,
                                       const char* path);
 
+/*
+ * Intern `path` in paths.dat NOW and return its id: the id a step at `path`
+ * registered afterwards is attributed to.  A path is interned when it is
+ * registered, whether or not a step ever refers to it, so ids follow the
+ * caller's registrations rather than the order in which steps first reach
+ * each file.  Registering a path twice returns the id it already has.
+ *
+ * Under the line-count table an unseen path registered here has no count to
+ * record and is refused by name, like the implicit registration
+ * trace_writer_register_step performs; use
+ * trace_writer_register_path_with_line_count there.
+ *
+ * Returns CT_TW_INVALID_PATH_ID on failure, with trace_writer_last_error set.
+ * The error buffer is cleared on entry.
+ */
+uint64_t trace_writer_register_path(trace_writer_t handle, const char* path);
+
+/*
+ * Intern `name` in varnames.dat NOW and return its id: the id a value
+ * registered under `name` afterwards carries.  Registering a name twice
+ * returns the id it already has.
+ *
+ * Returns UINT64_MAX on failure, with trace_writer_last_error set.  The error
+ * buffer is cleared on entry.
+ */
+uint64_t trace_writer_register_variable_name(trace_writer_t handle,
+                                             const char* name);
+
 /* --------------------------------------------------------------------------
  * Source-reload markers (GDH-M6 — design §6.3)
  *

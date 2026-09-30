@@ -148,6 +148,12 @@ task test, "Run all tests":
   # DeltaColumn round-trip, Layout A paths.dat, the position decoder, and the
   # meta.dat unknown-flag-bit rejection that keeps the extension clean.
   exec "nim c -r -d:release -p:src tests/test_column_aware_steps.nim"
+  # A function declared in a file no step visited is written at close, with its
+  # path in the space its address is computed in (and in meta.dat's list).
+  exec "nim c -r -d:release -p:src tests/test_function_in_a_file_with_no_steps.nim"
+  # A funcs.dat/types.dat record that is a bare name (the pre-b891a0f writer's
+  # shape) is refused with a message that says so.
+  exec "nim c -r -d:release -p:src tests/test_name_only_funcs_refusal.nim"
   # A column-aware trace may table some of its files and not others, and the
   # two kinds of file take different amounts of the position space. Writer
   # and reader size them by one rule; sizing an untabled file 0 in the reader
@@ -255,6 +261,37 @@ task test, "Run all tests":
   # count, and must be refused by name rather than silently dropping the step.
   # Same FFI-`include` compile requirements as the tests above.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_line_count_table.nim"
+  # A path or variable name registered through the C ABI is interned when it
+  # is registered, as the native API interns it, not when a record first
+  # refers to it. Same FFI-`include` compile requirements as the tests above.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_register_path_and_varname.nim"
+  # Values staged when a recording ends go to the last STEP's value record,
+  # not to a thread-switch record after it, even across a value-chunk boundary.
+  # Same FFI-`include` compile requirements as the tests above.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_trailing_values_attach_to_the_last_step.nim"
+  # A reload marker written through the C ABI follows the step registered
+  # before it (the pending step is flushed first). Same FFI-`include` compile
+  # requirements as the tests above.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_source_reload_order.nim"
+  # A call registered through the C ABI begins at the next step, never at the
+  # step pending when it arrived.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_call_entry_is_the_next_step.nim"
+  # Every class of C ABI entry point reports its failure to the caller, and
+  # the guard that does it is on every exported proc. Then the two mutation
+  # builds, each removing one half of the guard: the test must FAIL under both,
+  # or it is not measuring the guard.
+  exec "nim c -r -d:release -d:ffiFaultInjection --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_failures_reach_the_caller.nim"
+  for mutation in ["ffiGuardNoCatch", "ffiGuardNoLatch"]:
+    let (mutOut, mutCode) = gorgeEx("nim c -r -d:release -d:ffiFaultInjection -d:" &
+      mutation & " --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src " &
+      "-o:tests/test_ffi_failures_mutant_" & mutation &
+      " tests/test_ffi_failures_reach_the_caller.nim")
+    if mutCode == 0 or "ALL PASS" in mutOut:
+      echo mutOut
+      raise newException(AssertionDefect, "mutation " & mutation &
+        " left test_ffi_failures_reach_the_caller GREEN: the test does not " &
+        "detect the loss of the guard it exists for")
+    echo "PASS: mutation " & mutation & " turns test_ffi_failures_reach_the_caller red"
   # The C ABI's in-memory constructors: an embedder with no filesystem gets a
   # container's BYTES rather than a file. Carries its own positive control (the
   # file arm, in the same directory) and its own mutation control (one extra
