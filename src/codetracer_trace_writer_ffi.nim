@@ -2873,6 +2873,14 @@ proc trace_writer_register_source_reload(
       oldPathId: changed[i].old_path_id,
       newPathId: changed[i].new_path_id,
       generation: changed[i].generation)
+  # The marker goes AFTER every step the host registered before it. The
+  # most recent one is still pending here (held so later values can join
+  # its record), exactly as it is when a thread switch arrives, so it is
+  # flushed first; without that the marker would be written ahead of a
+  # step that ran the old version.
+  if flushPendingStep(handle) != 0:
+    # `flushPendingStep` has already set `last_error` to the step's refusal.
+    return CtTwInvalidReloadOrdinal
   let res = handle.msWriter.registerSourceReload(changes, in_flight_frames)
   # FALSIFIER (``gdh6FalsifyDiscardReloadResult``,
   # gdh6_reload_is_discoverable_end_to_end): discard the writer's Result and

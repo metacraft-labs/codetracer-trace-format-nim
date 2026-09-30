@@ -255,6 +255,10 @@ task test, "Run all tests":
   # count, and must be refused by name rather than silently dropping the step.
   # Same FFI-`include` compile requirements as the tests above.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_line_count_table.nim"
+  # A reload marker written through the C ABI follows the step registered
+  # before it (the pending step is flushed first). Same FFI-`include` compile
+  # requirements as the tests above.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_source_reload_order.nim"
   # The C ABI's in-memory constructors: an embedder with no filesystem gets a
   # container's BYTES rather than a file. Carries its own positive control (the
   # file arm, in the same directory) and its own mutation control (one extra
