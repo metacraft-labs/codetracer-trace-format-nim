@@ -16,15 +16,16 @@ proc createCtfsStreaming*(path: string, blockSize: uint32 = DefaultBlockSize,
                           encryption: CtfsEncryptionMethod = emNone,
                           maxShards: uint8 = DefaultMaxShards): Result[Ctfs, string] =
   ## Create a new CTFS v4 container that streams writes to disk.
-  ## The file is opened immediately and the initial root block (header +
-  ## file entries) is written so concurrent readers can see the container
-  ## structure as soon as it is created.
+  ## The file is opened immediately and the initial root region (header +
+  ## file entries: block 0, plus the blocks the entry array overflows into)
+  ## is written so concurrent readers can see the container structure as
+  ## soon as it is created.
   var c = createCtfs(blockSize, maxRootEntries, encryption, maxShards)
   try:
     c.streamFile = open(path, fmReadWrite)
     c.streamPath = path
     c.streaming = true
-    # Write the initial root block (block 0) to disk.
+    # Write the initial root region to disk.
     discard c.streamFile.writeBuffer(addr c.data[0], c.data.len)
     c.streamFile.flushFile()
     ok(c)
@@ -39,8 +40,9 @@ proc syncEntry*(c: var Ctfs, f: CtfsInternalFile) =
   ## newly added file entries are visible.
   if not c.streaming:
     return
-  # The file entry lives in block 0. Write the entire entry (24 bytes:
-  # size + mapBlock + name) so the reader sees a consistent snapshot.
+  # The file entry lives in the root region (block 0, or a later root block
+  # when the entry array overflows block 0). Write the entire entry (24
+  # bytes: size + mapBlock + name) so the reader sees a consistent snapshot.
   let entryOff = c.fileEntryOffset(f.entryIndex)
   try:
     c.streamFile.setFilePos(int64(entryOff))
@@ -51,11 +53,12 @@ proc syncEntry*(c: var Ctfs, f: CtfsInternalFile) =
     discard
 
 proc syncAllEntries*(c: var Ctfs) =
-  ## Flush the entire root block (block 0) to disk, updating all file
-  ## entry sizes at once for concurrent readers.
+  ## Flush the entire root region (block 0 and any blocks the entry array
+  ## overflows into) to disk, updating all file entry sizes at once for
+  ## concurrent readers.
   if not c.streaming:
     return
-  c.flushBlock(0)
+  c.flushRootBlocks()
   try:
     c.streamFile.flushFile()
   except IOError, OSError:

@@ -366,6 +366,14 @@ type
       ## fires per-statement so the GUI can offer per-column motions
       ## (step-over / step-in / step-out at sub-statement granularity).
 
+    columnAwareOptInAfterPaths: int
+      ## How many paths this writer had already interned when it first opted
+      ## into column-aware mode, or 0 when the opt-in came first.  Non-zero
+      ## fails ``close()``: those records were written bare, and a container
+      ## declaring ``FlagHasColumnAwareSteps`` states that every
+      ## ``paths.dat`` record is Layout A.  Counted over THIS writer's paths
+      ## rather than the interning table, which an MCR-attached writer shares.
+
     lineCountTable*: bool
       ## True iff this writer records a per-file line count in every
       ## ``paths.dat`` record and sizes each file's slot in the global
@@ -730,6 +738,13 @@ proc enableLinehits*(w: var MultiStreamTraceWriter) =
 # Column-aware step mode (P6.3 / P6.4)
 # ---------------------------------------------------------------------------
 
+proc optIntoColumnAware(w: var MultiStreamTraceWriter) =
+  ## The one place ``columnAwareSteps`` is switched on, so every opt-in
+  ## route records whether a path was interned before it.
+  if not w.columnAwareSteps and w.columnAwareOptInAfterPaths == 0:
+    w.columnAwareOptInAfterPaths = w.paths.len
+  w.columnAwareSteps = true
+
 proc enableColumnAwareSteps*(w: var MultiStreamTraceWriter) =
   ## Opt this writer into column-aware step encoding.  After calling
   ## this, ``writeColumnStep`` is permitted, and ``close()`` will set
@@ -737,10 +752,14 @@ proc enableColumnAwareSteps*(w: var MultiStreamTraceWriter) =
   ## column-unaware readers reject the trace cleanly via the reserved
   ## bits-4-15 check (see spec §"Reader Behaviour and Back-Compat").
   ##
-  ## Must be called before any step events are written — the flag is
-  ## trace-global; the writer MUST NOT mix column-aware and line-only
-  ## step records within a single trace.
-  w.columnAwareSteps = true
+  ## Must be called before the first path is registered and before any
+  ## step events are written — the flag is trace-global; the writer MUST
+  ## NOT mix column-aware and line-only step records within a single
+  ## trace, and every ``paths.dat`` record of a column-aware trace is
+  ## Layout A.  A path interned earlier was written as bare bytes and
+  ## cannot be re-framed, so an opt-in after one fails ``close()`` by
+  ## name; there is no Result here to refuse it through.
+  w.optIntoColumnAware()
   # M26b — the column-aware exec stream stores a byte-offset
   # `global_position_index`, which the db-backend decodes via the
   # column-aware path rather than `unpack_global_line_index`.  A
@@ -762,7 +781,7 @@ proc enableColumnBreakpointsSupport*(w: var MultiStreamTraceWriter) =
   ##
   ## See ``codetracer-trace-format-spec/internal-files.md`` §
   ## "Column-Aware Capability Flags".
-  w.columnAwareSteps = true
+  w.optIntoColumnAware()
   w.supportsColumnBreakpoints = true
   w.emitStepMap = false  # M26b — see enableColumnAwareSteps.
 
@@ -773,7 +792,7 @@ proc enableColumnMotionsSupport*(w: var MultiStreamTraceWriter) =
   ## ``close()`` time and — like ``enableColumnBreakpointsSupport`` —
   ## auto-enables ``columnAwareSteps`` because capability bits without
   ## wire-format column data is undefined behaviour per spec.
-  w.columnAwareSteps = true
+  w.optIntoColumnAware()
   w.supportsColumnMotions = true
   w.emitStepMap = false  # M26b — see enableColumnAwareSteps.
 
@@ -2410,6 +2429,18 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   ## un-popped frames.
   if w.closed:
     return ok()
+
+  # A COLUMN-AWARE OPT-IN THAT CAME AFTER A PATH. Those records are already in
+  # `paths.dat` as bare bytes, and the header about to be written would declare
+  # every record Layout A. Refused before anything else is written, because no
+  # later step can repair it.
+  if w.columnAwareOptInAfterPaths > 0:
+    return err("close: this writer opted into column-aware steps after " &
+      $w.columnAwareOptInAfterPaths & " path(s) had been interned (the " &
+      "first: " & w.paths[0] & "). Those paths.dat records were written " &
+      "bare, and a column-aware trace declares every paths.dat record " &
+      "Layout A, so the container would misframe them. Enable column-aware " &
+      "steps before the first path is registered")
 
   # FLUSH THE DEFERRED `funcs.dat` FIRST, while the container is still open and
   # every path this trace will ever register is already interned. That is the

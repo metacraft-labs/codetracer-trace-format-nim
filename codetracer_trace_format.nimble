@@ -36,6 +36,7 @@ task test, "Run all tests":
   # stream. -d:release because one fixture is a 512-block two-level file.
   exec "nim c -r -d:release tests/test_write_null_data_block.nim"
   exec "nim c -r tests/test_streaming.nim"
+  exec "nim c -r tests/test_root_directory_overflow.nim"
   exec "nim c -r tests/test_chunk_index.nim"
   exec "nim c -r tests/test_fixed_record_table.nim"
   exec "nim c -r tests/test_variable_record_table.nim"

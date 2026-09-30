@@ -4,8 +4,8 @@
 ## The line-only `global_position_index` encode changed from
 ## `prefixSum[path_id] + line` to `prefixSum[path_id] + (line - 1)` — the
 ## exact inverse of the decode the spec states
-## (`codetracer-trace-format-spec` branch `zk/gli-off-by-one`, commit
-## `becd9e1`). The two encodes differ by one at every step, and nothing in
+## (`codetracer-trace-format-spec` `internal-files.md` §"Global Line
+## Index"). The two encodes differ by one at every step, and nothing in
 ## the bytes distinguishes them: both put every step at an address the
 ## trace's own space can address, so `tryResolve` has nothing to refuse.
 ## A container written under the old encode and read under the new decode

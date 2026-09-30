@@ -733,6 +733,57 @@ proc test_capability_bits_reject_without_column_aware_buffer() {.raises: [].} =
   echo "PASS: test_capability_bits_reject_without_column_aware_buffer"
 
 
+proc test_column_aware_after_a_path_is_refused_at_close() {.raises: [].} =
+  ## Opting into column-aware mode after a path is interned is refused, by
+  ## name, at ``close()``.
+  ##
+  ## Under ``meta.dat`` bit 4 EVERY ``paths.dat`` record is Layout A
+  ## (``internal-files.md`` §"``paths.dat`` Layout A"). A path interned
+  ## before the opt-in was already written as bare path bytes, and nothing
+  ## rewrites it, so a container that finalized would declare a layout its
+  ## first record is not in. A reader then takes the path's leading ``/``
+  ## (47) as its length: a short path fails to decode, and a path longer
+  ## than 48 bytes decodes cleanly into the wrong string.
+  ##
+  ## ``enableColumnAwareSteps`` has no Result to refuse through, so the
+  ## refusal is where the mutually-exclusive-layouts one is: at ``close()``.
+  let dir = getTempDir()
+  for (label, enable) in [
+      ("enableColumnAwareSteps", 0),
+      ("enableColumnBreakpointsSupport", 1),
+      ("enableColumnMotionsSupport", 2)]:
+    var w = initMultiStreamWriter(dir / ("late_column_aware_" & label & ".ct"), "late_col").get()
+    doAssert w.registerPath("/src/interned_before_the_opt_in.nr").isOk
+    case enable
+    of 0: w.enableColumnAwareSteps()
+    of 1: w.enableColumnBreakpointsSupport()
+    else: w.enableColumnMotionsSupport()
+    let closed = w.close()
+    doAssert closed.isErr,
+      label & " after a path was interned must fail close(): that path's " &
+      "paths.dat record is bare, and the container would declare Layout A"
+    doAssert "column-aware" in closed.error and "paths.dat" in closed.error,
+      "the refusal must name the opt-in and the table; got: " & closed.error
+
+  # The control: the same writer with the opt-in FIRST closes, and its one
+  # record decodes as Layout A to exactly the path that was registered.
+  var ok = initMultiStreamWriter(dir / "late_column_aware_in_order.ct", "late_col").get()
+  ok.enableColumnAwareSteps()
+  doAssert ok.registerPath("/src/interned_before_the_opt_in.nr").isOk
+  doAssert ok.registerStep(0, 1, @[]).isOk
+  let closed = ok.close()
+  doAssert closed.isOk, "opt-in before the first path must close: " & closed.error
+  let ctBytes = ok.toBytes()
+  ok.closeCtfs()
+  var reader = openNewTraceFromBytes(ctBytes).get()
+  doAssert reader.meta.hasColumnAwareSteps
+  let p0 = reader.path(0)
+  doAssert p0.isOk and p0.get() == "/src/interned_before_the_opt_in.nr",
+    "path 0 must decode as Layout A to the registered path; got " &
+    (if p0.isOk: p0.get() else: p0.error)
+  echo "PASS: test_column_aware_after_a_path_is_refused_at_close"
+
+
 test_column_aware_round_trip()
 test_column_step_requires_opt_in()
 test_column_step_first_is_rejected()
@@ -748,4 +799,5 @@ test_capability_flags_round_trip()
 test_capability_flags_independent()
 test_capability_flags_default_off()
 test_capability_bits_reject_without_column_aware_buffer()
+test_column_aware_after_a_path_is_refused_at_close()
 echo "ALL PASS: test_column_aware_steps"

@@ -36,6 +36,15 @@ proc flushBlock*(c: var Ctfs, blockNum: uint64) =
   let size = int(c.blockSize)
   c.flushBlockRange(offset, size)
 
+proc flushRootBlocks*(c: var Ctfs) =
+  ## Write the whole root region — the header and every block of the
+  ## file-entry array (`rootBlockCount`) — to the streaming file.  Block 0
+  ## alone is not enough once the entry array overflows into later blocks.
+  if not c.streaming:
+    return
+  let n = c.rootBlockCount()
+  c.flushBlockRange(0, int(n) * int(c.blockSize))
+
 proc allocBlock*(c: var Ctfs): uint64 =
   ## Allocate the next free block, extending the data buffer as needed.
   let blk = c.nextFreeBlock
