@@ -262,6 +262,9 @@ task test, "Run all tests":
   # before it (the pending step is flushed first). Same FFI-`include` compile
   # requirements as the tests above.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_source_reload_order.nim"
+  # A call registered through the C ABI begins at the next step, never at the
+  # step pending when it arrived.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_call_entry_is_the_next_step.nim"
   # Every class of C ABI entry point reports its failure to the caller, and
   # the guard that does it is on every exported proc. Then the two mutation
   # builds, each removing one half of the guard: the test must FAIL under both,
