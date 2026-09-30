@@ -87,9 +87,8 @@ when defined(nimPreviewSlimSystem):
 ##        changed from ``prefixSum[path_id] + line`` to
 ##        ``prefixSum[path_id] + (line - 1)``, making it the exact
 ##        inverse of the decode the spec states.  Spec:
-##        ``codetracer-trace-format-spec`` branch ``zk/gli-off-by-one``
-##        (commit ``becd9e1``), ``internal-files.md`` §"Global Line
-##        Index" and ``trace-events.md`` §"Decoding
+##        ``codetracer-trace-format-spec`` ``internal-files.md`` §"Global
+##        Line Index" and ``trace-events.md`` §"Decoding
 ##        ``global_position_index``".
 ##
 ##        The bump exists because the two encodes are INDISTINGUISHABLE
