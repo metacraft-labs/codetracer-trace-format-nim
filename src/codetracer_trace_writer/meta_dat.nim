@@ -625,38 +625,27 @@ type
       ## what a container DECLARED, not only what this reader knows how
       ## to act on.
 
-proc writeRawBytes(
-    c: var Ctfs, f: var CtfsInternalFile,
+proc writeRawBytes(buf: var seq[byte],
     data: openArray[byte]): Result[void, string] =
-  c.writeToFile(f, data)
+  buf.add(data)
+  ok()
 
-proc writeU16LE(
-    c: var Ctfs, f: var CtfsInternalFile,
-    val: uint16): Result[void, string] =
-  let bytes = [byte(val and 0xFF), byte((val shr 8) and 0xFF)]
-  c.writeToFile(f, bytes)
+proc writeU16LE(buf: var seq[byte], val: uint16): Result[void, string] =
+  buf.add([byte(val and 0xFF), byte((val shr 8) and 0xFF)])
+  ok()
 
-proc writeU32LE(
-    c: var Ctfs, f: var CtfsInternalFile,
-    val: uint32): Result[void, string] =
-  let bytes = [byte(val and 0xFF), byte((val shr 8) and 0xFF),
-               byte((val shr 16) and 0xFF), byte((val shr 24) and 0xFF)]
-  c.writeToFile(f, bytes)
+proc writeU32LE(buf: var seq[byte], val: uint32): Result[void, string] =
+  buf.add([byte(val and 0xFF), byte((val shr 8) and 0xFF),
+           byte((val shr 16) and 0xFF), byte((val shr 24) and 0xFF)])
+  ok()
 
-proc writeVarint(
-    c: var Ctfs, f: var CtfsInternalFile,
-    val: uint64): Result[void, string] =
-  var buf: seq[byte]
+proc writeVarint(buf: var seq[byte], val: uint64): Result[void, string] =
   encodeVarint(val, buf)
-  c.writeToFile(f, buf)
+  ok()
 
-proc writeVarintString(
-    c: var Ctfs, f: var CtfsInternalFile,
-    s: string): Result[void, string] =
-  ? c.writeVarint(f, uint64(s.len))
-  if s.len > 0:
-    let bytes = cast[seq[byte]](s)
-    ? c.writeToFile(f, bytes)
+proc writeVarintString(buf: var seq[byte], s: string): Result[void, string] =
+  ? buf.writeVarint(uint64(s.len))
+  buf.add(s.toOpenArrayByte(0, s.high))
   ok()
 
 proc writeMetaDat*(
@@ -699,8 +688,12 @@ proc writeMetaDat*(
   # without the M-REC-1 spine.
   ? validateRecordingIdStr(meta.recordingId)
 
+  # Serialized whole and written once: a streaming container flushes on every
+  # `writeToFile`, and the path list alone is two fields per registered path.
+  var buf: seq[byte]
+
   # Magic
-  ? c.writeRawBytes(f, MetaDatMagic)
+  ? buf.writeRawBytes(MetaDatMagic)
 
   # Version.  GDH-M2: the schema version is decided by whether any
   # EXTENDED flag is set, so it is computed here and written below,
@@ -718,7 +711,7 @@ proc writeMetaDat*(
     extFlags = extFlags or FlagExtHasSourceReload
   let schemaVersion =
     if extFlags != 0: MetaDatVersionExtendedFlags else: MetaDatVersion
-  ? c.writeU16LE(f, schemaVersion)
+  ? buf.writeU16LE(schemaVersion)
 
   # Flags
   var flags: uint16 = 0
@@ -775,59 +768,59 @@ proc writeMetaDat*(
     flags = flags or FlagHasLineCountTable
   if hasCorrelationIndex:
     flags = flags or FlagHasCorrelationIndex
-  ? c.writeU16LE(f, flags)
+  ? buf.writeU16LE(flags)
 
   # Extended flags — schema version 5 only.  Absent at version 4, which
   # is what keeps a no-reload container byte-identical.
   if schemaVersion == MetaDatVersionExtendedFlags:
-    ? c.writeU32LE(f, extFlags)
+    ? buf.writeU32LE(extFlags)
 
   # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.
-  ? c.writeVarintString(f, meta.recordingId)
+  ? buf.writeVarintString(meta.recordingId)
 
   # Program
-  ? c.writeVarintString(f, meta.program)
+  ? buf.writeVarintString(meta.program)
 
   # Args
-  ? c.writeVarint(f, uint64(meta.args.len))
+  ? buf.writeVarint(uint64(meta.args.len))
   for arg in meta.args:
-    ? c.writeVarintString(f, arg)
+    ? buf.writeVarintString(arg)
 
   # Workdir
-  ? c.writeVarintString(f, meta.workdir)
+  ? buf.writeVarintString(meta.workdir)
 
   # Recorder ID
-  ? c.writeVarintString(f, recorderId)
+  ? buf.writeVarintString(recorderId)
 
   # Paths
-  ? c.writeVarint(f, uint64(paths.len))
+  ? buf.writeVarint(uint64(paths.len))
   for p in paths:
-    ? c.writeVarintString(f, p)
+    ? buf.writeVarintString(p)
 
   # MCR fields
   if mcrFields.isSome:
     let mcr = mcrFields.get()
-    ? c.writeVarint(f, uint64(ord(mcr.tickSource)))
-    ? c.writeVarint(f, uint64(mcr.totalThreads))
-    ? c.writeVarint(f, uint64(ord(mcr.atomicMode)))
-    ? c.writeVarint(f, mcr.totalEvents)
-    ? c.writeVarint(f, uint64(mcr.totalCheckpoints))
-    ? c.writeVarint(f, mcr.startTimeUnixUs)
-    ? c.writeVarintString(f, mcr.platform)
-    ? c.writeVarintString(f, mcr.tickGranularity)
-    ? c.writeVarintString(f, mcr.tickSourceStr)
-    ? c.writeVarintString(f, mcr.atomicModeStr)
-    ? c.writeVarintString(f, mcr.startTimeStr)
-    ? c.writeVarintString(f, mcr.hookProfile)
-    ? c.writeVarint(f, uint64(mcr.hookStrategies.len))
+    ? buf.writeVarint(uint64(ord(mcr.tickSource)))
+    ? buf.writeVarint(uint64(mcr.totalThreads))
+    ? buf.writeVarint(uint64(ord(mcr.atomicMode)))
+    ? buf.writeVarint(mcr.totalEvents)
+    ? buf.writeVarint(uint64(mcr.totalCheckpoints))
+    ? buf.writeVarint(mcr.startTimeUnixUs)
+    ? buf.writeVarintString(mcr.platform)
+    ? buf.writeVarintString(mcr.tickGranularity)
+    ? buf.writeVarintString(mcr.tickSourceStr)
+    ? buf.writeVarintString(mcr.atomicModeStr)
+    ? buf.writeVarintString(mcr.startTimeStr)
+    ? buf.writeVarintString(mcr.hookProfile)
+    ? buf.writeVarint(uint64(mcr.hookStrategies.len))
     for s in mcr.hookStrategies:
-      ? c.writeVarintString(f, s)
+      ? buf.writeVarintString(s)
 
   # Replay-launch fields (M-RLP-1, spec §6A.5).  One u8 flag.
   if replayLaunchFields.isSome:
     let rl = replayLaunchFields.get()
     let aslrByte: array[1, byte] = [byte(if rl.aslrDisabled: 1 else: 0)]
-    ? c.writeRawBytes(f, aslrByte)
+    ? buf.writeRawBytes(aslrByte)
 
   # Layout snapshot (M-RLP-2, spec §6B.7).  u64 hash, varint len, bytes.
   if layoutSnapshotFields.isSome:
@@ -836,22 +829,23 @@ proc writeMetaDat*(
     let h = ls.layoutHash
     for i in 0 ..< 8:
       hashBytes[i] = byte((h shr (i * 8)) and 0xFF'u64)
-    ? c.writeRawBytes(f, hashBytes)
-    ? c.writeVarint(f, uint64(ls.layoutFingerprint.len))
+    ? buf.writeRawBytes(hashBytes)
+    ? buf.writeVarint(uint64(ls.layoutFingerprint.len))
     if ls.layoutFingerprint.len > 0:
-      ? c.writeRawBytes(f, ls.layoutFingerprint)
+      ? buf.writeRawBytes(ls.layoutFingerprint)
 
   # Trace filter provenance (TF-M7, spec §7).  varint count, then for
   # each entry: (varint-length path string, 32 raw sha256 bytes).
   if emitProvenance:
-    ? c.writeVarint(f, uint64(filterProvenance.len))
+    ? buf.writeVarint(uint64(filterProvenance.len))
     for entry in filterProvenance:
-      ? c.writeVarintString(f, entry.path)
+      ? buf.writeVarintString(entry.path)
       var shaBytes = newSeq[byte](32)
       for i in 0 ..< 32:
         shaBytes[i] = entry.sha256[i]
-      ? c.writeRawBytes(f, shaBytes)
+      ? buf.writeRawBytes(shaBytes)
 
+  ? c.writeToFile(f, buf)
   ok()
 
 # ---------------------------------------------------------------------------

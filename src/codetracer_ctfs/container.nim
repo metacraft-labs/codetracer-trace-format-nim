@@ -192,9 +192,12 @@ proc writeToFile*(c: var Ctfs, f: var CtfsInternalFile,
     for i in 0 ..< toWrite:
       c.data[blockStart + offsetInBlock + i] = data[written + i]
 
-    # Flush this data block to disk when streaming.
+    # Flush the bytes just written when streaming. Only those: the rest of
+    # the block is either earlier payload, flushed by the call that wrote it,
+    # or the zeroes `allocBlock` flushed when the block was allocated. A whole
+    # block per call is 4 KiB of I/O for a 20-byte interning record.
     if c.streaming:
-      c.flushBlock(dataBlock)
+      c.flushBlockRange(blockStart + offsetInBlock, toWrite)
 
     written += toWrite
     f.writePos += uint64(toWrite)
