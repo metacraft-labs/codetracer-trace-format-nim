@@ -151,6 +151,9 @@ task test, "Run all tests":
   # A function declared in a file no step visited is written at close, with its
   # path in the space its address is computed in (and in meta.dat's list).
   exec "nim c -r -d:release -p:src tests/test_function_in_a_file_with_no_steps.nim"
+  # A funcs.dat/types.dat record that is a bare name (the pre-b891a0f writer's
+  # shape) is refused with a message that says so.
+  exec "nim c -r -d:release -p:src tests/test_name_only_funcs_refusal.nim"
   # A column-aware trace may table some of its files and not others, and the
   # two kinds of file take different amounts of the position space. Writer
   # and reader size them by one rule; sizing an untabled file 0 in the reader
