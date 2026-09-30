@@ -2459,6 +2459,23 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   # writer gave 100000. A per-file line count of `DefaultLinesPerFile` where the
   # trace records no real one is the same convention the Rust writer's
   # `LinePositionSpace` uses, and both constants are 100,000.
+  # EVERY DECLARATION PATH IS REGISTERED BEFORE THE SPACE IS SIZED. A function
+  # whose file no step visited brings a path nothing else interned; sizing the
+  # space from the paths interned so far and interning afterwards addressed that
+  # file past the end of the space (an IndexDefect inside `close()`). And it is
+  # registered through `registerPath`, the route every other path takes, so the
+  # record has the table's layout and the path reaches `meta.dat`'s list. Under
+  # the line-count table such a path has no recorded size and is refused there,
+  # by name: laying it out at an assumed size is what the table exists to stop.
+  var funcPathIds = newSeq[uint64](w.pendingFuncs.len)
+  for i, pf in w.pendingFuncs:
+    if pf.path.len > 0:
+      let idRes = w.registerPath(pf.path)
+      if idRes.isErr:
+        return err("close: function " & pf.name & " is declared at " &
+          pf.path & ", which could not be registered: " & idRes.error)
+      funcPathIds[i] = idRes.get()
+
   var lineCounts: seq[uint64] = @[]
   let pathCount = w.interningPtr[].paths.count()
   for i in 0 ..< int(pathCount):
@@ -2468,24 +2485,8 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
       lineCounts.add(DefaultLinesPerFile)
   var lineSpace = buildGlobalLineIndex(lineCounts)
 
-  for pf in w.pendingFuncs:
-    var pathId: uint64 = 0
-    if pf.path.len > 0:
-      # THE SAME ROUTE `registerPath` TAKES. A column-aware trace writes
-      # `paths.dat` in Layout A, so interning a declaration site's path through
-      # the bare encoder here appends a bare record to a Layout A table — and a
-      # reader decoding it reads the path's own bytes as line lengths and fails
-      # on the first that comes out negative. It only ever bit when a function
-      # was registered at a path nothing else had interned, which is why it sat
-      # here unnoticed.
-      pathId =
-        if w.columnAwareSteps:
-          ?w.container.ensurePathIdColumnAware(w.interningPtr[], pf.path, [])
-        elif w.lineCountTable:
-          ?w.container.ensureQualifiedPathIdWithLineCount(
-            w.interningPtr[], w.qualifier, pf.path, 0)
-        else:
-          ?w.container.ensureQualifiedPathId(w.interningPtr[], w.qualifier, pf.path)
+  for i, pf in w.pendingFuncs:
+    let pathId = funcPathIds[i]
     # A LINE ADDRESS, NOT THE COLUMN-AWARE POSITION ADDRESS, and the difference
     # is not academic: `toGlobalLineIndex` returns a byte offset in a
     # column-aware trace, so using it here gave a function in the second file
