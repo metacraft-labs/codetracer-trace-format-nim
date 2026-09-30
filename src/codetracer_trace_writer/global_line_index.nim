@@ -137,6 +137,20 @@ proc fileAddressCount*(lineLengths: openArray[uint32],
     return lineCount
   DefaultLinesPerFile
 
+proc positionSpaceCount*(lineLengths: openArray[seq[uint32]],
+    lineCounts: openArray[uint64], fileId: int, columnAware: bool): uint64 =
+  ## The address count of the one file `fileId`, by the rule
+  ## `positionSpaceCounts` applies to every file. A writer that extends its
+  ## space one registration at a time sizes the new file through this, so the
+  ## incremental and the one-pass layouts cannot disagree.
+  let count =
+    if fileId < lineCounts.len: lineCounts[fileId]
+    else: 0'u64
+  if columnAware and fileId < lineLengths.len:
+    fileAddressCount(lineLengths[fileId], count)
+  else:
+    fileAddressCount([], count)
+
 proc positionSpaceCounts*(lineLengths: openArray[seq[uint32]],
     lineCounts: openArray[uint64],
     fileCount: int, columnAware: bool): seq[uint64] =
@@ -151,13 +165,7 @@ proc positionSpaceCounts*(lineLengths: openArray[seq[uint32]],
   ## without a size table has always meant.
   result = newSeq[uint64](fileCount)
   for i in 0 ..< fileCount:
-    let lls =
-      if columnAware and i < lineLengths.len: lineLengths[i]
-      else: @[]
-    let count =
-      if i < lineCounts.len: lineCounts[i]
-      else: 0'u64
-    result[i] = fileAddressCount(lls, count)
+    result[i] = positionSpaceCount(lineLengths, lineCounts, i, columnAware)
 
 type
   GlobalLineIndex* = object
@@ -174,6 +182,18 @@ proc buildGlobalLineIndex*(lineCounts: openArray[uint64]): GlobalLineIndex =
     prefixSum: prefix,
     totalLines: prefix[^1]
   )
+
+proc appendFile*(gli: var GlobalLineIndex, count: uint64) =
+  ## Extend the space by one file of `count` addresses, placed after every
+  ## file already in it. No existing base moves, so this is O(1) and leaves
+  ## the index equal to `buildGlobalLineIndex` over the extended counts.
+  ##
+  ## `gli` must already be an index (at least `buildGlobalLineIndex([])`):
+  ## the default-initialised object has no base for file 0.
+  doAssert gli.prefixSum.len > 0,
+    "appendFile on an index that was never built"
+  gli.totalLines += count
+  gli.prefixSum.add(gli.totalLines)
 
 proc globalIndex*(gli: GlobalLineIndex, fileId: int, line: uint64): uint64 =
   ## Convert a 1-based `(file_id, line)` to a global line index:

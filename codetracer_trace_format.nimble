@@ -111,6 +111,9 @@ task test, "Run all tests":
   # into the next file's range — invisible behind an oversized stride,
   # a wrong answer at every boundary once slots are sized to real counts.
   exec "nim c -r -d:release -p:src tests/test_global_line_index_boundary.nim"
+  # Registering a path extends that space by one base; it must not rebuild
+  # every base. Asserted as growth (N vs 4N paths), not as a time.
+  exec "nim c -r -d:release -p:src tests/test_path_registration_scales_linearly.nim"
   # The per-file line-count table (meta.dat bit 14): a line-only container
   # that STATES how large each of its files is instead of leaving a reader
   # to assume DefaultLinesPerFile. With the sizes recorded, a step past a

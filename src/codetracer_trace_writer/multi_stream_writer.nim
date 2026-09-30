@@ -479,6 +479,19 @@ proc rebuildGli(w: var MultiStreamTraceWriter) =
       w.paths.len, w.columnAwareSteps))
   w.gliDirty = false
 
+proc extendGli(w: var MultiStreamTraceWriter) =
+  ## Add the path just appended to ``w.paths`` to the global line index.
+  ##
+  ## A new path goes after every existing one, so only its own base is new:
+  ## one prefix sum appended, sized by the same rule ``rebuildGli`` applies.
+  ## Rebuilding instead costs O(paths) per registration — O(paths^2) over a
+  ## trace that meets a new file every few steps. An index already awaiting
+  ## a rebuild is left to it, which will include this path.
+  if w.gliDirty:
+    return
+  w.gli.appendFile(positionSpaceCount(w.pathLineLengths, w.pathLineCounts,
+    w.paths.len - 1, w.columnAwareSteps))
+
 proc toGlobalLineIndex(w: var MultiStreamTraceWriter,
     pathId: uint64, line: uint64): uint64 =
   ## In column-aware mode, returns the byte-offset-based
@@ -926,11 +939,11 @@ proc registerPath*(w: var MultiStreamTraceWriter,
       w.pathLineLengths.add(lls)
     else:
       w.pathLineLengths.add(@[])
-    # Mirror the line count so ``rebuildGli`` sizes the file's slot to it.
+    # Mirror the line count so the global line index sizes the file's slot to it.
     # Zero outside the line-count table: no count was recorded, and
     # ``positionSpaceCounts`` reads that as the pre-table convention.
     w.pathLineCounts.add(if w.lineCountTable: lineCount else: 0'u64)
-    w.gliDirty = true
+    w.extendGli()
   ok(id)
 
 # ---------------------------------------------------------------------------
@@ -1098,7 +1111,10 @@ proc registerPathVersion*(w: var MultiStreamTraceWriter,
         discard
       else:
         w.pathLineCounts.add(recordedCount)
-    w.gliDirty = true
+    when gdh1Arm(gdh1FalsifyPrepend):
+      w.gliDirty = true
+    else:
+      w.extendGli()
 
   w.currentPathVersions[gdh1VersionKey(path)] = id
   ok(id)
