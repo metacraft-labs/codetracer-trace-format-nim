@@ -3,8 +3,8 @@
 ## C FFI interface for the CodeTracer trace writer.
 ## Drop-in replacement for the Rust codetracer_trace_writer_ffi.
 ##
-## Compile with: nim c --app:staticlib --mm:arc --noMain -d:release src/codetracer_trace_writer_ffi.nim
-## Or for shared: nim c --app:lib --mm:arc --noMain -d:release src/codetracer_trace_writer_ffi.nim
+## Compile with: nim c --app:staticlib --mm:arc --threads:off --noMain -d:release src/codetracer_trace_writer_ffi.nim
+## Or for shared: nim c --app:lib --mm:arc --threads:off --noMain -d:release src/codetracer_trace_writer_ffi.nim
 ##
 ## Differences from the Rust FFI (codetracer_trace_writer_ffi/src/lib.rs):
 ##
@@ -63,19 +63,52 @@ import std/macros
 import std/strutils
 
 # ---------------------------------------------------------------------------
-# Thread-local error buffer
+# The C ABI's runtime: the process lock and the per-thread error buffer
+#
+# A host library is built with `--threads:off`: ONE Nim heap for the process,
+# owned by no thread, so memory a writer allocated on a worker thread can be
+# freed after that worker exited. `codetracer_trace_writer_ffi_runtime.c`
+# explains why, and supplies the two things that make one heap safe: a
+# process-wide lock every entry point holds (`ffiGuard`), and a last-error
+# buffer that stays per thread and outside the Nim heap.
+#
+# Built as a host library with `--threads:on` (and without `-d:useMalloc`),
+# each thread gets its own heap and the cross-thread free crashes. That build
+# is warned about rather than refused, because hosts outside this repository
+# still build it that way and a refusal would break them before they can move.
 # ---------------------------------------------------------------------------
 
-var lastError {.threadvar.}: string
-var emptyStr {.threadvar.}: string
+when appType in ["lib", "staticlib"] and compileOption("threads") and
+    not defined(useMalloc):
+  {.warning: "the C ABI library should be built with --threads:off: under " &
+    "--threads:on every host thread gets its own Nim heap, and a writer used " &
+    "on a worker thread that exits is later freed into a dead heap (a crash). " &
+    "See codetracer_trace_writer_ffi_runtime.c.".}
 
-var errorSerial {.threadvar.}: uint64
+{.compile: "codetracer_trace_writer_ffi_runtime.c".}
+
+proc ct_ffi_lock() {.importc, cdecl.}
+proc ct_ffi_unlock() {.importc, cdecl.}
+proc ct_ffi_set_last_error(msg: cstring, len: csize_t): cint {.importc, cdecl.}
+proc ct_ffi_last_error(): cstring {.importc, cdecl.}
+
+var errorSerial: uint64
   ## Incremented by every `setError`, so an entry point can tell whether the
-  ## call it just made reported a failure without clearing `lastError` (which
-  ## callers read after the fact and which is never reset on success).
+  ## call it just made reported a failure without clearing the last error
+  ## (which callers read after the fact and which is never reset on success).
+  ## One counter for the process is enough: entry points run one at a time
+  ## under the process lock, and each compares the counter only across its
+  ## own call.
+
+proc storeLastError(msg: string) =
+  discard ct_ffi_set_last_error(cstring(msg), csize_t(msg.len))
+
+proc lastError(): string =
+  ## This thread's last error.
+  $ct_ffi_last_error()
 
 proc setError(msg: string) =
-  lastError = msg
+  storeLastError(msg)
   inc errorSerial
 
 proc setNotice(msg: string) =
@@ -83,7 +116,7 @@ proc setNotice(msg: string) =
   ## call: the entry-point guard does not latch it, so `trace_writer_close`
   ## still succeeds. For refusals that lose nothing the container depends on
   ## — today only a return with no matching call.
-  lastError = msg
+  storeLastError(msg)
 
 proc trace_writer_clear_last_error(): void {.exportc, cdecl, dynlib.} =
   ## Reset this thread's error buffer to the empty string.
@@ -96,16 +129,13 @@ proc trace_writer_clear_last_error(): void {.exportc, cdecl, dynlib.} =
   ## that point; without this entry point that is not expressible from C
   ## at all, and an assertion on a non-empty buffer would pass on a stale
   ## message (trap 5 — a sentinel that collides with a legitimate value).
-  lastError = ""
+  storeLastError("")
 
 proc trace_writer_last_error(): cstring {.exportc, cdecl, dynlib.} =
   ## Retrieve the last error message for the current thread.
   ## Returns a pointer valid until the next FFI call on the same thread.
   ## Returns an empty string when no error has occurred.
-  if lastError.len == 0:
-    emptyStr = ""
-    return cstring(emptyStr)
-  return cstring(lastError)
+  ct_ffi_last_error()
 
 # ---------------------------------------------------------------------------
 # Internal state: wraps TraceWriter + registries
@@ -290,6 +320,8 @@ when defined(ffiFaultInjection):
 # removes one half of the guard, and the test must go red under either.
 when defined(ffiGuardNoCatch):
   {.warning: "ffiGuardNoCatch: exceptions ESCAPE the C ABI entry points (mutation check). Never ship this build.".}
+when defined(ffiNoProcessLock):
+  {.warning: "ffiNoProcessLock: entry points run WITHOUT the process lock (mutation check). Never ship this build.".}
 when defined(ffiGuardNoLatch):
   {.warning: "ffiGuardNoLatch: void-call failures are NOT latched for close (mutation check). Never ship this build.".}
 
@@ -360,18 +392,29 @@ proc ffiGuardImpl(p: NimNode, failValue: NimNode, latchMode: string): NimNode =
       infix(ident("Exception"), "as", e),
       handler))
 
-  var body = newStmtList(inner)
-  body.add quote do:
+  # Everything below runs under the process lock (see the runtime section).
+  var locked = newStmtList()
+  locked.add quote do:
     let `serial` = errorSerial
   when defined(ffiGuardNoCatch):
-    body.add tryBody
+    locked.add tryBody
   else:
-    body.add tryStmt
+    locked.add tryStmt
   if latch:
     let hs = handleSym
-    body.add quote do:
+    locked.add quote do:
       if errorSerial != `serial`:
-        ffiLatch(`hs`, lastError)
+        ffiLatch(`hs`, lastError())
+  var body = newStmtList(inner)
+  when defined(ffiNoProcessLock):
+    body.add locked
+  else:
+    body.add quote do:
+      ct_ffi_lock()
+      try:
+        `locked`
+      finally:
+        ct_ffi_unlock()
   result.body = body
 
 proc defaultFail(retType: NimNode): NimNode =
@@ -567,7 +610,7 @@ proc trace_writer_free(handle: TraceWriterHandle) {.exportc, cdecl, dynlib, ffiG
         let flushRc = flushPendingStep(handle)
         if flushRc != 0:
           setError("trace_writer_free: failed to flush the pending step: " &
-            lastError)
+            lastError())
         # The same terminus `close` runs. A caller that releases the handle
         # without closing it first — which is what a wrapper's destructor does
         # when `close()` was never called — finalizes the container through
@@ -576,7 +619,7 @@ proc trace_writer_free(handle: TraceWriterHandle) {.exportc, cdecl, dynlib, ffiG
         let trailingRc = flushTrailingValues(handle)
         if trailingRc != 0:
           setError("trace_writer_free: failed to record the trailing " &
-            "values: " & lastError)
+            "values: " & lastError())
       # close() is idempotent — safe to call even if already closed
       let closeRes = handle.msWriter.close()
       if closeRes.isErr:

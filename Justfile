@@ -44,6 +44,7 @@ test-nim:
 # against it and run it.
 test-ffi:
     nimble testFfi
+    nimble testFfiThreads
 
 # Benchmarks are not part of `test` — they assert throughput and are
 # machine-dependent.

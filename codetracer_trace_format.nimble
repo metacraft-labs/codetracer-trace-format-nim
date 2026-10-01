@@ -360,20 +360,60 @@ task buildStaticLib, "Build static library (C FFI)":
     # The Godot/CodeTracer Windows build is MSVC, so the embedded archive must
     # use the same compiler, CRT, and .lib format. Run from a VS developer
     # environment; zstd_bindings.nim selects C:\zstd for this compiler.
-    exec "nim c --cc:vcc --app:staticlib --mm:arc --noMain -d:release --nimMainPrefix:codetracerTraceWriter -p:src -o:codetracer_trace_writer.lib src/codetracer_trace_writer_ffi.nim"
+    exec "nim c --cc:vcc --app:staticlib --mm:arc --threads:off --noMain -d:release --nimMainPrefix:codetracerTraceWriter -p:src -o:codetracer_trace_writer.lib src/codetracer_trace_writer_ffi.nim"
   else:
-    exec "nim c --app:staticlib --mm:arc --noMain -d:release --nimMainPrefix:codetracerTraceWriter --passC:\"-fPIC\" -p:src -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim"
+    exec "nim c --app:staticlib --mm:arc --threads:off --noMain -d:release --nimMainPrefix:codetracerTraceWriter --passC:\"-fPIC\" -p:src -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim"
 
 task buildSharedLib, "Build shared library (C FFI)":
   # See buildStaticLib for why --nimMainPrefix is required.
-  exec "nim c --app:lib --mm:arc --noMain -d:release --nimMainPrefix:codetracerTraceWriter -p:src -o:libcodetracer_trace_writer.so src/codetracer_trace_writer_ffi.nim"
+  exec "nim c --app:lib --mm:arc --threads:off --noMain -d:release --nimMainPrefix:codetracerTraceWriter -p:src -o:libcodetracer_trace_writer.so src/codetracer_trace_writer_ffi.nim"
+
+task testFfiThreads, "C hosts: close after the recording thread exited; concurrent writers":
+  # The host library is built --threads:off with a process lock around every
+  # entry point (src/codetracer_trace_writer_ffi_runtime.c). Two hosts, each
+  # with a control that proves it still reaches the defect it guards:
+  #
+  #  * test_ffi_worker_thread_exit.c must PASS against the shipped flags and
+  #    CRASH against an archive built --threads:on (per-thread heaps);
+  #  * test_ffi_concurrent_writers.c must PASS against the shipped flags and
+  #    FAIL against one built -d:ffiNoProcessLock (one heap, no lock).
+  when hostOS == "windows":
+    echo "SKIP: testFfiThreads uses pthreads and mmap"
+  else:
+    let dir = "build/ffi-threads"
+    mkDir(dir)
+    let common = " --app:staticlib --mm:arc --noMain -d:release --nimMainPrefix:codetracerTraceWriter --passC:\"-fPIC\" -p:src --hints:off"
+    exec "nim c" & common & " --threads:off --nimcache:" & dir & "/nc-ship -o:" & dir & "/lib-ship.a src/codetracer_trace_writer_ffi.nim"
+    exec "nim c" & common & " --threads:on --warnings:off --nimcache:" & dir & "/nc-tls -o:" & dir & "/lib-tls.a src/codetracer_trace_writer_ffi.nim"
+    exec "nim c" & common & " --threads:off --warnings:off -d:ffiNoProcessLock --nimcache:" & dir & "/nc-nolock -o:" & dir & "/lib-nolock.a src/codetracer_trace_writer_ffi.nim"
+    let extra = when hostOS == "macosx": " -framework Security -framework CoreFoundation" else: ""
+    for t in ["worker_thread_exit", "concurrent_writers"]:
+      for v in ["ship", "tls", "nolock"]:
+        exec "gcc -O1 -o " & dir & "/" & t & "-" & v & " tests/test_ffi_" & t & ".c " & dir & "/lib-" & v & ".a -lzstd -lm -lpthread -I include" & extra
+    exec dir & "/worker_thread_exit-ship"
+    exec dir & "/concurrent_writers-ship"
+    let (_, tlsCode) = gorgeEx(dir & "/worker_thread_exit-tls")
+    if tlsCode == 0:
+      raise newException(AssertionDefect, "the worker-thread host PASSED against a --threads:on " &
+        "archive: the test no longer reaches the cross-thread free it guards")
+    var lockCaught = false
+    for attempt in 0 ..< 5:
+      let (_, code) = gorgeEx(dir & "/concurrent_writers-nolock")
+      if code != 0:
+        lockCaught = true
+        break
+    if not lockCaught:
+      raise newException(AssertionDefect, "the concurrent-writers host PASSED 5 times against an " &
+        "archive without the process lock: it no longer exercises concurrent entry")
+    echo "PASS: --threads:on crashes the worker-exit host (exit " & $tlsCode &
+      "); no lock fails the concurrent host; the shipped flags pass both"
 
 task testFfi, "Build and run C FFI test":
   # --nimMainPrefix keeps the Nim runtime entry points uniquely named so
   # this lib can be embedded next to another Nim-compiled artifact (the MCR
   # emulator) without a duplicate-`NimMain` link error. It MUST match the
   # `proc codetracerTraceWriterNimMain` importc in codetracer_trace_writer_ffi.nim.
-  exec "nim c --app:staticlib --mm:arc --noMain -d:release --nimMainPrefix:codetracerTraceWriter --passC:\"-fPIC\" -p:src -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim"
+  exec "nim c --app:staticlib --mm:arc --threads:off --noMain -d:release --nimMainPrefix:codetracerTraceWriter --passC:\"-fPIC\" -p:src -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim"
   # MT1: the three replay-observation chokepoints must be exported symbols so a
   # replay-time observer (MCR) can interpose on them — guard it explicitly.
   exec "bash tests/check_chokepoint_symbols.sh libcodetracer_trace_writer.a"
