@@ -237,9 +237,14 @@
             # declare links nothing; fail the build rather than the consumer.
             doInstallCheck = true;
             installCheckPhase = ''
+              # The symbol table goes to a file first: `nm | grep -q` under
+              # stdenv's pipefail fails whenever grep exits at its match while
+              # nm still has output to write (nm dies of SIGPIPE), which makes
+              # the check depend on where in the archive the symbol sits.
+              ${pkgs.stdenv.cc.bintools.bintools}/bin/nm -g --defined-only \
+                  $out/lib/libcodetracer_trace_writer.a > defined-symbols.txt 2>/dev/null
               for sym in trace_writer_new trace_writer_free trace_writer_last_error; do
-                if ! ${pkgs.stdenv.cc.bintools.bintools}/bin/nm -g --defined-only \
-                    $out/lib/libcodetracer_trace_writer.a 2>/dev/null | grep -qw "$sym"; then
+                if ! grep -qw "$sym" defined-symbols.txt; then
                   echo "libcodetracer_trace_writer.a does not define $sym" >&2
                   exit 1
                 fi
