@@ -114,6 +114,10 @@ task test, "Run all tests":
   # Registering a path extends that space by one base; it must not rebuild
   # every base. Asserted as growth (N vs 4N paths), not as a time.
   exec "nim c -r -d:release -p:src tests/test_path_registration_scales_linearly.nim"
+  # A host resolving steps one call at a time (the C ABI's
+  # `ct_reader_step_location`) pays about one sequential decode, not one chunk
+  # decode and one position-space rebuild per step.
+  exec "nim c -r -d:release -p:src tests/test_per_step_location_cost.nim"
   # The per-file line-count table (meta.dat bit 14): a line-only container
   # that STATES how large each of its files is instead of leaving a reader
   # to assume DefaultLinesPerFile. With the sizes recorded, a step past a

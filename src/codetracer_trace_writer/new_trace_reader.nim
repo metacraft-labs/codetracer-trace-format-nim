@@ -55,6 +55,18 @@ type
     blockSize: uint32
     maxEntries: uint32
 
+    # The address space step positions are encoded in, built once at open:
+    # it is a prefix sum over every path, and `globalPositionSpace` is called
+    # per step by a host that resolves steps one call at a time.
+    posSpace: GlobalLineIndex
+
+    # The absolute positions of the last exec chunk `stepAbsoluteGlobalLineIndex`
+    # decoded, one per event (a non-step event carries the running position).
+    # A host resolving consecutive steps one call at a time decodes each chunk
+    # once instead of once per step.
+    gliChunk: int              ## index of the cached chunk, or -1
+    gliCache: seq[uint64]
+
     # Metadata
     meta*: MetaDatContents
 
@@ -720,6 +732,10 @@ proc openNewTraceFromBytes*(data: seq[byte],
   if ordRes.isErr:
     return err(ordRes.error)
 
+  reader.gliChunk = -1
+  reader.posSpace = buildGlobalLineIndex(positionSpaceCounts(
+    reader.lineLengths, reader.lineCounts, int(reader.pathReader.count()),
+    reader.meta.hasColumnAwareSteps))
   ok(reader)
 
 when ctHasFilesystem:
@@ -1061,7 +1077,7 @@ proc lineCountRaw*(r: NewTraceReader, fileId: uint64): uint64 =
     return 0'u64
   uint64(r.lineLengths[fileId].len)
 
-proc globalPositionSpace*(r: NewTraceReader): GlobalLineIndex =
+proc globalPositionSpace*(r: NewTraceReader): lent GlobalLineIndex =
   ## The address space this trace's ``global_position_index`` values were
   ## encoded in, laid out by the rule the writer used
   ## (``global_line_index.positionSpaceCounts``).
@@ -1081,9 +1097,7 @@ proc globalPositionSpace*(r: NewTraceReader): GlobalLineIndex =
   ## Inverting through it is still an assumption about the producer's
   ## packing — see the ``global_line_index`` module header — so callers
   ## must go through ``tryResolve``, not ``resolve``.
-  buildGlobalLineIndex(positionSpaceCounts(
-    r.lineLengths, r.lineCounts, int(r.pathCount()),
-    r.meta.hasColumnAwareSteps))
+  r.posSpace
 
 proc recordedLineCount*(r: NewTraceReader, fileId: uint64): uint64 =
   ## The line count this trace RECORDS for ``fileId``, or 0 when it
@@ -1233,16 +1247,23 @@ proc stepAbsoluteGlobalLineIndex*(r: var NewTraceReader,
   let chunkSize = uint64(r.execReader.chunkSize)
   let chunkIdx = int(n div chunkSize)
   let eventInChunk = int(n mod chunkSize)
+  if chunkIdx == r.gliChunk:
+    if eventInChunk >= r.gliCache.len:
+      return err("step " & $n & " is past the end of its exec chunk")
+    return ok(r.gliCache[eventInChunk])
   var currentGli: uint64 = 0
 
-  # Decode the containing chunk in one pass via readChunkEvents (O(N)
-  # per chunk) rather than looping ``readEvent(i)`` (O(N²) per chunk
-  # because each readEvent re-scans from chunk start).  When ct-print
-  # calls this proc once per step in a for-loop the difference is
-  # cubic vs quadratic — a 1000-event trace went from ~45s to <1s.
+  # Decode the containing chunk once, in one pass, and keep every event's
+  # absolute position: a caller that resolves steps one call at a time
+  # (ct-print, the C ABI's `ct_reader_step_location`) asks for the next step
+  # of the same chunk next.
   var chunkBuf: seq[StepEvent]
   discard ?r.execReader.readChunkEvents(chunkIdx, chunkBuf)
-  for i in 0 .. eventInChunk:
+  if eventInChunk >= chunkBuf.len:
+    return err("step " & $n & " is past the end of its exec chunk")
+  r.gliChunk = -1
+  r.gliCache.setLen(chunkBuf.len)
+  for i in 0 ..< chunkBuf.len:
     let ev = chunkBuf[i]
     case ev.kind
     of sekAbsoluteStep:
@@ -1261,8 +1282,9 @@ proc stepAbsoluteGlobalLineIndex*(r: var NewTraceReader,
     else:
       # Non-step events (raise, catch, thread_switch) don't change GLI
       discard
-
-  ok(currentGli)
+    r.gliCache[i] = currentGli
+  r.gliChunk = chunkIdx
+  ok(r.gliCache[eventInChunk])
 
 proc stepCount*(r: var NewTraceReader): Result[uint64, string] =
   ?r.ensureExecReader()

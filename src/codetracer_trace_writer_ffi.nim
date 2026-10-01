@@ -4849,11 +4849,14 @@ proc ct_reader_workdir(h: pointer, outLen: ptr csize_t): ptr uint8 {.exportc, cd
 
 import codetracer_trace_writer/global_line_index
 
-proc getOrBuildGli(rh: TraceReaderHandle): GlobalLineIndex =
-  ## Rebuild the writer's address space from the trace's paths and their
-  ## per-file line tables. See the note above on what the reconstruction
-  ## assumes, and `globalPositionSpace` for why the line tables are part
-  ## of the layout and not just of the column decode.
+template getOrBuildGli(rh: TraceReaderHandle): GlobalLineIndex =
+  ## The writer's address space, rebuilt from the trace's paths and their
+  ## per-file line tables when the reader opened (see the note above on
+  ## what the reconstruction assumes, and `globalPositionSpace` for why the
+  ## line tables are part of the layout and not just of the column decode).
+  ## A template over the reader's borrowed copy: `ct_reader_step_location`
+  ## is called once per step, and copying the per-path prefix sums on every
+  ## call made the walk cost proportional to the path count.
   rh[].globalPositionSpace()
 
 # ---------------------------------------------------------------------------
@@ -4884,7 +4887,7 @@ proc ct_reader_step_location(
     return 1.cint
   let globalIdx = gliRes.get()
 
-  let gli = getOrBuildGli(rh)
+  let gli {.cursor.} = getOrBuildGli(rh)  # borrowed: copying it per call cost O(paths)
   let resolved = gli.tryResolve(globalIdx)
   if resolved.isErr:
     setError("step " & $n & ": " & resolved.error)
@@ -4938,7 +4941,7 @@ proc ct_reader_step_locations(
   # Resolve each GLI with the shared prefix-sum.  The GlobalLineIndex
   # is rebuilt once for the whole batch (the per-step accessor rebuilds
   # it once per step), which is also a measurable saving.
-  let gli = getOrBuildGli(rh)
+  let gli {.cursor.} = getOrBuildGli(rh)  # borrowed: copying it per call cost O(paths)
   let pidArr = cast[ptr UncheckedArray[uint64]](outPathIds)
   let lineArr = cast[ptr UncheckedArray[uint64]](outLines)
   for i in 0 ..< int(written):
@@ -5002,7 +5005,7 @@ proc ct_reader_step_locations_with_columns(
 
   if not columnAware:
     # Legacy line-only trace: GLI resolves directly via prefix-sum.
-    let gli = getOrBuildGli(rh)
+    let gli {.cursor.} = getOrBuildGli(rh)  # borrowed: copying it per call cost O(paths)
     for i in 0 ..< int(written):
       let resolved = gli.tryResolve(glis[i])
       if resolved.isErr:
@@ -5029,8 +5032,8 @@ proc ct_reader_step_locations_with_columns(
   # column = 1 in that case, matching the legacy reader.
   # Build the line-only GLI once outside the loop in case any step
   # needs the legacy fallback (per-line data absent).  Cheap since
-  # ``getOrBuildGli`` caches via a thread-local in the runtime.
-  let gliFallback = getOrBuildGli(rh)
+  # ``getOrBuildGli`` is the reader's space, built once at open.
+  let gliFallback {.cursor.} = getOrBuildGli(rh)  # borrowed: copying it per call cost O(paths)
   for i in 0 ..< int(written):
     let posRes = rh[].decodeGlobalPositionIndex(glis[i])
     if posRes.isOk:
