@@ -150,7 +150,12 @@ proc detectNativeBundle*(data: openArray[byte]): Result[NativeBundleInfo, string
   if not hasCtfsMagic(data):
     return err("invalid CTFS magic")
   if not hasValidVersion(data):
-    return err("unsupported CTFS version: byte 0x" & toHex(int(data[5]), 2))
+    # The shared message, so this door and `codetracer_trace_reader`'s give the
+    # same account of the same byte. The hex spelling it replaced named the
+    # value but not the accepted set, and `ct-print` wraps this string in its
+    # own refusal line, so this string is where the distinction between "newer
+    # than this build" and "byte 5 is garbage" has to live.
+    return err(unsupportedCtfsVersionMessage(data))
 
   let blockSize = readU32LE(data, 8)
   let maxRoot = readU32LE(data, 12)

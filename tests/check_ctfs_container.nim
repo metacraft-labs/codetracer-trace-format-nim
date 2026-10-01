@@ -87,7 +87,7 @@ proc main() {.raises: [].} =
   if not hasCtfsMagic(raw):
     fail(args[0] & " does not carry the CTFS magic")
   if not hasValidVersion(raw):
-    fail(args[0] & " has an unrecognised CTFS version byte " & $raw[5])
+    fail(args[0] & ": " & unsupportedCtfsVersionMessage(raw))
 
   # Read the geometry out of the header rather than assuming the defaults, so
   # the checker adjudicates the container the producer actually wrote.

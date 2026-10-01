@@ -276,7 +276,13 @@ proc openTrace*(path: string;
   if not hasCtfsMagic(data):
     return err("not a valid CTFS file (bad magic)")
   if not hasValidVersion(data):
-    return err("unsupported CTFS version")
+    # NAMES THE VERSION. This used to be the bare string "unsupported CTFS
+    # version", which is what an operator holding a container from a newer
+    # writer saw: no value, no accepted set, and nothing separating "newer
+    # than me" from "byte 5 is garbage". `ctfs-container.md` §1c makes naming
+    # the offending value normative, and the reason it is normative rather
+    # than advisory is this format's own v3/v4 history.
+    return err(unsupportedCtfsVersionMessage(data))
 
   # Read block size and max entries from extended header
   if data.len < 16:

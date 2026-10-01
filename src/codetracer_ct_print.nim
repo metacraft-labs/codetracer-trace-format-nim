@@ -1372,7 +1372,12 @@ proc main() =
     of adkCtfsCorrupt:
       # CTFS magic OK but the bundle is broken — refuse instead of letting
       # the v4 reader produce a degenerate empty document.
-      quit("ct-print: refusing to decode broken CTFS bundle: " & detail)
+      # Not "broken": this arm also catches a container from a NEWER writer,
+      # whose version this build does not accept but which is perfectly
+      # well-formed. `detail` carries the accurate account either way, and
+      # asserting brokenness over it would be the diagnosis being wrong in
+      # exactly the direction `ctfs-container.md` §1c warns about.
+      quit("ct-print: refusing to decode this CTFS bundle: " & detail)
     of adkNotCtfs:
       # File exists but is not a CTFS .ct bundle. The legacy v2/v3 reader
       # used to accept arbitrary bytes here and produce a degenerate empty
