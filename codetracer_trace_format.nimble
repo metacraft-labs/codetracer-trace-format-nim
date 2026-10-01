@@ -164,6 +164,15 @@ task test, "Run all tests":
   # reading it as the permissive default. Carries its control: the same reader
   # opens a FULL container of the same recording and succeeds.
   exec "nim c -r -d:release -p:src tests/test_compact_profile_header_refusal.nim"
+  # The compact profile's BODY (ctfs-container.md §1d): the reference encoder
+  # and decoder round-trip every member of a real recording BYTE-EXACTLY and
+  # name the same members the full profile does; a single flipped bit in the
+  # directory is detected rather than silently answered with a short or
+  # shifted member; and the layout is asserted against the bytes to carry no
+  # mapping block and no padding, with the same assertion run against a FULL
+  # container of the same recording and required to FAIL. Also prints CCP-2's
+  # deliverable-4 overhead figures against a VERSION-5 baseline.
+  exec "nim c -r -d:release -p:src tests/test_compact_container_layout.nim"
   # The column-aware step encoding end to end: the writer's opt-in, the
   # DeltaColumn round-trip, Layout A paths.dat, the position decoder, and the
   # meta.dat unknown-flag-bit rejection that keeps the extension clean.

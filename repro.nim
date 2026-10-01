@@ -145,6 +145,11 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_base40.nim", binary: "build/test-bin/test_base40"),
   TestSpec(source: "tests/test_container.nim", binary: "build/test-bin/test_container"),
   TestSpec(source: "tests/test_ctfs_v5_member_forms.nim", binary: "build/test-bin/test_ctfs_v5_member_forms"),
+  # `ctfs-container.md` §1d, the compact profile's body: the reference
+  # encoder/decoder's byte-exact round trip, the flipped-directory-bit control,
+  # and the no-block-map assertion with its must-fail control against a full
+  # container.
+  TestSpec(source: "tests/test_compact_container_layout.nim", binary: "build/test-bin/test_compact_container_layout"),
   TestSpec(source: "tests/test_step_encoding_rule.nim", binary: "build/test-bin/test_step_encoding_rule"),
   TestSpec(source: "tests/test_step_map_v2.nim", binary: "build/test-bin/test_step_map_v2"),
   TestSpec(source: "tests/test_durability_publishes_sealed_chunks.nim", binary: "build/test-bin/test_durability_publishes_sealed_chunks"),
