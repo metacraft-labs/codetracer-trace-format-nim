@@ -4523,17 +4523,24 @@ proc allocJsonResult(s: string, outLen: ptr csize_t): ptr uint8 =
   return buf
 
 proc allocStringResult(s: string, outLen: ptr csize_t): ptr uint8 =
-  ## Return a pointer into a heap-copied string. Caller frees with ct_free_buffer.
+  ## Return a heap copy of `s` and its length in `outLen`. The caller frees it
+  ## with `ct_free_buffer`.
+  ##
+  ## Nil means FAILURE, and only failure. An empty string is a valid answer
+  ## (a zero-length name is a well-formed interning record) and comes back as
+  ## a non-nil buffer with `outLen = 0`; returning nil for it made every caller
+  ## read an empty name as a failed lookup.
   if outLen.isNil:
+    setError("allocStringResult: outLen is nil")
     return nil
   let n = s.len
   outLen[] = csize_t(n)
-  if n == 0:
-    return nil
-  let buf = cast[ptr uint8](alloc(n))
+  let buf = cast[ptr uint8](alloc(max(n, 1)))
   if buf.isNil:
+    setError("allocStringResult: out of memory for " & $n & " bytes")
     return nil
-  copyMem(buf, unsafeAddr s[0], n)
+  if n > 0:
+    copyMem(buf, unsafeAddr s[0], n)
   return buf
 
 # ---------------------------------------------------------------------------
@@ -4654,7 +4661,9 @@ proc ct_reader_event_count(h: pointer): uint64 {.exportc, cdecl, dynlib, ffiGuar
 
 proc ct_reader_path(h: pointer, id: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib, ffiGuard.} =
   ## Get path string by id. Caller must free result with ct_free_buffer.
-  if h.isNil or outLen.isNil: return nil
+  if h.isNil or outLen.isNil:
+    setError("a reader handle and an outLen are required")
+    return nil
   let rh = cast[TraceReaderHandle](h)
   let res = rh[].path(id)
   if res.isErr:
@@ -4664,7 +4673,9 @@ proc ct_reader_path(h: pointer, id: uint64, outLen: ptr csize_t): ptr uint8 {.ex
 
 proc ct_reader_function(h: pointer, id: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib, ffiGuard.} =
   ## Get function name by id. Caller must free result with ct_free_buffer.
-  if h.isNil or outLen.isNil: return nil
+  if h.isNil or outLen.isNil:
+    setError("a reader handle and an outLen are required")
+    return nil
   let rh = cast[TraceReaderHandle](h)
   let res = rh[].function(id)
   if res.isErr:
@@ -4674,7 +4685,9 @@ proc ct_reader_function(h: pointer, id: uint64, outLen: ptr csize_t): ptr uint8 
 
 proc ct_reader_type_name(h: pointer, id: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib, ffiGuard.} =
   ## Get type name by id. Caller must free result with ct_free_buffer.
-  if h.isNil or outLen.isNil: return nil
+  if h.isNil or outLen.isNil:
+    setError("a reader handle and an outLen are required")
+    return nil
   let rh = cast[TraceReaderHandle](h)
   let res = rh[].typeName(id)
   if res.isErr:
@@ -4684,7 +4697,9 @@ proc ct_reader_type_name(h: pointer, id: uint64, outLen: ptr csize_t): ptr uint8
 
 proc ct_reader_varname(h: pointer, id: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib, ffiGuard.} =
   ## Get variable name by id. Caller must free result with ct_free_buffer.
-  if h.isNil or outLen.isNil: return nil
+  if h.isNil or outLen.isNil:
+    setError("a reader handle and an outLen are required")
+    return nil
   let rh = cast[TraceReaderHandle](h)
   let res = rh[].varname(id)
   if res.isErr:
@@ -4742,7 +4757,9 @@ proc ct_reader_varname_count(h: pointer): uint64 {.exportc, cdecl, dynlib, ffiGu
 
 proc ct_reader_step(h: pointer, n: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib, ffiGuard.} =
   ## Returns step event N as JSON bytes. Caller must free with ct_free_buffer.
-  if h.isNil or outLen.isNil: return nil
+  if h.isNil or outLen.isNil:
+    setError("a reader handle and an outLen are required")
+    return nil
   let rh = cast[TraceReaderHandle](h)
   let res = rh[].step(n)
   if res.isErr:
@@ -4756,7 +4773,9 @@ proc ct_reader_step(h: pointer, n: uint64, outLen: ptr csize_t): ptr uint8 {.exp
 
 proc ct_reader_values(h: pointer, n: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib, ffiGuard.} =
   ## Returns variable values for step N as JSON array. Caller must free with ct_free_buffer.
-  if h.isNil or outLen.isNil: return nil
+  if h.isNil or outLen.isNil:
+    setError("a reader handle and an outLen are required")
+    return nil
   let rh = cast[TraceReaderHandle](h)
   let res = rh[].values(n)
   if res.isErr:
@@ -4770,7 +4789,9 @@ proc ct_reader_values(h: pointer, n: uint64, outLen: ptr csize_t): ptr uint8 {.e
 
 proc ct_reader_call(h: pointer, key: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib, ffiGuard.} =
   ## Returns call record by key as JSON. Caller must free with ct_free_buffer.
-  if h.isNil or outLen.isNil: return nil
+  if h.isNil or outLen.isNil:
+    setError("a reader handle and an outLen are required")
+    return nil
   let rh = cast[TraceReaderHandle](h)
   let res = rh[].call(key)
   if res.isErr:
@@ -4781,7 +4802,9 @@ proc ct_reader_call(h: pointer, key: uint64, outLen: ptr csize_t): ptr uint8 {.e
 proc ct_reader_call_for_step(h: pointer, stepId: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib, ffiGuard.} =
   ## Returns the innermost call record enclosing the given step as JSON.
   ## Caller must free with ct_free_buffer.
-  if h.isNil or outLen.isNil: return nil
+  if h.isNil or outLen.isNil:
+    setError("a reader handle and an outLen are required")
+    return nil
   let rh = cast[TraceReaderHandle](h)
   let res = rh[].callForStep(stepId)
   if res.isErr:
@@ -4795,7 +4818,9 @@ proc ct_reader_call_for_step(h: pointer, stepId: uint64, outLen: ptr csize_t): p
 
 proc ct_reader_event(h: pointer, index: uint64, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib, ffiGuard.} =
   ## Returns IO event by index as JSON. Caller must free with ct_free_buffer.
-  if h.isNil or outLen.isNil: return nil
+  if h.isNil or outLen.isNil:
+    setError("a reader handle and an outLen are required")
+    return nil
   let rh = cast[TraceReaderHandle](h)
   let res = rh[].ioEvent(index)
   if res.isErr:
@@ -4809,13 +4834,17 @@ proc ct_reader_event(h: pointer, index: uint64, outLen: ptr csize_t): ptr uint8 
 
 proc ct_reader_program(h: pointer, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib, ffiGuard.} =
   ## Get program name from trace metadata. Caller must free with ct_free_buffer.
-  if h.isNil or outLen.isNil: return nil
+  if h.isNil or outLen.isNil:
+    setError("a reader handle and an outLen are required")
+    return nil
   let rh = cast[TraceReaderHandle](h)
   allocStringResult(rh[].meta.program, outLen)
 
 proc ct_reader_workdir(h: pointer, outLen: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib, ffiGuard.} =
   ## Get workdir from trace metadata. Caller must free with ct_free_buffer.
-  if h.isNil or outLen.isNil: return nil
+  if h.isNil or outLen.isNil:
+    setError("a reader handle and an outLen are required")
+    return nil
   let rh = cast[TraceReaderHandle](h)
   allocStringResult(rh[].meta.workdir, outLen)
 

@@ -241,6 +241,9 @@ task test, "Run all tests":
   # every value lookup was refused, and the refusal was turned into an empty
   # string that the assertions read as "no values".
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_reader_ffi.nim"
+  # An empty type, variable or function name is a name: the reader's C ABI
+  # returns it as a non-nil zero-length buffer, nil only on failure.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_reader_ffi_empty_names.nim"
   # Every test file is reachable from this task. Two were not, for months
   # each, and both described behaviour that had moved on without them.
   exec "nim c -r -d:release -p:src tests/test_every_test_is_listed.nim"

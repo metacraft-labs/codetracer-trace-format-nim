@@ -132,8 +132,9 @@ const
 # nimble ``test`` task and therefore in ``just test``:
 # ``tests/test_line_only_orphan_carry_forward.nim``,
 # ``tests/test_orphan_call_args_step_location.nim``,
-# ``tests/test_reader_ffi_column_aware_paths.nim`` and
-# ``tests/test_reader_ffi_line_only_position_space.nim``. All four drive the
+# ``tests/test_reader_ffi_column_aware_paths.nim``,
+# ``tests/test_reader_ffi_line_only_position_space.nim`` and
+# ``tests/test_reader_ffi_empty_names.nim``. All five drive the
 # C FFI entry points directly — the first two to pin ``flushPendingStep``'s
 # orphan-values branch, the last two to pin what the ABI does with a
 # ``paths.dat`` layout and a step position it cannot resolve on its own.
