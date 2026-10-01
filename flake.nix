@@ -198,6 +198,55 @@
             '';
           };
 
+          # The C FFI of the trace writer, as the static archive
+          # `nimble buildStaticLib` produces plus its headers: what a
+          # recorder written in another language (the Go wasm recorder's cgo
+          # writer, for one) links to emit `.ct` containers.  `lib/` and
+          # `include/` mirror the source-tree locations the sibling-checkout
+          # builds read.  Consumers also link libzstd.
+          packages.trace-writer-ffi = pkgs.stdenv.mkDerivation {
+            pname = "codetracer-trace-writer-ffi";
+            version = "0.1.0";
+            src = ./.;
+
+            nativeBuildInputs = [ nim ];
+            buildInputs = [ pkgs.zstd ];
+
+            # Same flags as the `buildStaticLib` nimble task; see there for
+            # why each is required.
+            buildPhase = ''
+              runHook preBuild
+              export HOME=$TMPDIR
+              nim c --app:staticlib --mm:arc --threads:off --noMain -d:release \
+                --nimMainPrefix:codetracerTraceWriter --passC:"-fPIC" --hints:off \
+                --nimcache:$TMPDIR/nimcache \
+                -p:src ${pkgs.lib.concatMapStringsSep " " (p: "--path:${p}") nimDepPaths} \
+                -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim
+              runHook postBuild
+            '';
+
+            installPhase = ''
+              runHook preInstall
+              mkdir -p $out/lib $out/include
+              cp libcodetracer_trace_writer.a $out/lib/
+              cp include/*.h $out/include/
+              runHook postInstall
+            '';
+
+            # An archive that does not define the entry points the headers
+            # declare links nothing; fail the build rather than the consumer.
+            doInstallCheck = true;
+            installCheckPhase = ''
+              for sym in trace_writer_new trace_writer_free trace_writer_last_error; do
+                if ! ${pkgs.stdenv.cc.bintools.bintools}/bin/nm -g --defined-only \
+                    $out/lib/libcodetracer_trace_writer.a 2>/dev/null | grep -qw "$sym"; then
+                  echo "libcodetracer_trace_writer.a does not define $sym" >&2
+                  exit 1
+                fi
+              done
+            '';
+          };
+
           # `ct-print` — the `.ct` container inspector every recorder in the
           # CodeTracer subtree shells out to, and the repo's shipping
           # artifact.  Built with a bare `nim c` against the pinned dependency
