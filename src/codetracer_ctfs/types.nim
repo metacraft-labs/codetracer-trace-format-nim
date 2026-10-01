@@ -13,6 +13,46 @@ const
   CtfsVersion*: uint8 = 4
   CtfsVersionV3*: uint8 = 3  ## Previous version, accepted by v4 readers
   CtfsVersionV2*: uint8 = 2  ## Legacy version, accepted by v4 readers
+  CtfsVersionV6*: uint8 = 6
+    ## The 24-byte header that carries `Profile` and whole-file `Compression`
+    ## (`ctfs-container.md` §1, §1a, §1b).
+    ##
+    ## **Why 6 and not 5.** Version 5 is the direct-block `MapBlock` tag — a
+    ## member of at most one block stored without a mapping block — which the
+    ## spec allocated for a different campaign and which this package does not
+    ## implement either (`CtfsVersion` here is still 4). Version 6 is 5's body
+    ## plus the extended header, so the gap is a version this package has yet
+    ## to adopt rather than a number skipped by accident.
+    ##
+    ## **This constant is NOT in `AcceptedCtfsVersions`, and that is the
+    ## point.** A v6 container's `FileEntry` array starts at `24 + R` rather
+    ## than `16 + R`, so a reader that accepted the version without
+    ## implementing the body would resolve every entry out of the reserved
+    ## bytes — the same shape of defect as reading a pre-correction container
+    ## because its version stamp was trusted (`meta_dat.nim`'s
+    ## `LastShiftedGlobalIndexVersion`). The compact body is the next
+    ## milestone's work; until it lands, every reader here refuses v6 BY NAME,
+    ## which is what `ctfs-container.md` §1c requires and what the named
+    ## constant makes checkable from one place.
+  AcceptedCtfsVersions*: array[3, uint8] = [
+    CtfsVersionV2, CtfsVersionV3, CtfsVersion]
+    ## The CLOSED set of container versions the readers in this package
+    ## decode. Named rather than written as three literals at each check
+    ## because the refusal and this set have to move together: a reader
+    ## comparing against a stale literal would answer a container it cannot
+    ## read instead of refusing it.
+    ##
+    ## It is {2, 3, 4} because this package has not adopted the spec's
+    ## version 5 yet; that is the direct-block campaign's to add, and adding
+    ## it here is a one-element change to this array plus its body support.
+  V6HeaderSize* = 24
+    ## Size of the version-6 container header, in bytes: the 16 bytes every
+    ## earlier version has, plus `profile`, `compression` and six reserved
+    ## bytes.
+  V6ProfileOffset* = 16
+  V6CompressionOffset* = 17
+  V6ReservedOffset* = 18
+  V6ReservedLen* = 6
   DefaultMaxShards*: uint8 = 0
     ## `ctfs-container.md`: a container that is not sharded writes `0`, and `1`
     ## is not a synonym for it. This wrote `1` while the Rust writer wrote `0`
@@ -35,6 +75,30 @@ type
   CtfsEncryptionMethod* = enum
     emNone = 0        ## No encryption
     emAes256Gcm = 1   ## AES-256-GCM encryption (reserved, not yet implemented)
+
+  CtfsProfile* = enum
+    ## `ctfs-container.md` §1a. Byte 16 of a v6 header. CLOSED SET: these are
+    ## the only two defined values and anything else is a refusal, so the
+    ## parser is `parseCtfsProfile`, which returns a `Result`, and not a
+    ## cast from the byte.
+    cpFull = 0        ## Block 0, FileEntry array, block map
+    cpCompact = 1     ## Directory + concatenated raw streams, no block map
+
+  CtfsWholeFileCompression* = enum
+    ## `ctfs-container.md` §1b. Byte 17 of a v6 header: the scheme applied to
+    ## the container image from offset 24 to the end of the stored object.
+    ##
+    ## **This is a different field from `CtfsCompressionMethod`**, which is
+    ## per-stream and lives inside the region a whole-file scheme covers. The
+    ## set is two members because a member is a promise that every reader of
+    ## the format implements the scheme, and zstd is the only one both this
+    ## package and the Rust db-backend already decode (`ruzstd` on
+    ## `wasm32-unknown-unknown`). It deliberately does NOT carry the
+    ## `reserved, not yet implemented` member that `CtfsCompressionMethod`
+    ## carries for LZ4 — an enumerated scheme with no implementation is a
+    ## capability a consumer can read and cannot rely on.
+    wfcNone = 0       ## Stored as-is. What a BlockTracer archive declares
+    wfcZstd = 1       ## One zstd frame over the body
 
   ## Inline chunk header for chunked compressed streams.
   ## Written before each compressed chunk in the stream:
