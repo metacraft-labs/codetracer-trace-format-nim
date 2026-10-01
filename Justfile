@@ -88,3 +88,9 @@ format-nix:
 # Verify the flake's default package (`ct-print`) builds.
 nix-build:
     nix build .#default
+
+# Entering the dev shell from another git repository must write nothing
+# there (no git hooks, no .nimble). Runs `nix develop`, so it is not part of
+# `test`, which runs inside the shell.
+test-dev-shell:
+    bash tests/test_dev_shell_writes_nothing_elsewhere.sh

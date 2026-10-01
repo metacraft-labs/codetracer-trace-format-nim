@@ -151,14 +151,39 @@
             # pcre directly instead of relying on a run-time library search.
             CT_PCRE_LIB_DIR = "${pkgs.pcre.out}/lib";
 
-            shellHook = preCommit.shellHook + ''
-              # Seed a project-local, writable NIMBLE_DIR from the pinned
-              # sources above.  nimble needs to write (nimbledata2.json), so
-              # the store copy is materialised once into `.nimble/` rather
-              # than used in place.  Honour an NIMBLE_DIR the caller already
-              # set (CI may point at a shared cache).
+            # EVERYTHING THIS HOOK WRITES IS ANCHORED TO THIS REPOSITORY, never
+            # to the directory the shell happens to be entered from.
+            # git-hooks.nix's `shellHook` installs `.pre-commit-config.yaml`
+            # and a pre-commit hook into whatever git repository encloses
+            # `$PWD`: entered from a sibling checkout (`nix develop
+            # ../codetracer-trace-format-nim`, or a captured `print-dev-env`
+            # sourced elsewhere) it planted this repo's `just lint` hook in
+            # that sibling and blocked its commits. So it runs only when the
+            # enclosing repository is this one, recognised by files only this
+            # repository has at its top level; elsewhere it is skipped and
+            # nothing is written. `tests/test_dev_shell_writes_nothing_elsewhere.sh`.
+            shellHook = ''
+              ct_tfn_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+              if [ -n "$ct_tfn_root" ] \
+                && [ -f "$ct_tfn_root/codetracer_trace_format.nimble" ] \
+                && [ -f "$ct_tfn_root/src/codetracer_trace_writer_ffi.nim" ]; then
+                ( cd "$ct_tfn_root" && ${preCommit.shellHook} )
+              else
+                ct_tfn_root=""
+              fi
+
+              # Seed a writable NIMBLE_DIR from the pinned sources above.
+              # nimble needs to write (nimbledata2.json), so the store copy is
+              # materialised once rather than used in place: into this
+              # repository's `.nimble/` when the shell is entered from inside
+              # it, into the user cache otherwise. Honour an NIMBLE_DIR the
+              # caller already set (CI may point at a shared cache).
               if [ -z "''${NIMBLE_DIR:-}" ]; then
-                export NIMBLE_DIR="$PWD/.nimble"
+                if [ -n "$ct_tfn_root" ]; then
+                  export NIMBLE_DIR="$ct_tfn_root/.nimble"
+                else
+                  export NIMBLE_DIR="''${XDG_CACHE_HOME:-$HOME/.cache}/codetracer-trace-format-nim/nimble"
+                fi
               fi
               if [ ! -d "$NIMBLE_DIR/pkgs2" ]; then
                 mkdir -p "$NIMBLE_DIR"
