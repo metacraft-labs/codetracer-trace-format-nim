@@ -145,7 +145,10 @@ for (const p of expected.probes) {
 }
 
 // --- source views ----------------------------------------------------------
-check("meta.has_alternate_source_views", num(NUM.hasSourceViewsFlag), 1);
+// meta.dat is written at the first record, before a view or a span exists, so
+// bits 5 and 13 are clear and the members are found by their presence
+// (internal-files.md "Stream-presence flags are a hint, not a gate").
+check("meta.has_alternate_source_views", num(NUM.hasSourceViewsFlag), 0);
 check("sourceViewCount", num(NUM.sourceViewCount), expected.views.length);
 expected.views.forEach((v, i) => {
   check(`view[${i}].pathId`, num(NUM.sourceViewPath, i), v.path);
@@ -177,7 +180,7 @@ check("io[out of range] refuses",
   num(NUM.ioDecodes, expected.ioEvents.length), 0);
 
 // --- spans -----------------------------------------------------------------
-check("meta.has_span_stream", num(NUM.hasSpanStreamFlag), 1);
+check("meta.has_span_stream", num(NUM.hasSpanStreamFlag), 0);
 check("spanRecordCount", num(NUM.spanRecordCount), expected.spanRecords);
 check("spanSettledCount", num(NUM.spanSettledCount), expected.spans.length);
 expected.spans.forEach((s, i) => {

@@ -175,11 +175,10 @@ proc corpusViewsForPath*(pathId: uint64): seq[uint64] =
 
 const CorpusIoCount* = 6
 
-proc corpusIoKind*(i: int): IOEventKind =
-  ## Cycles all four kinds, so the EventLogKind ordinal round trip
-  ## (`ioEventKindToOrdinal` -> byte -> `ordinalToIOEventKind`) is exercised
-  ## for each of them rather than for stdout alone.
-  IOEventKind(i mod 4)
+proc corpusIoKind*(i: int): EventLogKind =
+  ## Cycles the EventLogKinds, so the kind byte's exact round trip is
+  ## exercised for more than one kind.
+  EventLogKind(i mod 14)
 
 proc corpusIoStep*(i: int): uint64 =
   uint64(i * 811 + 7)
@@ -324,7 +323,7 @@ const
 
 proc verifySourceViews(r: NewTraceReader): int32 =
   ## Codes 100..119.
-  if not r.meta.hasAlternateSourceViews: return 100
+  if r.sourceViewCount() == 0: return 100
   if r.sourceViewCount() != uint64(CorpusViewCount): return 101
   for i in 0 ..< CorpusViewCount:
     let svRes = r.sourceView(uint64(i))
@@ -551,7 +550,7 @@ proc verifyCorpus*(data: seq[byte]): int32 =
   if svRc != 0: return svRc
   let ioRc = verifyIoEvents(r)
   if ioRc != 0: return ioRc
-  let spanRc = verifySpans(data, r.meta.hasSpanStream)
+  let spanRc = verifySpans(data, hasSpanStreamFiles(data))
   if spanRc != 0: return spanRc
   let lhRc = verifyLinehits(data)
   if lhRc != 0: return lhRc
@@ -609,8 +608,13 @@ proc legacyValueBytes*(i: int): seq[byte] =
   ## type id alongside it, which is exactly what the SPEC framing dropped.
   @[0x18'u8, byte((int(LegacyValueByte) + i) and 0xFF)]
 
-proc legacyIoKind*(i: int): IOEventKind =
-  IOEventKind(i mod 4)
+proc legacyIoOrdinal*(i: int): uint8 =
+  ## The legacy record's kind byte: the old four-value API ordinal.
+  uint8(i mod 4)
+
+proc legacyIoKind*(i: int): EventLogKind =
+  ## The EventLogKind a reader reports for `legacyIoOrdinal(i)`.
+  [elkWrite, elkWriteOther, elkReadFile, elkError][i mod 4]
 
 proc legacyIoStep*(i: int): uint64 =
   uint64(i * 5 + 1)
