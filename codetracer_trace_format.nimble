@@ -151,6 +151,13 @@ task test, "Run all tests":
   # `include`s codetracer_trace_writer_ffi to drive ct_reader_open, so it
   # needs --mm:arc and the --nimMainPrefix the FFI's NimMain importc expects.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_meta_dat_v3_global_index_refusal.nim"
+  # CCP-1, and the same lesson one level up: the CONTAINER header gains a
+  # profile and a whole-file compression scheme, both closed sets, and a
+  # reader that does not know a value refuses the container by name instead
+  # of parsing it as something else. The v6 version bump is the gate -- the
+  # accepted set is closed at {2,3,4} -- and the arm carries its control: the
+  # same reader opens a FULL container of the same recording and succeeds.
+  exec "nim c -r -d:release -p:src tests/test_compact_profile_header_refusal.nim"
   # The column-aware step encoding end to end: the writer's opt-in, the
   # DeltaColumn round-trip, Layout A paths.dat, the position decoder, and the
   # meta.dat unknown-flag-bit rejection that keeps the extension clean.
