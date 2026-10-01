@@ -157,6 +157,13 @@ task test, "Run all tests":
   # recorded lines. `include`s codetracer_trace_writer_ffi to drive
   # ct_reader_open, so it needs --mm:arc and the FFI's --nimMainPrefix.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_older_versions_are_refused.nim"
+  # The same rule in the other direction, for the version AFTER 5: a container
+  # declaring the version-6 header (a profile and a whole-file compression
+  # scheme, both closed sets -- ctfs-container.md §1a, §1b) is refused by name,
+  # and the two fields' parsers refuse an unknown or absent value rather than
+  # reading it as the permissive default. Carries its control: the same reader
+  # opens a FULL container of the same recording and succeeds.
+  exec "nim c -r -d:release -p:src tests/test_compact_profile_header_refusal.nim"
   # The column-aware step encoding end to end: the writer's opt-in, the
   # DeltaColumn round-trip, Layout A paths.dat, the position decoder, and the
   # meta.dat unknown-flag-bit rejection that keeps the extension clean.
