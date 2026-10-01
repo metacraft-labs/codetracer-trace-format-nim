@@ -10,9 +10,12 @@
 # repository.
 #
 # Asserted, from a scratch git repository (and from a subdirectory of it):
+#   * NIMBLE_DIR is the user-cache path, not anything under the caller's
+#     directory or repository;
 #   * no `.pre-commit-config.yaml`, no installed hook, no `.nimble/`, no
 #     `core.hooksPath` change -- `git status --ignored` stays empty;
-# and, as the positive control, entered from this repository the hook still
+# and, as the positive control, entered from inside this repository (its
+# `tests/` directory) NIMBLE_DIR is this repository's `.nimble/` and the hook
 # installs: `.pre-commit-config.yaml` is the git-hooks.nix symlink.
 #
 #   bash tests/test_dev_shell_writes_nothing_elsewhere.sh
@@ -27,9 +30,11 @@ git -C "$SCRATCH" -c user.name=t -c user.email=t@t commit -q --allow-empty -m in
 mkdir -p "$SCRATCH/sub"
 hooks_before="$(ls "$SCRATCH/.git/hooks")"
 
+CACHE_NIMBLE="${XDG_CACHE_HOME:-$HOME/.cache}/codetracer-trace-format-nim/nimble"
 for dir in "$SCRATCH" "$SCRATCH/sub"; do
-  ( cd "$dir" && env -u NIMBLE_DIR nix develop "$REPO" --no-write-lock-file -c true ) \
-    >/dev/null 2>&1 || fail "the dev shell did not start from $dir"
+  nimble_dir="$( cd "$dir" && env -u NIMBLE_DIR nix develop "$REPO" --no-write-lock-file \
+    -c sh -c 'printf %s "$NIMBLE_DIR"' 2>/dev/null )" || fail "the dev shell did not start from $dir"
+  [ "$nimble_dir" = "$CACHE_NIMBLE" ] || fail "entered from $dir: NIMBLE_DIR is '$nimble_dir', not the user cache '$CACHE_NIMBLE'"
   [ ! -e "$SCRATCH/.pre-commit-config.yaml" ] || fail "entered from $dir: .pre-commit-config.yaml was written into the other repository"
   [ ! -e "$SCRATCH/.nimble" ] && [ ! -e "$SCRATCH/sub/.nimble" ] || fail "entered from $dir: a .nimble directory was seeded into the other repository"
   [ "$(ls "$SCRATCH/.git/hooks")" = "$hooks_before" ] || fail "entered from $dir: git hooks were installed into the other repository"
@@ -37,7 +42,9 @@ for dir in "$SCRATCH" "$SCRATCH/sub"; do
   [ -z "$(git -C "$SCRATCH" status --porcelain --ignored)" ] || fail "entered from $dir: the other repository is dirty: $(git -C "$SCRATCH" status --porcelain --ignored)"
 done
 
-( cd "$REPO" && nix develop "$REPO" --no-write-lock-file -c true ) >/dev/null 2>&1 || fail "the dev shell did not start from this repository"
+nimble_dir="$( cd "$REPO/tests" && env -u NIMBLE_DIR nix develop "$REPO" --no-write-lock-file \
+  -c sh -c 'printf %s "$NIMBLE_DIR"' 2>/dev/null )" || fail "the dev shell did not start from this repository"
+[ "$nimble_dir" = "$REPO/.nimble" ] || fail "control: entered from inside this repository, NIMBLE_DIR is '$nimble_dir', not '$REPO/.nimble'"
 [ -L "$REPO/.pre-commit-config.yaml" ] || fail "control: entered from this repository, the hook did not install .pre-commit-config.yaml"
 
 echo "PASS: entered from another repository the dev shell writes nothing there; from this one it installs its hooks"
