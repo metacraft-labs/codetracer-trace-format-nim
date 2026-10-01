@@ -67,7 +67,7 @@ proc writeMixedTrace(file: string) =
   ## File 0 carries a two-line length table (20 addressable columns in
   ## total); file 1 carries none. Both are stepped through.
   var w = initMultiStreamWriter(file & ".build", "mixed_column_aware").get()
-  w.enableColumnAwareSteps()
+  doAssert w.enableColumnAwareSteps().isOk
   doAssert w.registerPath(TabledPath, TabledLineLengths).isOk
   doAssert w.registerPath(UntabledPath).isOk
   doAssert w.registerStep(0, 1, @[]).isOk
@@ -82,7 +82,7 @@ proc writeMixedTrace(file: string) =
 proc writeFullyTabledTrace(file: string) =
   ## Both files tabled — the case the column decode is for.
   var w = initMultiStreamWriter(file & ".build", "fully_tabled_column_aware").get()
-  w.enableColumnAwareSteps()
+  doAssert w.enableColumnAwareSteps().isOk
   doAssert w.registerPath(TabledPath, TabledLineLengths).isOk
   doAssert w.registerPath(UntabledPath, [8'u32, 8'u32, 8'u32]).isOk
   doAssert w.registerStep(0, 2, @[]).isOk

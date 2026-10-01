@@ -1111,18 +1111,22 @@ proc trace_writer_set_workdir(
     handle: TraceWriterHandle,
     workdir: cstring,
 ) {.exportc, cdecl, dynlib, ffiGuard.} =
-  ## Override the working directory recorded in the trace metadata.
-  ## Can be called before or after begin_events — the value is stored and
-  ## propagated to the writer when/if it becomes ready.
+  ## Set the working directory recorded in the trace metadata.
+  ## Can be called before or after begin_events, but before the first
+  ## record: meta.dat is written then and never rewritten, so a later call is
+  ## refused (`trace_writer_last_error`, and `trace_writer_close` fails).
   if handle.isNil:
     return
-  handle.workdir = toNimStr(workdir)
-  # Update the metadata in the writer if already created
+  let wd = toNimStr(workdir)
   if handle.useMultiStream:
     if handle.msWriterReady:
-      handle.msWriter.metadata.workdir = handle.workdir
+      let r = handle.msWriter.setWorkdir(wd)
+      if r.isErr:
+        setError("trace_writer_set_workdir: " & r.error)
+        return
   elif handle.writerReady:
-    handle.writer.metadata.workdir = handle.workdir
+    handle.writer.metadata.workdir = wd
+  handle.workdir = wd
 
 proc trace_writer_set_recording_id(
     handle: TraceWriterHandle,
@@ -1191,7 +1195,8 @@ proc trace_writer_set_args(
   ## pair so non-UTF8 / embedded-NUL argv survives the FFI boundary.
   ## Can be called before or after begin_events — the value is stored
   ## and propagated to the multi-stream writer's metadata when/if it
-  ## becomes ready.  Passing a NULL handle is a no-op.
+  ## becomes ready, up to the first record (see `trace_writer_set_workdir`).
+  ## Passing a NULL handle is a no-op.
   if handle.isNil:
     return
   var argSeq = newSeq[string](int(args_count))
@@ -1202,10 +1207,14 @@ proc trace_writer_set_args(
       if not aPtr.isNil and aLen > 0.csize_t:
         argSeq[i] = newString(int(aLen))
         copyMem(addr argSeq[i][0], aPtr, int(aLen))
-  handle.metaArgs = argSeq
-  # Propagate to the multi-stream writer's metadata if already created.
+  # Propagate to the multi-stream writer's metadata if already created; it
+  # refuses once meta.dat is written (at the first record).
   if handle.useMultiStream and handle.msWriterReady:
-    handle.msWriter.metadata.args = handle.metaArgs
+    let r = handle.msWriter.setArgs(argSeq)
+    if r.isErr:
+      setError("trace_writer_set_args: " & r.error)
+      return
+  handle.metaArgs = argSeq
 
 # ---------------------------------------------------------------------------
 # Replay observation seam — the three "chokepoints".
@@ -1813,6 +1822,96 @@ proc trace_writer_register_assignment(
     return 1.cint
   0.cint
 
+# ---------------------------------------------------------------------------
+# The place model: value-stream tags 1 and 4-8 (`trace-events.md` §"Value
+# Stream"). Each event attaches to the step being buffered, exactly as values,
+# drops and assignments do, and reaches the trace in that step's value record.
+# Values are pre-encoded CBOR `ValueRecord`s (the `ct_value_*` encoder), stored
+# verbatim. Each returns 0 on success, 1 on failure (`trace_writer_last_error`).
+# ---------------------------------------------------------------------------
+
+proc copyCbor(data: ptr uint8, len: csize_t): seq[byte] =
+  result = newSeq[byte](int(len))
+  if not data.isNil and len > 0.csize_t:
+    copyMem(addr result[0], data, int(len))
+
+template placeModelEntry(handle: TraceWriterHandle, entry: string,
+    body: untyped) =
+  if handle.isNil:
+    setError(entry & ": NULL handle")
+    return 1.cint
+  if not handle.useMultiStream:
+    setError(entry & ": the single-stream writer does not record the place " &
+      "model; open the writer in the binary (multi-stream) format")
+    return 1.cint
+  if not handle.msWriterReady:
+    setError(entry & ": writer is not ready")
+    return 1.cint
+  body
+  return 0.cint
+
+proc trace_writer_register_cell_value(
+    handle: TraceWriterHandle, place: int64,
+    value_cbor: ptr uint8, value_cbor_len: csize_t,
+): cint {.exportc, cdecl, dynlib, ffiGuardLatch(1.cint).} =
+  ## Tag 4 ``CellValue``: the value held by the cell at ``place``.
+  placeModelEntry(handle, "trace_writer_register_cell_value"):
+    encodeCellValueEvent(place, copyCbor(value_cbor, value_cbor_len),
+      handle.pendingExtraValueEvents)
+
+proc trace_writer_register_compound_value(
+    handle: TraceWriterHandle, place: int64,
+    value_cbor: ptr uint8, value_cbor_len: csize_t,
+): cint {.exportc, cdecl, dynlib, ffiGuardLatch(1.cint).} =
+  ## Tag 5 ``CompoundValue``: the compound value at ``place``.
+  placeModelEntry(handle, "trace_writer_register_compound_value"):
+    encodeCompoundValueEvent(place, copyCbor(value_cbor, value_cbor_len),
+      handle.pendingExtraValueEvents)
+
+proc trace_writer_assign_cell(
+    handle: TraceWriterHandle, place: int64,
+    new_value_cbor: ptr uint8, new_value_cbor_len: csize_t,
+): cint {.exportc, cdecl, dynlib, ffiGuardLatch(1.cint).} =
+  ## Tag 6 ``AssignCell``: ``new_value`` is stored into the cell at ``place``.
+  placeModelEntry(handle, "trace_writer_assign_cell"):
+    encodeAssignCellEvent(place, copyCbor(new_value_cbor, new_value_cbor_len),
+      handle.pendingExtraValueEvents)
+
+proc trace_writer_assign_compound_item(
+    handle: TraceWriterHandle, place: int64, index: uint64, item_place: int64,
+): cint {.exportc, cdecl, dynlib, ffiGuardLatch(1.cint).} =
+  ## Tag 7 ``AssignCompoundItem``: item ``index`` of the compound at ``place``
+  ## becomes the cell at ``item_place``.
+  placeModelEntry(handle, "trace_writer_assign_compound_item"):
+    encodeAssignCompoundItemEvent(place, index, item_place,
+      handle.pendingExtraValueEvents)
+
+proc trace_writer_register_variable_cell(
+    handle: TraceWriterHandle, variable_name: cstring, place: int64,
+): cint {.exportc, cdecl, dynlib, ffiGuardLatch(1.cint).} =
+  ## Tag 8 ``VariableCell``: the variable ``variable_name`` is the cell at
+  ## ``place``. The name is interned in ``varnames.dat``.
+  placeModelEntry(handle, "trace_writer_register_variable_cell"):
+    let vnIdRes = handle.msWriter.registerVarname(toNimStr(variable_name))
+    if vnIdRes.isErr:
+      setError("trace_writer_register_variable_cell: " & vnIdRes.error)
+      return 1.cint
+    encodeVariableCellEvent(vnIdRes.get(), place,
+      handle.pendingExtraValueEvents)
+
+proc trace_writer_bind_variable(
+    handle: TraceWriterHandle, variable_name: cstring, place: int64,
+): cint {.exportc, cdecl, dynlib, ffiGuardLatch(1.cint).} =
+  ## Tag 1 ``BindVariable``: ``variable_name`` is bound to ``place``. The
+  ## failure-reporting twin of ``ct_bind_variable``.
+  placeModelEntry(handle, "trace_writer_bind_variable"):
+    let vnIdRes = handle.msWriter.registerVarname(toNimStr(variable_name))
+    if vnIdRes.isErr:
+      setError("trace_writer_bind_variable: " & vnIdRes.error)
+      return 1.cint
+    encodeBindVariableEvent(vnIdRes.get(), place,
+      handle.pendingExtraValueEvents)
+
 proc trace_writer_register_drop_variables(
     handle: TraceWriterHandle,
     names: ptr UncheckedArray[cstring],
@@ -1961,20 +2060,6 @@ proc trace_writer_register_return_cbor(
       ),
     ),
   ))
-
-proc toIOEventKind(k: FfiEventLogKind): IOEventKind =
-  ## Map FFI event log kinds to multi-stream IOEventKind.
-  ## The multi-stream IO event stream has a simpler set of kinds.
-  case k
-  of ffiElkWrite, ffiElkWriteFile, ffiElkWriteOther:
-    ioStdout
-  of ffiElkRead, ffiElkReadFile, ffiElkReadOther, ffiElkReadDir,
-      ffiElkOpenDir, ffiElkCloseDir, ffiElkSocket, ffiElkOpen:
-    ioFileOp
-  of ffiElkError:
-    ioError
-  of ffiElkTraceLogEvent, ffiElkEvmEvent:
-    ioStderr
 
 proc ptrLenToString(p: ptr UncheckedArray[byte], n: csize_t): string =
   ## Materialise a (ptr, len) pair.  NOT `$cstring`: a caller's string may
@@ -2249,14 +2334,25 @@ proc trace_writer_register_special_event(
       if handle.hasPendingStep: handle.msWriter.stepCount
       elif handle.msWriter.stepCount > 0: handle.msWriter.stepCount - 1
       else: 0'u64
-    failIfErr handle.msWriter.registerIOEvent(toIOEventKind(kind), data,
+    # The kind is the recorder's exact `EventLogKind`; an unassigned value is
+    # refused, never mapped onto a kind (`trace-events.md` §"EventLogKind").
+    let kindRes = eventLogKindFromOrdinal(uint64(cast[int32](kind)))
+    if kindRes.isErr:
+      setError("trace_writer_register_special_event: " & kindRes.error)
+      return
+    failIfErr handle.msWriter.registerIOEvent(kindRes.get(), data,
       metadata = metaBytes, stepId = some(currentStepId))
+    return
+
+  let legacyKind = eventLogKindFromOrdinal(uint64(cast[int32](kind)))
+  if legacyKind.isErr:
+    setError("trace_writer_register_special_event: " & legacyKind.error)
     return
 
   failIfErr handle.writer.writeEvent(TraceLowLevelEvent(
     kind: tleEvent,
     recordEvent: RecordEvent(
-      kind: toEventLogKind(kind),
+      kind: legacyKind.get(),
       metadata: toNimStr(metadata),
       content: toNimStr(content),
     ),
@@ -2355,10 +2451,17 @@ proc ct_bind_variable(
   if handle.isNil:
     return
   let name = toNimStr(variable_name)
-  let variableId = internVariable(handle, name)
   if handle.useMultiStream:
-    setError("ct_bind_variable: multi-stream writer does not yet support history events")
+    if not handle.msWriterReady:
+      setError("ct_bind_variable: writer is not ready")
+      return
+    let vnIdRes = handle.msWriter.registerVarname(name)
+    if vnIdRes.isErr:
+      setError("ct_bind_variable: " & vnIdRes.error)
+      return
+    encodeBindVariableEvent(vnIdRes.get(), place, handle.pendingExtraValueEvents)
     return
+  let variableId = internVariable(handle, name)
   if not handle.writerReady:
     return
   failIfErr handle.writer.writeBindVariable(variableId, place)
@@ -2382,12 +2485,23 @@ proc ct_assignment(
   if handle.isNil:
     return
   let name = toNimStr(target_name)
-  let variableId = internVariable(handle, name)
   let rvalue = buildRvalue(rvalue_kind, simple_variable_id, compound_ids,
                            compound_len, field_name, index, call_key)
   if handle.useMultiStream:
-    setError("ct_assignment: multi-stream writer does not yet support history events")
+    if not handle.msWriterReady:
+      setError("ct_assignment: writer is not ready")
+      return
+    let vnIdRes = handle.msWriter.registerVarname(name)
+    if vnIdRes.isErr:
+      setError("ct_assignment: " & vnIdRes.error)
+      return
+    var enc = CborEncoder.init()
+    enc.encodeCborRValue(rvalue)
+    encodeAssignmentEvent(vnIdRes.get(),
+      (if toPassBy(pass_by) == pbValue: 0'u8 else: 1'u8), enc.getBytes(),
+      handle.pendingExtraValueEvents)
     return
+  let variableId = internVariable(handle, name)
   if not handle.writerReady:
     return
   failIfErr handle.writer.writeEvent(TraceLowLevelEvent(
@@ -2568,7 +2682,7 @@ proc trace_writer_enable_column_aware_steps(
   if handle.useMultiStream:
     if not handle.msWriterReady:
       return
-    handle.msWriter.enableColumnAwareSteps()
+    failIfErr handle.msWriter.enableColumnAwareSteps()
 
 proc trace_writer_enable_column_breakpoints_support(
     handle: TraceWriterHandle,
@@ -2590,7 +2704,7 @@ proc trace_writer_enable_column_breakpoints_support(
   if handle.useMultiStream:
     if not handle.msWriterReady:
       return
-    handle.msWriter.enableColumnBreakpointsSupport()
+    failIfErr handle.msWriter.enableColumnBreakpointsSupport()
 
 proc trace_writer_enable_column_motions_support(
     handle: TraceWriterHandle,
@@ -2605,7 +2719,7 @@ proc trace_writer_enable_column_motions_support(
   if handle.useMultiStream:
     if not handle.msWriterReady:
       return
-    handle.msWriter.enableColumnMotionsSupport()
+    failIfErr handle.msWriter.enableColumnMotionsSupport()
 
 proc trace_writer_register_delta_column(
     handle: TraceWriterHandle,
@@ -3198,6 +3312,33 @@ proc trace_writer_register_source_reload(
     return CtTwInvalidReloadOrdinal
   res.get()
 
+proc trace_writer_declare_source_reload(
+    handle: TraceWriterHandle,
+): cint {.exportc, cdecl, dynlib, ffiGuard.} =
+  ## Declare, before the first record, that this trace MAY carry source
+  ## reload markers (`meta.dat` `flags_ext` bit 0, `internal-files.md`
+  ## §"Extended flags"). A recorder attached to a reload agent calls it right
+  ## after `trace_writer_begin_events`; `trace_writer_register_source_reload`
+  ## is refused in a trace that did not. A declared trace that records no
+  ## reload is well-formed. Returns 0 on success, 1 on refusal (after the
+  ## first record, or before the writer is begun).
+  if handle.isNil:
+    setError("NULL handle")
+    return 1.cint
+  if not handle.useMultiStream:
+    setError("trace_writer_declare_source_reload: source reloads are " &
+      "recorded by the multi-stream writer only")
+    return 1.cint
+  if not handle.msWriterReady:
+    setError("trace_writer_declare_source_reload: writer not ready (call " &
+      "trace_writer_begin_events first)")
+    return 1.cint
+  let r = handle.msWriter.declareSourceReload()
+  if r.isErr:
+    setError(r.error)
+    return 1.cint
+  0.cint
+
 proc trace_writer_source_reload_count(
     handle: TraceWriterHandle,
 ): uint64 {.exportc, cdecl, dynlib, ffiGuard.} =
@@ -3747,7 +3888,10 @@ proc trace_writer_add_filter_provenance(
   entry.path = pStr
   if not sha256_bytes.isNil:
     copyMem(addr entry.sha256[0], sha256_bytes, 32)
-  handle.msWriter.filterProvenance.add(entry)
+  let r = handle.msWriter.addFilterProvenance(entry)
+  if r.isErr:
+    setError(r.error)
+    return 1.cint
   # The presence of at least one entry is enough to set the flag bit;
   # the explicit "empty-but-recorded" path is the dedicated
   # `trace_writer_record_empty_filter_provenance` proc below.
@@ -3771,7 +3915,10 @@ proc trace_writer_record_empty_filter_provenance(
   if not handle.msWriterReady:
     setError("writer not ready (call begin_events first)")
     return 1.cint
-  handle.msWriter.recordEmptyFilterProvenance = true
+  let r = handle.msWriter.recordEmptyFilterProvenanceBlock()
+  if r.isErr:
+    setError(r.error)
+    return 1.cint
   0.cint
 
 proc ct_write_meta_dat(
@@ -3789,8 +3936,7 @@ proc ct_write_meta_dat(
     return 1.cint
 
   if handle.useMultiStream:
-    # Multi-stream writer writes meta.dat automatically during close().
-    # Nothing to do here — the metadata and paths are already tracked.
+    # The multi-stream writer writes meta.dat at the first record (or close).
     if not handle.msWriterReady:
       setError("writer not ready (call begin_events first)")
       return 1.cint
@@ -3820,12 +3966,12 @@ proc ct_write_meta_dat_to_buffer(
     program: ptr uint8, program_len: csize_t,
     workdir: ptr uint8, workdir_len: csize_t,
     args: ptr ptr uint8, arg_lens: ptr csize_t, args_count: csize_t,
-    paths: ptr ptr uint8, path_lens: ptr csize_t, paths_count: csize_t,
     recorder_id: ptr uint8, recorder_id_len: csize_t,
     recording_id: ptr uint8, recording_id_len: csize_t,
     out_buf: ptr ptr uint8, out_len: ptr csize_t
 ): cint {.exportc, cdecl, dynlib, ffiGuard.} =
-  ## Write meta.dat to a newly allocated buffer from explicit fields.
+  ## Write a version 6 meta.dat to a newly allocated buffer from explicit
+  ## fields. It carries no path list: a trace's source paths are `paths.dat`.
   ## The caller must free the buffer with ct_free_buffer.
   ## Returns 0 on success.
   ##
@@ -3854,14 +4000,6 @@ proc ct_write_meta_dat_to_buffer(
       argSeq[i] = newString(int(aLen))
       copyMem(addr argSeq[i][0], aPtr, int(aLen))
 
-  var pathSeq = newSeq[string](int(paths_count))
-  for i in 0 ..< int(paths_count):
-    let pPtr = cast[ptr UncheckedArray[ptr uint8]](paths)[i]
-    let pLen = cast[ptr UncheckedArray[csize_t]](path_lens)[i]
-    if not pPtr.isNil and pLen > 0.csize_t:
-      pathSeq[i] = newString(int(pLen))
-      copyMem(addr pathSeq[i][0], pPtr, int(pLen))
-
   var recId = ""
   if not recorder_id.isNil and recorder_id_len > 0.csize_t:
     recId = newString(int(recorder_id_len))
@@ -3887,7 +4025,11 @@ proc ct_write_meta_dat_to_buffer(
   let meta = TraceMetadata(
     recordingId: recordingIdStr,
     program: progStr, args: argSeq, workdir: wdStr)
-  let buf = writeMetaDatToBuffer(meta, pathSeq, recorderId = recId)
+  let encoded = encodeMetaDat(meta, MetaDatFlagsInput(recorderId: recId))
+  if encoded.isErr:
+    setError(encoded.error)
+    return 1.cint
+  let buf = encoded.get()
 
   let outPtr = cast[ptr uint8](alloc(buf.len))
   if outPtr.isNil:
@@ -4058,19 +4200,6 @@ proc ct_meta_dat_arg(h: MetaDatReaderHandle, idx: csize_t, out_len: ptr csize_t)
   if h.args[int(idx)].len == 0:
     return nil
   return cast[ptr uint8](unsafeAddr h.args[int(idx)][0])
-
-proc ct_meta_dat_paths_count(h: MetaDatReaderHandle): csize_t {.exportc, cdecl, dynlib, ffiGuard.} =
-  if h.isNil:
-    return 0.csize_t
-  return csize_t(h.paths.len)
-
-proc ct_meta_dat_path(h: MetaDatReaderHandle, idx: csize_t, out_len: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib, ffiGuard.} =
-  if h.isNil or out_len.isNil or int(idx) >= h.paths.len:
-    return nil
-  out_len[] = csize_t(h.paths[int(idx)].len)
-  if h.paths[int(idx)].len == 0:
-    return nil
-  return cast[ptr uint8](unsafeAddr h.paths[int(idx)][0])
 
 proc ct_meta_dat_recorder_id(h: MetaDatReaderHandle, out_len: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib, ffiGuard.} =
   if h.isNil or out_len.isNil:
@@ -4492,12 +4621,7 @@ proc callRecordToJson(rec: call_stream.CallRecord): string =
   result.add("]}")
 
 proc ioEventToJson(ev: IOEvent): string =
-  let kindStr = case ev.kind
-    of ioStdout: "stdout"
-    of ioStderr: "stderr"
-    of ioFileOp: "file_op"
-    of ioError: "error"
-  "{\"kind\":\"" & kindStr & "\",\"step_id\":" & $ev.stepId &
+  "{\"kind\":\"" & eventLogKindName(ev.kind) & "\",\"step_id\":" & $ev.stepId &
     ",\"data\":" & bytesToJsonArray(ev.data) & "}"
 
 # ---------------------------------------------------------------------------
@@ -5404,7 +5528,8 @@ proc ct_reader_event_fields(
 ): cint {.exportc, cdecl, dynlib, ffiGuard.} =
   ## Returns the fields of IO event at `index`.
   ## The data pointer is heap-allocated; caller must free with ct_free_buffer.
-  ## kind values: 0=stdout, 1=stderr, 2=file_op, 3=error.
+  ## `outKind` is the event's exact `EventLogKind` ordinal (0-13,
+  ## `trace-events.md` §"EventLogKind (u8 enum)").
   ## Returns 0 on success, non-zero on failure.
   if h.isNil or outKind.isNil or outStepId.isNil or
       outData.isNil or outDataLen.isNil:

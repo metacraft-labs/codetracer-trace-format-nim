@@ -120,6 +120,26 @@ const
     ## ``codetracer-trace-format/codetracer_trace_writer/src/value_stream.rs``,
     ## which is what lets each writer's output be read by the other's decoder.
 
+  TagBindVariable* = 1'u8
+    ## ``BindVariable {variable_id: varint, place: signed varint}``.
+  TagCellValue* = 4'u8
+    ## ``CellValue {place: signed varint, value: varint len + CBOR}``.
+  TagCompoundValue* = 5'u8
+    ## ``CompoundValue {place: signed varint, value: varint len + CBOR}``.
+  TagAssignCell* = 6'u8
+    ## ``AssignCell {place: signed varint, new_value: varint len + CBOR}``.
+  TagAssignCompoundItem* = 7'u8
+    ## ``AssignCompoundItem {place: signed varint, index: varint,
+    ## item_place: signed varint}``.
+  TagVariableCell* = 8'u8
+    ## ``VariableCell {variable_id: varint, place: signed varint}``.
+    ##
+    ## Tags 1 and 4-8 carry the place model (`trace-events.md` §"Value
+    ## Stream"): every tag 0-9 is part of the format, a writer writes every
+    ## tag its API exposes and a reader decodes all of them. Places are
+    ## zigzag-signed varints and every CBOR value is length-prefixed, byte
+    ## for byte as the Rust ``ValueStreamEvent`` encodes them.
+
   TagAssignment* = 9'u8
     ## Value-stream event tag 9 (``trace-events.md`` §"Value Stream Events"):
     ## ``Assignment {to: varint, pass_by: u8, from: length-prefixed CBOR RValue}``.
@@ -279,6 +299,54 @@ proc encodeDropVariablesEvent*(variableIds: openArray[uint64],
   for id in variableIds:
     encodeVarint(id, outBuf)
 
+proc encodeBlob(data: openArray[byte], outBuf: var seq[byte]) =
+  encodeVarint(uint64(data.len), outBuf)
+  for b in data:
+    outBuf.add(b)
+
+proc encodeBindVariableEvent*(variableId: uint64, place: int64,
+    outBuf: var seq[byte]) =
+  ## Tag 1 ``BindVariable``.
+  outBuf.add(TagBindVariable)
+  encodeVarint(variableId, outBuf)
+  encodeSignedVarint(place, outBuf)
+
+proc encodeCellValueEvent*(place: int64, valueCbor: openArray[byte],
+    outBuf: var seq[byte]) =
+  ## Tag 4 ``CellValue``.
+  outBuf.add(TagCellValue)
+  encodeSignedVarint(place, outBuf)
+  encodeBlob(valueCbor, outBuf)
+
+proc encodeCompoundValueEvent*(place: int64, valueCbor: openArray[byte],
+    outBuf: var seq[byte]) =
+  ## Tag 5 ``CompoundValue``.
+  outBuf.add(TagCompoundValue)
+  encodeSignedVarint(place, outBuf)
+  encodeBlob(valueCbor, outBuf)
+
+proc encodeAssignCellEvent*(place: int64, newValueCbor: openArray[byte],
+    outBuf: var seq[byte]) =
+  ## Tag 6 ``AssignCell``.
+  outBuf.add(TagAssignCell)
+  encodeSignedVarint(place, outBuf)
+  encodeBlob(newValueCbor, outBuf)
+
+proc encodeAssignCompoundItemEvent*(place: int64, index: uint64,
+    itemPlace: int64, outBuf: var seq[byte]) =
+  ## Tag 7 ``AssignCompoundItem``.
+  outBuf.add(TagAssignCompoundItem)
+  encodeSignedVarint(place, outBuf)
+  encodeVarint(index, outBuf)
+  encodeSignedVarint(itemPlace, outBuf)
+
+proc encodeVariableCellEvent*(variableId: uint64, place: int64,
+    outBuf: var seq[byte]) =
+  ## Tag 8 ``VariableCell``.
+  outBuf.add(TagVariableCell)
+  encodeVarint(variableId, outBuf)
+  encodeSignedVarint(place, outBuf)
+
 proc encodeLengthPrefixedEvent*(tag: uint8, payload: openArray[byte],
     outBuf: var seq[byte]) =
   ## Encode one forward-compatible self-delimiting value-stream event (tag >= 10):
@@ -319,8 +387,14 @@ type
   ValueEventKind* = enum
     ## Which tagged value-stream event a decoded record entry is.
     veStepValues
+    veBindVariable
     veDropVariable
     veDropVariables
+    veCellValue
+    veCompoundValue
+    veAssignCell
+    veAssignCompoundItem
+    veVariableCell
     veAssignment
 
   DecodedValueEvent* = object
@@ -337,6 +411,114 @@ type
       droppedIds*: seq[uint64]
     of veAssignment:
       assignment*: AssignmentEventEntry
+    of veBindVariable, veVariableCell:
+      variableId*: uint64
+      variablePlace*: int64
+    of veCellValue, veCompoundValue, veAssignCell:
+      place*: int64
+      valueCbor*: seq[byte]
+    of veAssignCompoundItem:
+      compoundPlace*: int64
+      itemIndex*: uint64
+      itemPlace*: int64
+
+proc decodeOneValueEvent(data: openArray[byte], pos: var int, tag: uint8,
+    events: var seq[DecodedValueEvent],
+    skippedTags: var seq[uint8]): Result[void, string] =
+  ## Decode the fields of one tagged value-stream event, its tag already read.
+  case tag
+  of TagStepValues:
+    let count = int(?decodeVarint(data, pos))
+    var values = newSeq[VariableValue](count)
+    for i in 0 ..< count:
+      let vnId = ?decodeVarint(data, pos)
+      let dLen = int(?decodeVarint(data, pos))
+      if pos + dLen > data.len:
+        return err("truncated value data in StepValues record")
+      var d = newSeq[byte](dLen)
+      for j in 0 ..< dLen:
+        d[j] = data[pos + j]
+      pos += dLen
+      values[i] = VariableValue(
+        varnameId: vnId,
+        typeId: decodeCborTopLevelTypeId(d),
+        data: d)
+    events.add(DecodedValueEvent(kind: veStepValues, values: values))
+  of TagBindVariable, TagVariableCell:
+    let vid = ?decodeVarint(data, pos)
+    let place = ?decodeSignedVarint(data, pos)
+    if tag == TagBindVariable:
+      events.add(DecodedValueEvent(kind: veBindVariable,
+        variableId: vid, variablePlace: place))
+    else:
+      events.add(DecodedValueEvent(kind: veVariableCell,
+        variableId: vid, variablePlace: place))
+  of TagCellValue, TagCompoundValue, TagAssignCell:
+    let place = ?decodeSignedVarint(data, pos)
+    let vLen = ?decodeVarint(data, pos)
+    if vLen > uint64(data.len - pos):
+      return err("truncated CBOR value in value-stream event tag " & $tag)
+    let blob = @(data.toOpenArray(pos, pos + int(vLen) - 1))
+    pos += int(vLen)
+    case tag
+    of TagCellValue:
+      events.add(DecodedValueEvent(kind: veCellValue, place: place,
+        valueCbor: blob))
+    of TagCompoundValue:
+      events.add(DecodedValueEvent(kind: veCompoundValue, place: place,
+        valueCbor: blob))
+    else:
+      events.add(DecodedValueEvent(kind: veAssignCell, place: place,
+        valueCbor: blob))
+  of TagAssignCompoundItem:
+    let place = ?decodeSignedVarint(data, pos)
+    let index = ?decodeVarint(data, pos)
+    let itemPlace = ?decodeSignedVarint(data, pos)
+    events.add(DecodedValueEvent(kind: veAssignCompoundItem,
+      compoundPlace: place, itemIndex: index, itemPlace: itemPlace))
+  of TagDropVariable:
+    let id = ?decodeVarint(data, pos)
+    events.add(DecodedValueEvent(kind: veDropVariable, droppedId: id))
+  of TagDropVariables:
+    let count = int(?decodeVarint(data, pos))
+    var ids = newSeq[uint64](count)
+    for i in 0 ..< count:
+      ids[i] = ?decodeVarint(data, pos)
+    events.add(DecodedValueEvent(kind: veDropVariables, droppedIds: ids))
+  of TagAssignment:
+    let vnId = ?decodeVarint(data, pos)
+    if pos >= data.len:
+      return err("truncated pass_by in Assignment value-stream event")
+    let passBy = data[pos]
+    inc pos
+    let fromLen = int(?decodeVarint(data, pos))
+    if pos + fromLen > data.len:
+      return err("truncated RValue payload in Assignment value-stream event")
+    var blob = newSeq[byte](fromLen)
+    for j in 0 ..< fromLen:
+      blob[j] = data[pos + j]
+    pos += fromLen
+    events.add(DecodedValueEvent(kind: veAssignment,
+      assignment: AssignmentEventEntry(
+        varnameId: vnId, passBy: passBy, rvalueCbor: blob)))
+  else:
+    when defined(oldReaderPreForwardCompat):
+      return err("unsupported value-stream event tag " & $tag &
+        " in Nim value record (this reader predates the tag; rebuild ct-print " &
+        "from codetracer-trace-format-nim)")
+    else:
+      if tag >= 10:
+        let payloadLen = int(?decodeVarint(data, pos))
+        if pos + payloadLen > data.len:
+          return err("truncated payload in value-stream event tag " & $tag &
+            " (expected " & $payloadLen & " bytes, only " & $(data.len - pos) & " remain)")
+        pos += payloadLen
+        skippedTags.add(tag)
+      else:
+        return err("unsupported value-stream event tag " & $tag &
+          " in Nim value record (this reader predates the tag; rebuild ct-print " &
+          "from codetracer-trace-format-nim)")
+  ok()
 
 proc decodeRecordEvents*(data: openArray[byte],
     skippedTags: var seq[uint8]): Result[seq[DecodedValueEvent], string] =
@@ -360,66 +542,11 @@ proc decodeRecordEvents*(data: openArray[byte],
   while pos < data.len:
     let tag = data[pos]
     inc pos
-    case tag
-    of TagStepValues:
-      let count = int(?decodeVarint(data, pos))
-      var values = newSeq[VariableValue](count)
-      for i in 0 ..< count:
-        let vnId = ?decodeVarint(data, pos)
-        let dLen = int(?decodeVarint(data, pos))
-        if pos + dLen > data.len:
-          return err("truncated value data in StepValues record")
-        var d = newSeq[byte](dLen)
-        for j in 0 ..< dLen:
-          d[j] = data[pos + j]
-        pos += dLen
-        values[i] = VariableValue(
-          varnameId: vnId,
-          typeId: decodeCborTopLevelTypeId(d),
-          data: d)
-      events.add(DecodedValueEvent(kind: veStepValues, values: values))
-    of TagDropVariable:
-      let id = ?decodeVarint(data, pos)
-      events.add(DecodedValueEvent(kind: veDropVariable, droppedId: id))
-    of TagDropVariables:
-      let count = int(?decodeVarint(data, pos))
-      var ids = newSeq[uint64](count)
-      for i in 0 ..< count:
-        ids[i] = ?decodeVarint(data, pos)
-      events.add(DecodedValueEvent(kind: veDropVariables, droppedIds: ids))
-    of TagAssignment:
-      let vnId = ?decodeVarint(data, pos)
-      if pos >= data.len:
-        return err("truncated pass_by in Assignment value-stream event")
-      let passBy = data[pos]
-      inc pos
-      let fromLen = int(?decodeVarint(data, pos))
-      if pos + fromLen > data.len:
-        return err("truncated RValue payload in Assignment value-stream event")
-      var blob = newSeq[byte](fromLen)
-      for j in 0 ..< fromLen:
-        blob[j] = data[pos + j]
-      pos += fromLen
-      events.add(DecodedValueEvent(kind: veAssignment,
-        assignment: AssignmentEventEntry(
-          varnameId: vnId, passBy: passBy, rvalueCbor: blob)))
-    else:
-      when defined(oldReaderPreForwardCompat):
-        return err("unsupported value-stream event tag " & $tag &
-          " in Nim value record (this reader predates the tag; rebuild ct-print " &
-          "from codetracer-trace-format-nim)")
-      else:
-        if tag >= 10:
-          let payloadLen = int(?decodeVarint(data, pos))
-          if pos + payloadLen > data.len:
-            return err("truncated payload in value-stream event tag " & $tag &
-              " (expected " & $payloadLen & " bytes, only " & $(data.len - pos) & " remain)")
-          pos += payloadLen
-          skippedTags.add(tag)
-        else:
-          return err("unsupported value-stream event tag " & $tag &
-            " in Nim value record (this reader predates the tag; rebuild ct-print " &
-            "from codetracer-trace-format-nim)")
+    let tagStart = pos - 1
+    let r = decodeOneValueEvent(data, pos, tag, events, skippedTags)
+    if r.isErr:
+      return err("value-stream event tag " & $tag & " at byte " & $tagStart &
+        ": " & r.error)
   ok(events)
 
 proc decodeRecordEvents*(data: openArray[byte]):
@@ -556,17 +683,15 @@ proc writeChunk(ctfs: var Ctfs, w: var ValueStreamWriter,
 
   let chunkStart = w.dataOffset
 
-  # DATA-FIRST-THEN-INDEX ordering (matches span_stream.flushChunk): append the
-  # compressed chunk body to values.dat and sync its size FIRST, then append the
-  # chunk's byte offset to values.idx and sync.  A concurrent follow reader that
-  # observes N index entries can then always assume chunks 0..N-1 are fully on
-  # disk; the reverse order could publish an offset for bytes not yet written,
-  # yielding a transient short/zero decode.
+  # The chunk's bytes, then its offset in the companion index, then ONE
+  # publish: every block written since the last seal (the chunk, its mapping,
+  # the index, interning records), then the root entries that publish their
+  # sizes (`ctfs-container.md` §6, "Durability", rule 2). A follow reader that
+  # sees N index entries can assume chunks 0..N-1 are on disk.
   let datRes = ctfs.writeToFile(w.dataFile,
       compressed.toOpenArray(0, int(compressedSize) - 1))
   if datRes.isErr:
     return err("failed to write value chunk: " & datRes.error)
-  ctfs.syncEntry(w.dataFile)
 
   var offBytes: array[8, byte]
   let offLE = toBytesLE(chunkStart)
@@ -958,6 +1083,23 @@ proc readStepAssignments*(r: var ValueStreamReader,
   var skipped: seq[uint8] = @[]
   let res = decodeRecordAssignments(r.cachedRecords[within], skipped)
   r.noteSkippedTags(skipped)
+  res
+
+proc readStepEvents*(r: var ValueStreamReader,
+    stepIndex: uint64): Result[seq[DecodedValueEvent], string] =
+  ## Every value-stream event of a step's record, tags 0-9, in wire order.
+  r.lastSkippedTags.setLen(0)
+  if r.legacy:
+    let vals = ? r.readStepValues(stepIndex)
+    if vals.len == 0:
+      return ok(newSeq[DecodedValueEvent]())
+    return ok(@[DecodedValueEvent(kind: veStepValues, values: vals)])
+  let within = ?r.cacheRecordFor(stepIndex)
+  var skipped: seq[uint8] = @[]
+  let res = decodeRecordEvents(r.cachedRecords[within], skipped)
+  r.noteSkippedTags(skipped)
+  if res.isErr:
+    return err("values.dat record " & $stepIndex & ": " & res.error)
   res
 
 proc lastSkippedTags*(r: ValueStreamReader): seq[uint8] =

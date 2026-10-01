@@ -110,7 +110,7 @@ proc writeTestTrace(path: string) =
   # ``values.off`` VariableRecordTable, which nothing here produces. The
   # fixture declared a container it had not written, and every value lookup
   # was refused for a file that was never going to exist.
-  let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/main.py", "/src/util.py"],
+  let metaWr = ctfs.writeMetaDat(metaFile, meta,
     recorderId = "ffi-test", hasStepStream = true, hasValueStream = true,
     hasCallStream = true, hasIoEventStream = true, hasInterningTables = true)
   doAssert metaWr.isOk
@@ -144,9 +144,11 @@ proc writeTestTrace(path: string) =
   doAssert ioRes.isOk
   var ioW = ioRes.get()
 
-  # Step 0: absolute step at path 0, line 1. Line 1 of the first file is
-  # address 0 — the in-file offset is 0-based (`global_line_index`).
-  doAssert ctfs.writeEvent(execW, StepEvent(kind: sekAbsoluteStep, globalLineIndex: 0)).isOk
+  # Step 0: absolute step at path 0, line 1001 (address 1000: the in-file
+  # offset is 0-based). Two varint bytes, so the deltas below are shorter
+  # and the normative rule keeps them deltas (`trace-events.md`
+  # §"Encoding Rules").
+  doAssert ctfs.writeEvent(execW, StepEvent(kind: sekAbsoluteStep, globalLineIndex: 1000)).isOk
   doAssert ctfs.writeStepValues(valW, @[
     VariableValue(varnameId: 0, typeId: 0,
       data: cborOf(ValueRecord(kind: vrkInt, intVal: 42, intTypeId: IntTypeId))),
@@ -187,7 +189,7 @@ proc writeTestTrace(path: string) =
 
   # IO event
   doAssert ctfs.writeEvent(ioW, IOEvent(
-    kind: ioStdout, stepId: 1, data: "output\n".toBytes)).isOk
+    kind: elkWrite, stepId: 1, data: "output\n".toBytes)).isOk
 
   # Every stream the fixture wrote has to be finalized, not just the exec one.
   doAssert ctfs.flush(execW).isOk
@@ -242,7 +244,7 @@ proc test_reader_ffi_lifecycle() =
 
   let step0 = ffiGetJson(h, 0, ct_reader_step)
   doAssert step0.contains("absolute_step"), "step 0: " & step0
-  doAssert step0.contains("\"global_line_index\":0"), "step 0 gli: " & step0
+  doAssert step0.contains("\"global_line_index\":1000"), "step 0 gli: " & step0
 
   let step1 = ffiGetJson(h, 1, ct_reader_step)
   doAssert step1.contains("delta_step"), "step 1: " & step1
@@ -286,7 +288,7 @@ proc test_reader_ffi_lifecycle() =
   doAssert ct_reader_event_count(h) == 1
 
   let ev0 = ffiGetJson(h, 0, ct_reader_event)
-  doAssert ev0.contains("\"kind\":\"stdout\""), "ev0: " & ev0
+  doAssert ev0.contains("\"kind\":\"Write\""), "ev0: " & ev0
   doAssert ev0.contains("\"step_id\":1"), "ev0: " & ev0
   echo "PASS: io_events"
 
@@ -310,24 +312,24 @@ proc test_reader_ffi_structured_accessors() =
 
   # -- Step locations --
   # The test trace writes:
-  #   step 0: AbsoluteStep(globalLineIndex=0) -> path 0, line 1
-  #   step 1: DeltaStep(+1) -> GLI=1 -> path 0, line 2
-  #   step 2: DeltaStep(+2) -> GLI=3 -> path 0, line 4
+  #   step 0: AbsoluteStep(globalLineIndex=1000) -> path 0, line 1001
+  #   step 1: DeltaStep(+1) -> GLI=1001 -> path 0, line 1002
+  #   step 2: DeltaStep(+2) -> GLI=1003 -> path 0, line 1004
   # With 2 paths and DefaultLinesPerFile=100_000, path 0 covers GLI
   # [0, 99999], holding its lines 1..100000.
   var pathId, line: uint64
 
   doAssert ct_reader_step_location(h, 0, addr pathId, addr line) == 0
   doAssert pathId == 0, "step 0 pathId: " & $pathId
-  doAssert line == 1, "step 0 line: " & $line
+  doAssert line == 1001, "step 0 line: " & $line
 
   doAssert ct_reader_step_location(h, 1, addr pathId, addr line) == 0
   doAssert pathId == 0, "step 1 pathId: " & $pathId
-  doAssert line == 2, "step 1 line: " & $line
+  doAssert line == 1002, "step 1 line: " & $line
 
   doAssert ct_reader_step_location(h, 2, addr pathId, addr line) == 0
   doAssert pathId == 0, "step 2 pathId: " & $pathId
-  doAssert line == 4, "step 2 line: " & $line
+  doAssert line == 1004, "step 2 line: " & $line
   echo "PASS: step_location"
 
   # -- Bulk step locations (mission goal #1 perf path) --
@@ -341,9 +343,9 @@ proc test_reader_ffi_structured_accessors() =
       cast[ptr uint64](addr bulkPids[0]),
       cast[ptr uint64](addr bulkLines[0]))
     doAssert written == 3'u64, "bulk step_locations written: " & $written
-    doAssert bulkPids[0] == 0 and bulkLines[0] == 1
-    doAssert bulkPids[1] == 0 and bulkLines[1] == 2
-    doAssert bulkPids[2] == 0 and bulkLines[2] == 4
+    doAssert bulkPids[0] == 0 and bulkLines[0] == 1001
+    doAssert bulkPids[1] == 0 and bulkLines[1] == 1002
+    doAssert bulkPids[2] == 0 and bulkLines[2] == 1004
 
     # Mid-range request: start at step 1 and ask for 2.  Must match the
     # per-step accessor so that the bulk and per-step paths are
@@ -354,8 +356,8 @@ proc test_reader_ffi_structured_accessors() =
       cast[ptr uint64](addr midPids[0]),
       cast[ptr uint64](addr midLines[0]))
     doAssert mid == 2'u64, "bulk step_locations mid written: " & $mid
-    doAssert midPids[0] == 0 and midLines[0] == 2
-    doAssert midPids[1] == 0 and midLines[1] == 4
+    doAssert midPids[0] == 0 and midLines[0] == 1002
+    doAssert midPids[1] == 0 and midLines[1] == 1004
 
     # startN past total events should report zero entries written.
     var dummyPid: uint64
@@ -443,7 +445,7 @@ proc test_reader_ffi_structured_accessors() =
 
   doAssert ct_reader_event_fields(h, 0, addr kind, addr stepId,
     addr dataPtr, addr dataLen) == 0
-  doAssert kind == 0, "event 0 kind: " & $kind  # ioStdout = 0
+  doAssert kind == 0, "event 0 kind: " & $kind  # elkWrite = 0
   doAssert stepId == 1, "event 0 stepId: " & $stepId
   doAssert dataLen == 7.csize_t, "event 0 dataLen: " & $dataLen  # "output\n"
   if not dataPtr.isNil:

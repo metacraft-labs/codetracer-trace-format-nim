@@ -14,6 +14,10 @@ task test, "Run all tests":
   exec "nim c -r tests/test_nimcache_is_worktree_local.nim"
   exec "nim c -r tests/test_base40.nim"
   exec "nim c -r tests/test_container.nim"
+  # Container version 5: a member's MapBlock is 0 (empty), its only data
+  # block tagged with bit 63, or a mapping block; readers refuse every
+  # other container version, naming it.
+  exec "nim c -r -p:src tests/test_ctfs_v5_member_forms.nim"
   # M61/M61b integrity hardening: the write-side null-mapping guards and the
   # duplicate-name rejection ported from the native-recorder fork.
   exec "nim c -r tests/test_ctfs_append_null_data_block.nim"
@@ -36,6 +40,10 @@ task test, "Run all tests":
   # stream. -d:release because one fixture is a 512-block two-level file.
   exec "nim c -r -d:release tests/test_write_null_data_block.nim"
   exec "nim c -r tests/test_streaming.nim"
+  # Durability: a recording read while its writer is still open (what a
+  # killed process leaves) has meta.dat, every sealed chunk and every interning
+  # record registered before the seal.
+  exec "nim c -r -d:release -p:src tests/test_durability_publishes_sealed_chunks.nim"
   exec "nim c -r tests/test_root_directory_overflow.nim"
   exec "nim c -r tests/test_chunk_index.nim"
   exec "nim c -r tests/test_fixed_record_table.nim"
@@ -79,6 +87,9 @@ task test, "Run all tests":
   exec "nim c -r -p:src tests/test_interning_table.nim"
   exec "nim c -r -p:src tests/test_qualified_interning.nim"
   exec "nim c -r -p:src tests/test_exec_stream.nim"
+  # The normative AbsoluteStep/DeltaStep rule and the reader's refusal of a
+  # delta before a chunk's first AbsoluteStep.
+  exec "nim c -r -d:release -p:src tests/test_step_encoding_rule.nim"
   exec "nim c -r -p:src tests/test_value_stream.nim"
   exec "nim c -r -p:src tests/test_call_stream.nim"
   exec "nim c -r -p:src tests/test_io_event_stream.nim"
@@ -141,16 +152,11 @@ task test, "Run all tests":
   # which needs a SECOND build of the writer (from the pinned pre-campaign
   # revision) and so cannot be a corpus member.
   exec "nim c -r -d:release -p:src tests/test_gdh2_reload_marker.nim"
-  # The schema break that carries the corrected encode. A container written
-  # under the superseded prefixSum[path_id] + line reads one line high under
-  # the current decode -- silently, because the address is INSIDE the space
-  # and tryResolve has nothing to refuse. meta.dat's version is the only
-  # field that can tell the two apart, so v3 and below are refused by name.
-  # Carries its own mutation control: resolving the same container's
-  # addresses without the gate is what puts every step one line high.
-  # `include`s codetracer_trace_writer_ffi to drive ct_reader_open, so it
-  # needs --mm:arc and the --nimMainPrefix the FFI's NimMain importc expects.
-  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_meta_dat_v3_global_index_refusal.nim"
+  # Every reader door refuses meta.dat versions other than 6 and containers
+  # other than version 5, naming both; the current versions open at the
+  # recorded lines. `include`s codetracer_trace_writer_ffi to drive
+  # ct_reader_open, so it needs --mm:arc and the FFI's --nimMainPrefix.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_older_versions_are_refused.nim"
   # The column-aware step encoding end to end: the writer's opt-in, the
   # DeltaColumn round-trip, Layout A paths.dat, the position decoder, and the
   # meta.dat unknown-flag-bit rejection that keeps the extension clean.
@@ -194,6 +200,9 @@ task test, "Run all tests":
   exec "nim c -r -d:release -p:src tests/test_linehits_reader.nim"
   exec "nim c -r -d:release -p:src tests/test_memwrites_builder.nim"
   exec "nim c -r -d:release -p:src tests/test_step_map_builder.nim"
+  # step-map.ns version 2: the specified bytes, 64 KiB chunking, line 0 keyed
+  # as line 1, and the reader's refusals.
+  exec "nim c -r -d:release -p:src tests/test_step_map_v2.nim"
   exec "nim c -r -p:src tests/test_partial_trace_cache.nim"
   exec "nim c -r -d:release -p:src tests/test_ram_cache.nim"
   exec "nim c -r -d:release -p:src tests/test_file_access.nim"
@@ -244,6 +253,10 @@ task test, "Run all tests":
   # An empty type, variable or function name is a name: the reader's C ABI
   # returns it as a non-nil zero-length buffer, nil only on failure.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_reader_ffi_empty_names.nim"
+  # The 2026-10 revision through the C ABI: every value tag 0-9, every
+  # EventLogKind exactly, record framing, meta.dat v6 written once at the
+  # first record and the declared source-reload capability.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_fmt_2026_10.nim"
   # Every test file is reachable from this task. Two were not, for months
   # each, and both described behaviour that had moved on without them.
   exec "nim c -r -d:release -p:src tests/test_every_test_is_listed.nim"
@@ -339,6 +352,7 @@ task bench, "Run benchmarks":
   # Both measure the host — see the header of tests/bench_chunked_table.nim.
   exec "nim c -d:release -r tests/bench_chunked_table.nim"
   exec "nim c -d:release -r tests/bench_varint.nim"
+  exec "nim c -d:release -r -p:src tests/bench_streaming_writer.nim"
   exec "nim c -d:release -r -p:src tests/test_exec_stream.nim"
 
 task benchSuite, "Run unified benchmark regression suite":

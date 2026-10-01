@@ -23,9 +23,9 @@ import codetracer_trace_writer/global_line_index
 import codetracer_ctfs/container
 
 # ---------------------------------------------------------------------------
-# A minimal, independent Nim STMP reader — mirrors the db-backend
-# `StepMapNamespace::parse` byte layout so a Nim test can assert the writer's
-# output without depending on the Rust crate.
+# The step map, decoded through the library's version 2 reader into
+# `path_id -> (line -> ascending step_ids)`. Its byte layout is pinned by hand
+# in `tests/test_step_map_v2.nim`; this file asserts what the writer indexes.
 # ---------------------------------------------------------------------------
 
 type
@@ -33,59 +33,15 @@ type
     ## `path_id -> (line -> ascending step_ids)`.
     byPath: Table[uint64, Table[uint32, seq[int64]]]
 
-proc readU16(buf: openArray[byte], off: int): uint16 =
-  uint16(buf[off]) or (uint16(buf[off + 1]) shl 8)
-
-proc readU32(buf: openArray[byte], off: int): uint32 =
-  uint32(buf[off]) or (uint32(buf[off + 1]) shl 8) or
-    (uint32(buf[off + 2]) shl 16) or (uint32(buf[off + 3]) shl 24)
-
-proc readU64(buf: openArray[byte], off: int): uint64 =
-  var v: uint64 = 0
-  for i in 0 ..< 8:
-    v = v or (uint64(buf[off + i]) shl (8 * i))
-  v
-
-proc readI64(buf: openArray[byte], off: int): int64 =
-  cast[int64](readU64(buf, off))
-
 proc parseStepMap(buf: seq[byte]): ParsedStepMap =
-  ## Parse a `STMP` blob exactly as the M26 reader does (18-byte header,
-  ## 20-byte path entries, 32-byte line entries, i64 step lists).
   result.byPath = initTable[uint64, Table[uint32, seq[int64]]]()
-  doAssert buf.len >= 18, "STMP shorter than header"
-  let magic = readU32(buf, 0)
-  doAssert magic == StepMapMagic, "bad STMP magic: " & $magic
-  let version = readU16(buf, 4)
-  doAssert version == StepMapVersion, "bad STMP version: " & $version
-  let pathCount = int(readU32(buf, 6))
-  let pathTableOffset = int(readU64(buf, 10))
-
-  for p in 0 ..< pathCount:
-    let pbase = pathTableOffset + p * 20
-    let pathId = readU64(buf, pbase)
-    let lineCount = int(readU32(buf, pbase + 8))
-    let linesOffset = int(readU64(buf, pbase + 12))
-
-    var byLine = initTable[uint32, seq[int64]]()
-    for l in 0 ..< lineCount:
-      let lbase = linesOffset + l * 32
-      let line = readU32(buf, lbase)
-      let stepCount = int(readU32(buf, lbase + 4))
-      let firstHint = readI64(buf, lbase + 8)
-      let lastHint = readI64(buf, lbase + 16)
-      let stepsOffset = int(readU64(buf, lbase + 24))
-
-      var ids: seq[int64]
-      for s in 0 ..< stepCount:
-        ids.add(readI64(buf, stepsOffset + s * 8))
-      if stepCount > 0:
-        doAssert ids[0] == firstHint,
-          "first hint mismatch on line " & $line
-        doAssert ids[^1] == lastHint,
-          "last hint mismatch on line " & $line
-      byLine[line] = ids
-    result.byPath[pathId] = byLine
+  let r = openStepMap(buf)
+  doAssert r.isOk, "step-map.ns does not open: " & r.error
+  let lines = r.get().loadAll()
+  doAssert lines.isOk, "step-map.ns does not decode: " & lines.error
+  for ln in lines.get():
+    result.byPath.mgetOrPut(ln.pathId, initTable[uint32, seq[int64]]())[
+      ln.line] = ln.steps
 
 # ---------------------------------------------------------------------------
 # Test 1: standalone builder serialise -> parse round-trip.
@@ -125,7 +81,7 @@ proc test_empty_builder() =
   let b = initStepMapBuilder()
   doAssert b.entryCount == 0
   let blob = b.serialize()
-  doAssert blob.len == 18, "empty STMP must be just the header"
+  doAssert blob.len == 26, "empty STMP must be just the 26-byte header"
   let parsed = parseStepMap(blob)
   doAssert parsed.byPath.len == 0
   echo "PASS: test_empty_builder"
@@ -190,8 +146,7 @@ proc test_column_aware_suppresses_step_map() =
   let writerRes = initMultiStreamWriter("test_sm_col.ct", "step_map_col_test")
   doAssert writerRes.isOk
   var w = writerRes.get()
-  w.enableColumnAwareSteps()
-
+  doAssert w.enableColumnAwareSteps().isOk
   let p0 = w.registerPath("/src/main.py", @[10'u32, 10, 10])
   doAssert p0.isOk
 

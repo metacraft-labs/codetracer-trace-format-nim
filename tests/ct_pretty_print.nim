@@ -231,14 +231,8 @@ proc prettyPrintCtfsHeader(data: openArray[byte]): seq[string] =
   # Encryption
   let enc = readEncryptionMethod(data)
   result.add("encryption: " & $enc)
-  # Max shards (v4+) or compression (v3 backward compat)
-  let version = data[5]
-  if version == 3:
-    let comp = readCompressionMethod(data)
-    result.add("compression: " & $comp & " (v3 legacy)")
-  else:
-    let shards = readMaxShards(data)
-    result.add("max_shards: " & $shards)
+  # Max shards
+  result.add("max_shards: " & $readMaxShards(data))
   # Block size
   var bs4: array[4, byte]
   bs4[0] = data[8]; bs4[1] = data[9]; bs4[2] = data[10]; bs4[3] = data[11]
@@ -273,6 +267,13 @@ proc readInternalFileData(data: openArray[byte], mapBlock: uint64,
                           blockSize: uint32 = DefaultBlockSize): seq[byte] =
   ## Read internal file data given map block and size.
   result = newSeq[byte](int(fileSize))
+  # A member of at most one block is stored direct: `MapBlock` is its only
+  # data block, tagged with bit 63 (`ctfs-container.md` §2).
+  if (mapBlock and (1'u64 shl 63)) != 0:
+    let blockOff = int(mapBlock and not (1'u64 shl 63)) * int(blockSize)
+    for i in 0 ..< int(fileSize):
+      result[i] = data[blockOff + i]
+    return
   let usable = uint64(blockSize) div 8 - 1
   var remaining = int(fileSize)
   var destPos = 0
@@ -306,7 +307,9 @@ proc prettyPrintCtFile*(data: openArray[byte]): string =
   for i, entry in entries:
     lines.add("[" & $i & "] name: " & escapeStr(entry.name) &
               " size: " & $entry.size &
-              " map_block: " & $entry.mapBlock)
+              " map_block: " & (if (entry.mapBlock and (1'u64 shl 63)) != 0:
+                "direct " & $(entry.mapBlock and not (1'u64 shl 63))
+              else: $entry.mapBlock))
 
   # Read block size for data access
   var bs4: array[4, byte]

@@ -80,8 +80,6 @@ proc test_a_registered_path_is_interned_at_registration() =
     r.path(2).get() == "/src/b.nr",
     "paths.dat must hold the paths in registration order; got " &
     r.path(0).get() & ", " & r.path(1).get() & ", " & r.path(2).get()
-  doAssert r.meta.paths == @["/src/a.nr", "/src/never_stepped.nr", "/src/b.nr"],
-    "meta.dat's path list must be paths.dat's; got " & $r.meta.paths
 
   echo "PASS: test_a_registered_path_is_interned_at_registration"
 

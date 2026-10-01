@@ -134,7 +134,8 @@ const
 # ``tests/test_orphan_call_args_step_location.nim``,
 # ``tests/test_reader_ffi_column_aware_paths.nim``,
 # ``tests/test_reader_ffi_line_only_position_space.nim`` and
-# ``tests/test_reader_ffi_empty_names.nim``. All five drive the
+# ``tests/test_reader_ffi_empty_names.nim`` (and
+# ``tests/test_ffi_fmt_2026_10.nim``). All of them drive the
 # C FFI entry points directly — the first two to pin ``flushPendingStep``'s
 # orphan-values branch, the last two to pin what the ABI does with a
 # ``paths.dat`` layout and a step position it cannot resolve on its own.
@@ -143,6 +144,10 @@ const
 const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_base40.nim", binary: "build/test-bin/test_base40"),
   TestSpec(source: "tests/test_container.nim", binary: "build/test-bin/test_container"),
+  TestSpec(source: "tests/test_ctfs_v5_member_forms.nim", binary: "build/test-bin/test_ctfs_v5_member_forms"),
+  TestSpec(source: "tests/test_step_encoding_rule.nim", binary: "build/test-bin/test_step_encoding_rule"),
+  TestSpec(source: "tests/test_step_map_v2.nim", binary: "build/test-bin/test_step_map_v2"),
+  TestSpec(source: "tests/test_durability_publishes_sealed_chunks.nim", binary: "build/test-bin/test_durability_publishes_sealed_chunks"),
   # M61/M61b integrity hardening: the write-side null-mapping guards and the
   # duplicate-name rejection ported from the native-recorder fork.
   TestSpec(source: "tests/test_ctfs_append_null_data_block.nim", binary: "build/test-bin/test_ctfs_append_null_data_block"),

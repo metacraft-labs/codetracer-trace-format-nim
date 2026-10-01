@@ -529,13 +529,8 @@ proc computePathVersionOrdinals(r: var NewTraceReader): Result[void, string] =
 proc openNewTraceFromBytes*(data: seq[byte],
     blockSize: uint32 = DefaultBlockSize,
     maxEntries: uint32 = DefaultMaxRootEntries,
-    assumeColumnAwarePaths: bool = false;
-    acceptShiftedGlobalIndex: bool = false): Result[NewTraceReader, string] =
+    assumeColumnAwarePaths: bool = false): Result[NewTraceReader, string] =
   ## Open a trace from in-memory bytes. Used for testing.
-  ##
-  ## ``acceptShiftedGlobalIndex`` is `readMetaDat`'s parameter, forwarded — see
-  ## it for what a caller asserts by passing it and why the reader cannot
-  ## decide it.
   ##
   ## ``assumeColumnAwarePaths`` overrides the ``meta.dat`` bit 4
   ## declaration for the ``paths.dat`` record layout only.  Pass it when
@@ -568,27 +563,25 @@ proc openNewTraceFromBytes*(data: seq[byte],
   # without meta.dat is now read entirely from the binary tables.
   let metaDataRes = readInternalFile(data, "meta.dat", blockSize, maxEntries)
   if metaDataRes.isOk:
-    # ``acceptShiftedGlobalIndex`` is forwarded and not decided here, for
-    # ``assumeColumnAwarePaths``'s reason one parameter up: the evidence is the
-    # caller's, so the override is the caller's. See ``readMetaDat``.
-    let metaRes = readMetaDat(metaDataRes.get(),
-                              acceptShiftedGlobalIndex = acceptShiftedGlobalIndex)
+    let metaRes = readMetaDat(metaDataRes.get())
     if metaRes.isErr:
       return err("meta.dat present but not readable: " & metaRes.error)
     reader.meta = metaRes.get()
 
-  # Load interning tables (these are small, load at startup)
-  let pathRes = initInterningTableReader(data, "paths", blockSize, maxEntries)
-  if pathRes.isOk: reader.pathReader = pathRes.get()
-
-  let funcRes = initInterningTableReader(data, "funcs", blockSize, maxEntries)
-  if funcRes.isOk: reader.funcReader = funcRes.get()
-
-  let typeRes = initInterningTableReader(data, "types", blockSize, maxEntries)
-  if typeRes.isOk: reader.typeReader = typeRes.get()
-
-  let vnRes = initInterningTableReader(data, "varnames", blockSize, maxEntries)
-  if vnRes.isOk: reader.varnameReader = vnRes.get()
+  # Load interning tables (these are small, load at startup). A table that
+  # is absent is empty; a table that is present but does not read is refused,
+  # not answered as empty (`ctfs-container.md` §4, "A null is not an absence").
+  template loadTable(name: string, dest: untyped) =
+    if hasInternalFile(data, name & ".dat", maxEntries) or
+        hasInternalFile(data, name & ".off", maxEntries):
+      let tr = initInterningTableReader(data, name, blockSize, maxEntries)
+      if tr.isErr:
+        return err(name & ".dat: " & tr.error)
+      dest = tr.get()
+  loadTable("paths", reader.pathReader)
+  loadTable("funcs", reader.funcReader)
+  loadTable("types", reader.typeReader)
+  loadTable("varnames", reader.varnameReader)
 
   # P6.5 / Layout A — the shape of a ``paths.dat`` record is decided by
   # ``meta.dat`` bit 4 (``FlagHasColumnAwareSteps``).  When it is set
@@ -649,11 +642,12 @@ proc openNewTraceFromBytes*(data: seq[byte],
         parseLayoutAPathRecords(reader.pathReader, probe = true).isOk
 
   # Alternate source views (spec §"Alternate Source Views
-  # (Deminification Support)").  When the writer set bit 5 we eagerly
-  # decode every record so the per-view accessors below run in O(1).
-  # When the bit is clear we don't touch the container — pre-extension
-  # traces have no such files.
-  if reader.meta.hasAlternateSourceViews:
+  # (Deminification Support)").  Found by the member's presence, not by
+  # meta.dat bit 5: `meta.dat` is written at open, before a view is
+  # registered, so the bit cannot say (`internal-files.md` §"Stream-presence
+  # flags are a hint, not a gate").  Every record is decoded eagerly so the
+  # per-view accessors below run in O(1).
+  if hasInternalFile(data, "srcviews.dat", maxEntries):
     # See the writer's note on the abbreviated 12-char base name:
     # ``source_views.dat`` (spec name, 16 chars) collides with
     # ``source_views.off`` in the base40 filename encoding, so the
@@ -744,14 +738,12 @@ when ctHasFilesystem:
   # filesystem surface of the reader.
 
   proc openNewTrace*(path: string,
-      assumeColumnAwarePaths: bool = false;
-      acceptShiftedGlobalIndex: bool = false): Result[NewTraceReader, string] =
+      assumeColumnAwarePaths: bool = false): Result[NewTraceReader, string] =
     ## Open a multi-stream trace file from disk.
     ## Loads meta.dat and interning tables at startup.
     ## All other streams are loaded lazily on first access.
     ##
-    ## See `openNewTraceFromBytes` for ``assumeColumnAwarePaths`` and
-    ## `readMetaDat` for ``acceptShiftedGlobalIndex``.
+    ## See `openNewTraceFromBytes` for ``assumeColumnAwarePaths``.
 
     if not fileExists(path):
       return err("file not found: " & path)
@@ -766,8 +758,7 @@ when ctHasFilesystem:
     except:
       return err("failed to read file: " & path)
 
-    openNewTraceFromBytes(data, assumeColumnAwarePaths = assumeColumnAwarePaths,
-                          acceptShiftedGlobalIndex = acceptShiftedGlobalIndex)
+    openNewTraceFromBytes(data, assumeColumnAwarePaths = assumeColumnAwarePaths)
 
   proc refresh*(r: var NewTraceReader, path: string): Result[void, string] =
     ## Re-read a growing CTFS container into this handle and invalidate every
@@ -1237,11 +1228,10 @@ proc stepAbsoluteGlobalLineIndex*(r: var NewTraceReader,
     n: uint64): Result[uint64, string] =
   ## Return the absolute global line index for step N.
   ##
-  ## The exec stream stores steps as a mix of AbsoluteStep and DeltaStep
-  ## events. Each chunk starts with an AbsoluteStep, and subsequent events
-  ## may be DeltaStep (relative to the previous). This method scans from
-  ## the start of the chunk containing step N, accumulating deltas, to
-  ## produce the absolute global line index.
+  ## The exec stream stores positions as AbsoluteStep and DeltaStep records;
+  ## each chunk's first position record is an AbsoluteStep and a reader
+  ## decodes a chunk by itself (`resolveChunkPositions`), refusing a delta
+  ## before the chunk's anchor.
   ?r.ensureExecReader()
 
   let chunkSize = uint64(r.execReader.chunkSize)
@@ -1251,8 +1241,6 @@ proc stepAbsoluteGlobalLineIndex*(r: var NewTraceReader,
     if eventInChunk >= r.gliCache.len:
       return err("step " & $n & " is past the end of its exec chunk")
     return ok(r.gliCache[eventInChunk])
-  var currentGli: uint64 = 0
-
   # Decode the containing chunk once, in one pass, and keep every event's
   # absolute position: a caller that resolves steps one call at a time
   # (ct-print, the C ABI's `ct_reader_step_location`) asks for the next step
@@ -1262,27 +1250,7 @@ proc stepAbsoluteGlobalLineIndex*(r: var NewTraceReader,
   if eventInChunk >= chunkBuf.len:
     return err("step " & $n & " is past the end of its exec chunk")
   r.gliChunk = -1
-  r.gliCache.setLen(chunkBuf.len)
-  for i in 0 ..< chunkBuf.len:
-    let ev = chunkBuf[i]
-    case ev.kind
-    of sekAbsoluteStep:
-      currentGli = ev.globalLineIndex
-    of sekDeltaStep:
-      currentGli = uint64(int64(currentGli) + ev.lineDelta)
-    of sekDeltaColumn:
-      # P6.5: in column-aware traces ``global_position_index`` is
-      # one-dimensional, so a column-only delta is also a position
-      # delta.  Apply it to the running GLI so callers that decode the
-      # absolute position see the post-column-delta cursor.  In
-      # line-only traces this branch never fires because writers
-      # cannot emit tag 0x07 without the column flag and the meta-dat
-      # strict-rejection check guards against mismatches.
-      currentGli = uint64(int64(currentGli) + ev.columnDelta)
-    else:
-      # Non-step events (raise, catch, thread_switch) don't change GLI
-      discard
-    r.gliCache[i] = currentGli
+  ? resolveChunkPositions(chunkBuf, chunkIdx, r.gliCache)
   r.gliChunk = chunkIdx
   ok(r.gliCache[eventInChunk])
 
@@ -1442,8 +1410,8 @@ proc stepAbsoluteGlobalLineIndices*(r: var NewTraceReader,
   if chunkSize == 0'u64:
     return err("execReader has zero chunkSize")
 
-  var currentGli: uint64 = 0
   var events: seq[StepEvent] = @[]
+  var positions: seq[uint64] = @[]
   var n = startN
   while n < stopN:
     let chunkIdx = int(n div chunkSize)
@@ -1455,22 +1423,11 @@ proc stepAbsoluteGlobalLineIndices*(r: var NewTraceReader,
       return err(firstIdxRes.error)
     let firstIdx = firstIdxRes.get()
 
-    for offset, ev in events:
+    ? resolveChunkPositions(events, chunkIdx, positions)
+    for offset in 0 ..< events.len:
       let absIdx = firstIdx + uint64(offset)
-      case ev.kind
-      of sekAbsoluteStep:
-        currentGli = ev.globalLineIndex
-      of sekDeltaStep:
-        currentGli = uint64(int64(currentGli) + ev.lineDelta)
-      of sekDeltaColumn:
-        # P6.5: see ``stepAbsoluteGlobalLineIndex`` for rationale —
-        # column deltas advance ``global_position_index`` in the
-        # one-dimensional column-aware position space.
-        currentGli = uint64(int64(currentGli) + ev.columnDelta)
-      else:
-        discard
       if absIdx >= n and absIdx < stopN:
-        output[int(absIdx - startN)] = currentGli
+        output[int(absIdx - startN)] = positions[offset]
 
     # Advance ``n`` to the next chunk boundary so the outer loop picks
     # the correct chunk on the next iteration.
@@ -1504,6 +1461,12 @@ proc ensureValueReader(r: var NewTraceReader): Result[void, string] =
 proc values*(r: var NewTraceReader, n: uint64): Result[seq[VariableValue], string] =
   ?r.ensureValueReader()
   r.valueReader.readStepValues(n)
+
+proc valueEvents*(r: var NewTraceReader,
+    n: uint64): Result[seq[DecodedValueEvent], string] =
+  ## Every value-stream event of exec record ``n`` — tags 0-9, in wire order.
+  ?r.ensureValueReader()
+  r.valueReader.readStepEvents(n)
 
 iterator valuesIter*(r: var NewTraceReader, n: uint64): VariableValue =
   ## Yields variable values one at a time for a given step.

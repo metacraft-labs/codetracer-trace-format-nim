@@ -60,7 +60,6 @@ proc writeFullTrace(): seq[byte] {.raises: [].} =
     args: @["--verbose", "--count=100"],
     workdir: "/home/test")
   let metaWr = ctfs.writeMetaDat(metaFile, meta,
-    @["/src/main.py", "/src/utils.py", "/src/math.py"],
     recorderId = "m21-integration", hasStepStream = true,
     hasValueStream = true, hasIoEventStream = true)
   doAssert metaWr.isOk
@@ -170,7 +169,7 @@ proc writeFullTrace(): seq[byte] {.raises: [].} =
 
   # Write 5 IO events
   for i in 0 ..< 5:
-    let kind = if i < 3: ioStdout else: ioStderr
+    let kind = if i < 3: elkWrite else: elkWriteOther
     let ioWr = ctfs.writeEvent(ioW, IOEvent(
       kind: kind,
       stepId: uint64(i * 20),
@@ -348,18 +347,18 @@ proc test_reader_full_integration() {.raises: [].} =
 
   let io0 = reader.ioEvent(0)
   doAssert io0.isOk, "ioEvent 0 failed"
-  doAssert io0.get().kind == ioStdout, "io 0 kind"
+  doAssert io0.get().kind == elkWrite, "io 0 kind"
   doAssert io0.get().stepId == 0, "io 0 stepId"
   doAssert io0.get().data == "line_0\n".toBytes, "io 0 data"
 
   let io3 = reader.ioEvent(3)
   doAssert io3.isOk, "ioEvent 3 failed"
-  doAssert io3.get().kind == ioStderr, "io 3 kind"
+  doAssert io3.get().kind == elkWriteOther, "io 3 kind"
   doAssert io3.get().stepId == 60, "io 3 stepId"
 
   let io4 = reader.ioEvent(4)
   doAssert io4.isOk, "ioEvent 4 failed"
-  doAssert io4.get().kind == ioStderr, "io 4 kind"
+  doAssert io4.get().kind == elkWriteOther, "io 4 kind"
   doAssert io4.get().stepId == 80, "io 4 stepId"
   doAssert io4.get().data == "line_4\n".toBytes, "io 4 data"
 
@@ -393,7 +392,7 @@ proc test_reader_cache_eviction() {.raises: [].} =
   doAssert metaFileRes.isOk
   var metaFile = metaFileRes.get()
   let meta = TraceMetadata(recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb", program: "cache_test", args: @[], workdir: "/tmp")
-  let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/cache.py"],
+  let metaWr = ctfs.writeMetaDat(metaFile, meta,
     hasStepStream = true, hasValueStream = true)
   doAssert metaWr.isOk
 
@@ -491,7 +490,7 @@ proc writeTraceWithSortedCalls(): seq[byte] {.raises: [].} =
   doAssert metaFileRes.isOk
   var metaFile = metaFileRes.get()
   let meta = TraceMetadata(recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb", program: "search_test", args: @[], workdir: "/tmp")
-  let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/main.py"],
+  let metaWr = ctfs.writeMetaDat(metaFile, meta,
     hasStepStream = true, hasValueStream = true)
   doAssert metaWr.isOk
 

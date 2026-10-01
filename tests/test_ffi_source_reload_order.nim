@@ -36,6 +36,7 @@ proc test_the_marker_follows_the_step_registered_before_it() =
   doAssert h != nil, "trace_writer_new failed: " & ffiLastError()
   doAssert trace_writer_begin_in_memory(h) == 0, ffiLastError()
   doAssert trace_writer_enable_line_count_table(h) == 0, ffiLastError()
+  doAssert trace_writer_declare_source_reload(h) == 0, ffiLastError()
   doAssert trace_writer_register_path_with_line_count(
     h, cstring(PathA), CountA) == 0, ffiLastError()
   trace_writer_start(h, cstring(PathA), 1)

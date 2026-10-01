@@ -42,18 +42,13 @@
 ## by decoding the last chunk (all chunks but the last hold exactly
 ## ``chunk_size`` records).
 ##
-## ## kind / metadata reconciliation
+## ## kind
 ##
-## The on-disk ``kind`` byte is the ``EventLogKind`` ordinal — the SAME u8 the
-## legacy ``events.log`` carries (``trace-events.md`` §"EventLogKind").  The Nim
-## convenience API surfaces a coarser ``IOEventKind`` (stdout/stderr/file_op/
-## error); ``ioEventKindToOrdinal`` maps it to a canonical ``EventLogKind``
-## ordinal on write and ``ordinalToIOEventKind`` maps any ``EventLogKind``
-## ordinal back to the coarse kind on read.  The mapping round-trips for every
-## ``IOEventKind`` (stdout↔Write, stderr↔TraceLogEvent, file_op↔ReadFile,
-## error↔Error), so ct-print's ``io_kind`` output is byte-identical across the
-## format change.  ``metadata`` is carried verbatim (previously dropped on the
-## multi-stream path); ``data`` is the record's ``content``.
+## The on-disk ``kind`` byte is the recorder's exact ``EventLogKind`` ordinal
+## (``trace-events.md`` §"EventLogKind (u8 enum)"), and it round-trips exactly:
+## the writer stores the ordinal its caller gave and the reader reports it as
+## that kind. Values 14-255 are unassigned and refused on both sides, by value.
+## ``metadata`` is carried verbatim; ``data`` is the record's ``content``.
 ##
 ## # Backward compatibility (legacy Nim-v4 bundles)
 ##
@@ -76,6 +71,9 @@ import ../codetracer_ctfs/streaming
 import ../codetracer_ctfs/variable_record_table
 import ../codetracer_ctfs/zstd_bindings
 import ./varint
+import ../codetracer_trace_types
+
+export codetracer_trace_types.EventLogKind
 
 const
   DefaultEventsChunkSize* = 64
@@ -88,14 +86,8 @@ const
     ## (zstd decode is level-agnostic), only on the chunk codec.
 
 type
-  IOEventKind* = enum
-    ioStdout = 0
-    ioStderr = 1
-    ioFileOp = 2
-    ioError = 3
-
   IOEvent* = object
-    kind*: IOEventKind
+    kind*: EventLogKind
     stepId*: uint64
     metadata*: seq[byte]  ## event metadata bytes (verbatim; the legacy
                           ## ``RecordEvent.metadata`` string).  Empty by default.
@@ -121,35 +113,32 @@ type
     cachedChunkIdx: int        ## -1 means no cache
     cachedRecords: seq[seq[byte]]
 
-# ---------------------------------------------------------------------------
-# kind ↔ EventLogKind-ordinal reconciliation
-# ---------------------------------------------------------------------------
+proc eventLogKindName*(k: EventLogKind): string =
+  ## The kind's name as `trace-events.md` §"EventLogKind (u8 enum)" spells it.
+  case k
+  of elkWrite: "Write"
+  of elkWriteFile: "WriteFile"
+  of elkWriteOther: "WriteOther"
+  of elkRead: "Read"
+  of elkReadFile: "ReadFile"
+  of elkReadOther: "ReadOther"
+  of elkReadDir: "ReadDir"
+  of elkOpenDir: "OpenDir"
+  of elkCloseDir: "CloseDir"
+  of elkSocket: "Socket"
+  of elkOpen: "Open"
+  of elkError: "Error"
+  of elkTraceLogEvent: "TraceLogEvent"
+  of elkEvmEvent: "EvmEvent"
 
-proc ioEventKindToOrdinal*(kind: IOEventKind): uint8 =
-  ## Map the coarse ``IOEventKind`` to a canonical ``EventLogKind`` ordinal for
-  ## the on-disk ``kind`` byte (``trace-events.md`` §"EventLogKind", matching the
-  ## Rust ``EventLogKind as u8``).  The chosen representatives round-trip through
-  ## ``ordinalToIOEventKind`` so ct-print's ``io_kind`` output is unchanged:
-  ##   ioStdout → Write (0), ioStderr → TraceLogEvent (12),
-  ##   ioFileOp → ReadFile (4), ioError → Error (11).
-  case kind
-  of ioStdout: 0'u8   # elkWrite
-  of ioStderr: 12'u8  # elkTraceLogEvent
-  of ioFileOp: 4'u8   # elkReadFile
-  of ioError: 11'u8   # elkError
-
-proc ordinalToIOEventKind*(ord: uint8): IOEventKind =
-  ## Map any ``EventLogKind`` ordinal back to the coarse ``IOEventKind`` the Nim
-  ## API surfaces.  Mirrors the FFI's ``toIOEventKind`` collapse so every
-  ## ``EventLogKind`` value (0..13, and any future value) resolves to a stable
-  ## coarse kind; unknown ordinals default to ``ioStdout``.
-  case ord
-  of 0, 1, 2:  ioStdout            # Write / WriteFile / WriteOther
-  of 3, 4, 5, 6, 7, 8, 9, 10: ioFileOp
-                                   # Read* / *Dir / Socket / Open
-  of 11: ioError                   # Error
-  of 12, 13: ioStderr              # TraceLogEvent / EvmEvent
-  else: ioStdout                   # forward-compatible default
+proc eventLogKindFromOrdinal*(ord: uint64): Result[EventLogKind, string] =
+  ## The ``EventLogKind`` an on-disk or caller-supplied ordinal names; an
+  ## unassigned value (14 and up) is refused by value, never mapped onto a
+  ## kind (``trace-events.md`` §"EventLogKind (u8 enum)").
+  if ord > uint64(high(EventLogKind)):
+    return err("event kind " & $ord & " is not an assigned EventLogKind " &
+      "(0-" & $ord(high(EventLogKind)) & ")")
+  ok(EventLogKind(ord))
 
 # ---------------------------------------------------------------------------
 # Per-record encode/decode (SPEC: kind / step_id / metadata / content)
@@ -161,7 +150,7 @@ proc encodeIOEvent*(ev: IOEvent): seq[byte] {.raises: [].} =
   ## varint content_len, content`` — byte-identical to the Rust
   ## ``IoEventRecord::encode``.
   var buf: seq[byte]
-  buf.add(ioEventKindToOrdinal(ev.kind))
+  buf.add(uint8(ord(ev.kind)))
   encodeVarint(ev.stepId, buf)
   encodeVarint(uint64(ev.metadata.len), buf)
   buf.add(ev.metadata)
@@ -171,8 +160,8 @@ proc encodeIOEvent*(ev: IOEvent): seq[byte] {.raises: [].} =
 
 proc decodeIOEvent*(data: openArray[byte]): Result[IOEvent, string] {.raises: [].} =
   ## Decode an IOEvent from its SPEC wire format (the whole record, no length
-  ## prefix).  ``kind`` is reconstructed from the stored ``EventLogKind`` ordinal
-  ## via ``ordinalToIOEventKind``.
+  ## prefix).  ``kind`` is the stored ``EventLogKind`` ordinal; an unassigned
+  ## value is refused.
   if data.len < 1:
     return err("IO event record too short (no kind byte)")
 
@@ -199,10 +188,12 @@ proc decodeIOEvent*(data: openArray[byte]): Result[IOEvent, string] {.raises: []
   pos += dataLen
 
   if pos != data.len:
-    return err("trailing bytes in IO event record")
+    return err("IO event record's fields end at byte " & $pos & " of its " &
+      $data.len & "-byte frame")
 
+  let kind = ? eventLogKindFromOrdinal(kindByte)
   ok(IOEvent(
-    kind: ordinalToIOEventKind(kindByte),
+    kind: kind,
     stepId: stepId,
     metadata: meta,
     data: evData))
@@ -221,9 +212,13 @@ proc decodeLegacyIOEvent(data: openArray[byte]): Result[IOEvent, string] {.raise
   var pos = 0
   let kindByte = data[pos]
   pos += 1
-  if kindByte > byte(high(IOEventKind)):
-    return err("invalid legacy IO event kind: " & $kindByte)
-  let kind = IOEventKind(kindByte)
+  # The legacy 4-value API ordinal: stdout, stderr, file op, error.
+  let kind = case kindByte
+    of 0: elkWrite
+    of 1: elkWriteOther
+    of 2: elkReadFile
+    of 3: elkError
+    else: return err("invalid legacy IO event kind: " & $kindByte)
   let stepId = ?decodeVarint(data, pos)
   let dataLen = int(?decodeVarint(data, pos))
   if pos + dataLen > data.len:
@@ -290,17 +285,15 @@ proc flushChunk(ctfs: var Ctfs, w: var IOEventStreamWriter): Result[void, string
 
   let chunkStart = w.dataOffset
 
-  # DATA-FIRST-THEN-INDEX ordering (matches span_stream.flushChunk): append the
-  # compressed chunk body to events.dat and sync its size FIRST, then append the
-  # chunk's byte offset to events.idx and sync.  A concurrent follow reader that
-  # observes N index entries can then always assume chunks 0..N-1 are fully on
-  # disk; the reverse order could publish an offset for bytes not yet written,
-  # yielding a transient short/zero decode.
+  # The chunk's bytes, then its offset in the companion index, then ONE
+  # publish: every block written since the last seal (the chunk, its mapping,
+  # the index, interning records), then the root entries that publish their
+  # sizes (`ctfs-container.md` §6, "Durability", rule 2). A follow reader that
+  # sees N index entries can assume chunks 0..N-1 are on disk.
   let datRes = ctfs.writeToFile(w.dataFile,
       compressed.toOpenArray(0, int(compressedSize) - 1))
   if datRes.isErr:
     return err("failed to write io event chunk: " & datRes.error)
-  ctfs.syncEntry(w.dataFile)
 
   var offBytes: array[8, byte]
   let offLE = toBytesLE(chunkStart)
@@ -490,4 +483,7 @@ proc readEvent*(r: var IOEventStreamReader,
   if within >= r.cachedRecords.len:
     return err("io event record " & $within & " missing in chunk " &
       $chunkNumber)
-  decodeIOEvent(r.cachedRecords[within])
+  let ev = decodeIOEvent(r.cachedRecords[within])
+  if ev.isErr:
+    return err("events.dat record " & $index & ": " & ev.error)
+  ev
