@@ -690,7 +690,118 @@ proc hasValidVersion*(data: openArray[byte]): bool =
   ## True when the version byte is 5, the only version this library reads
   ## (`ctfs-container.md` §2, "Older versions are refused"). Callers that
   ## report a refusal use `ctfsVersionError`, which names the version found.
+  ##
+  ## Version 6 is NOT read here, and the omission is the gate the compact
+  ## profile rests on: see `CtfsVersionV6`.
   ctfsVersionError(data).len == 0
+
+# ---------------------------------------------------------------------------
+# The version-6 header fields: profile, and the whole-file compression scheme.
+#
+# `ctfs-container.md` §1a, §1b, §1c. Both fields are CLOSED sets, and §1c makes
+# refusing an unknown value normative rather than advisory. The reason it is
+# normative is this format's own history: a layout change once shipped under an
+# unchanged version stamp, and a reader that trusted the stamp placed every step
+# one line high AND returned success. `meta_dat.nim`'s
+# `LastShiftedGlobalIndexVersion` and its opt-in are what that cost.
+#
+# So none of the five procs below has a permissive arm. An unknown scheme is not
+# `none`, an unknown profile is not `full`, a non-zero reserved byte is not
+# "ignored", and a header too short to carry a field the version declares is a
+# refusal rather than an absent field — "the byte says 0" and "there is no byte"
+# are different facts, and a parser that answers both the same way cannot report
+# the second.
+# ---------------------------------------------------------------------------
+
+proc parseCtfsProfile*(value: uint8): Result[CtfsProfile, string] =
+  ## Parse byte 16 of a version-6 header against the CLOSED set of
+  ## `ctfs-container.md` §1a. An unrecognised value is an error and never
+  ## `cpFull`: a parser that maps everything it does not recognise onto the
+  ## most-capable value reports success on a container it is about to misread.
+  case value
+  of 0'u8: ok(cpFull)
+  of 1'u8: ok(cpCompact)
+  else: err("unknown CTFS container profile " & $value &
+    ": the set is closed at 0 (full) and 1 (compact) — ctfs-container.md §1a")
+
+proc parseWholeFileCompression*(
+    value: uint8): Result[CtfsWholeFileCompression, string] =
+  ## Parse byte 17 of a version-6 header against the CLOSED set of
+  ## `ctfs-container.md` §1b. An unrecognised value is an error and never
+  ## `wfcNone`: reading an unknown scheme as "no compression" hands the caller
+  ## a body it will parse as a container and that is not one.
+  case value
+  of 0'u8: ok(wfcNone)
+  of 1'u8: ok(wfcZstd)
+  else: err("unknown CTFS whole-file compression scheme " & $value &
+    ": the set is closed at 0 (none) and 1 (zstd) — ctfs-container.md §1b")
+
+proc readCtfsProfile*(data: openArray[byte]): Result[CtfsProfile, string] =
+  ## The profile a container declares.
+  ##
+  ## For version 5 the answer is `cpFull`, and that is an inference from a
+  ## KNOWN version with a fully specified body — not a default applied to an
+  ## unrecognised value. Version 6 reads byte 16 and parses it against the
+  ## closed set. Every other version is the refusal `ctfsVersionError` gives,
+  ## which is what keeps the two cases apart.
+  if data.len < 6:
+    return err(ctfsVersionError(data))
+  if data[5] == CtfsVersionV6:
+    if data.len <= V6ProfileOffset:
+      return err("CTFS header declares version " & $CtfsVersionV6 &
+        " but is only " & $data.len & " bytes, too short to carry the " &
+        "profile byte at offset " & $V6ProfileOffset &
+        "; a missing profile is not profile 0 (full)")
+    return parseCtfsProfile(data[V6ProfileOffset])
+  let versionErr = ctfsVersionError(data)
+  if versionErr.len > 0:
+    return err(versionErr)
+  ok(cpFull)
+
+proc readWholeFileCompression*(
+    data: openArray[byte]): Result[CtfsWholeFileCompression, string] =
+  ## The whole-file compression scheme a container declares. `wfcNone` for
+  ## version 5, by the same known-version argument as `readCtfsProfile`; a
+  ## truncated version-6 header is a refusal rather than `wfcNone`.
+  if data.len < 6:
+    return err(ctfsVersionError(data))
+  if data[5] == CtfsVersionV6:
+    if data.len <= V6CompressionOffset:
+      return err("CTFS header declares version " & $CtfsVersionV6 &
+        " but is only " & $data.len & " bytes, too short to carry the " &
+        "compression byte at offset " & $V6CompressionOffset &
+        "; a missing scheme is not scheme 0 (none)")
+    return parseWholeFileCompression(data[V6CompressionOffset])
+  let versionErr = ctfsVersionError(data)
+  if versionErr.len > 0:
+    return err(versionErr)
+  ok(wfcNone)
+
+proc checkV6Reserved*(data: openArray[byte]): Result[void, string] =
+  ## Bytes 18--23 of a version-6 header MUST be zero. A non-zero value is a
+  ## refusal rather than something to ignore, because "ignored" and "unknown"
+  ## are the same byte: the only way to spend those bytes is another version
+  ## bump.
+  ##
+  ## A buffer too short to carry the version byte is deferred rather than
+  ## judged — this check cannot know whether it is looking at a version-6
+  ## header at all, and `ctfsVersionError` owns that question. That is the one
+  ## permissive answer here and it is stated so it is a decision.
+  if data.len < 6 or data[5] != CtfsVersionV6:
+    return ok()
+  if data.len < V6HeaderSize:
+    return err("CTFS header declares version " & $CtfsVersionV6 &
+      " but is only " & $data.len & " bytes, short of the " & $V6HeaderSize &
+      "-byte version-" & $CtfsVersionV6 & " header")
+  for i in 0 ..< V6ReservedLen:
+    let off = V6ReservedOffset + i
+    if data[off] != 0'u8:
+      return err("CTFS version-" & $CtfsVersionV6 &
+        " reserved byte at offset " & $off & " is " & $data[off] &
+        ", not 0: the reserved area is not a growth area and a non-zero " &
+        "value there is a container this reader cannot account for — " &
+        "ctfs-container.md §1")
+  ok()
 
 proc readEncryptionMethod*(data: openArray[byte]): CtfsEncryptionMethod =
   ## Read the encryption method from a CTFS header (byte 6).
