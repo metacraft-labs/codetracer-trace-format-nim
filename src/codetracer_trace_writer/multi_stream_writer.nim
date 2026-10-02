@@ -43,6 +43,8 @@ export results, value_stream.VariableValue, io_event_stream.EventLogKind,
 # inverting with another produces plausible wrong positions that no
 # container check can catch.
 export global_line_index.DefaultLinesPerFile
+export global_line_index.ConventionalLineLength
+export global_line_index.conventionalLineLengths
 
 type
   SourceViewRecord* = object
@@ -208,6 +210,12 @@ type
       ## per spec §"Source Location Addressing".  Parallel to ``paths``;
       ## empty seq for files whose line_lengths the caller didn't
       ## supply.  Ignored when ``columnAwareSteps`` is false.
+    pathConventional: seq[bool]
+      ## Parallel to ``pathLineLengths`` in column-aware mode: whether the
+      ## path's table is the conventional one (``isConventionalTable``). On
+      ## such a file a column above ``ConventionalLineLength`` is recorded at
+      ## that column and a line above ``DefaultLinesPerFile`` is refused
+      ## (``internal-files.md`` §"`paths.dat` Layout A").
     pathLineCounts: seq[uint64]
     pendingFuncs: seq[tuple[path: string, line: uint64, name: string]]
       ## `funcs.dat` records, held until `close`.
@@ -502,6 +510,29 @@ proc extendGli(w: var MultiStreamTraceWriter) =
   w.gli.appendFile(positionSpaceCount(w.pathLineLengths, w.pathLineCounts,
     w.paths.len - 1, w.columnAwareSteps))
 
+proc isConventionalPath(w: MultiStreamTraceWriter, pathId: uint64): bool =
+  ## Whether ``pathId``'s table is the conventional one.
+  w.columnAwareSteps and pathId < uint64(w.pathConventional.len) and
+    w.pathConventional[int(pathId)]
+
+proc checkConventionalLine(w: MultiStreamTraceWriter,
+    pathId: uint64, line: uint64): Result[void, string] =
+  ## Refuse a step past the last line of a file with the conventional
+  ## table: its position would fall inside the next file's range.
+  if w.isConventionalPath(pathId) and line > DefaultLinesPerFile:
+    return err(conventionalLineDiagnostic(w.paths[int(pathId)], line))
+  ok()
+
+proc clampConventionalColumn(w: MultiStreamTraceWriter, pathId: uint64,
+    columnDelta: int64): int64 =
+  ## A column above ``ConventionalLineLength`` on a file with the
+  ## conventional table is recorded at that column of its line, as a line 0
+  ## is recorded as line 1. ``columnDelta`` is the offset from column 1.
+  if w.isConventionalPath(pathId):
+    min(columnDelta, int64(ConventionalLineLength) - 1)
+  else:
+    columnDelta
+
 proc toGlobalLineIndex(w: var MultiStreamTraceWriter,
     pathId: uint64, line: uint64): uint64 =
   ## In column-aware mode, returns the byte-offset-based
@@ -524,6 +555,11 @@ proc toGlobalLineIndex(w: var MultiStreamTraceWriter,
     # known line count we clamp to the file's total capacity (the reader's
     # ``decodeGlobalPositionIndex`` handles past-end addresses the same
     # way).
+    if w.isConventionalPath(pathId):
+      # Every line has the same length, so the sum is a product.
+      let upTo = max(min(int64(line) - 1, int64(DefaultLinesPerFile)), 0'i64)
+      return w.gli.prefixSum[int(pathId)] +
+        uint64(upTo) * uint64(ConventionalLineLength)
     let lls = w.pathLineLengths[int(pathId)]
     var lineOffset: uint64 = 0
     let upTo = min(int(line) - 1, lls.len)
@@ -1020,19 +1056,28 @@ proc registerPath*(w: var MultiStreamTraceWriter,
   ## trace is line-only, ``lineLengths`` is ignored and the legacy
   ## bare-path-bytes record format is preserved byte-for-byte.
   ##
-  ## Recorders that don't yet surface per-line column counts can leave
-  ## ``lineLengths`` at its default empty value.  Column-aware traces
-  ## still write the ``path_len`` and ``line_count = 0`` framing so
-  ## the reader can decode the record uniformly — empty
-  ## ``lineLengths`` just signals "no per-line data available yet"
-  ## and column resolution falls back to surfacing ``None``.
+  ## On a column-aware writer the file's table is decided when the path is
+  ## first mentioned — here, or by a step, a function or an id request that
+  ## names it — by ``columnTableAtFirstMention`` (``internal-files.md``
+  ## §"`paths.dat` Layout A"): a given table as given, except that one
+  ## whose lines hold nothing gives its first line a position; an empty
+  ## table or none, the conventional table. A recorder that can read a
+  ## file's source registers its real table before the file's first
+  ## mention. For a path already interned, ``lineLengths`` does not change
+  ## the recorded table.
+  var table: seq[uint32]
   let idRes =
     if w.columnAwareSteps:
       # Column-aware paths key their dedup on the bare path (the on-disk record
       # is the self-describing Layout A form); IC-M2's qualifier applies to the
       # line-only producers (MCR, the GDScript VM), so column-aware attach keeps
       # the bare record.
-      w.container.ensurePathIdColumnAware(w.interningPtr[], path, lineLengths)
+      let existing = w.interningPtr[].paths.lookupId(path)
+      if existing.isSome:
+        Result[uint64, string].ok(existing.get())
+      else:
+        table = columnTableAtFirstMention(lineLengths)
+        w.container.ensurePathIdColumnAware(w.interningPtr[], path, table)
     elif w.lineCountTable:
       w.container.ensureQualifiedPathIdWithLineCount(
         w.interningPtr[], w.qualifier, path, lineCount)
@@ -1045,15 +1090,11 @@ proc registerPath*(w: var MultiStreamTraceWriter,
   if id == uint64(w.paths.len):
     w.paths.add(path)
     # Mirror the per-file line-lengths so ``toGlobalLineIndex`` can
-    # compute byte-offset positions in column-aware mode.  When line
-    # lengths weren't supplied, store an empty seq so ``rebuildGli``
-    # falls back to the legacy ``DefaultLinesPerFile`` allocation for
-    # that path.
+    # compute byte-offset positions in column-aware mode.  A line-only
+    # writer stores an empty seq: its slots are sized by line count.
     if w.columnAwareSteps:
-      var lls = newSeq[uint32](lineLengths.len)
-      for i in 0 ..< lineLengths.len:
-        lls[i] = lineLengths[i]
-      w.pathLineLengths.add(lls)
+      w.pathConventional.add(isConventionalTable(table))
+      w.pathLineLengths.add(move(table))
     else:
       w.pathLineLengths.add(@[])
     # Mirror the line count so the global line index sizes the file's slot to it.
@@ -1416,6 +1457,7 @@ proc registerStep*(w: var MultiStreamTraceWriter, pathId: uint64,
     discard
   else:
     ? w.checkLineWithinFile(pathId, line)
+  ? w.checkConventionalLine(pathId, line)
 
   let gli = w.toGlobalLineIndex(pathId, line)
 
@@ -1531,6 +1573,7 @@ proc registerStepWithColumn*(w: var MultiStreamTraceWriter,
       "writer that has not opted into column-aware mode " &
       "(call enableColumnAwareSteps first)")
   ? w.checkLineWithinFile(pathId, line)
+  ? w.checkConventionalLine(pathId, line)
 
   # A file with no per-line table has no column axis. Its slot in the position
   # space is sized by the line-only fallback, so one address IS one line, and a
@@ -1549,7 +1592,7 @@ proc registerStepWithColumn*(w: var MultiStreamTraceWriter,
   # the column onto a pending step and flushes both through here as one event —
   # so a guard present only on ``registerColumnStep`` left the defect live on
   # the path every recorder actually takes.
-  var effectiveDelta = columnDelta
+  var effectiveDelta = w.clampConventionalColumn(pathId, columnDelta)
   if columnDelta != 0 and
      (int(pathId) >= w.pathLineLengths.len or
       w.pathLineLengths[int(pathId)].len == 0):
@@ -1629,6 +1672,15 @@ proc registerColumnStep*(w: var MultiStreamTraceWriter,
       "per-line length table, so its positions are line-only and a column " &
       "delta would decode as a different line. Register the path with its " &
       "per-line counts, or emit line-only steps for it.")
+
+  # On a file with the conventional table, a move past column
+  # ``ConventionalLineLength`` stops at that column of the current line.
+  var columnDelta = columnDelta
+  if w.isConventionalPath(w.lastPathId):
+    let column = int64(w.lastGlobalLineIndex) -
+      int64(w.toGlobalLineIndex(w.lastPathId, w.lastLine)) + 1
+    columnDelta = min(column + columnDelta, int64(ConventionalLineLength)) -
+      column
 
   # In column-aware mode `global_position_index` is one-dimensional, so
   # a column delta is also a position delta.  The exec-stream writer

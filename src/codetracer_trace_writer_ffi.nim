@@ -2798,10 +2798,15 @@ proc trace_writer_register_path_with_line_lengths(
   ## ``line_count`` is the number of entries in ``line_lengths`` (each
   ## entry is a 32-bit unsigned line length, in 1-based column
   ## addressing).  ``line_lengths`` may be NULL when ``line_count`` is
-  ## 0, in which case the FFI behaves as plain
-  ## ``trace_writer_register_step``-style path interning with no per-line
-  ## data — column resolution falls back to surfacing ``None`` at read
-  ## time (spec §"Decoding ``global_position_index``" default).
+  ## 0. On a column-aware writer the table is decided at the path's first
+  ## mention (~codetracer-trace-format-spec/internal-files.md~
+  ## §"``paths.dat`` Layout A"): no table records the conventional one —
+  ## 100000 lines of 1024 positions, on which a column above 1024 is
+  ## recorded at 1024 and a line above 100000 is refused — and a table
+  ## whose lines hold nothing gives its first line one position. The same
+  ## holds for a path first named by ``trace_writer_register_step`` or a
+  ## function. For a path already interned the table does not change the
+  ## recorded one.
   ##
   ## When the writer has NOT opted into column-aware mode
   ## (``trace_writer_enable_column_aware_steps`` was not called) the

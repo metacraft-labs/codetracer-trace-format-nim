@@ -1,6 +1,6 @@
 ## A variable registered after a column nudge reaches the step the nudge
-## belongs to, and a column offered for a file with no column axis does not
-## move that step to another line.
+## belongs to, and a file the recorder gave no table still places the column
+## on its own line.
 ##
 ## This file began as the M-leo regression: `register_variable_*` landing
 ## after `trace_writer_register_delta_column` stranded the value, because
@@ -21,9 +21,9 @@
 ##
 ## Falsifiability:
 ##
-## * Remove the `effectiveDelta` guard in `registerStepWithColumn` and the
-##   untabled case reports line 15 — the requested line plus its own column
-##   minus one — instead of line 10.
+## * Record a file first named by a step with no table (a `line_count` 0
+##   record, as before 2026-10) and the untabled case loses its column, or
+##   reads back in the next file.
 ## * Restore the pre-fold behaviour (emit the line step eagerly on
 ##   `register_delta_column`) and the tabled case sees two steps, with `x` on
 ##   neither or on the wrong one.
@@ -179,48 +179,39 @@ proc test_a_trailing_variable_lands_on_the_column_aware_step() =
   ct_reader_close(r)
   echo "PASS: a trailing variable lands on the column-aware step it annotates"
 
-proc test_a_column_without_an_axis_leaves_the_step_on_its_own_line() =
-  ## THE OTHER HALF. The same sequence against a file with no per-line table.
-  ## The step is kept at its line, the column is dropped, and the writer says
-  ## which file lost it.
+proc test_a_file_first_named_by_the_step_gets_the_conventional_table() =
+  ## THE OTHER HALF. The same sequence against a file the recorder never gave
+  ## a table. The step's mention of it records the conventional table — 100000
+  ## lines of 1024 positions (`internal-files.md` §"`paths.dat` Layout A") —
+  ## so the file has a column axis and the column lands where the recorder
+  ## asked, on the step that carries the value.
   let (ctPath, dropped) = recordOne(
     getTempDir() / "ct_pending_value_after_delta_column",
     "untabled", "/src/untabled.leo", tabled = false)
 
+  doAssert dropped.len == 0,
+    "the conventional table is a column axis; no column may be dropped; " &
+    "writer reported " & $dropped
+
   let r = ct_reader_open(cstring(ctPath))
   doAssert r != nil, "ct_reader_open failed: " & $trace_writer_last_error()
-
   doAssert ct_reader_step_count(r) == 1'u64,
-    "the step is kept — only its column is refused; got " &
-    $ct_reader_step_count(r) & " steps"
-
-  # Line 10, not line 15. One address is one line in a file sized by the
-  # line-only fallback, so a folded column delta of 5 would land five lines
-  # further down and read back as a position the program never executed.
-  # This is the assertion the defect moves; the report below is how a caller
-  # finds out, and it is checked second so a failure names the position first.
+    "one combined event; got " & $ct_reader_step_count(r) & " steps"
   let (_, line, column) = stepLocation(r, 0'u64)
-  doAssert (line, column) == (uint64(StepLine), 1'u64),
-    "a file with no column axis must resolve to (10, 1); got (" &
-    $line & ", " & $column & ")"
+  doAssert (line, column) == (uint64(StepLine), uint64(ColumnDelta + 1)),
+    "the step must decode to (10, 6); got (" & $line & ", " & $column & ")"
 
-  doAssert dropped.len == 1,
-    "the writer must report the one file whose column it dropped; got " &
-    $dropped
-
-  # The step surviving is the point — the value still has somewhere to go.
   let xId = varnameId(r, "x")
   doAssert xId != high(uint64), "varname 'x' must be interned in the trace"
   let vals = valuesJson(r, 0'u64)
   doAssert vals.contains("\"varname_id\":" & $xId),
-    "dropping the column must not cost the step its values; step 0 holds " &
-    vals
+    "step 0 must hold 'x'; it holds " & vals
 
   ct_reader_close(r)
-  echo "PASS: a column without an axis leaves the step on its own line"
+  echo "PASS: a file first named by the step gets the conventional table"
 
 # Run the tests
 test_a_trailing_variable_lands_on_the_column_aware_step()
-test_a_column_without_an_axis_leaves_the_step_on_its_own_line()
+test_a_file_first_named_by_the_step_gets_the_conventional_table()
 
 echo "ALL PASS: test_pending_value_after_delta_column"

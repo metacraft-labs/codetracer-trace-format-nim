@@ -95,6 +95,47 @@ const DefaultLinesPerFile*: uint64 = 100_000
   ## kept readable, and the reason the constant still lives here next to
   ## the prefix-sum arithmetic it parameterises.
 
+const ConventionalLineLength*: uint32 = 1024
+  ## The per-line position count of the conventional column-aware table
+  ## (``internal-files.md`` §"`paths.dat` Layout A"): a column-aware file
+  ## first mentioned with no table is recorded as ``DefaultLinesPerFile``
+  ## lines of this many positions. A column above it is recorded at this
+  ## column of its line; a line above ``DefaultLinesPerFile`` is refused.
+
+proc conventionalLineLengths*(): seq[uint32] =
+  ## The conventional column-aware table.
+  result = newSeq[uint32](int(DefaultLinesPerFile))
+  for L in result.mitems:
+    L = ConventionalLineLength
+
+proc isConventionalTable*(lineLengths: openArray[uint32]): bool =
+  ## Whether ``lineLengths`` is the conventional table. Decided by content,
+  ## so a file is treated alike whether the writer chose the table or the
+  ## recorder built it: the two are the same record on the wire.
+  if uint64(lineLengths.len) != DefaultLinesPerFile:
+    return false
+  for L in lineLengths:
+    if L != ConventionalLineLength:
+      return false
+  true
+
+proc columnTableAtFirstMention*(lineLengths: openArray[uint32]): seq[uint32] =
+  ## The table a column-aware writer records for a file first mentioned with
+  ## ``lineLengths`` (``internal-files.md`` §"`paths.dat` Layout A"):
+  ##
+  ## * empty — no table given — is the conventional table;
+  ## * a table whose lines hold nothing gives its first line one position,
+  ##   keeping its line count (``[0]`` → ``[1]``, ``[0, 0]`` → ``[1, 0]``),
+  ##   so the file's size is not 0;
+  ## * anything else is recorded as given.
+  if lineLengths.len == 0:
+    return conventionalLineLengths()
+  result = @lineLengths
+  for L in lineLengths:
+    if L != 0:
+      return
+  result[0] = 1
+
 proc fileAddressCount*(lineLengths: openArray[uint32],
     lineCount: uint64 = 0): uint64 =
   ## Addresses the global position space allocates to one file: **the

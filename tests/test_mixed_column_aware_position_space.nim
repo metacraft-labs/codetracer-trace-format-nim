@@ -45,11 +45,25 @@
 ##      exactly. A "fix" that made every position fall back to the line-only
 ##      space would pass 2 and fail this.
 ##
-## No mocks: the containers come from this repository's writer and are read
-## back through the real reader.
+## The writer no longer produces such a container: a column-aware
+## registration with no table is refused (``internal-files.md`` §"`paths.dat`
+## Layout A", since 2026-10). Containers recorded before that still exist, so
+## the reader's handling of them is kept under test. The fixture is written
+## with a stand-in table for file 1 whose positions coincide with the untabled
+## layout's — `[1, 1, 1]`, one address per line, the same addresses an untabled
+## file gives lines 1 to 3 — and its `paths.dat` record is then rewritten to
+## the untabled form (`line_count` 0), which is byte for byte what the writer
+## used to emit.
+##
+## No mocks: the containers come from this repository's writer and CTFS
+## container code, and are read back through the real reader.
 
 import std/[os, strutils, assertions]
 import results
+import codetracer_ctfs/types
+import codetracer_ctfs/container
+import codetracer_ctfs/base40
+import codetracer_trace_writer/varint
 import codetracer_trace_types
 import codetracer_trace_reader
 import codetracer_trace_writer/multi_stream_writer
@@ -63,13 +77,57 @@ const
 
 let dir = getTempDir() / "ctfnim-mixed-column-aware-position-space"
 
+proc readU64(data: openArray[byte], off: int): uint64 =
+  for i in 0 ..< 8:
+    result = result or (uint64(data[off + i]) shl (8 * i))
+
+proc untableLastPath(bytes: seq[byte]): seq[byte] =
+  ## Rebuild the container with the LAST `paths.dat` record in the untabled
+  ## Layout A form (`path_len, path, line_count 0`), every other member
+  ## copied as it is.
+  let blockSize = uint32(readU64(bytes, 8) and 0xFFFF_FFFF'u64)
+  let maxEntries = uint32(readU64(bytes, 12) and 0xFFFF_FFFF'u64)
+  let dat = readInternalFile(bytes, "paths.dat", blockSize, maxEntries).get()
+  let off = readInternalFile(bytes, "paths.off", blockSize, maxEntries).get()
+  var offsets: seq[uint64]
+  for i in 0 ..< off.len div 8:
+    offsets.add(readU64(off, i * 8))
+  let last = offsets.len - 2
+  var record = dat[int(offsets[last]) ..< int(offsets[last + 1])]
+  var pos = 0
+  let pathLen = int(decodeVarint(record, pos).get())
+  record.setLen(pos + pathLen)
+  encodeVarint(0'u64, record)
+  var newDat = dat[0 ..< int(offsets[last])] & record
+  var newOff = off[0 ..< (last + 1) * 8]
+  for i in 0 ..< 8:
+    newOff.add(byte((uint64(newDat.len) shr (8 * i)) and 0xFF))
+
+  var c = createCtfs(blockSize, maxEntries)
+  for i in 0 ..< int(maxEntries):
+    let entryOff = HeaderSize + ExtHeaderSize + i * FileEntrySize
+    if entryOff + FileEntrySize > bytes.len:
+      break
+    let encoded = readU64(bytes, entryOff + 16)
+    if encoded == 0:
+      continue
+    let name = base40Decode(encoded)
+    let content =
+      if name == "paths.dat": newDat
+      elif name == "paths.off": newOff
+      else: readInternalFile(bytes, name, blockSize, maxEntries).get()
+    var f = c.addFile(name).get()
+    if content.len > 0:
+      doAssert c.writeToFile(f, content).isOk
+  c.toBytes()
+
 proc writeMixedTrace(file: string) =
   ## File 0 carries a two-line length table (20 addressable columns in
   ## total); file 1 carries none. Both are stepped through.
   var w = initMultiStreamWriter(file & ".build", "mixed_column_aware").get()
   doAssert w.enableColumnAwareSteps().isOk
   doAssert w.registerPath(TabledPath, TabledLineLengths).isOk
-  doAssert w.registerPath(UntabledPath).isOk
+  doAssert w.registerPath(UntabledPath, [1'u32, 1, 1]).isOk
   doAssert w.registerStep(0, 1, @[]).isOk
   doAssert w.registerStep(0, 2, @[]).isOk
   doAssert w.registerStep(1, 1, @[]).isOk
@@ -77,7 +135,7 @@ proc writeMixedTrace(file: string) =
   doAssert w.close().isOk
   let bytes = w.toBytes()
   w.closeCtfs()
-  writeFile(file, cast[string](bytes))
+  writeFile(file, cast[string](untableLastPath(bytes)))
 
 proc writeFullyTabledTrace(file: string) =
   ## Both files tabled — the case the column decode is for.

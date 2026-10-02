@@ -109,6 +109,10 @@ task test, "Run all tests":
   # the bytes answers a line-only trace with a truncated path, a fabricated
   # per-file line table and the wrong step line — with no error.
   exec "nim c -r -d:release -p:src tests/test_paths_dat_layout_authority.nim"
+  # A column-aware file's table is decided by the writer at the file's first
+  # mention: all-zero tables get one position, a missing table the
+  # conventional one, whose columns are clamped and lines bounded.
+  exec "nim c -r -d:release -p:src tests/test_column_table_decided_at_first_mention.nim"
   # A line-only global_position_index says nothing about how its integers were
   # apportioned between files, and the two writers of this container format
   # disagree — prefixSum[path_id] + (line - 1) here, (path_id shl 32) or line
@@ -300,6 +304,7 @@ task test, "Run all tests":
   # count, and must be refused by name rather than silently dropping the step.
   # Same FFI-`include` compile requirements as the tests above.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_line_count_table.nim"
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_column_table_decided_at_first_mention.nim"
   # A path or variable name registered through the C ABI is interned when it
   # is registered, as the native API interns it, not when a record first
   # refers to it. Same FFI-`include` compile requirements as the tests above.

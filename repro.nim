@@ -201,6 +201,7 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_multi_stream_integration.nim", binary: "build/test-bin/test_multi_stream_integration"),
   TestSpec(source: "tests/test_new_trace_reader.nim", binary: "build/test-bin/test_new_trace_reader"),
   TestSpec(source: "tests/test_paths_dat_layout_authority.nim", binary: "build/test-bin/test_paths_dat_layout_authority"),
+  TestSpec(source: "tests/test_column_table_decided_at_first_mention.nim", binary: "build/test-bin/test_column_table_decided_at_first_mention"),
   TestSpec(source: "tests/test_line_only_position_space.nim", binary: "build/test-bin/test_line_only_position_space"),
   TestSpec(source: "tests/test_path_registration_scales_linearly.nim", binary: "build/test-bin/test_path_registration_scales_linearly"),
   TestSpec(source: "tests/test_per_step_location_cost.nim", binary: "build/test-bin/test_per_step_location_cost"),
