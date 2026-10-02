@@ -23,6 +23,14 @@ int main(void) {
 
     printf("=== C FFI Test for codetracer_trace_writer ===\n\n");
 
+    /* The archive this test links is the one build_ffi.nims produces, and it
+     * must say so: a host library built any other way (--threads:on, no
+     * process lock) is not safe to call from several host threads. */
+    ASSERT(strcmp(trace_writer_build_config(),
+                  "app:staticlib;threads:off;mm:arc;release:on;processLock:on") == 0,
+           "the shipped archive must report the build_ffi.nims configuration");
+    printf("[OK] trace_writer_build_config: %s\n", trace_writer_build_config());
+
     /* Create a trace writer */
     trace_writer_t writer = trace_writer_new("test_program", FFI_TRACE_FORMAT_BINARY);
     ASSERT(writer != NULL, "trace_writer_new should return non-NULL");

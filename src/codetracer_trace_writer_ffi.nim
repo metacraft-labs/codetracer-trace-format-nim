@@ -3,8 +3,8 @@
 ## C FFI interface for the CodeTracer trace writer.
 ## Drop-in replacement for the Rust codetracer_trace_writer_ffi.
 ##
-## Compile with: nim c --app:staticlib --mm:arc --threads:off --noMain -d:release src/codetracer_trace_writer_ffi.nim
-## Or for shared: nim c --app:lib --mm:arc --threads:off --noMain -d:release src/codetracer_trace_writer_ffi.nim
+## Build with `nim e build_ffi.nims` (static) or `nim e build_ffi.nims
+## --app:lib` (shared) from the repository root; that script holds the flags.
 ##
 ## Differences from the Rust FFI (codetracer_trace_writer_ffi/src/lib.rs):
 ##
@@ -136,6 +136,26 @@ proc trace_writer_last_error(): cstring {.exportc, cdecl, dynlib.} =
   ## Returns a pointer valid until the next FFI call on the same thread.
   ## Returns an empty string when no error has occurred.
   ct_ffi_last_error()
+
+const ffiBuildConfig = "app:" & appType &
+  ";threads:" & (if compileOption("threads"): "on" else: "off") &
+  ";mm:" & (if compileOption("mm", "arc"): "arc"
+            elif compileOption("mm", "orc"): "orc"
+            else: "other") &
+  ";release:" & (if defined(release) or defined(danger): "on" else: "off") &
+  ";processLock:" & (if defined(ffiNoProcessLock): "off" else: "on")
+
+proc trace_writer_build_config(): cstring {.exportc, cdecl, dynlib.} =
+  ## How this library was compiled, as `key:value` pairs joined by `;` —
+  ## for a host library built by `build_ffi.nims`,
+  ## `app:staticlib;threads:off;mm:arc;release:on;processLock:on`.
+  ##
+  ## The C ABI's thread safety is a property of the BUILD, not of the source:
+  ## the same source compiled `--threads:on` gives every host thread its own
+  ## heap and crashes on a cross-thread free. A consumer that builds or
+  ## receives the archive some other way can ask it instead of trusting the
+  ## command line that produced it. The string is static and never fails.
+  ffiBuildConfig
 
 # ---------------------------------------------------------------------------
 # Internal state: wraps TraceWriter + registries

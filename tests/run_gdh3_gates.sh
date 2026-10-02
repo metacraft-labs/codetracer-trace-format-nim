@@ -121,12 +121,11 @@ echo
 # ---------------------------------------------------------------------------
 build_lib() {  # build_lib <tag> [extra defines...]
   local tag="$1"; shift
-  nim c --app:staticlib --mm:arc --threads:off --noMain -d:release \
-    --nimMainPrefix:codetracerTraceWriter --passC:"-fPIC" -p:src \
+  nim e --hints:off build_ffi.nims \
+    --nimcache:"$WORK/nc-lib-$tag" --out:"$WORK/lib-$tag.a" -- \
     --hints:off --warnings:off \
-    --nimcache:"$WORK/nc-lib-$tag" \
     "${ZSTDFLAGS[@]+"${ZSTDFLAGS[@]}"}" \
-    "$@" -o:"$WORK/lib-$tag.a" src/codetracer_trace_writer_ffi.nim \
+    "$@" \
     >"$WORK/lib-$tag.build.log" 2>&1
 }
 

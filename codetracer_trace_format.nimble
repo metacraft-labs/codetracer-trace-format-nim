@@ -395,23 +395,13 @@ task testReader, "Run trace reader tests":
   exec "nim c -r -p:src tests/test_trace_reader.nim"
 
 task buildStaticLib, "Build static library (C FFI)":
-  # --passC:"-fPIC" is required so the static lib can be linked into shared
-  # objects (e.g. Python's .so extension via maturin/PyO3).
-  # --nimMainPrefix keeps the Nim runtime entry points uniquely named so
-  # this lib can be embedded next to another Nim-compiled artifact (the MCR
-  # emulator) without a duplicate-`NimMain` link error. It MUST match the
-  # `proc codetracerTraceWriterNimMain` importc in codetracer_trace_writer_ffi.nim.
-  when hostOS == "windows":
-    # The Godot/CodeTracer Windows build is MSVC, so the embedded archive must
-    # use the same compiler, CRT, and .lib format. Run from a VS developer
-    # environment; zstd_bindings.nim selects C:\zstd for this compiler.
-    exec "nim c --cc:vcc --app:staticlib --mm:arc --threads:off --noMain -d:release --nimMainPrefix:codetracerTraceWriter -p:src -o:codetracer_trace_writer.lib src/codetracer_trace_writer_ffi.nim"
-  else:
-    exec "nim c --app:staticlib --mm:arc --threads:off --noMain -d:release --nimMainPrefix:codetracerTraceWriter --passC:\"-fPIC\" -p:src -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim"
+  # The flags live in build_ffi.nims, the one build every producer of the
+  # archive runs (this task, the flake's trace-writer-ffi package, and the
+  # Rust `codetracer_trace_writer_nim` crate's build.rs).
+  exec "nim e --hints:off build_ffi.nims"
 
 task buildSharedLib, "Build shared library (C FFI)":
-  # See buildStaticLib for why --nimMainPrefix is required.
-  exec "nim c --app:lib --mm:arc --threads:off --noMain -d:release --nimMainPrefix:codetracerTraceWriter -p:src -o:libcodetracer_trace_writer.so src/codetracer_trace_writer_ffi.nim"
+  exec "nim e --hints:off build_ffi.nims --app:lib"
 
 task testFfiThreads, "C hosts: close after the recording thread exited; concurrent writers":
   # The host library is built --threads:off with a process lock around every
@@ -427,10 +417,12 @@ task testFfiThreads, "C hosts: close after the recording thread exited; concurre
   else:
     let dir = "build/ffi-threads"
     mkDir(dir)
-    let common = " --app:staticlib --mm:arc --noMain -d:release --nimMainPrefix:codetracerTraceWriter --passC:\"-fPIC\" -p:src --hints:off"
-    exec "nim c" & common & " --threads:off --nimcache:" & dir & "/nc-ship -o:" & dir & "/lib-ship.a src/codetracer_trace_writer_ffi.nim"
-    exec "nim c" & common & " --threads:on --warnings:off --nimcache:" & dir & "/nc-tls -o:" & dir & "/lib-tls.a src/codetracer_trace_writer_ffi.nim"
-    exec "nim c" & common & " --threads:off --warnings:off -d:ffiNoProcessLock --nimcache:" & dir & "/nc-nolock -o:" & dir & "/lib-nolock.a src/codetracer_trace_writer_ffi.nim"
+    # The shipped archive is build_ffi.nims's; the two controls are the same
+    # build with one override each, passed after `--` so it wins.
+    let build = "nim e --hints:off build_ffi.nims"
+    exec build & " --nimcache:" & dir & "/nc-ship --out:" & dir & "/lib-ship.a -- --hints:off"
+    exec build & " --nimcache:" & dir & "/nc-tls --out:" & dir & "/lib-tls.a -- --hints:off --threads:on --warnings:off"
+    exec build & " --nimcache:" & dir & "/nc-nolock --out:" & dir & "/lib-nolock.a -- --hints:off --warnings:off -d:ffiNoProcessLock"
     let extra = when hostOS == "macosx": " -framework Security -framework CoreFoundation" else: ""
     for t in ["worker_thread_exit", "concurrent_writers"]:
       for v in ["ship", "tls", "nolock"]:
@@ -454,11 +446,9 @@ task testFfiThreads, "C hosts: close after the recording thread exited; concurre
       "); no lock fails the concurrent host; the shipped flags pass both"
 
 task testFfi, "Build and run C FFI test":
-  # --nimMainPrefix keeps the Nim runtime entry points uniquely named so
-  # this lib can be embedded next to another Nim-compiled artifact (the MCR
-  # emulator) without a duplicate-`NimMain` link error. It MUST match the
-  # `proc codetracerTraceWriterNimMain` importc in codetracer_trace_writer_ffi.nim.
-  exec "nim c --app:staticlib --mm:arc --threads:off --noMain -d:release --nimMainPrefix:codetracerTraceWriter --passC:\"-fPIC\" -p:src -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim"
+  # The archive every producer builds (see build_ffi.nims); test_ffi.c checks
+  # it reports that build's configuration.
+  exec "nim e --hints:off build_ffi.nims"
   # MT1: the three replay-observation chokepoints must be exported symbols so a
   # replay-time observer (MCR) can interpose on them — guard it explicitly.
   exec "bash tests/check_chokepoint_symbols.sh libcodetracer_trace_writer.a"

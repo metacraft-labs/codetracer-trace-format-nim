@@ -103,6 +103,20 @@ const char* trace_writer_last_error(void);
  */
 void trace_writer_clear_last_error(void);
 
+/*
+ * How this library was compiled: `key:value` pairs joined by ';'.  A host
+ * library built by the repository's build_ffi.nims answers
+ * "app:staticlib;threads:off;mm:arc;release:on;processLock:on".
+ *
+ * The C ABI is safe to call from several host threads only when the library
+ * was built --threads:off with its process lock (one Nim heap, entered by one
+ * thread at a time); the same source built --threads:on crashes when a writer
+ * is freed after the thread that used it exited.  A host that did not build
+ * the archive itself can check this instead of trusting the build.  The
+ * string is static, never NULL, and never fails.
+ */
+const char* trace_writer_build_config(void);
+
 /* --------------------------------------------------------------------------
  * Lifecycle
  * -------------------------------------------------------------------------- */

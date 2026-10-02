@@ -212,16 +212,14 @@
             nativeBuildInputs = [ nim ];
             buildInputs = [ pkgs.zstd ];
 
-            # Same flags as the `buildStaticLib` nimble task; see there for
-            # why each is required.
+            # build_ffi.nims holds the flags; every producer of the archive
+            # runs it, so this one cannot drift from the others.
             buildPhase = ''
               runHook preBuild
               export HOME=$TMPDIR
-              nim c --app:staticlib --mm:arc --threads:off --noMain -d:release \
-                --nimMainPrefix:codetracerTraceWriter --passC:"-fPIC" --hints:off \
-                --nimcache:$TMPDIR/nimcache \
-                -p:src ${pkgs.lib.concatMapStringsSep " " (p: "--path:${p}") nimDepPaths} \
-                -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim
+              nim e --hints:off build_ffi.nims --nimcache:$TMPDIR/nimcache \
+                --out:$PWD/libcodetracer_trace_writer.a -- --hints:off \
+                ${pkgs.lib.concatMapStringsSep " " (p: "--path:${p}") nimDepPaths}
               runHook postBuild
             '';
 
@@ -243,7 +241,7 @@
               # the check depend on where in the archive the symbol sits.
               ${pkgs.stdenv.cc.bintools.bintools}/bin/nm -g --defined-only \
                   $out/lib/libcodetracer_trace_writer.a > defined-symbols.txt 2>/dev/null
-              for sym in trace_writer_new trace_writer_free trace_writer_last_error; do
+              for sym in trace_writer_new trace_writer_free trace_writer_last_error trace_writer_build_config; do
                 if ! grep -qw "$sym" defined-symbols.txt; then
                   echo "libcodetracer_trace_writer.a does not define $sym" >&2
                   exit 1
