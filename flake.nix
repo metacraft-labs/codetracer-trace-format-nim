@@ -168,6 +168,13 @@
                 && [ -f "$ct_tfn_root/codetracer_trace_format.nimble" ] \
                 && [ -f "$ct_tfn_root/src/codetracer_trace_writer_ffi.nim" ]; then
                 ( cd "$ct_tfn_root" && ${preCommit.shellHook} )
+                # git-hooks.nix's installer leaves core.hooksPath as the RELATIVE
+                # `.git/hooks`, in the config every worktree shares. A linked worktree
+                # cannot resolve it (there `.git` is a file), so git silently runs no
+                # hooks there. Point it at the common hooks directory instead.
+                if [ "$(git -C "$ct_tfn_root" config --local --get core.hooksPath 2>/dev/null)" = .git/hooks ]; then
+                  git -C "$ct_tfn_root" config --local core.hooksPath "$(git -C "$ct_tfn_root" rev-parse --path-format=absolute --git-common-dir)/hooks"
+                fi
               else
                 ct_tfn_root=""
               fi
