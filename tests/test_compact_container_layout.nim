@@ -815,11 +815,24 @@ proc predictedFullV5Size(members: openArray[CompactMember],
   blocks * blockSize
 
 proc reportOne(label: string, fullBytes: seq[byte]) {.raises: [].} =
+  ## A reader error here is a FAILURE, not a "NOT MEASURED".
+  ##
+  ## Both arms below used to `echo "NOT MEASURED"` and `return`, and the driver
+  ## treats a returning proc as a pass — so a container this repository's own
+  ## reader stopped being able to read would have turned this measurement off
+  ## and left the suite green. The two states that reach here are not
+  ## symmetrical: `fullBytes` is already in hand, so "absent" is impossible and
+  ## every remaining outcome is "present and unreadable", which is exactly the
+  ## state a skip must not be spent on.
   let members = collectFullProfileMembers(fullBytes).valueOr:
-    echo "  " & label & ": NOT MEASURED — " & error
+    doAssert false, label & ": the container is IN HAND and this repository's " &
+      "own reader cannot read it: " & error & ". That is a finding about the " &
+      "reader or the container, and reporting it as NOT MEASURED would hide " &
+      "it behind a passing suite."
     return
   let compactBytes = encodeCompactContainer(members).valueOr:
-    echo "  " & label & ": NOT MEASURED — " & error
+    doAssert false, label & ": the members decoded and the compact encoder " &
+      "then refused them: " & error
     return
   var payload = 0
   var empties = 0
@@ -881,15 +894,33 @@ proc measure_the_overhead_reduction() {.raises: [].} =
   reportOne("this repository's writer, " & $StepCount &
     "-step recording (version 5)", writeFullContainer())
 
-  if fileExists(SpecFixture):
+  # THREE states, and only the first is a legitimate skip.
+  #
+  #   1. the sibling spec repo is not checked out  -> skip, and say so
+  #   2. it is checked out and the fixture does not read -> FAIL
+  #   3. it reads -> measure
+  #
+  # State 2 used to be state 1's message with a different suffix, and both
+  # returned without failing. The distinction is the whole point: state 1 is
+  # fixed by checking the repo out and state 2 is not fixed by anything the
+  # person running the suite can do at the command line -- it means this
+  # reader and a committed container from a documented producer disagree. A
+  # version floor that moves under this fixture lands in state 2, so if the
+  # two are reported the same way the floor moves silently.
+  if not fileExists(SpecFixture):
+    echo "  " & SpecFixture & ": NOT MEASURED (reader-subject absent) — the " &
+      "sibling spec repo is not checked out next to this one; `repro ws " &
+      "enable codetracer` provides it"
+  else:
     let bytes = readCtfsFromFile(SpecFixture).valueOr:
-      echo "  " & SpecFixture & ": NOT MEASURED — " & error
+      doAssert false, SpecFixture & ": the fixture is PRESENT and this " &
+        "reader refuses it: " & error & ". A committed container from a " &
+        "documented producer that this repository cannot read is a finding " &
+        "about the two of them, and it must not be reported as an absent " &
+        "subject -- checking the repo out again will not fix it."
       return
     reportOne(SpecFixture & " (committed spec fixture, version " &
       $bytes[5] & ")", bytes)
-  else:
-    echo "  " & SpecFixture & ": NOT MEASURED — the sibling spec repo is " &
-      "not checked out next to this one"
 
   echo "  The published BlockTracer container the campaign's Introduction " &
     "measures (/t/vl/3h/vl3h7u4w62wz3p4c44gpikxtbt/trace.ct, Aztec, 21 " &

@@ -108,9 +108,63 @@ proc test_the_current_versions_open_at_the_recorded_lines() =
       "step " & $i & " read back at " & $gli.resolve(pos)
   echo "PASS: test_the_current_versions_open_at_the_recorded_lines"
 
+proc test_the_container_version_and_the_meta_dat_schema_are_two_gates() =
+  ## THE FINDING, pinned: these are two fields and two gates, and the one in
+  ## front is not the one that decides.
+  ##
+  ## It was proposed (CTFS-Compact-Profile CCP-4, finding 7) that this reader
+  ## should widen its CONTAINER version set to {3, 4, 5}, on the correct
+  ## ground that §1c's rule is "refuse a version you do not IMPLEMENT" and
+  ## this library implements the version-3 and version-4 bodies — their
+  ## `MapBlock` simply never sets the direct-block tag, so the same code reads
+  ## them. The argument about the body is right. The conclusion does not
+  ## follow, and this arm is why: a container below version 5 also carries a
+  ## `meta.dat` below schema 6, whose body is genuinely different (through
+  ## version 5 there is a path list after `recorder_id`; from 6 there is not),
+  ## so the second gate refuses it whatever the first one does.
+  ##
+  ## MEASURED when this arm was written, over 173 real containers in the
+  ## workspace: 136 at container version 3 or 4 — every one of them carrying
+  ## `meta.dat` schema 3, 4 or 5 or no `meta.dat` at all — and 24 at container
+  ## version 5, every one carrying schema 6. Not one counterexample in either
+  ## direction. Widening the container gate alone therefore changes the
+  ## MESSAGE on all 136 and the OUTCOME on none, and it changes the message
+  ## for the worse: a "schema version 3 is not supported" or, for the
+  ## `meta.dat`-less ones, a "meta.dat is missing — the bundle is truncated",
+  ## in place of a refusal that names the field actually responsible.
+  ##
+  ## So what this asserts is not the floor but the SHAPE: the two gates refuse
+  ## with two different messages naming two different fields, and neither
+  ## subsumes the other. If that ever stops holding — if a container below 5
+  ## appears carrying schema 6 — the reasoning above has to be re-taken rather
+  ## than assumed, and this arm is what makes that visible.
+  let older = TmpDir / "ctfs4_schema6.ct"
+  writeCurrent(older)
+  stamp(older, ctfsVersion = 4)            # schema left at 6
+  for i, e in refusalsOf(older):
+    doAssert e.len > 0, "door " & $i & " opened a container at version 4"
+    doAssert "container version 4" in e,
+      "door " & $i & " must refuse on the CONTAINER version, which is the " &
+      "field that is wrong, and name it: " & e
+    doAssert "schema version" notin e,
+      "door " & $i & " blamed the schema for a container-version problem: " & e
+
+  let newer = TmpDir / "ctfs5_schema4.ct"
+  writeCurrent(newer)
+  stamp(newer, metaVersion = 4)            # container left at 5
+  for i, e in refusalsOf(newer):
+    doAssert e.len > 0, "door " & $i & " opened a meta.dat at schema 4"
+    doAssert "schema version 4" in e,
+      "door " & $i & " must refuse on the SCHEMA version and name it: " & e
+    doAssert "container version" notin e,
+      "door " & $i & " blamed the container version for a schema problem: " & e
+
+  echo "PASS: test_the_container_version_and_the_meta_dat_schema_are_two_gates"
+
 when isMainModule:
   createDir(TmpDir)
   test_meta_dat_versions_other_than_6_are_refused_by_name()
   test_container_versions_other_than_5_are_refused_by_name()
   test_the_current_versions_open_at_the_recorded_lines()
+  test_the_container_version_and_the_meta_dat_schema_are_two_gates()
   removeDir(TmpDir)
