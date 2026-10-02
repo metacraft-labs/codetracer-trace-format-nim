@@ -63,6 +63,7 @@ import results
 import codetracer_ctfs/types
 import codetracer_ctfs/container
 import codetracer_ctfs/compact
+import codetracer_ctfs/base40
 import codetracer_ctfs/chunk_index
 import codetracer_ctfs/zstd_bindings
 import codetracer_trace_types
@@ -215,6 +216,36 @@ proc canonicalBytes(ev: TraceLowLevelEvent): seq[byte] =
   result = enc.getBytes()
   enc.destroy()
 
+proc fullProfileMemberNames(data: openArray[byte]): seq[string]
+    {.raises: [].} =
+  ## The member names of a FULL container, in `FileEntry`-array order, read out
+  ## of the array itself.
+  ##
+  ## The ORDER is the point. The profile-choosing writer claims to emit a
+  ## compact container's members in the order the full profile's array carries
+  ## them -- `events.log`, `events.fmt`, `meta.dat`, then the paths table --
+  ## which is what makes §1d's "a compact and a full container of one recording
+  ## name the same members identically" true of THIS writer and not only of the
+  ## reference encoder. A comparison against a hand-listed set of names would
+  ## have been true whatever order the writer picked, so the names come from the
+  ## container.
+  let blockSize = readU32LE(data, 8)
+  doAssert blockSize != 0'u32, "the full container declares a zero block size"
+  var maxEntries = readU32LE(data, 12)
+  if maxEntries == 0'u32:
+    maxEntries = uint32(
+      (int(blockSize) - HeaderSize - ExtHeaderSize) div FileEntrySize)
+  for i in 0 ..< int(maxEntries):
+    let off = HeaderSize + ExtHeaderSize + i * FileEntrySize
+    if off + FileEntrySize > data.len:
+      break
+    let entrySize = readU64LE(data, off)
+    let entryMap = readU64LE(data, off + 8)
+    let encoded = readU64LE(data, off + 16)
+    if entrySize == 0'u64 and entryMap == 0'u64 and encoded == 0'u64:
+      continue
+    result.add(base40Decode(encoded))
+
 proc answersFromFull(path: string): QueryAnswers =
   ## Every query, answered through the production full-profile reader.
   var rRes = openTrace(path)
@@ -231,12 +262,7 @@ proc answersFromFull(path: string): QueryAnswers =
   result.workdir = r.metadata.workdir
   result.args = r.metadata.args
   result.recordingId = r.metadata.recordingId
-  let data = readFileBytes(path)
-  let maxEntries = readU32LE(data, 12)
-  for name in ["events.log", "events.fmt", "meta.dat", "paths.dat",
-               "paths.off"]:
-    if readInternalFile(data, name, readU32LE(data, 8), maxEntries).isOk:
-      result.memberNames.add(name)
+  result.memberNames = fullProfileMemberNames(readFileBytes(path))
 
 proc answersFromCompact(path: string): QueryAnswers =
   ## Every query, answered through the compact load path: §1d's six checks,
