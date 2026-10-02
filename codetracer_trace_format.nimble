@@ -177,6 +177,18 @@ task test, "Run all tests":
   # container of the same recording and required to FAIL. Also prints CCP-2's
   # deliverable-4 overhead figures against a VERSION-5 baseline.
   exec "nim c -r -d:release -p:src tests/test_compact_container_layout.nim"
+  # CCP-4: the writer chooses the profile from a measured RAW-BYTE threshold.
+  # The default is 1 MiB of raw stream bytes; the switchover to the streaming
+  # full profile replays the buffered prefix, which is the one place in this
+  # campaign where a bug is SILENT (a valid full container missing part of the
+  # recording), so the arm compares against the same recording written always
+  # full and carries a PLANTED DROP that must make it fail; the boundary is
+  # asserted one event under and one event over; two recordings of equal RAW
+  # size and 1,452x different compressibility must take the same path, with a
+  # compressed-size rule shown to SPLIT them; and a writer-produced compact
+  # container is asserted to carry NO zstd frame, with its raw events.log equal
+  # to the full profile's own events.log inflated.
+  exec "nim c -r -d:release -p:src tests/test_profile_threshold_choice.nim"
   # The column-aware step encoding end to end: the writer's opt-in, the
   # DeltaColumn round-trip, Layout A paths.dat, the position decoder, and the
   # meta.dat unknown-flag-bit rejection that keeps the extension clean.
