@@ -105,6 +105,16 @@ proc conventionalLineDiagnostic*(path: string, line: uint64): string =
     "table of 100000 lines; its position would fall inside the next " &
     "file's range"
 
+proc lateColumnTableDiagnostic*(path: string,
+    recordedLines, offeredLines: int): string =
+  ## THE refusal of a table offered for a path interned with a different
+  ## one. The Rust writer states it in the same words.
+  "paths.dat: " & path & " was interned with a " & $recordedLines &
+    "-line table, and a later registration offering a different " &
+    $offeredLines & "-line table is refused; a file's table is fixed " &
+    "when the file is first interned, so register it before the file's " &
+    "first step, function or call"
+
 proc lookupId*(it: InterningTableWriter, payload: string): Option[uint64] =
   ## The id ``payload`` is interned under, without interning it.
   let existing = it.lookup.getOrDefault(payload, high(uint64))

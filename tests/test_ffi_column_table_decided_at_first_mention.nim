@@ -16,6 +16,9 @@
 ##      at column 1024.
 ##   4. A step past line 100000 of a conventional file is refused by name, and
 ##      `trace_writer_close` then fails naming it.
+##   5. A table offered after the file was interned — here by a step — is
+##      refused by name unless it is the recorded table, and the recording
+##      fails.
 ##
 ## No mocks: the container is produced by the real C entry points and read
 ## back through this repository's own reader.
@@ -111,6 +114,25 @@ proc test_c_refuses_a_line_past_the_conventional_table() =
   trace_writer_free(h)
   echo "PASS: test_c_refuses_a_line_past_the_conventional_table"
 
+proc test_c_refuses_a_table_after_the_file_was_interned() =
+  let h = columnAwareHandle()
+  doAssert h.register(PathA, [5'u32, 5]) == 0, ffiLastError()
+  trace_writer_start(h, cstring(PathA), 1)
+  trace_writer_register_step(h, cstring(PathC), 1)
+  trace_writer_register_step(h, cstring(PathA), 2)
+  doAssert ffiLastError().len == 0, ffiLastError()
+  doAssert h.register(PathA, [5'u32, 5]) == 0,
+    "the recorded table again is accepted: " & ffiLastError()
+  doAssert h.register(PathC, [3'u32, 4]) != 0,
+    "a table after a step interned the file must be refused"
+  doAssert PathC in ffiLastError() and "first interned" in ffiLastError(),
+    "the refusal must name the path; last_error: " & ffiLastError()
+  doAssert trace_writer_close(h) != 0, "the refusal must fail the recording"
+  doAssert PathC in ffiLastError(), "close must name it: " & ffiLastError()
+  trace_writer_free(h)
+  echo "PASS: test_c_refuses_a_table_after_the_file_was_interned"
+
 test_c_tables_are_decided_at_first_mention()
+test_c_refuses_a_table_after_the_file_was_interned()
 test_c_refuses_a_line_past_the_conventional_table()
 echo "ALL PASS: test_ffi_column_table_decided_at_first_mention"

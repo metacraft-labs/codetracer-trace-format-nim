@@ -13,7 +13,11 @@
 ##   of 1024 positions;
 ## * on a file with the conventional table a column above 1024 is recorded at
 ##   column 1024 of its line, and a line above 100000 is refused, naming the
-##   path. A file with any other table keeps its columns as given.
+##   path. A file with any other table keeps its columns as given;
+## * a non-empty table offered for a path already interned is refused,
+##   naming the path, unless it is the recorded table: the file's size fixed
+##   the base of every later file. That includes a table offered after a
+##   step, a function or an id request first mentioned the path.
 ##
 ## Before this rule an empty table was written as `line_count` 0: the file had
 ## no positions, shared its base with the next file, and every position in it
@@ -176,6 +180,42 @@ proc test_a_recorder_built_conventional_table_is_the_conventional_table() =
   doAssert r.at(0) == (id, 2'u32, 1024'u32), $r.at(0)
   echo "PASS: test_a_recorder_built_conventional_table_is_the_conventional_table"
 
+proc test_a_later_different_table_is_refused_naming_the_path() =
+  for (first, later) in [(@[3'u32, 4], @[3'u32, 5]), (@[3'u32, 4], @[3'u32, 4, 5]),
+                         (newSeq[uint32](), @[3'u32, 4])]:
+    var w = columnAwareWriter("late")
+    doAssert w.registerPath(P, first).isOk
+    let res = w.registerPath(P, later)
+    doAssert res.isErr, "a table " & $later & " offered after " & P &
+      " was interned with " & $first & " must be refused; it returned id " &
+      $res.get()
+    doAssert P in res.error and "first interned" in res.error, res.error
+  echo "PASS: test_a_later_different_table_is_refused_naming_the_path"
+
+proc test_a_table_after_an_implicit_mention_is_refused() =
+  ## The Python recorder's ordering until `e573455`: a step interned the
+  ## file, then its real table arrived.
+  var w = columnAwareWriter("after_step")
+  let id = w.pathIdForStep(P)
+  doAssert id.isOk
+  doAssert w.registerStep(id.get(), 1, @[]).isOk
+  let late = w.registerPath(P, [3'u32, 4])
+  doAssert late.isErr and P in late.error, "a table after the step that " &
+    "interned the file must be refused naming it"
+  echo "PASS: test_a_table_after_an_implicit_mention_is_refused"
+
+proc test_a_later_table_equal_to_the_recorded_one_is_accepted() =
+  ## Compared after the same normalisation: `[0]` again is `[1]` again, and
+  ## the conventional table built by the recorder is the one the writer
+  ## chose for an implicit mention.
+  var w = columnAwareWriter("late_equal")
+  doAssert w.registerPath(P, [0'u32]).isOk
+  doAssert w.registerPath(P, [0'u32]).isOk
+  doAssert w.registerPath(P, [1'u32]).isOk
+  doAssert w.registerPath(Q).isOk
+  doAssert w.registerPath(Q, conventionalLineLengths()).isOk
+  echo "PASS: test_a_later_table_equal_to_the_recorded_one_is_accepted"
+
 proc test_a_line_only_writer_ignores_tables() =
   var w = initMultiStreamWriter(dir / "line_only.build", "line_only").get()
   doAssert w.registerPath(P).isOk
@@ -191,4 +231,7 @@ test_a_table_whose_lines_hold_nothing_gives_its_first_line_a_position()
 test_the_same_table_again_and_a_bare_lookup_return_the_id()
 test_columns_and_lines_on_a_conventional_file()
 test_a_recorder_built_conventional_table_is_the_conventional_table()
+test_a_later_different_table_is_refused_naming_the_path()
+test_a_table_after_an_implicit_mention_is_refused()
+test_a_later_table_equal_to_the_recorded_one_is_accepted()
 test_a_line_only_writer_ignores_tables()

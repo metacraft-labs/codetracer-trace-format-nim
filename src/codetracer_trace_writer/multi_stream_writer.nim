@@ -1063,8 +1063,10 @@ proc registerPath*(w: var MultiStreamTraceWriter,
   ## whose lines hold nothing gives its first line a position; an empty
   ## table or none, the conventional table. A recorder that can read a
   ## file's source registers its real table before the file's first
-  ## mention. For a path already interned, ``lineLengths`` does not change
-  ## the recorded table.
+  ## mention. For a path already interned, a non-empty ``lineLengths`` that
+  ## is not the recorded table (after the same normalisation) is refused,
+  ## naming the path: positions already written depend on the file's size.
+  ## The same table again, or none, returns the existing id.
   var table: seq[uint32]
   let idRes =
     if w.columnAwareSteps:
@@ -1074,7 +1076,13 @@ proc registerPath*(w: var MultiStreamTraceWriter,
       # the bare record.
       let existing = w.interningPtr[].paths.lookupId(path)
       if existing.isSome:
-        Result[uint64, string].ok(existing.get())
+        let id = existing.get()
+        if lineLengths.len > 0 and id < uint64(w.pathLineLengths.len):
+          let offered = columnTableAtFirstMention(lineLengths)
+          if offered != w.pathLineLengths[int(id)]:
+            return err(lateColumnTableDiagnostic(path,
+              w.pathLineLengths[int(id)].len, offered.len))
+        Result[uint64, string].ok(id)
       else:
         table = columnTableAtFirstMention(lineLengths)
         w.container.ensurePathIdColumnAware(w.interningPtr[], path, table)
