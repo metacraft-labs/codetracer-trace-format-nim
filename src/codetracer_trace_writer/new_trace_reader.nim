@@ -82,7 +82,8 @@ type
     # is set.  ``lineLengths[fileId][line]`` is the addressable column
     # count of line (0-indexed) in file ``fileId``.  When the trace is
     # not column-aware, this stays empty and column queries return
-    # ``none``.
+    # ``none``.  An EMPTY entry is a ``line_count = 0`` record: the
+    # conventional table (100000 lines of 1024), held as that rule.
     lineLengths: seq[seq[uint32]]
     # Per-file line counts, parsed from the line-count-table paths.dat
     # records when `meta.hasLineCountTable` is set.  ``lineCounts[fileId]``
@@ -1017,6 +1018,9 @@ proc varnameCount*(r: NewTraceReader): uint64 = r.varnameReader.count()
 #                                            Addressing")
 # ---------------------------------------------------------------------------
 
+proc lineLengthRaw*(r: NewTraceReader, fileId: uint64,
+    lineIndex0: uint32): Option[uint32]
+
 proc lineLength*(r: NewTraceReader, fileId: uint64,
     lineIndex0: uint32): Option[uint32] =
   ## Return the addressable column count of ``lineIndex0`` (0-indexed,
@@ -1024,21 +1028,16 @@ proc lineLength*(r: NewTraceReader, fileId: uint64,
   ## ``fileId``.  Returns ``none`` when the trace is not column-aware,
   ## when ``fileId`` is out of range, when the line index is past the
   ## file's known line table, or when the recorder did not surface a
-  ## per-line table (``line_count = 0`` in paths.dat).  The back-compat
-  ## default is "no per-line data" → ``none``, matching the spec
-  ## contract for pre-extension traces.
+  ## per-line table.  A ``line_count = 0`` record is the conventional
+  ## table: every line up to ``DefaultLinesPerFile`` has
+  ## ``ConventionalLineLength`` columns.
   ##
   ## Note: callers that have a 1-indexed line number (per the spec
   ## convention used by AbsoluteStep / DeltaStep cursor tracking) must
   ## subtract 1 before calling.
   if not r.meta.hasColumnAwareSteps:
     return none(uint32)
-  if fileId >= uint64(r.lineLengths.len):
-    return none(uint32)
-  let lls = r.lineLengths[fileId]
-  if int(lineIndex0) >= lls.len:
-    return none(uint32)
-  some(lls[int(lineIndex0)])
+  r.lineLengthRaw(fileId, lineIndex0)
 
 proc lineLengthRaw*(r: NewTraceReader, fileId: uint64,
     lineIndex0: uint32): Option[uint32] =
@@ -1049,10 +1048,15 @@ proc lineLengthRaw*(r: NewTraceReader, fileId: uint64,
   ## steps and for one opened with ``assumeColumnAwarePaths = true``;
   ## on a trace opened normally that declares line-only steps there is
   ## no table and every query is ``none``.  Also ``none`` when ``fileId``
-  ## is out of range or ``lineIndex0`` is past the file's line table.
+  ## is out of range or ``lineIndex0`` is past the file's line table.  A
+  ## ``line_count = 0`` record answers by the conventional table's rule.
   if fileId >= uint64(r.lineLengths.len):
     return none(uint32)
   let lls = r.lineLengths[fileId]
+  if lls.len == 0:
+    if uint64(lineIndex0) < DefaultLinesPerFile:
+      return some(ConventionalLineLength)
+    return none(uint32)
   if int(lineIndex0) >= lls.len:
     return none(uint32)
   some(lls[int(lineIndex0)])
@@ -1062,11 +1066,12 @@ proc lineCountRaw*(r: NewTraceReader, fileId: uint64): uint64 =
   ## paths.dat Layout A for ``fileId``.  Returns ``0`` when this handle
   ## parsed no Layout A table for the file — which includes every trace
   ## that declares line-only steps and was opened without
-  ## ``assumeColumnAwarePaths`` (the legitimate "no per-line data"
-  ## sentinel — see spec §"paths.dat per-line offset table").
+  ## ``assumeColumnAwarePaths``. A ``line_count = 0`` record is the
+  ## conventional table, so its count is ``DefaultLinesPerFile``.
   if fileId >= uint64(r.lineLengths.len):
     return 0'u64
-  uint64(r.lineLengths[fileId].len)
+  let lls = r.lineLengths[fileId]
+  if lls.len == 0: DefaultLinesPerFile else: uint64(lls.len)
 
 proc globalPositionSpace*(r: NewTraceReader): lent GlobalLineIndex =
   ## The address space this trace's ``global_position_index`` values were
@@ -1109,13 +1114,12 @@ proc ensurePositionTables(r: var NewTraceReader) =
   ## Idempotent: callable from every per-step resolution.
   ##
   ## A file's slot is sized by ``global_line_index.fileAddressCount``, the
-  ## same rule the writer's ``rebuildGli`` lays the space out with. That
-  ## matters for the files with no line-length table: they occupy
-  ## ``DefaultLinesPerFile`` addresses in the space the positions were
-  ## encoded in, so sizing them ``0`` here would put every later file's
-  ## base that much too low and land the file search in the file before
-  ## the right one — which then answers with a line number that is the
-  ## next file's base, in range and indistinguishable from a real one.
+  ## same rule the writer's ``rebuildGli`` lays the space out with
+  ## (``positionSpaceCount``). That matters for a ``line_count = 0``
+  ## record: it is the conventional table and occupies
+  ## ``ConventionalFileSize`` addresses, so sizing it ``0`` here would put
+  ## every later file's base that much too low and land the file search in
+  ## the file before the right one.
   if r.posTablesBuilt:
     return
   let fileCount = r.lineLengths.len
@@ -1124,6 +1128,8 @@ proc ensurePositionTables(r: var NewTraceReader) =
   r.fileSize = newSeq[uint64](fileCount)
   var runningGlobal: uint64 = 0
   for fid in 0 ..< fileCount:
+    # A file with the conventional table (an empty entry) keeps an empty
+    # line base: its lines are resolved by the rule, not by a table.
     let lls = r.lineLengths[fid]
     var lb = newSeq[uint64](lls.len)
     var sum: uint64 = 0
@@ -1132,7 +1138,7 @@ proc ensurePositionTables(r: var NewTraceReader) =
       sum += uint64(lls[i])
     r.lineBase[fid] = lb
     r.fileBase[fid] = runningGlobal
-    r.fileSize[fid] = fileAddressCount(lls)
+    r.fileSize[fid] = positionSpaceCount(r.lineLengths, [], fid, true)
     runningGlobal += r.fileSize[fid]
   r.posTablesBuilt = true
 
@@ -1175,7 +1181,10 @@ proc decodeGlobalPositionIndex*(r: var NewTraceReader,
   let q = p - r.fileBase[fid]
   let lb = r.lineBase[fid]
   if lb.len == 0:
-    return err("file " & $fid & " has no line-length table")
+    # The conventional table: every line has ConventionalLineLength columns.
+    let width = uint64(ConventionalLineLength)
+    return ok((file: uint64(fid), line: uint32(q div width + 1),
+      column: uint32(q mod width + 1)))
 
   # Binary search for the line: largest l with lb[l] <= q.
   lo = 0

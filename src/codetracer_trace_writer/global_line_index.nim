@@ -101,9 +101,19 @@ const ConventionalLineLength*: uint32 = 1024
   ## first mentioned with no table is recorded as ``DefaultLinesPerFile``
   ## lines of this many positions. A column above it is recorded at this
   ## column of its line; a line above ``DefaultLinesPerFile`` is refused.
+  ##
+  ## The table is written as ``line_count = 0`` with no line lengths, its
+  ## only encoding, and is held as this rule rather than as an array: an
+  ## EMPTY column-aware table means the conventional one, in the writer, in
+  ## ``paths.dat`` and in the reader.
+
+const ConventionalFileSize*: uint64 =
+  DefaultLinesPerFile * uint64(ConventionalLineLength)
+  ## The positions a file with the conventional table occupies.
 
 proc conventionalLineLengths*(): seq[uint32] =
-  ## The conventional column-aware table.
+  ## The conventional column-aware table spelled out — for a recorder or a
+  ## test that builds it; the writer and the reader never hold it.
   result = newSeq[uint32](int(DefaultLinesPerFile))
   for L in result.mitems:
     L = ConventionalLineLength
@@ -128,8 +138,11 @@ proc columnTableAtFirstMention*(lineLengths: openArray[uint32]): seq[uint32] =
   ##   keeping its line count (``[0]`` → ``[1]``, ``[0, 0]`` → ``[1, 0]``),
   ##   so the file's size is not 0;
   ## * anything else is recorded as given.
-  if lineLengths.len == 0:
-    return conventionalLineLengths()
+  ##
+  ## The conventional table is returned in its held form, EMPTY — whether
+  ## none was given or the 100000 × 1024 table itself was.
+  if lineLengths.len == 0 or isConventionalTable(lineLengths):
+    return @[]
   result = @lineLengths
   for L in lineLengths:
     if L != 0:
@@ -187,8 +200,13 @@ proc positionSpaceCount*(lineLengths: openArray[seq[uint32]],
   let count =
     if fileId < lineCounts.len: lineCounts[fileId]
     else: 0'u64
-  if columnAware and fileId < lineLengths.len:
-    fileAddressCount(lineLengths[fileId], count)
+  if columnAware:
+    # Every column-aware file has a table; an empty one is the
+    # conventional table, held as its rule.
+    if fileId < lineLengths.len and lineLengths[fileId].len > 0:
+      fileAddressCount(lineLengths[fileId])
+    else:
+      ConventionalFileSize
   else:
     fileAddressCount([], count)
 
@@ -201,9 +219,11 @@ proc positionSpaceCounts*(lineLengths: openArray[seq[uint32]],
   ## `lineLengths` carries the column-aware per-line tables and
   ## `lineCounts` the line-only per-file line counts; a trace supplies
   ## whichever its mode addresses in, and either may be short of
-  ## `fileCount` (or empty) for the files it says nothing about. Those
-  ## fall back to `DefaultLinesPerFile`, which is what a container
-  ## without a size table has always meant.
+  ## `fileCount` (or empty) for the files it says nothing about. In a
+  ## line-only trace those fall back to `DefaultLinesPerFile`, which is
+  ## what a container without a size table has always meant; in a
+  ## column-aware one an empty table is the conventional table
+  ## (`ConventionalFileSize`).
   result = newSeq[uint64](fileCount)
   for i in 0 ..< fileCount:
     result[i] = positionSpaceCount(lineLengths, lineCounts, i, columnAware)

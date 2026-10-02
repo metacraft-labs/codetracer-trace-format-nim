@@ -143,7 +143,8 @@ proc ensurePathIdColumnAware*(ctfs: var Ctfs, it: var InterningTableWriter,
   ## ``lineLengths`` is written as given. ``MultiStreamTraceWriter.registerPath``
   ## decides it first (``columnTableAtFirstMention``), so a record it writes
   ## always has a table of non-zero size (``internal-files.md`` §"`paths.dat`
-  ## Layout A").
+  ## Layout A"); an empty ``lineLengths`` is the conventional table, whose
+  ## only encoding is ``line_count = 0``.
   let existing = it.lookup.getOrDefault(path, high(uint64))
   if existing != high(uint64):
     return ok(existing)

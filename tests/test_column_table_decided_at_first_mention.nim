@@ -14,6 +14,9 @@
 ## * on a file with the conventional table a column above 1024 is recorded at
 ##   column 1024 of its line, and a line above 100000 is refused, naming the
 ##   path. A file with any other table keeps its columns as given;
+## * the conventional table is written as `line_count = 0` with no line
+##   lengths, its only encoding, whether the writer chose it or the recorder
+##   passed it; a reader decodes `0` as the conventional table;
 ## * a non-empty table offered for a path already interned is refused,
 ##   naming the path, unless it is the recorded table: the file's size fixed
 ##   the base of every later file. That includes a table offered after a
@@ -30,6 +33,7 @@ import std/[os, strutils, assertions, options]
 import results
 import codetracer_trace_writer/multi_stream_writer
 import codetracer_trace_writer/new_trace_reader
+import codetracer_ctfs/container
 
 const
   P = "/src/app.py"
@@ -216,6 +220,29 @@ proc test_a_later_table_equal_to_the_recorded_one_is_accepted() =
   doAssert w.registerPath(Q, conventionalLineLengths()).isOk
   echo "PASS: test_a_later_table_equal_to_the_recorded_one_is_accepted"
 
+proc pathsDatOf(name: string): seq[byte] =
+  let bytes = cast[seq[byte]](readFile(dir / name & ".ct"))
+  readInternalFile(bytes, "paths.dat").get()
+
+proc test_the_conventional_table_is_written_as_line_count_zero() =
+  ## One byte of table instead of 100000 varints, by either route.
+  for (name, table) in [("conv_by_writer", newSeq[uint32]()),
+                        ("conv_by_recorder", conventionalLineLengths())]:
+    var w = columnAwareWriter(name)
+    doAssert w.registerPath(P, table).isOk
+    doAssert w.registerStep(0, 3, @[]).isOk
+    var r = w.finish(name)
+    let dat = pathsDatOf(name)
+    var want = @[byte(P.len)]
+    for c in P: want.add(byte(c))
+    want.add(0'u8)
+    doAssert dat == want, name & ": the conventional table must be the " &
+      "record `path_len, path, 0`; paths.dat holds " & $dat.len & " bytes"
+    doAssert r.table(0).isConventional,
+      name & ": line_count 0 must read back as 100000 lines of 1024"
+    doAssert r.at(0) == (0'u64, 3'u32, 1'u32), $r.at(0)
+  echo "PASS: test_the_conventional_table_is_written_as_line_count_zero"
+
 proc test_a_line_only_writer_ignores_tables() =
   var w = initMultiStreamWriter(dir / "line_only.build", "line_only").get()
   doAssert w.registerPath(P).isOk
@@ -234,4 +261,5 @@ test_a_recorder_built_conventional_table_is_the_conventional_table()
 test_a_later_different_table_is_refused_naming_the_path()
 test_a_table_after_an_implicit_mention_is_refused()
 test_a_later_table_equal_to_the_recorded_one_is_accepted()
+test_the_conventional_table_is_written_as_line_count_zero()
 test_a_line_only_writer_ignores_tables()

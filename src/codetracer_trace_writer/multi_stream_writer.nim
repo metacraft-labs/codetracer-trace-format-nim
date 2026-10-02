@@ -207,15 +207,10 @@ type
       ## P6 follow-up — per-path line-length tables, used in column-aware
       ## mode to compute byte-offset-based ``global_position_index`` values
       ## that match the reader's ``decodeGlobalPositionIndex`` expectation
-      ## per spec §"Source Location Addressing".  Parallel to ``paths``;
-      ## empty seq for files whose line_lengths the caller didn't
-      ## supply.  Ignored when ``columnAwareSteps`` is false.
-    pathConventional: seq[bool]
-      ## Parallel to ``pathLineLengths`` in column-aware mode: whether the
-      ## path's table is the conventional one (``isConventionalTable``). On
-      ## such a file a column above ``ConventionalLineLength`` is recorded at
-      ## that column and a line above ``DefaultLinesPerFile`` is refused
-      ## (``internal-files.md`` §"`paths.dat` Layout A").
+      ## per spec §"Source Location Addressing".  Parallel to ``paths``.
+      ## In column-aware mode an EMPTY seq is the conventional table
+      ## (100000 lines of 1024), held as its rule rather than spelled out;
+      ## on a line-only writer every entry is empty and unused.
     pathLineCounts: seq[uint64]
     pendingFuncs: seq[tuple[path: string, line: uint64, name: string]]
       ## `funcs.dat` records, held until `close`.
@@ -510,10 +505,16 @@ proc extendGli(w: var MultiStreamTraceWriter) =
   w.gli.appendFile(positionSpaceCount(w.pathLineLengths, w.pathLineCounts,
     w.paths.len - 1, w.columnAwareSteps))
 
+proc columnTableLineCount(table: seq[uint32]): int =
+  ## The line count of a held column-aware table; the empty one is the
+  ## conventional table.
+  if table.len == 0: int(DefaultLinesPerFile) else: table.len
+
 proc isConventionalPath(w: MultiStreamTraceWriter, pathId: uint64): bool =
   ## Whether ``pathId``'s table is the conventional one.
-  w.columnAwareSteps and pathId < uint64(w.pathConventional.len) and
-    w.pathConventional[int(pathId)]
+  ## The table is held as its rule: an empty column-aware table.
+  w.columnAwareSteps and pathId < uint64(w.pathLineLengths.len) and
+    w.pathLineLengths[int(pathId)].len == 0
 
 proc checkConventionalLine(w: MultiStreamTraceWriter,
     pathId: uint64, line: uint64): Result[void, string] =
@@ -547,8 +548,7 @@ proc toGlobalLineIndex(w: var MultiStreamTraceWriter,
   ## base. See ``global_line_index.globalIndex``.
   if w.gliDirty:
     w.rebuildGli()
-  if w.columnAwareSteps and pathId < uint64(w.pathLineLengths.len) and
-     w.pathLineLengths[int(pathId)].len > 0:
+  if w.columnAwareSteps and pathId < uint64(w.pathLineLengths.len):
     # Cumulative byte offset of column 1 on ``line``: sum of the lengths
     # of preceding lines.  ``line`` is 1-based per the cursor convention;
     # line 1 sits at offset 0 within the file.  When ``line`` exceeds the
@@ -1079,9 +1079,10 @@ proc registerPath*(w: var MultiStreamTraceWriter,
         let id = existing.get()
         if lineLengths.len > 0 and id < uint64(w.pathLineLengths.len):
           let offered = columnTableAtFirstMention(lineLengths)
-          if offered != w.pathLineLengths[int(id)]:
+          let recorded = w.pathLineLengths[int(id)]
+          if offered != recorded:
             return err(lateColumnTableDiagnostic(path,
-              w.pathLineLengths[int(id)].len, offered.len))
+              columnTableLineCount(recorded), columnTableLineCount(offered)))
         Result[uint64, string].ok(id)
       else:
         table = columnTableAtFirstMention(lineLengths)
@@ -1101,7 +1102,6 @@ proc registerPath*(w: var MultiStreamTraceWriter,
     # compute byte-offset positions in column-aware mode.  A line-only
     # writer stores an empty seq: its slots are sized by line count.
     if w.columnAwareSteps:
-      w.pathConventional.add(isConventionalTable(table))
       w.pathLineLengths.add(move(table))
     else:
       w.pathLineLengths.add(@[])
@@ -1601,9 +1601,7 @@ proc registerStepWithColumn*(w: var MultiStreamTraceWriter,
   # so a guard present only on ``registerColumnStep`` left the defect live on
   # the path every recorder actually takes.
   var effectiveDelta = w.clampConventionalColumn(pathId, columnDelta)
-  if columnDelta != 0 and
-     (int(pathId) >= w.pathLineLengths.len or
-      w.pathLineLengths[int(pathId)].len == 0):
+  if columnDelta != 0 and int(pathId) >= w.pathLineLengths.len:
     w.noteColumnWithoutAxis(pathId)
     effectiveDelta = 0
 
@@ -1674,8 +1672,7 @@ proc registerColumnStep*(w: var MultiStreamTraceWriter,
   # from a real step at that later line. Measured in the Solana recorder, whose
   # DWARF source paths do not resolve on the recording machine, so every file
   # went untabled and every step after the first reported the wrong line.
-  if int(w.lastPathId) >= w.pathLineLengths.len or
-     w.pathLineLengths[int(w.lastPathId)].len == 0:
+  if int(w.lastPathId) >= w.pathLineLengths.len:
     return err("registerColumnStep: file " & $w.lastPathId & " has no " &
       "per-line length table, so its positions are line-only and a column " &
       "delta would decode as a different line. Register the path with its " &

@@ -5297,9 +5297,10 @@ proc ct_reader_line_length_raw(
 # ---------------------------------------------------------------------------
 #
 # Companion to ``ct_reader_line_length_raw``: returns the number of lines
-# the trace has registered for ``file_id`` via paths.dat Layout A.
-# Returns 0 when the file has no Layout A data (or ``file_id`` is out of
-# range).  ``UINT64_MAX`` is reserved for error signalling — the proc
+# the trace has registered for ``file_id`` via paths.dat Layout A — 100000
+# for the conventional table (a ``line_count = 0`` record). Returns 0 when
+# the file has no Layout A
+# data (or ``file_id`` is out of range).  ``UINT64_MAX`` is reserved for error signalling — the proc
 # never returns it because the per-file lookup is total.
 
 proc ct_reader_line_count_raw(
