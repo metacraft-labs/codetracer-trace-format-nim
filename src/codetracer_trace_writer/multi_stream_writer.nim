@@ -9,6 +9,7 @@
 ## This module is the new replacement for the old TraceWriter that produced
 ## single-stream events.log + meta.json + paths.json.
 
+import std/algorithm
 import std/options
 import std/tables
 import results
@@ -1726,20 +1727,19 @@ proc flushCompletedCalls(w: var MultiStreamTraceWriter): Result[void, string] =
   ## were assigned at entry time so a child key > parent key. Sorting by
   ## call_key and appending in that order makes the on-disk record index
   ## equal to the entry-order call_key.
+  ##
+  ## A recursion returns innermost first, so the buffer can hold its keys in
+  ## strictly descending order. The order is restored by sorting a permutation
+  ## of (key, index) pairs — O(n log n) integer moves, no record ever moved — so a
+  ## 100k-deep recursion flushes in about the time its records take to encode.
   if w.completedCalls.len == 0:
     return ok()
-  # Insertion-sort by callKey: typical fan-out is small (1..few siblings
-  # per parent), so this is effectively linear and avoids pulling in a
-  # generic sort over a tuple type.
-  for i in 1 ..< w.completedCalls.len:
-    var j = i
-    while j > 0 and w.completedCalls[j - 1][0] > w.completedCalls[j][0]:
-      let tmp = w.completedCalls[j - 1]
-      w.completedCalls[j - 1] = w.completedCalls[j]
-      w.completedCalls[j] = tmp
-      dec j
-  for entry in w.completedCalls:
-    let res = w.container.writeCall(w.callWriter, entry[1])
+  var order = newSeq[(uint64, int)](w.completedCalls.len)
+  for i in 0 ..< order.len:
+    order[i] = (w.completedCalls[i][0], i)
+  order.sort()
+  for (_, i) in order:
+    let res = w.container.writeCall(w.callWriter, w.completedCalls[i][1])
     if res.isErr:
       return err("failed to write call record: " & res.error)
     w.callCount += 1

@@ -209,6 +209,9 @@ task test, "Run all tests":
   exec "nim c -r -p:src tests/test_streaming_value_encoder.nim"
   exec "nim c -r -p:src tests/test_value_ref.nim"
   exec "nim c -r -d:release -p:src tests/test_multi_stream_writer.nim"
+  # A recursion's returns reach the call buffer innermost first; flushing them
+  # in call_key order must not cost a pass over the buffer per record.
+  exec "nim c -r -d:release -p:src tests/test_deep_call_nesting_flush.nim"
   # MT7-5a: the exported, ABI-stable, per-thread crossing block that mirrors the
   # writer's `pendingCrossings` seq (read back via the C symbols the reader uses).
   exec "nim c -r -d:release -p:src tests/test_crossing_state.nim"
