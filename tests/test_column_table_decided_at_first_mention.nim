@@ -241,7 +241,33 @@ proc test_the_conventional_table_is_written_as_line_count_zero() =
     doAssert r.table(0).isConventional,
       name & ": line_count 0 must read back as 100000 lines of 1024"
     doAssert r.at(0) == (0'u64, 3'u32, 1'u32), $r.at(0)
+    doAssert r.pathTableKind(0) == some(ptkConventional),
+      name & ": the reader says the file has the conventional table"
   echo "PASS: test_the_conventional_table_is_written_as_line_count_zero"
+
+proc test_the_reader_names_each_kind_of_path_table() =
+  ## `line_count` 0 is the conventional table, never "no table": the kind
+  ## tells a caller which a file has without reading 100000 line lengths.
+  var w = columnAwareWriter("kinds")
+  doAssert w.registerPath(P, [3'u32]).isOk
+  doAssert w.registerPath(Q).isOk
+  doAssert w.registerStep(0, 1, @[]).isOk
+  var r = w.finish("kinds")
+  doAssert r.pathTableKind(0) == some(ptkLines)
+  doAssert r.pathTableKind(1) == some(ptkConventional)
+  doAssert r.pathTableKind(2).isNone, "no such path"
+  var lw = initMultiStreamWriter(dir / "kinds_bare.build", "kinds_bare").get()
+  doAssert lw.registerPath(P).isOk
+  doAssert lw.registerStep(0, 1, @[]).isOk
+  var lr = lw.finish("kinds_bare")
+  doAssert lr.pathTableKind(0) == some(ptkBare)
+  var cw = initMultiStreamWriter(dir / "kinds_count.build", "kinds_count").get()
+  doAssert cw.enableLineCountTable().isOk
+  doAssert cw.registerPath(P, lineCount = 7).isOk
+  doAssert cw.registerStep(0, 1, @[]).isOk
+  var cr = cw.finish("kinds_count")
+  doAssert cr.pathTableKind(0) == some(ptkLineCount)
+  echo "PASS: test_the_reader_names_each_kind_of_path_table"
 
 proc test_a_line_only_writer_ignores_tables() =
   var w = initMultiStreamWriter(dir / "line_only.build", "line_only").get()
@@ -262,4 +288,5 @@ test_a_later_different_table_is_refused_naming_the_path()
 test_a_table_after_an_implicit_mention_is_refused()
 test_a_later_table_equal_to_the_recorded_one_is_accepted()
 test_the_conventional_table_is_written_as_line_count_zero()
+test_the_reader_names_each_kind_of_path_table()
 test_a_line_only_writer_ignores_tables()

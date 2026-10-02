@@ -27,7 +27,7 @@ include codetracer_trace_writer_ffi
 
 {.pop.}
 
-import std/[strutils, options]
+import std/[os, strutils, options]
 import codetracer_trace_writer/new_trace_reader as ntr
 
 const
@@ -99,6 +99,33 @@ proc test_c_tables_are_decided_at_first_mention() =
   doAssert found, "the step on the conventional file is in the container"
   echo "PASS: test_c_tables_are_decided_at_first_mention"
 
+proc test_c_reader_names_the_conventional_table() =
+  ## Through the reader C ABI: the kind is explicit, and the per-line
+  ## accessors answer the conventional table by its rule rather than 0.
+  let h = columnAwareHandle()
+  doAssert h.register(PathA, [5'u32, 5]) == 0, ffiLastError()
+  trace_writer_start(h, cstring(PathA), 1)
+  trace_writer_register_step(h, cstring(PathB), 7)
+  trace_writer_register_step(h, cstring(PathA), 2)
+  doAssert trace_writer_close(h) == 0, ffiLastError()
+  let n = int(trace_writer_container_len(h))
+  var bytes = newSeq[byte](n)
+  copyMem(addr bytes[0], trace_writer_container_ptr(h), n)
+  trace_writer_free(h)
+  let ct = getTempDir() / "ffi_conventional_kind.ct"
+  writeFile(ct, cast[string](bytes))
+  let r = ct_reader_open(cstring(ct))
+  doAssert r != nil
+  doAssert ct_reader_path_table_kind(r, 0) == CtPathTableLines
+  doAssert ct_reader_path_table_kind(r, 1) == CtPathTableConventional
+  doAssert ct_reader_path_table_kind(r, 2) == -1, "no such path"
+  doAssert ct_reader_line_count_raw(r, 1) == 100000
+  var width: uint32
+  doAssert ct_reader_line_length_raw(r, 1, 99999, addr width) == 0 and width == 1024
+  doAssert ct_reader_line_length_raw(r, 1, 100000, addr width) != 0
+  ct_reader_close(r)
+  echo "PASS: test_c_reader_names_the_conventional_table"
+
 proc test_c_refuses_a_line_past_the_conventional_table() =
   let h = columnAwareHandle()
   trace_writer_start(h, cstring(PathB), 1)
@@ -133,6 +160,7 @@ proc test_c_refuses_a_table_after_the_file_was_interned() =
   echo "PASS: test_c_refuses_a_table_after_the_file_was_interned"
 
 test_c_tables_are_decided_at_first_mention()
+test_c_reader_names_the_conventional_table()
 test_c_refuses_a_table_after_the_file_was_interned()
 test_c_refuses_a_line_past_the_conventional_table()
 echo "ALL PASS: test_ffi_column_table_decided_at_first_mention"

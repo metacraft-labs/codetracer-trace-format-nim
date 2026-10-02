@@ -5298,8 +5298,8 @@ proc ct_reader_line_length_raw(
 #
 # Companion to ``ct_reader_line_length_raw``: returns the number of lines
 # the trace has registered for ``file_id`` via paths.dat Layout A — 100000
-# for the conventional table (a ``line_count = 0`` record). Returns 0 when
-# the file has no Layout A
+# for the conventional table (a ``line_count = 0`` record; see
+# ``ct_reader_path_table_kind``). Returns 0 when the file has no Layout A
 # data (or ``file_id`` is out of range).  ``UINT64_MAX`` is reserved for error signalling — the proc
 # never returns it because the per-file lookup is total.
 
@@ -5311,6 +5311,34 @@ proc ct_reader_line_count_raw(
     return 0'u64
   let rh = cast[TraceReaderHandle](h)
   rh[].lineCountRaw(file_id)
+
+# ---------------------------------------------------------------------------
+# ct_reader_path_table_kind — what paths.dat records about a file's size
+# ---------------------------------------------------------------------------
+#
+# 0 bare record (no size), 1 line count (meta.dat bit 14), 2 per-line table
+# (bit 4), 3 the conventional table (bit 4, ``line_count = 0``: 100000 lines
+# of 1024 positions — internal-files.md §"paths.dat Layout A"); -1 for a
+# NULL handle or a ``file_id`` with no path. For a conventional file
+# ``ct_reader_line_count_raw`` answers 100000 and
+# ``ct_reader_line_length_raw`` / ``ct_reader_line_length`` 1024 for every
+# line below it, by the rule rather than from a stored table.
+
+const
+  CtPathTableBare* = 0.cint
+  CtPathTableLineCount* = 1.cint
+  CtPathTableLines* = 2.cint
+  CtPathTableConventional* = 3.cint
+
+proc ct_reader_path_table_kind(h: pointer, file_id: uint64): cint {.exportc,
+    cdecl, dynlib, ffiGuardFail(-1.cint).} =
+  if h.isNil:
+    return -1.cint
+  let rh = cast[TraceReaderHandle](h)
+  let kind = rh[].pathTableKind(file_id)
+  if kind.isNone:
+    return -1.cint
+  cint(ord(kind.get()))
 
 # ---------------------------------------------------------------------------
 # ct_reader_has_column_aware_steps — metadata accessor

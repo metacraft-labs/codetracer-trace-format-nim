@@ -1018,6 +1018,31 @@ proc varnameCount*(r: NewTraceReader): uint64 = r.varnameReader.count()
 #                                            Addressing")
 # ---------------------------------------------------------------------------
 
+type
+  PathTableKind* = enum
+    ## What ``paths.dat`` records about a file's size, by the layout
+    ## ``meta.dat`` declares (``internal-files.md`` §"Interning Tables").
+    ptkBare = 0          ## no size: a bare record (neither bit 4 nor 14)
+    ptkLineCount = 1     ## a line count (bit 14)
+    ptkLines = 2         ## a per-line table (bit 4, ``line_count > 0``)
+    ptkConventional = 3  ## the conventional table, 100000 lines of 1024
+                         ## (bit 4, ``line_count = 0``)
+
+proc pathTableKind*(r: NewTraceReader, fileId: uint64): Option[PathTableKind] =
+  ## Which kind of size ``paths.dat`` records for ``fileId``; ``none`` when
+  ## there is no such path. A column-aware record of ``line_count = 0`` is
+  ## ``ptkConventional`` — never "no table" — so a caller can tell it from
+  ## a file with no Layout A data without reading its line lengths.
+  if fileId >= r.pathCount():
+    return none(PathTableKind)
+  if fileId < uint64(r.lineLengths.len):
+    if r.lineLengths[fileId].len == 0:
+      return some(ptkConventional)
+    return some(ptkLines)
+  if r.meta.hasLineCountTable:
+    return some(ptkLineCount)
+  some(ptkBare)
+
 proc lineLengthRaw*(r: NewTraceReader, fileId: uint64,
     lineIndex0: uint32): Option[uint32]
 
