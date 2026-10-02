@@ -246,10 +246,29 @@
               # stdenv's pipefail fails whenever grep exits at its match while
               # nm still has output to write (nm dies of SIGPIPE), which makes
               # the check depend on where in the archive the symbol sits.
+              # nm's stderr is kept.  Its exit status already aborts the phase
+              # under `set -e`, so `2>/dev/null` did not make a failing nm
+              # survivable -- it made it mute: the phase died after printing
+              # nothing at all, neither nm's error nor this check's own
+              # message.  Measured on aarch64-darwin by pointing nm at a
+              # missing path with and without the redirect.
               ${pkgs.stdenv.cc.bintools.bintools}/bin/nm -g --defined-only \
-                  $out/lib/libcodetracer_trace_writer.a > defined-symbols.txt 2>/dev/null
+                  $out/lib/libcodetracer_trace_writer.a > defined-symbols.txt
+
+              # Reduce nm's `<address> <type> <name>` lines to bare names, less
+              # the leading underscore Mach-O prefixes every C symbol with and
+              # ELF prefixes none with.  `_` is itself a word character, so
+              # `grep -w trace_writer_new` cannot match `_trace_writer_new`:
+              # the word-boundary form of this check could never pass on
+              # darwin, whatever the archive held.  Comparing whole names
+              # rather than substrings keeps the check able to refuse -- the
+              # internal `_ffiImpl_trace_writer_new__*` wrapper is present
+              # either way and must not be mistaken for the exported symbol.
+              awk '{ print $NF }' defined-symbols.txt | sed 's/^_//' \
+                  | sort -u > defined-names.txt
+
               for sym in trace_writer_new trace_writer_free trace_writer_last_error trace_writer_build_config; do
-                if ! grep -qw "$sym" defined-symbols.txt; then
+                if ! grep -qxF "$sym" defined-names.txt; then
                   echo "libcodetracer_trace_writer.a does not define $sym" >&2
                   exit 1
                 fi
