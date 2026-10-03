@@ -616,7 +616,7 @@ proc buildNativeFullDocument*(data: openArray[byte], opts: NativeOpts):
       metaDatPaths.add(splitInterningPayload(pathR.get()).name)
   if md.mcrFields.isSome:
     let mcr = md.mcrFields.get()
-    recordingMode = "mcr"
+    recordingMode = md.recorderId
     platform = mcr.platform
     tickSource = mcr.tickSourceStr
     tickDef = mcr.tickGranularity
