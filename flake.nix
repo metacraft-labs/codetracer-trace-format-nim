@@ -116,6 +116,7 @@
 
               # The C back-end `nim c` shells out to.
               pkgs.gcc
+              pkgs.bash # Declared non-SIP monitored launch shell.
 
               # `codetracer_ctfs` links libzstd; several tests resolve its
               # include/lib dirs through pkg-config.
