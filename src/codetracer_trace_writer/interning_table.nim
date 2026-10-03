@@ -297,10 +297,10 @@ proc initInterningTableReader*(ctfsBytes: openArray[byte], baseName: string,
                                 blockSize: uint32 = DefaultBlockSize,
                                 maxEntries: uint32 = DefaultMaxRootEntries): Result[InterningTableReader, string] =
   ## Initialize a reader from raw CTFS container bytes.
-  let tableRes = initVariableRecordTableReader(ctfsBytes, baseName, blockSize, maxEntries)
+  var tableRes = initVariableRecordTableReader(ctfsBytes, baseName, blockSize, maxEntries)
   if tableRes.isErr:
     return err(tableRes.error)
-  ok(InterningTableReader(table: tableRes.get()))
+  ok(InterningTableReader(table: move tableRes.get()))
 
 proc readById*(r: InterningTableReader, id: uint64): Result[string, string] =
   ## Read the interned string by its ID.

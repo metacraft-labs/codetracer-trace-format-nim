@@ -553,7 +553,7 @@ proc readMemberBytes*(data: openArray[byte], name: string,
       return err("internal file " & name & " is stored in one direct block " &
         "but declares " & $fileSize & " bytes, more than one " & $blockSize &
         "-byte block holds")
-    var direct = newSeq[byte](int(fileSize))
+    var direct = newSeqUninit[byte](int(fileSize))  # every byte copied below
     if fileSize > 0:
       copyMem(addr direct[0], unsafeAddr data[int(b) * int(blockSize)],
         int(fileSize))
@@ -566,7 +566,9 @@ proc readMemberBytes*(data: openArray[byte], name: string,
   if fileSize == 0:
     return ok(newSeq[byte](0))
 
-  var fileBytes = newSeq[byte](int(fileSize))
+  # Every byte is copied in by the loop below, which fails rather than stops
+  # short, so the buffer is not zeroed first.
+  var fileBytes = newSeqUninit[byte](int(fileSize))
   let usable = uint64(blockSize) div 8 - 1
 
   var remaining = int(fileSize)

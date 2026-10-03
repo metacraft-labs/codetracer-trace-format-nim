@@ -371,7 +371,9 @@ proc parseLayoutAPathRecords(pathReader: InterningTableReader,
   ## record exactly.  Treat the result as a hint about a suspected
   ## recorder bug, never as a licence to reinterpret the record.
   let pathTotal = pathReader.count()
-  var llsAll = newSeq[seq[uint32]](int(pathTotal))
+  # Grown record by record: a probe usually stops at the first record, and
+  # then never needed a table per path.
+  var llsAll: seq[seq[uint32]]
   for i in 0'u64 ..< pathTotal:
     let rawRes = pathReader.readRawById(i)
     if rawRes.isErr:
@@ -422,7 +424,7 @@ proc parseLayoutAPathRecords(pathReader: InterningTableReader,
     if probe and pos != raw.len:
       return err("paths.dat[" & $i & "]: not Layout A (" &
         $(raw.len - pos) & " trailing byte(s))")
-    llsAll[i] = lls
+    llsAll.add(move lls)
   ok(llsAll)
 
 proc parseLineCountPathRecords(pathReader: InterningTableReader):
@@ -751,8 +753,8 @@ when ctHasFilesystem:
     try:
       let f = open(path, fmRead)
       let size = f.getFileSize()
-      data = newSeq[byte](size)
-      discard f.readBytes(data, 0, size)
+      data = newSeqUninit[byte](size)  # filled by the read, cut to what it read
+      data.setLen(f.readBytes(data, 0, size))
       f.close()
     except:
       return err("failed to read file: " & path)
