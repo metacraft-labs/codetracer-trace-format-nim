@@ -221,6 +221,9 @@ task test, "Run all tests":
   # the canonical Rust IoEventStreamReader (skips cleanly if the sibling Rust
   # repo or its toolchain is absent).
   exec "nim c -r -d:release -p:src tests/test_nim_io_event_stream_crossread.nim"
+  # The Nim and Rust step-map readers answer every lookup alike, a lookup of
+  # line 0 (answered as line 1) included.
+  exec "nim c -r -d:release -p:src tests/test_nim_step_map_crossread.nim"
   exec "nim c -r -p:src tests/test_streaming_value_encoder.nim"
   exec "nim c -r -p:src tests/test_value_ref.nim"
   exec "nim c -r -d:release -p:src tests/test_multi_stream_writer.nim"
