@@ -68,25 +68,26 @@ proc ensureQualifiedId*(ctfs: var Ctfs, it: var InterningTableWriter,
   ## different qualifiers gets two distinct ids, while a genuine repeat of the
   ## same ``(qualifier, name)`` dedups to one id. An empty qualifier stores the
   ## bare name and is byte-identical to the old ``ensureId`` output.
-  let payload = qualifiedPayload(qualifier, name)
-  let existing = it.lookup.getOrDefault(payload, high(uint64))
-  if existing != high(uint64):
-    return ok(existing)
-
-  let id = it.nextId
-  it.nextId += 1
-
-  # Convert payload to bytes and append to the variable record table
-  var payloadBytes = newSeq[byte](payload.len)
-  for i in 0 ..< payload.len:
-    payloadBytes[i] = byte(payload[i])
-
-  let appendRes = ctfs.append(it.table, payloadBytes)
-  if appendRes.isErr:
-    return err(appendRes.error)
-
-  it.lookup[payload] = id
-  ok(id)
+  template ensurePayload(payload: string): Result[uint64, string] =
+    let existing = it.lookup.getOrDefault(payload, high(uint64))
+    if existing != high(uint64):
+      ok(existing)
+    else:
+      let id = it.nextId
+      it.nextId += 1
+      let appendRes = ctfs.append(it.table,
+        payload.toOpenArrayByte(0, payload.len - 1))
+      if appendRes.isErr:
+        err(appendRes.error)
+      else:
+        it.lookup[payload] = id
+        ok(id)
+  # An empty qualifier's payload is the name itself, looked up without a copy.
+  if qualifier.len == 0:
+    ensurePayload(name)
+  else:
+    let payload = qualifiedPayload(qualifier, name)
+    ensurePayload(payload)
 
 proc ensureId*(ctfs: var Ctfs, it: var InterningTableWriter, name: string): Result[uint64, string] =
   ## Return the ID for name. If name hasn't been seen, append it to the table
@@ -308,8 +309,8 @@ proc readById*(r: InterningTableReader, id: uint64): Result[string, string] =
     return err(dataRes.error)
   let data = dataRes.get()
   var s = newString(data.len)
-  for i in 0 ..< data.len:
-    s[i] = char(data[i])
+  if data.len > 0:
+    copyMem(addr s[0], unsafeAddr data[0], data.len)
   ok(s)
 
 proc readRawById*(r: InterningTableReader,

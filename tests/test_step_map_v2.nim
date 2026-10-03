@@ -60,7 +60,7 @@ block keys_are_delta_coded_and_line_0_is_line_1:
   # (5,3): dp 3, line 3 (absolute after a path change), count 1, run (7,1)
   doAssert content == @[0'u8, 1, 2, 5, 2, 0, 6, 1, 6, 1, 3, 3, 1, 7, 1],
     $content
-  let r = openStepMap(m).get()
+  var r = openStepMap(m).get()
   doAssert r.pathCount == 2 and r.lineCount == 3 and r.stepCount == 4
   doAssert r.lookup(2, 0).get() == @[4'i64, 9],
     "a lookup of line 0 is a lookup of line 1"
@@ -91,7 +91,7 @@ block chunks_close_after_the_record_that_reaches_64_KiB:
     let raw = inflate(m.toOpenArray(s, e - 1))
     if i + 1 < n:
       doAssert raw.len >= 65536, "chunk " & $i & " closed early at " & $raw.len
-  let r = openStepMap(m).get()
+  var r = openStepMap(m).get()
   let all = r.loadAll().get()
   doAssert all.len == expect.len
   for ln in all:
@@ -135,7 +135,7 @@ block the_writer_keys_exec_record_ids_and_line_0_as_1:
   doAssert w.registerStep(0, 4, []).isOk          # record 3
   doAssert w.close().isOk
   let m = readInternalFile(w.toBytes(), "step-map.ns").get()
-  let r = openStepMap(m).get()
+  var r = openStepMap(m).get()
   doAssert r.lookup(0, 1).get() == @[0'i64, 2], $r.lookup(0, 1).get()
   doAssert r.lookup(0, 4).get() == @[3'i64]
   echo "PASS the_writer_keys_exec_record_ids_and_line_0_as_1"

@@ -249,14 +249,14 @@ proc decodeStepEvent*(data: openArray[byte], pos: var int,
       "decode shorter and plausibly instead of failing")
   case tag
   of TagAbsoluteStep:
-    let gli = ?decodeVarint(data, pos)
+    let gli = varintOrReturn(data, pos)
     ok(StepEvent(kind: sekAbsoluteStep, globalLineIndex: gli))
   of TagDeltaStep:
-    let delta = ?decodeSignedVarint(data, pos)
+    let delta = signedVarintOrReturn(data, pos)
     ok(StepEvent(kind: sekDeltaStep, lineDelta: delta))
   of TagRaise:
-    let typeId = ?decodeVarint(data, pos)
-    let msgLen = ?decodeVarint(data, pos)
+    let typeId = varintOrReturn(data, pos)
+    let msgLen = varintOrReturn(data, pos)
     if pos + int(msgLen) > data.len:
       return err("raise message truncated")
     var msg = newSeq[byte](int(msgLen))
@@ -265,23 +265,23 @@ proc decodeStepEvent*(data: openArray[byte], pos: var int,
     pos += int(msgLen)
     ok(StepEvent(kind: sekRaise, exceptionTypeId: typeId, message: msg))
   of TagCatch:
-    let typeId = ?decodeVarint(data, pos)
+    let typeId = varintOrReturn(data, pos)
     ok(StepEvent(kind: sekCatch, catchExceptionTypeId: typeId))
   of TagThreadSwitch:
-    let tid = ?decodeVarint(data, pos)
+    let tid = varintOrReturn(data, pos)
     ok(StepEvent(kind: sekThreadSwitch, threadId: tid))
   of TagThreadStart:
-    let tid = ?decodeVarint(data, pos)
+    let tid = varintOrReturn(data, pos)
     ok(StepEvent(kind: sekThreadStart, startThreadId: tid))
   of TagThreadExit:
-    let tid = ?decodeVarint(data, pos)
+    let tid = varintOrReturn(data, pos)
     ok(StepEvent(kind: sekThreadExit, exitThreadId: tid))
   of TagDeltaColumn:
-    let delta = ?decodeSignedVarint(data, pos)
+    let delta = signedVarintOrReturn(data, pos)
     ok(StepEvent(kind: sekDeltaColumn, columnDelta: delta))
   of TagSourceReload:
-    let ordinal = ?decodeVarint(data, pos)
-    let count = ?decodeVarint(data, pos)
+    let ordinal = varintOrReturn(data, pos)
+    let count = varintOrReturn(data, pos)
     # A count is a length prefix read off the wire, so it is bounded
     # against the bytes that remain before anything is allocated: the
     # smallest possible change record is three one-byte varints.
@@ -291,12 +291,12 @@ proc decodeStepEvent*(data: openArray[byte], pos: var int,
         " bytes of the chunk can hold")
     var changed = newSeq[SourceReloadChange](int(count))
     for i in 0 ..< int(count):
-      let oldId = ?decodeVarint(data, pos)
-      let newId = ?decodeVarint(data, pos)
-      let gen = ?decodeVarint(data, pos)
+      let oldId = varintOrReturn(data, pos)
+      let newId = varintOrReturn(data, pos)
+      let gen = varintOrReturn(data, pos)
       changed[i] = SourceReloadChange(
         oldPathId: oldId, newPathId: newId, generation: gen)
-    let inFlight = ?decodeVarint(data, pos)
+    let inFlight = varintOrReturn(data, pos)
     ok(StepEvent(kind: sekSourceReload, reloadOrdinal: ordinal,
       changed: changed, inFlightFrames: inFlight))
   else:

@@ -1539,13 +1539,17 @@ proc danglingTypeId(handle: TraceWriterHandle, typeId: csize_t, what: string): b
     " type(s) are registered on this writer.")
   true
 
+const IntValueCborCapacity = 48
+  ## The most an `Int` value's CBOR takes: map(3), "kind", "Int", "i", a
+  ## nine-byte integer, "type_id" and a nine-byte id — 38 bytes.
+
 proc registerReturnIntById(handle: TraceWriterHandle, value: int64, typeId: csize_t) =
 
   if handle.useMultiStream:
     # Encode the return value as CBOR bytes using the streaming encoder
-    var sve = StreamingValueEncoder.init()
+    var sve = StreamingValueEncoder.init(IntValueCborCapacity)
     discard sve.writeInt(value, uint64(typeId))
-    let retBytes = sve.getBytes()
+    let retBytes = sve.takeBytes()
     discard flushPendingStep(handle)
     returnIfErr handle.msWriter.registerReturn(retBytes)
     return
@@ -1600,7 +1604,7 @@ proc trace_writer_register_return_raw(
   if handle.useMultiStream:
     var sve = StreamingValueEncoder.init()
     discard sve.writeRaw(toNimStr(value_repr), uint64(typeId))
-    let retBytes = sve.getBytes()
+    let retBytes = sve.takeBytes()
     discard flushPendingStep(handle)
     returnIfErr handle.msWriter.registerReturn(retBytes)
     return
@@ -1627,9 +1631,9 @@ proc registerVariableIntById(
         return
       let vnId = vnIdRes.get()
       # Encode the value as CBOR
-      var sve = StreamingValueEncoder.init()
+      var sve = StreamingValueEncoder.init(IntValueCborCapacity)
       discard sve.writeInt(value, uint64(typeId))
-      let data = sve.getBytes()
+      let data = sve.takeBytes()
       handle.pendingValues.add(VariableValue(
         varnameId: vnId, typeId: uint64(typeId), data: data))
     return
@@ -1685,7 +1689,7 @@ proc registerVariableRawById(
       # Encode the value as CBOR
       var sve = StreamingValueEncoder.init()
       discard sve.writeRaw(toNimStr(value_repr), uint64(typeId))
-      let data = sve.getBytes()
+      let data = sve.takeBytes()
       handle.pendingValues.add(VariableValue(
         varnameId: vnId, typeId: uint64(typeId), data: data))
     return
@@ -4709,12 +4713,12 @@ when ctHasFilesystem:
       setError("NULL path")
       return nil
     let p = $path
-    let res = openNewTrace(p)
+    var res = openNewTrace(p)
     if res.isErr:
       setError(res.error)
       return nil
     let h = cast[TraceReaderHandle](alloc0(sizeof(NewTraceReader)))
-    h[] = res.get()
+    h[] = move res.get()
     return cast[pointer](h)
 
   proc ct_reader_open_assume_column_aware_paths(
@@ -4738,12 +4742,12 @@ when ctHasFilesystem:
       setError("NULL path")
       return nil
     let p = $path
-    let res = openNewTrace(p, assumeColumnAwarePaths = true)
+    var res = openNewTrace(p, assumeColumnAwarePaths = true)
     if res.isErr:
       setError(res.error)
       return nil
     let h = cast[TraceReaderHandle](alloc0(sizeof(NewTraceReader)))
-    h[] = res.get()
+    h[] = move res.get()
     return cast[pointer](h)
 
   proc ct_reader_refresh(h: pointer, path: cstring): cint {.exportc, cdecl, dynlib, ffiGuard.} =

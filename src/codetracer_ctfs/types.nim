@@ -170,10 +170,7 @@ proc rootBlockCount*(c: Ctfs): uint64 =
   rootBlockCount(c.blockSize, c.maxRootEntries, c.maxShards)
 
 proc readU64LE*(data: openArray[byte], offset: int): uint64 =
-  var arr: array[8, byte]
-  for i in 0 ..< 8:
-    arr[i] = data[offset + i]
-  fromBytesLE(uint64, arr)
+  fromBytesLE(uint64, data.toOpenArray(offset, offset + 7))
 
 proc writeU64LE*(data: var openArray[byte], offset: int, val: uint64) =
   let le = toBytesLE(val)
@@ -181,10 +178,7 @@ proc writeU64LE*(data: var openArray[byte], offset: int, val: uint64) =
     data[offset + i] = le[i]
 
 proc readU32LE*(data: openArray[byte], offset: int): uint32 =
-  var arr: array[4, byte]
-  for i in 0 ..< 4:
-    arr[i] = data[offset + i]
-  fromBytesLE(uint32, arr)
+  fromBytesLE(uint32, data.toOpenArray(offset, offset + 3))
 
 proc writeU32LE*(data: var openArray[byte], offset: int, val: uint32) =
   let le = toBytesLE(val)

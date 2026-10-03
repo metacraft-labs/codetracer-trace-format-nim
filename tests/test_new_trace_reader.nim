@@ -490,6 +490,14 @@ proc bench_navigate_to_step() {.raises: [].} =
     ", \"total_us\": " & $totalUs &
     ", \"avg_us\": " & $medianUs & "}"
 
+  # The exec chunk cache holds the whole stream: each of its chunks is
+  # inflated once, however the reads jump about. A cache sized for no chunks
+  # (its index built from offsets already moved into the reader) inflated one
+  # per read here, 1,000 in all.
+  let chunks = (numSteps + DefaultExecChunkSize - 1) div DefaultExecChunkSize
+  doAssert reader.execChunkDecompressions == uint64(chunks),
+    "1,000 step reads over " & $chunks & " chunks inflated " &
+    $reader.execChunkDecompressions & " chunks"
   doAssert medianUs < 100.0, "navigate too slow: " & $medianUs & "us > 100us"
   echo "PASS: bench_navigate_to_step"
 

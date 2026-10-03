@@ -86,6 +86,7 @@ import ../codetracer_ctfs/zstd_bindings
 import ../codetracer_trace_types
 import ./cbor
 import ./varint
+import ./record_chunk
 
 const
   DefaultValuesChunkSize* = 256
@@ -204,9 +205,7 @@ type
     totalRecordsVal: uint64
     legacy: bool               ## true ⇒ legacy .off VRT layout; false ⇒ SPEC
     legacyTable: VariableRecordTableReader  ## only valid when legacy == true
-    # Cache for last decompressed SPEC chunk: the decoded per-record byte slices.
-    cachedChunkIdx: int        ## -1 means no cache
-    cachedRecords: seq[seq[byte]]
+    chunk: RecordChunk         ## the SPEC chunk the last read inflated
     lastSkippedTags*: seq[uint8]  ## tags >= 10 skipped in the most recent readStepValues / readStepAssignments
     skippedTags*: seq[uint8]      ## distinct tags >= 10 skipped across all reads
     skippedTagCounts*: seq[(uint8, int)] ## cumulative count per tag
@@ -240,16 +239,11 @@ proc topLevelTypeId*(v: ValueRecord): uint64 =
   of vrkCell, vrkValueRef: 0'u64
 
 proc decodeCborTopLevelTypeId(data: openArray[byte]): uint64 =
-  ## Decode the CBOR ``ValueRecord`` in ``data`` and return its top-level
-  ## ``type_id``.  Returns 0 on any decode failure (the data is still surfaced
-  ## verbatim; only the convenience type id is unavailable).
-  if data.len == 0:
-    return 0
-  var dec = CborDecoder.init(data)
-  let recRes = dec.decodeCborValueRecord()
-  if recRes.isErr:
-    return 0
-  topLevelTypeId(recRes.get())
+  ## The CBOR ``ValueRecord`` in ``data``'s top-level ``type_id``, read
+  ## without decoding the value (``cborTopLevelTypeId``).  0 when it has none
+  ## or does not parse (the data is still surfaced verbatim; only the
+  ## convenience type id is unavailable).
+  cborTopLevelTypeId(data)
 
 # ---------------------------------------------------------------------------
 # Per-record encode/decode (SPEC tag-0 StepValues, parallel-indexed by step)
@@ -428,25 +422,23 @@ proc decodeOneValueEvent(data: openArray[byte], pos: var int, tag: uint8,
   ## Decode the fields of one tagged value-stream event, its tag already read.
   case tag
   of TagStepValues:
-    let count = int(?decodeVarint(data, pos))
+    let count = int(varintOrReturn(data, pos))
     var values = newSeq[VariableValue](count)
     for i in 0 ..< count:
-      let vnId = ?decodeVarint(data, pos)
-      let dLen = int(?decodeVarint(data, pos))
-      if pos + dLen > data.len:
+      let vnId = varintOrReturn(data, pos)
+      let dLen = int(varintOrReturn(data, pos))
+      if dLen < 0 or pos + dLen > data.len:
         return err("truncated value data in StepValues record")
-      var d = newSeq[byte](dLen)
-      for j in 0 ..< dLen:
-        d[j] = data[pos + j]
-      pos += dLen
+      template d: untyped = data.toOpenArray(pos, pos + dLen - 1)
       values[i] = VariableValue(
         varnameId: vnId,
         typeId: decodeCborTopLevelTypeId(d),
-        data: d)
+        data: @d)
+      pos += dLen
     events.add(DecodedValueEvent(kind: veStepValues, values: values))
   of TagBindVariable, TagVariableCell:
-    let vid = ?decodeVarint(data, pos)
-    let place = ?decodeSignedVarint(data, pos)
+    let vid = varintOrReturn(data, pos)
+    let place = signedVarintOrReturn(data, pos)
     if tag == TagBindVariable:
       events.add(DecodedValueEvent(kind: veBindVariable,
         variableId: vid, variablePlace: place))
@@ -454,8 +446,8 @@ proc decodeOneValueEvent(data: openArray[byte], pos: var int, tag: uint8,
       events.add(DecodedValueEvent(kind: veVariableCell,
         variableId: vid, variablePlace: place))
   of TagCellValue, TagCompoundValue, TagAssignCell:
-    let place = ?decodeSignedVarint(data, pos)
-    let vLen = ?decodeVarint(data, pos)
+    let place = signedVarintOrReturn(data, pos)
+    let vLen = varintOrReturn(data, pos)
     if vLen > uint64(data.len - pos):
       return err("truncated CBOR value in value-stream event tag " & $tag)
     let blob = @(data.toOpenArray(pos, pos + int(vLen) - 1))
@@ -471,32 +463,30 @@ proc decodeOneValueEvent(data: openArray[byte], pos: var int, tag: uint8,
       events.add(DecodedValueEvent(kind: veAssignCell, place: place,
         valueCbor: blob))
   of TagAssignCompoundItem:
-    let place = ?decodeSignedVarint(data, pos)
-    let index = ?decodeVarint(data, pos)
-    let itemPlace = ?decodeSignedVarint(data, pos)
+    let place = signedVarintOrReturn(data, pos)
+    let index = varintOrReturn(data, pos)
+    let itemPlace = signedVarintOrReturn(data, pos)
     events.add(DecodedValueEvent(kind: veAssignCompoundItem,
       compoundPlace: place, itemIndex: index, itemPlace: itemPlace))
   of TagDropVariable:
-    let id = ?decodeVarint(data, pos)
+    let id = varintOrReturn(data, pos)
     events.add(DecodedValueEvent(kind: veDropVariable, droppedId: id))
   of TagDropVariables:
-    let count = int(?decodeVarint(data, pos))
+    let count = int(varintOrReturn(data, pos))
     var ids = newSeq[uint64](count)
     for i in 0 ..< count:
-      ids[i] = ?decodeVarint(data, pos)
+      ids[i] = varintOrReturn(data, pos)
     events.add(DecodedValueEvent(kind: veDropVariables, droppedIds: ids))
   of TagAssignment:
-    let vnId = ?decodeVarint(data, pos)
+    let vnId = varintOrReturn(data, pos)
     if pos >= data.len:
       return err("truncated pass_by in Assignment value-stream event")
     let passBy = data[pos]
     inc pos
-    let fromLen = int(?decodeVarint(data, pos))
-    if pos + fromLen > data.len:
+    let fromLen = int(varintOrReturn(data, pos))
+    if fromLen < 0 or pos + fromLen > data.len:
       return err("truncated RValue payload in Assignment value-stream event")
-    var blob = newSeq[byte](fromLen)
-    for j in 0 ..< fromLen:
-      blob[j] = data[pos + j]
+    let blob = @(data.toOpenArray(pos, pos + fromLen - 1))
     pos += fromLen
     events.add(DecodedValueEvent(kind: veAssignment,
       assignment: AssignmentEventEntry(
@@ -508,7 +498,7 @@ proc decodeOneValueEvent(data: openArray[byte], pos: var int, tag: uint8,
         "from codetracer-trace-format-nim)")
     else:
       if tag >= 10:
-        let payloadLen = int(?decodeVarint(data, pos))
+        let payloadLen = int(varintOrReturn(data, pos))
         if pos + payloadLen > data.len:
           return err("truncated payload in value-stream event tag " & $tag &
             " (expected " & $payloadLen & " bytes, only " & $(data.len - pos) & " remain)")
@@ -560,9 +550,14 @@ proc decodeRecord*(data: openArray[byte],
   ## concatenated.  A record that carries none — whether it is empty or holds
   ## only other event kinds — yields an empty sequence.
   var values: seq[VariableValue] = @[]
-  for ev in ?decodeRecordEvents(data, skippedTags):
+  var events = ?decodeRecordEvents(data, skippedTags)
+  for ev in mitems(events):
     if ev.kind == veStepValues:
-      values.add(ev.values)
+      if values.len == 0:
+        values = move ev.values
+      else:
+        for v in mitems(ev.values):
+          values.add(move v)
   ok(values)
 
 proc decodeRecord*(data: openArray[byte]): Result[seq[VariableValue], string] =
@@ -832,38 +827,6 @@ proc totalRecords*(w: ValueStreamWriter): uint64 = w.totalRecords
 # Reader
 # ---------------------------------------------------------------------------
 
-proc decompressChunkRecords(compressed: openArray[byte]):
-    Result[seq[seq[byte]], string] =
-  ## Decompress one SPEC chunk and split it into its length-prefixed records.
-  if compressed.len == 0:
-    return ok(newSeq[seq[byte]]())
-  let frameSize = ZSTD_getFrameContentSize(
-    unsafeAddr compressed[0], csize_t(compressed.len))
-  if frameSize == ZSTD_CONTENTSIZE_UNKNOWN or frameSize == ZSTD_CONTENTSIZE_ERROR:
-    return err("cannot determine decompressed size for value chunk")
-  var raw = newSeq[byte](int(frameSize))
-  if frameSize > 0:
-    let decompSize = ZSTD_decompress(
-      addr raw[0], csize_t(frameSize),
-      unsafeAddr compressed[0], csize_t(compressed.len))
-    if ZSTD_isError(decompSize) != 0:
-      return err("zstd decompress failed for value chunk: " &
-        $ZSTD_getErrorName(decompSize))
-    raw.setLen(int(decompSize))
-
-  var records: seq[seq[byte]] = @[]
-  var pos = 0
-  while pos < raw.len:
-    let recLen = int(?decodeVarint(raw, pos))
-    if pos + recLen > raw.len:
-      return err("value record length extends past chunk")
-    var rec = newSeq[byte](recLen)
-    for j in 0 ..< recLen:
-      rec[j] = raw[pos + j]
-    pos += recLen
-    records.add(rec)
-  ok(records)
-
 proc initValueStreamReader*(ctfsBytes: openArray[byte],
     blockSize: uint32 = DefaultBlockSize,
     maxEntries: uint32 = DefaultMaxRootEntries,
@@ -889,17 +852,17 @@ proc initValueStreamReader*(ctfsBytes: openArray[byte],
     return ok(ValueStreamReader(
       legacy: true,
       legacyTable: tableRes.get(),
-      cachedChunkIdx: -1))
+      chunk: initRecordChunk()))
 
-  let datRes = readInternalFile(ctfsBytes, "values.dat", blockSize, maxEntries)
+  var datRes = readInternalFile(ctfsBytes, "values.dat", blockSize, maxEntries)
   if datRes.isErr:
     return err("failed to read values.dat: " & datRes.error)
-  let datData = datRes.get()
+  var datData = move datRes.get()
 
   let idxRes = readInternalFile(ctfsBytes, "values.idx", blockSize, maxEntries)
   if idxRes.isErr:
     return err("failed to read values.idx: " & idxRes.error)
-  let idxData = idxRes.get()
+  template idxData: untyped = idxRes.get()
 
   if idxData.len < 4:
     return err("values.idx too small for chunk_size header")
@@ -923,25 +886,26 @@ proc initValueStreamReader*(ctfsBytes: openArray[byte],
 
   # Recover total record count: all chunks but the last hold exactly chunk_size
   # records; the last holds whatever decodes out of it (Rust parity).
+  # The last chunk, inflated to count its records, stays held for the reads
+  # that follow.
   var totalRecords: uint64 = 0
+  var chunk = initRecordChunk()
   if numChunks > 0:
     let lastChunk = numChunks - 1
     let startOff = int(offsets[lastChunk])
     let endOff = datData.len
     if startOff > endOff:
       return err("last value chunk offset past end of values.dat")
-    let lastRecs = ?decompressChunkRecords(
-      datData.toOpenArray(startOff, endOff - 1))
-    totalRecords = uint64(lastChunk) * uint64(chunkSize) + uint64(lastRecs.len)
+    ? chunk.load(lastChunk, datData.toOpenArray(startOff, endOff - 1), "value")
+    totalRecords = uint64(lastChunk) * uint64(chunkSize) + uint64(chunk.len)
 
   ok(ValueStreamReader(
     legacy: false,
-    data: datData,
+    data: move datData,
     chunkSize: chunkSize,
-    offsets: offsets,
+    offsets: move offsets,
     totalRecordsVal: totalRecords,
-    cachedChunkIdx: -1,
-    cachedRecords: @[]))
+    chunk: move chunk))
 
 proc count*(r: ValueStreamReader): uint64 =
   if r.legacy:
@@ -973,7 +937,7 @@ proc readLegacyRecord(data: openArray[byte]): Result[seq[VariableValue], string]
 
 proc cacheRecordFor(r: var ValueStreamReader,
     stepIndex: uint64): Result[int, string] =
-  ## Decompress whichever chunk holds ``stepIndex`` into ``r.cachedRecords``
+  ## Inflate whichever chunk holds ``stepIndex`` into ``r.chunk``
   ## (reusing the cache when it already holds that chunk) and return the
   ## record's index WITHIN the chunk.
   ##
@@ -986,19 +950,17 @@ proc cacheRecordFor(r: var ValueStreamReader,
   let chunkNumber = int(stepIndex div uint64(r.chunkSize))
   let within = int(stepIndex mod uint64(r.chunkSize))
 
-  if r.cachedChunkIdx != chunkNumber:
+  if r.chunk.held != chunkNumber:
     let startOff = int(r.offsets[chunkNumber])
     let endOff =
       if chunkNumber + 1 < r.offsets.len: int(r.offsets[chunkNumber + 1])
       else: r.data.len
     if startOff > endOff or endOff > r.data.len:
       return err("value chunk offsets out of range")
-    let recs = ?decompressChunkRecords(
-      r.data.toOpenArray(startOff, endOff - 1))
-    r.cachedRecords = recs
-    r.cachedChunkIdx = chunkNumber
+    ? r.chunk.load(chunkNumber, r.data.toOpenArray(startOff, endOff - 1),
+      "value")
 
-  if within >= r.cachedRecords.len:
+  if within >= r.chunk.len:
     return err("value record " & $within & " missing in chunk " & $chunkNumber)
   ok(within)
 
@@ -1034,7 +996,7 @@ proc readStepValues*(r: var ValueStreamReader,
 
   let within = ?r.cacheRecordFor(stepIndex)
   var skipped: seq[uint8] = @[]
-  let res = decodeRecord(r.cachedRecords[within], skipped)
+  let res = decodeRecord(r.chunk.record(within), skipped)
   r.noteSkippedTags(skipped)
   res
 
@@ -1050,7 +1012,7 @@ proc readStepDropVariable*(r: var ValueStreamReader,
 
   let within = ?r.cacheRecordFor(stepIndex)
   var skipped: seq[uint8] = @[]
-  let res = decodeRecordDropVariable(r.cachedRecords[within], skipped)
+  let res = decodeRecordDropVariable(r.chunk.record(within), skipped)
   r.noteSkippedTags(skipped)
   res
 
@@ -1066,7 +1028,7 @@ proc readStepDropVariables*(r: var ValueStreamReader,
 
   let within = ?r.cacheRecordFor(stepIndex)
   var skipped: seq[uint8] = @[]
-  let res = decodeRecordDropVariables(r.cachedRecords[within], skipped)
+  let res = decodeRecordDropVariables(r.chunk.record(within), skipped)
   r.noteSkippedTags(skipped)
   res
 
@@ -1081,7 +1043,7 @@ proc readStepAssignments*(r: var ValueStreamReader,
 
   let within = ?r.cacheRecordFor(stepIndex)
   var skipped: seq[uint8] = @[]
-  let res = decodeRecordAssignments(r.cachedRecords[within], skipped)
+  let res = decodeRecordAssignments(r.chunk.record(within), skipped)
   r.noteSkippedTags(skipped)
   res
 
@@ -1096,7 +1058,7 @@ proc readStepEvents*(r: var ValueStreamReader,
     return ok(@[DecodedValueEvent(kind: veStepValues, values: vals)])
   let within = ?r.cacheRecordFor(stepIndex)
   var skipped: seq[uint8] = @[]
-  let res = decodeRecordEvents(r.cachedRecords[within], skipped)
+  let res = decodeRecordEvents(r.chunk.record(within), skipped)
   r.noteSkippedTags(skipped)
   if res.isErr:
     return err("values.dat record " & $stepIndex & ": " & res.error)

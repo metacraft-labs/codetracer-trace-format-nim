@@ -2669,7 +2669,9 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   # the line-count table such a path has no recorded size and is refused there,
   # by name: laying it out at an assumed size is what the table exists to stop.
   var funcPathIds = newSeq[uint64](w.pendingFuncs.len)
-  for i, pf in w.pendingFuncs:
+  # Indexed rather than `pairs`, which copies each element's two strings.
+  for i in 0 ..< w.pendingFuncs.len:
+    template pf: untyped = w.pendingFuncs[i]
     if pf.path.len > 0:
       let idRes = w.registerPath(pf.path)
       if idRes.isErr:
@@ -2686,7 +2688,8 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
       lineCounts.add(DefaultLinesPerFile)
   var lineSpace = buildGlobalLineIndex(lineCounts)
 
-  for i, pf in w.pendingFuncs:
+  for i in 0 ..< w.pendingFuncs.len:
+    template pf: untyped = w.pendingFuncs[i]
     let pathId = funcPathIds[i]
     # A LINE ADDRESS, NOT THE COLUMN-AWARE POSITION ADDRESS, and the difference
     # is not academic: `toGlobalLineIndex` returns a byte offset in a

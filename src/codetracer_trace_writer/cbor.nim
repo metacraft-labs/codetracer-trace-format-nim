@@ -858,6 +858,96 @@ proc decodeCborValueRecord*(dec: var CborDecoder): Result[ValueRecord, string] =
       return err("cbor: unknown CBOR tag in ValueRecord: " & $tag)
   decodeCborValueRecordImpl(dec)
 
+# ---- A ValueRecord's top-level type id, without decoding the value ----
+
+proc cborHead(d: openArray[byte], pos: var int, major: var byte,
+    arg: var uint64): bool {.inline.} =
+  ## Read one item's head: its major type and argument. False when the head
+  ## is truncated or uses an encoding `readTypeAndValue` refuses (indefinite
+  ## lengths, reserved additional information).
+  if pos >= d.len:
+    return false
+  let initial = d[pos]
+  inc pos
+  major = initial shr 5
+  let info = initial and 0x1F
+  if info <= 23:
+    arg = uint64(info)
+  elif info <= 27:
+    let n = 1 shl int(info - 24)
+    if d.len - pos < n:
+      return false
+    arg = 0
+    for i in 0 ..< n:
+      arg = (arg shl 8) or uint64(d[pos + i])
+    pos += n
+  else:
+    return false
+  true
+
+proc cborSkip(d: openArray[byte], pos: var int, depth = 0): bool =
+  ## Step over one complete item. False when it does not parse.
+  if depth > 256:
+    return false
+  var major: byte
+  var arg: uint64
+  if not cborHead(d, pos, major, arg):
+    return false
+  case major
+  of 0, 1, 7:
+    true  # the head is the whole item (a float's bits are its argument)
+  of 2, 3:
+    if arg > uint64(d.len - pos):
+      return false
+    pos += int(arg)
+    true
+  of 4, 5:
+    # Every item takes at least one byte, which bounds the count.
+    let items = if major == 4: arg else: arg * 2
+    if arg > uint64(d.len - pos) or items > uint64(d.len - pos):
+      return false
+    for _ in 0'u64 ..< items:
+      if not cborSkip(d, pos, depth + 1):
+        return false
+    true
+  of 6:
+    cborSkip(d, pos, depth + 1)
+  else:
+    false
+
+proc cborTopLevelTypeId*(data: openArray[byte]): uint64 =
+  ## The `type_id` entry of a CBOR `ValueRecord`'s top-level map: the id
+  ## `decodeCborValueRecord` puts in the kind's own type-id field, read
+  ## without decoding the value. The map's other entries are stepped over,
+  ## not built. 0 when the record has no top-level `type_id` (`Cell`, a
+  ## tagged `ValueRef`) or does not parse as far as it.
+  const typeIdKey = "type_id"
+  var pos = 0
+  var major: byte
+  var arg: uint64
+  if not cborHead(data, pos, major, arg) or major != 5:
+    return 0
+  let entries = arg
+  for _ in 0'u64 ..< entries:
+    if not cborHead(data, pos, major, arg) or major != 3 or
+        arg > uint64(data.len - pos):
+      return 0
+    let keyStart = pos
+    pos += int(arg)
+    var isTypeId = arg == uint64(typeIdKey.len)
+    if isTypeId:
+      for i in 0 ..< typeIdKey.len:
+        if data[keyStart + i] != byte(typeIdKey[i]):
+          isTypeId = false
+          break
+    if isTypeId:
+      if not cborHead(data, pos, major, arg) or major != 0:
+        return 0
+      return arg
+    if not cborSkip(data, pos):
+      return 0
+  0
+
 # ---- TypeRecord ----
 # Rust: TypeRecord { kind: TypeKind, lang_type: String, specific_info: TypeSpecificInfo }
 # TypeSpecificInfo is #[serde(tag = "kind")] enum

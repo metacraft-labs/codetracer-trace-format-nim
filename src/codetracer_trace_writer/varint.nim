@@ -35,9 +35,29 @@ proc encodeVarintTo*(val: uint64, output: var openArray[byte], pos: var int) {.r
     if v == 0:
       break
 
-proc decodeVarint*(data: openArray[byte], pos: var int): Result[uint64, string] {.raises: [].} =
-  ## Decode a LEB128 unsigned varint from data starting at pos.
-  ## Advances pos past the consumed bytes.
+proc readVarint*(data: openArray[byte], pos: var int,
+    value: var uint64): bool {.inline, raises: [].} =
+  ## `decodeVarint` for a hot loop: no `Result` to build. True with `value`
+  ## set and `pos` advanced; false, with `pos` unchanged, where
+  ## `decodeVarint` refuses (a truncated varint or one over ten bytes).
+  var v = 0'u64
+  var shift = 0
+  var p = pos
+  while p < data.len:
+    let b = data[p]
+    inc p
+    v = v or (uint64(b and 0x7F) shl shift)
+    if (b and 0x80) == 0:
+      value = v
+      pos = p
+      return true
+    shift += 7
+    if shift >= 64:
+      return false
+  false
+
+proc decodeVarintMultiByte(data: openArray[byte],
+    pos: var int): Result[uint64, string] {.raises: [].} =
   var result_val: uint64 = 0
   var shift: int = 0
   while true:
@@ -52,6 +72,19 @@ proc decodeVarint*(data: openArray[byte], pos: var int): Result[uint64, string] 
     if shift >= 64:
       return err("varint: too many bytes (>10)")
 
+proc decodeVarint*(data: openArray[byte],
+    pos: var int): Result[uint64, string] {.inline, raises: [].} =
+  ## Decode a LEB128 unsigned varint from data starting at pos.
+  ## Advances pos past the consumed bytes.
+  ##
+  ## Inline for the one-byte case, values below 128, which is most of the
+  ## lengths, ids and deltas a reader decodes.
+  if pos >= 0 and pos < data.len and data[pos] < 0x80'u8:
+    result = ok(uint64(data[pos]))
+    inc pos
+  else:
+    result = decodeVarintMultiByte(data, pos)
+
 proc encodeSignedVarint*(val: int64, output: var seq[byte]) {.raises: [].} =
   ## Encode a signed 64-bit integer using zigzag encoding + LEB128.
   let zigzag = if val >= 0: uint64(val) shl 1
@@ -65,3 +98,18 @@ proc decodeSignedVarint*(data: openArray[byte], pos: var int): Result[int64, str
     ok(int64(v shr 1))
   else:
     ok(not int64(v shr 1))
+
+template varintOrReturn*(data: openArray[byte], pos: var int): uint64 =
+  ## `?decodeVarint(data, pos)` for a hot decoder: the same value, or the same
+  ## `err` returned from the enclosing proc, without a `Result` built for
+  ## every varint that decodes.
+  var v {.gensym.}: uint64
+  if not readVarint(data, pos, v):
+    return err(decodeVarint(data, pos).error)
+  v
+
+template signedVarintOrReturn*(data: openArray[byte], pos: var int): int64 =
+  ## `?decodeSignedVarint(data, pos)`, as `varintOrReturn`.
+  let z {.gensym.} = varintOrReturn(data, pos)
+  if (z and 1) == 0: int64(z shr 1) else: not int64(z shr 1)
+

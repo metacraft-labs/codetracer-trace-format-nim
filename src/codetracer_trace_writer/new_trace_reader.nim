@@ -99,7 +99,8 @@ type
     # GDH-M1 / design §7.0 — the VERSION ORDINAL of every path entry,
     # 0-based and in path-id order: 0 for the first entry carrying a
     # given interning payload, 1 for the second, and so on.  Parallel to
-    # the paths.dat records, one entry per id, computed once at open.
+    # the paths.dat records, one entry per id, computed on the first
+    # version query (`ensurePathVersions`); empty until then.
     #
     # `paths.dat` needs no new layout for this: a second version of a
     # file is a second record with the SAME payload and its own line
@@ -120,6 +121,9 @@ type
     # id in a trace with no versioned paths.  Parallel to
     # `pathVersionOrdinals`.
     pathVersionTotals: seq[uint64]
+    pathVersionsBuilt: bool
+    pathVersionsError: string
+      ## Why the ordinals could not be computed, when they could not.
     # Advisory: the trace declares line-only paths.dat records, yet every
     # record also decodes as a complete Layout A record.  Surfaced by
     # `columnAwarePathsSuspected`; never used to reinterpret data.
@@ -460,8 +464,8 @@ proc parseLineCountPathRecords(pathReader: InterningTableReader):
       return err("paths.dat[" & $i & "]: payload truncated (payload_len " &
         $payloadLen & ", " & $(raw.len - pos) & " byte(s) left)")
     var s = newString(payloadLen)
-    for k in 0 ..< payloadLen:
-      s[k] = char(raw[pos + k])
+    if payloadLen > 0:
+      copyMem(addr s[0], unsafeAddr raw[pos], payloadLen)
     pos += payloadLen
     let countRes = decodeVarint(raw, pos)
     if countRes.isErr:
@@ -487,8 +491,8 @@ proc path*(r: NewTraceReader, id: uint64): Result[string, string] {.gcsafe.}
   ## `{.gcsafe.}` is declared here rather than inferred because Nim infers
   ## GC-safety from a proc's BODY, and a forward declaration has none at the
   ## point its callers are analysed: everything that reaches `path` through
-  ## this declaration — `computePathVersionOrdinals`, and therefore
-  ## `openNewTraceFromBytes` and `openNewTrace` — was silently inferred
+  ## this declaration — `computePathVersionOrdinals`, and therefore the
+  ## version accessors that call it — was silently inferred
   ## GC-UNSAFE, which made the whole reader unusable from a `{.gcsafe.}` proc
   ## type. `path` touches no globals (only the `NewTraceReader` it is given),
   ## so the annotation states a fact rather than waiving a check: the compiler
@@ -500,38 +504,39 @@ proc computePathVersionOrdinals(r: var NewTraceReader): Result[void, string] =
   ## ordinal, in path-id order, and count how many entries share each
   ## payload.
   ##
-  ## Linear in the number of paths and run once at open, so
-  ## ``pathVersionOrdinal`` is O(1). It is computed EAGERLY rather than
-  ## lazily because a lazy answer would have to be recomputed after a
-  ## ``refresh``, and a stale ordinal is the kind of wrong answer that
-  ## reads as a legitimate one.
-  let total = r.pathReader.count()
-  r.pathVersionOrdinals = newSeq[uint64](int(total))
-  r.pathVersionTotals = newSeq[uint64](int(total))
-  var seen = initTable[string, seq[uint64]]()
-  for id in 0'u64 ..< total:
-    let payloadRes = r.path(id)
+  ## Linear in the number of paths. It runs on the first version query
+  ## rather than at open, because it reads and hashes every path string,
+  ## which an open that only wants a step's location does not need. It
+  ## cannot go stale: ``refresh`` replaces the whole reader, and with it
+  ## the not-yet-built state.
+  let total = int(r.pathReader.count())
+  r.pathVersionOrdinals = newSeq[uint64](total)
+  r.pathVersionTotals = newSeq[uint64](total)
+  # One count per distinct payload; each id's ordinal is the count before it.
+  var payloads = newSeq[string](total)
+  var seen = initTable[string, uint64](total)
+  for id in 0 ..< total:
+    var payloadRes = r.path(uint64(id))
     if payloadRes.isErr:
       return err("paths.dat[" & $id & "]: " & payloadRes.error)
-    let payload = payloadRes.get()
-    var ids = seen.getOrDefault(payload, @[])
-    r.pathVersionOrdinals[int(id)] = uint64(ids.len)
-    ids.add(id)
-    seen[payload] = ids
-  for _, ids in seen:
-    for id in ids:
-      r.pathVersionTotals[int(id)] = uint64(ids.len)
+    payloads[id] = move payloadRes.get()
+    let n = addr seen.mgetOrPut(payloads[id], 0'u64)
+    r.pathVersionOrdinals[id] = n[]
+    inc n[]
+  for id in 0 ..< total:
+    r.pathVersionTotals[id] = seen.getOrDefault(payloads[id])
   ok()
 
 # ---------------------------------------------------------------------------
 # Opening
 # ---------------------------------------------------------------------------
 
-proc openNewTraceFromBytes*(data: seq[byte],
+proc openNewTraceFromBytes*(data: sink seq[byte],
     blockSize: uint32 = DefaultBlockSize,
     maxEntries: uint32 = DefaultMaxRootEntries,
     assumeColumnAwarePaths: bool = false): Result[NewTraceReader, string] =
-  ## Open a trace from in-memory bytes. Used for testing.
+  ## Open a trace from in-memory bytes. The reader keeps ``data``: pass the
+  ## buffer by its last use (or ``move`` it) and it is taken without a copy.
   ##
   ## ``assumeColumnAwarePaths`` overrides the ``meta.dat`` bit 4
   ## declaration for the ``paths.dat`` record layout only.  Pass it when
@@ -562,7 +567,7 @@ proc openNewTraceFromBytes*(data: seq[byte],
   # It used to be the case that such a container was read through the
   # legacy `paths.json` sidecar; that sidecar is retired, so a container
   # without meta.dat is now read entirely from the binary tables.
-  let metaDataRes = readInternalFile(data, "meta.dat", blockSize, maxEntries)
+  let metaDataRes = readInternalFile(reader.data, "meta.dat", blockSize, maxEntries)
   if metaDataRes.isOk:
     let metaRes = readMetaDat(metaDataRes.get())
     if metaRes.isErr:
@@ -573,12 +578,12 @@ proc openNewTraceFromBytes*(data: seq[byte],
   # is absent is empty; a table that is present but does not read is refused,
   # not answered as empty (`ctfs-container.md` §4, "A null is not an absence").
   template loadTable(name: string, dest: untyped) =
-    if hasInternalFile(data, name & ".dat", maxEntries) or
-        hasInternalFile(data, name & ".off", maxEntries):
-      let tr = initInterningTableReader(data, name, blockSize, maxEntries)
+    if hasInternalFile(reader.data, name & ".dat", maxEntries) or
+        hasInternalFile(reader.data, name & ".off", maxEntries):
+      var tr = initInterningTableReader(reader.data, name, blockSize, maxEntries)
       if tr.isErr:
         return err(name & ".dat: " & tr.error)
-      dest = tr.get()
+      dest = move tr.get()
   loadTable("paths", reader.pathReader)
   loadTable("funcs", reader.funcReader)
   loadTable("types", reader.typeReader)
@@ -648,13 +653,13 @@ proc openNewTraceFromBytes*(data: seq[byte],
   # registered, so the bit cannot say (`internal-files.md` §"Stream-presence
   # flags are a hint, not a gate").  Every record is decoded eagerly so the
   # per-view accessors below run in O(1).
-  if hasInternalFile(data, "srcviews.dat", maxEntries):
+  if hasInternalFile(reader.data, "srcviews.dat", maxEntries):
     # See the writer's note on the abbreviated 12-char base name:
     # ``source_views.dat`` (spec name, 16 chars) collides with
     # ``source_views.off`` in the base40 filename encoding, so the
     # on-disk files are ``srcviews.dat`` / ``srcviews.off``.
     let svRes = initVariableRecordTableReader(
-      data, "srcviews", blockSize, maxEntries)
+      reader.data, "srcviews", blockSize, maxEntries)
     if svRes.isErr:
       return err("source_views.dat: " & svRes.error)
     let svReader = svRes.get()
@@ -720,13 +725,6 @@ proc openNewTraceFromBytes*(data: seq[byte],
       if pathId < pathCount:
         reader.sourceViewsByPath[int(pathId)].add(i)
 
-  # GDH-M1 — the version ordinals, computed after every layout decision
-  # above has been made, so the payload each ordinal is keyed on is the
-  # one `path()` answers with.
-  let ordRes = reader.computePathVersionOrdinals()
-  if ordRes.isErr:
-    return err(ordRes.error)
-
   reader.gliChunk = -1
   reader.posSpace = buildGlobalLineIndex(positionSpaceCounts(
     reader.lineLengths, reader.lineCounts, int(reader.pathReader.count()),
@@ -766,11 +764,11 @@ when ctHasFilesystem:
     ## lazily-opened stream reader whose chunk table may have grown.
     ## Re-opens under the same ``assumeColumnAwarePaths`` reading this
     ## handle was created with.
-    let reopened = openNewTrace(path,
+    var reopened = openNewTrace(path,
       assumeColumnAwarePaths = r.assumedColumnAwarePaths)
     if reopened.isErr:
       return err(reopened.error)
-    r = reopened.get()
+    r = move reopened.get()
     ok()
 
 # ---------------------------------------------------------------------------
@@ -897,7 +895,21 @@ proc pathCount*(r: NewTraceReader): uint64 =
 # Versioned paths (GDH-M1 — design §6.1 / §7.0)
 # ---------------------------------------------------------------------------
 
-proc pathVersionOrdinal*(r: NewTraceReader,
+proc ensurePathVersions(r: var NewTraceReader): Result[void, string] =
+  ## Compute the version ordinals once. The layout decisions they key on
+  ## (`path()`'s answer) were all made at open.
+  if not r.pathVersionsBuilt:
+    let res = r.computePathVersionOrdinals()
+    r.pathVersionsBuilt = true
+    if res.isErr:
+      r.pathVersionOrdinals.setLen(0)
+      r.pathVersionTotals.setLen(0)
+      r.pathVersionsError = res.error
+  if r.pathVersionsError.len > 0:
+    return err(r.pathVersionsError)
+  ok()
+
+proc pathVersionOrdinal*(r: var NewTraceReader,
     id: uint64): Result[uint64, string] =
   ## The 0-based VERSION ORDINAL of path ``id``: 0 for the first entry in
   ## ``paths.dat`` carrying this entry's string, 1 for the second, and so
@@ -913,15 +925,17 @@ proc pathVersionOrdinal*(r: NewTraceReader,
   ## generation the observer sent starts at 1 rather than 0. The two are
   ## off by one by construction and the reload marker records the mapping
   ## rather than leaving it to be inferred.
+  ? r.ensurePathVersions()
   if id >= uint64(r.pathVersionOrdinals.len):
     return err("pathVersionOrdinal: path id " & $id & " is out of range (" &
       $r.pathVersionOrdinals.len & " path(s) in paths.dat)")
   ok(r.pathVersionOrdinals[int(id)])
 
-proc pathVersionCount*(r: NewTraceReader,
+proc pathVersionCount*(r: var NewTraceReader,
     id: uint64): Result[uint64, string] =
   ## How many ``paths.dat`` entries — including ``id`` itself — carry
   ## ``id``'s string. ``1`` for an unversioned path.
+  ? r.ensurePathVersions()
   if id >= uint64(r.pathVersionTotals.len):
     return err("pathVersionCount: path id " & $id & " is out of range (" &
       $r.pathVersionTotals.len & " path(s) in paths.dat)")
@@ -1241,7 +1255,7 @@ proc ensureExecReader(r: var NewTraceReader): Result[void, string] =
     # ``StepStreamReader`` reads byte-for-byte.  Pre-M24a-1 Nim-v4 bundles
     # never set the flag and use the legacy framing (per-chunk u32 count +
     # total_events trailer); ``legacy = not hasStepStream`` keeps them readable.
-    let res = initExecStreamReader(r.data, int(r.blockSize), int(r.maxEntries),
+    var res = initExecStreamReader(r.data, int(r.blockSize), int(r.maxEntries),
       legacy = not r.meta.hasStepStream,
       # GDH-M2: tag 0x08 is decodable only where the container declares
       # it.  A container that carries the tag with the flag clear is
@@ -1250,7 +1264,7 @@ proc ensureExecReader(r: var NewTraceReader): Result[void, string] =
       # strictly worse than refusing.
       allowSourceReload = r.meta.hasSourceReload)
     if res.isErr: return err(res.error)
-    r.execReader = res.get()
+    r.execReader = move res.get()
     r.execLoaded = true
   ok()
 
@@ -1279,12 +1293,10 @@ proc stepAbsoluteGlobalLineIndex*(r: var NewTraceReader,
   # absolute position: a caller that resolves steps one call at a time
   # (ct-print, the C ABI's `ct_reader_step_location`) asks for the next step
   # of the same chunk next.
-  var chunkBuf: seq[StepEvent]
-  discard ?r.execReader.readChunkEvents(chunkIdx, chunkBuf)
-  if eventInChunk >= chunkBuf.len:
-    return err("step " & $n & " is past the end of its exec chunk")
   r.gliChunk = -1
-  ? resolveChunkPositions(chunkBuf, chunkIdx, r.gliCache)
+  ? r.execReader.chunkPositions(chunkIdx, r.gliCache)
+  if eventInChunk >= r.gliCache.len:
+    return err("step " & $n & " is past the end of its exec chunk")
   r.gliChunk = chunkIdx
   ok(r.gliCache[eventInChunk])
 
@@ -1485,10 +1497,10 @@ proc ensureValueReader(r: var NewTraceReader): Result[void, string] =
     # layout that the Rust ``ValueStreamReader`` reads byte-for-byte.  Pre-M24a-2
     # Nim-v4 bundles never set the flag and use the legacy ``.off`` VRT framing;
     # ``legacy = not hasValueStream`` keeps them readable.
-    let res = initValueStreamReader(r.data, r.blockSize, r.maxEntries,
+    var res = initValueStreamReader(r.data, r.blockSize, r.maxEntries,
       legacy = not r.meta.hasValueStream)
     if res.isErr: return err(res.error)
-    r.valueReader = res.get()
+    r.valueReader = move res.get()
     r.valueLoaded = true
   ok()
 
@@ -1548,9 +1560,9 @@ proc skippedValueTagCounts*(r: NewTraceReader): seq[(uint8, int)] =
 
 proc ensureCallReader(r: var NewTraceReader): Result[void, string] =
   if not r.callLoaded:
-    let res = initCallStreamReader(r.data, r.blockSize, r.maxEntries)
+    var res = initCallStreamReader(r.data, r.blockSize, r.maxEntries)
     if res.isErr: return err(res.error)
-    r.callReader = res.get()
+    r.callReader = move res.get()
     r.callLoaded = true
   ok()
 
@@ -1669,10 +1681,10 @@ proc ensureIOEventReader(r: var NewTraceReader): Result[void, string] =
     # layout that the Rust ``IoEventStreamReader`` reads byte-for-byte.
     # Pre-M24a-3 Nim-v4 bundles never set the flag and use the legacy ``.off``
     # VRT framing; ``legacy = not hasIoEventStream`` keeps them readable.
-    let res = initIOEventStreamReader(r.data, r.blockSize, r.maxEntries,
+    var res = initIOEventStreamReader(r.data, r.blockSize, r.maxEntries,
       legacy = not r.meta.hasIoEventStream)
     if res.isErr: return err(res.error)
-    r.ioEventReader = res.get()
+    r.ioEventReader = move res.get()
     r.ioEventLoaded = true
   ok()
 

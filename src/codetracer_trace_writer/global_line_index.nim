@@ -239,10 +239,8 @@ proc buildGlobalLineIndex*(lineCounts: openArray[uint64]): GlobalLineIndex =
   prefix[0] = 0
   for i in 0 ..< lineCounts.len:
     prefix[i + 1] = prefix[i] + lineCounts[i]
-  GlobalLineIndex(
-    prefixSum: prefix,
-    totalLines: prefix[^1]
-  )
+  let total = prefix[^1]
+  GlobalLineIndex(prefixSum: move prefix, totalLines: total)
 
 proc appendFile*(gli: var GlobalLineIndex, count: uint64) =
   ## Extend the space by one file of `count` addresses, placed after every

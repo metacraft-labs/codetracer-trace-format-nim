@@ -71,6 +71,7 @@ import ../codetracer_ctfs/streaming
 import ../codetracer_ctfs/variable_record_table
 import ../codetracer_ctfs/zstd_bindings
 import ./varint
+import ./record_chunk
 import ../codetracer_trace_types
 
 export codetracer_trace_types.EventLogKind
@@ -109,9 +110,7 @@ type
     totalRecordsVal: uint64
     legacy: bool               ## true ⇒ legacy .off VRT layout; false ⇒ SPEC
     legacyTable: VariableRecordTableReader  ## only valid when legacy == true
-    # Cache for last decompressed SPEC chunk: the decoded per-record byte slices.
-    cachedChunkIdx: int        ## -1 means no cache
-    cachedRecords: seq[seq[byte]]
+    chunk: RecordChunk         ## the SPEC chunk the last read inflated
 
 proc eventLogKindName*(k: EventLogKind): string =
   ## The kind's name as `trace-events.md` §"EventLogKind (u8 enum)" spells it.
@@ -336,38 +335,6 @@ proc count*(w: IOEventStreamWriter): uint64 = w.totalRecords
 # Reader
 # ---------------------------------------------------------------------------
 
-proc decompressChunkRecords(compressed: openArray[byte]):
-    Result[seq[seq[byte]], string] =
-  ## Decompress one SPEC chunk and split it into its length-prefixed records.
-  if compressed.len == 0:
-    return ok(newSeq[seq[byte]]())
-  let frameSize = ZSTD_getFrameContentSize(
-    unsafeAddr compressed[0], csize_t(compressed.len))
-  if frameSize == ZSTD_CONTENTSIZE_UNKNOWN or frameSize == ZSTD_CONTENTSIZE_ERROR:
-    return err("cannot determine decompressed size for io event chunk")
-  var raw = newSeq[byte](int(frameSize))
-  if frameSize > 0:
-    let decompSize = ZSTD_decompress(
-      addr raw[0], csize_t(frameSize),
-      unsafeAddr compressed[0], csize_t(compressed.len))
-    if ZSTD_isError(decompSize) != 0:
-      return err("zstd decompress failed for io event chunk: " &
-        $ZSTD_getErrorName(decompSize))
-    raw.setLen(int(decompSize))
-
-  var records: seq[seq[byte]] = @[]
-  var pos = 0
-  while pos < raw.len:
-    let recLen = int(?decodeVarint(raw, pos))
-    if pos + recLen > raw.len:
-      return err("io event record length extends past chunk")
-    var rec = newSeq[byte](recLen)
-    for j in 0 ..< recLen:
-      rec[j] = raw[pos + j]
-    pos += recLen
-    records.add(rec)
-  ok(records)
-
 proc initIOEventStreamReader*(ctfsBytes: openArray[byte],
     blockSize: uint32 = DefaultBlockSize,
     maxEntries: uint32 = DefaultMaxRootEntries,
@@ -393,12 +360,12 @@ proc initIOEventStreamReader*(ctfsBytes: openArray[byte],
     return ok(IOEventStreamReader(
       legacy: true,
       legacyTable: tableRes.get(),
-      cachedChunkIdx: -1))
+      chunk: initRecordChunk()))
 
-  let datRes = readInternalFile(ctfsBytes, "events.dat", blockSize, maxEntries)
+  var datRes = readInternalFile(ctfsBytes, "events.dat", blockSize, maxEntries)
   if datRes.isErr:
     return err("failed to read events.dat: " & datRes.error)
-  let datData = datRes.get()
+  var datData = move datRes.get()
 
   let idxRes = readInternalFile(ctfsBytes, "events.idx", blockSize, maxEntries)
   if idxRes.isErr:
@@ -428,24 +395,24 @@ proc initIOEventStreamReader*(ctfsBytes: openArray[byte],
   # Recover total record count: all chunks but the last hold exactly chunk_size
   # records; the last holds whatever decodes out of it (Rust parity).
   var totalRecords: uint64 = 0
+  var chunk = initRecordChunk()
   if numChunks > 0:
     let lastChunk = numChunks - 1
     let startOff = int(offsets[lastChunk])
     let endOff = datData.len
     if startOff > endOff:
       return err("last io event chunk offset past end of events.dat")
-    let lastRecs = ?decompressChunkRecords(
-      datData.toOpenArray(startOff, endOff - 1))
-    totalRecords = uint64(lastChunk) * uint64(chunkSize) + uint64(lastRecs.len)
+    ? chunk.load(lastChunk, datData.toOpenArray(startOff, endOff - 1),
+      "io event")
+    totalRecords = uint64(lastChunk) * uint64(chunkSize) + uint64(chunk.len)
 
   ok(IOEventStreamReader(
     legacy: false,
-    data: datData,
+    data: move datData,
     chunkSize: chunkSize,
-    offsets: offsets,
+    offsets: move offsets,
     totalRecordsVal: totalRecords,
-    cachedChunkIdx: -1,
-    cachedRecords: @[]))
+    chunk: move chunk))
 
 proc count*(r: IOEventStreamReader): uint64 =
   if r.legacy:
@@ -468,22 +435,20 @@ proc readEvent*(r: var IOEventStreamReader,
   let chunkNumber = int(index div uint64(r.chunkSize))
   let within = int(index mod uint64(r.chunkSize))
 
-  if r.cachedChunkIdx != chunkNumber:
+  if r.chunk.held != chunkNumber:
     let startOff = int(r.offsets[chunkNumber])
     let endOff =
       if chunkNumber + 1 < r.offsets.len: int(r.offsets[chunkNumber + 1])
       else: r.data.len
     if startOff > endOff or endOff > r.data.len:
       return err("io event chunk offsets out of range")
-    let recs = ?decompressChunkRecords(
-      r.data.toOpenArray(startOff, endOff - 1))
-    r.cachedRecords = recs
-    r.cachedChunkIdx = chunkNumber
+    ? r.chunk.load(chunkNumber, r.data.toOpenArray(startOff, endOff - 1),
+      "io event")
 
-  if within >= r.cachedRecords.len:
+  if within >= r.chunk.len:
     return err("io event record " & $within & " missing in chunk " &
       $chunkNumber)
-  let ev = decodeIOEvent(r.cachedRecords[within])
+  let ev = decodeIOEvent(r.chunk.record(within))
   if ev.isErr:
     return err("events.dat record " & $index & ": " & ev.error)
   ev

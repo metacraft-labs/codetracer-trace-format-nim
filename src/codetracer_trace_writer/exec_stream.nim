@@ -322,9 +322,9 @@ proc decodeSpecChunkRecordCount(compressed: openArray[byte],
     unsafeAddr compressed[0], csize_t(compressed.len))
   if frameSize == ZSTD_CONTENTSIZE_UNKNOWN or frameSize == ZSTD_CONTENTSIZE_ERROR:
     return err("cannot determine decompressed size for last step chunk")
-  var raw = newSeq[byte](int(frameSize))
-  let decompSize = ZSTD_decompress(
-    addr raw[0], csize_t(frameSize),
+  var raw = newSeqUninit[byte](int(frameSize))  # written by the inflate
+  let decompSize = zstdDecompressShared(
+    if raw.len > 0: addr raw[0] else: nil, csize_t(frameSize),
     unsafeAddr compressed[0], csize_t(compressed.len))
   if ZSTD_isError(decompSize) != 0:
     return err("zstd decompress failed for last step chunk: " &
@@ -371,11 +371,11 @@ proc initExecStreamReader*(ctfsBytes: openArray[byte],
   ## The FFI reader passes ``legacy = not meta.hasStepStream``: pre-M24a-1
   ## bundles never set the ``has_step_stream`` flag, so a clear flag selects the
   ## legacy reader and a set flag the SPEC reader.
-  let datRes = readInternalFile(ctfsBytes, "steps.dat",
+  var datRes = readInternalFile(ctfsBytes, "steps.dat",
       uint32(blockSize), uint32(maxEntries))
   if datRes.isErr:
     return err("failed to read steps.dat: " & datRes.error)
-  let datData = datRes.get()
+  var datData = move datRes.get()
 
   let idxRes = readInternalFile(ctfsBytes, "steps.idx",
       uint32(blockSize), uint32(maxEntries))
@@ -450,13 +450,17 @@ proc initExecStreamReader*(ctfsBytes: openArray[byte],
         datData.toOpenArray(startOff, endOff - 1), allowSourceReload)
       totalEvents = uint64(lastChunk) * uint64(chunkSize) + uint64(lastCount)
 
+  # Sized before `offsets` is handed to the reader: a field initialiser that
+  # reads `offsets` after the one that takes it may see it moved out, and a
+  # cache sized for no chunks misses on every read.
+  var cache = initChunkCache[ExecChunkMeta](offsets.len, cacheBytes)
   ok(ExecStreamReader(
-    data: datData,
+    data: move datData,
     chunkSize: chunkSize,
-    offsets: offsets,
+    offsets: move offsets,
     totalEventsVal: totalEvents,
     legacy: legacy,
-    cache: initChunkCache[ExecChunkMeta](offsets.len, cacheBytes),
+    cache: move cache,
     allowSourceReload: allowSourceReload,
     payloadStart: payloadStart,
   ))
@@ -626,6 +630,30 @@ proc readChunkEvents*(r: var ExecStreamReader,
 
   ok(firstEventIdx)
 
+proc advanceCursor(ev: StepEvent, i: int, chunkIdx: int, cursor: var uint64,
+    anchored: var bool): Result[void, string] =
+  ## Move a chunk's cursor past record `i`, `ev` (`trace-events.md`
+  ## §"Encoding Rules", "Reading").
+  case ev.kind
+  of sekAbsoluteStep:
+    cursor = ev.globalLineIndex
+    anchored = true
+  of sekDeltaStep, sekDeltaColumn:
+    if not anchored:
+      return err("steps.dat chunk " & $chunkIdx & ": record " & $i & " is a " &
+        (if ev.kind == sekDeltaStep: "DeltaStep" else: "DeltaColumn") &
+        " before the chunk's first AbsoluteStep, so it has no position to " &
+        "be relative to")
+    let d = if ev.kind == sekDeltaStep: ev.lineDelta else: ev.columnDelta
+    let p = int64(cursor) + d
+    if p < 0:
+      return err("steps.dat chunk " & $chunkIdx & ": record " & $i &
+        " resolves to a negative position")
+    cursor = uint64(p)
+  else:
+    discard
+  ok()
+
 proc resolveChunkPositions*(events: openArray[StepEvent], chunkIdx: int,
     output: var seq[uint64]): Result[void, string] =
   ## Resolve every record of one decoded chunk to the cursor position after
@@ -638,25 +666,33 @@ proc resolveChunkPositions*(events: openArray[StepEvent], chunkIdx: int,
   var cursor = 0'u64
   var anchored = false
   for i in 0 ..< events.len:
-    let ev = events[i]
-    case ev.kind
-    of sekAbsoluteStep:
-      cursor = ev.globalLineIndex
-      anchored = true
-    of sekDeltaStep, sekDeltaColumn:
-      if not anchored:
-        return err("steps.dat chunk " & $chunkIdx & ": record " & $i & " is a " &
-          (if ev.kind == sekDeltaStep: "DeltaStep" else: "DeltaColumn") &
-          " before the chunk's first AbsoluteStep, so it has no position to " &
-          "be relative to")
-      let d = if ev.kind == sekDeltaStep: ev.lineDelta else: ev.columnDelta
-      let p = int64(cursor) + d
-      if p < 0:
-        return err("steps.dat chunk " & $chunkIdx & ": record " & $i &
-          " resolves to a negative position")
-      cursor = uint64(p)
-    else:
-      discard
+    ? advanceCursor(events[i], i, chunkIdx, cursor, anchored)
+    output[i] = cursor
+  ok()
+
+proc chunkPositions*(r: var ExecStreamReader, chunkIdx: int,
+    output: var seq[uint64]): Result[void, string] =
+  ## `resolveChunkPositions` over chunk `chunkIdx`'s records, decoded in one
+  ## pass over the inflated chunk rather than collected into a sequence of
+  ## events first.
+  if chunkIdx < 0 or chunkIdx >= r.offsets.len:
+    return err("chunk index out of range: " & $chunkIdx)
+  let slot = ?r.chunkSlot(chunkIdx)
+  let count = int(r.cache.meta(slot).eventCount)
+  output.setLenUninit(count)  # every entry is written below
+  var pos = r.payloadStart
+  var cursor = 0'u64
+  var anchored = false
+  for i in 0 ..< count:
+    let ev = decodeStepEvent(r.cache.data(slot), pos, r.allowSourceReload)
+    if ev.isErr:
+      output.setLen(0)
+      return err("failed to decode event " & $i & " while resolving chunk " &
+        $chunkIdx & ": " & ev.error)
+    let adv = advanceCursor(ev.get(), i, chunkIdx, cursor, anchored)
+    if adv.isErr:
+      output.setLen(0)
+      return err(adv.error)
     output[i] = cursor
   ok()
 

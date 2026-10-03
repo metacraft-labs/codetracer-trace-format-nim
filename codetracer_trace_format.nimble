@@ -91,6 +91,9 @@ task test, "Run all tests":
   # delta before a chunk's first AbsoluteStep.
   exec "nim c -r -d:release -p:src tests/test_step_encoding_rule.nim"
   exec "nim c -r -p:src tests/test_value_stream.nim"
+  # The value reader's `typeId` is read off the CBOR without decoding it; it
+  # must answer what a full decode does, for every kind.
+  exec "nim c -r -p:src tests/test_cbor_top_level_type_id.nim"
   exec "nim c -r -p:src tests/test_call_stream.nim"
   exec "nim c -r -p:src tests/test_io_event_stream.nim"
   # RS-M1: spans.dat / spans.idx / spantype.ns writer + reader, and the

@@ -55,6 +55,11 @@ proc reset*(sve: var StreamingValueEncoder) =
 proc getBytes*(sve: StreamingValueEncoder): seq[byte] =
   sve.enc.getBytes()
 
+proc takeBytes*(sve: var StreamingValueEncoder): seq[byte] =
+  ## The encoded bytes, moved out without a copy; the encoder is left empty.
+  result = move sve.enc.buf
+  sve.reset()
+
 proc getBytesView*(sve: StreamingValueEncoder): lent seq[byte] =
   ## Return view of internal buffer without copying.
   sve.enc.buf

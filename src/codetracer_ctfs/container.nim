@@ -492,6 +492,12 @@ proc findFileEntry*(data: openArray[byte], name: string,
         size: readU64LE(data, off), mapBlock: readU64LE(data, off + 8))
   CtfsEntryLookup(found: false)
 
+proc truncatedContainerNote(wholeBlocks: uint64, blockSize: uint32,
+    len: int): string =
+  " — the container carries " & $wholeBlocks & " whole " & $blockSize &
+    "-byte blocks in " & $len &
+    " bytes, so it is truncated or its tail write was interrupted"
+
 proc readMemberBytes*(data: openArray[byte], name: string,
     fileSize: uint64, mapBlock: uint64,
     blockSize: uint32): Result[seq[byte], string] =
@@ -523,9 +529,9 @@ proc readMemberBytes*(data: openArray[byte], name: string,
   # floor, never `+ blockSize - 1`: rounding up would make the incomplete
   # final block addressable, which is the one arithmetic §5d forbids.
   let wholeBlocks = uint64(data.len div int(blockSize))
-  let truncatedNote = " — the container carries " & $wholeBlocks &
-    " whole " & $blockSize & "-byte blocks in " & $data.len &
-    " bytes, so it is truncated or its tail write was interrupted"
+  # Formatted only for a refusal; an ordinary read does not build it.
+  template truncatedNote: string =
+    truncatedContainerNote(wholeBlocks, blockSize, data.len)
 
   if mapBlock == 0'u64:
     if fileSize == 0:
