@@ -69,6 +69,7 @@ import repro_dsl_stdlib/foreign_env
 import ct_test_nim_unittest
 
 import std/os
+import build_writer_artifacts
 
 type
   TestSpec = object
@@ -132,8 +133,10 @@ const
 # nimble ``test`` task and therefore in ``just test``:
 # ``tests/test_line_only_orphan_carry_forward.nim``,
 # ``tests/test_orphan_call_args_step_location.nim``,
-# ``tests/test_reader_ffi_column_aware_paths.nim`` and
-# ``tests/test_reader_ffi_line_only_position_space.nim``. All four drive the
+# ``tests/test_reader_ffi_column_aware_paths.nim``,
+# ``tests/test_reader_ffi_line_only_position_space.nim`` and
+# ``tests/test_reader_ffi_empty_names.nim`` (and
+# ``tests/test_ffi_fmt_2026_10.nim``). All of them drive the
 # C FFI entry points directly — the first two to pin ``flushPendingStep``'s
 # orphan-values branch, the last two to pin what the ABI does with a
 # ``paths.dat`` layout and a step position it cannot resolve on its own.
@@ -142,6 +145,15 @@ const
 const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_base40.nim", binary: "build/test-bin/test_base40"),
   TestSpec(source: "tests/test_container.nim", binary: "build/test-bin/test_container"),
+  TestSpec(source: "tests/test_ctfs_v5_member_forms.nim", binary: "build/test-bin/test_ctfs_v5_member_forms"),
+  # `ctfs-container.md` §1d, the compact profile's body: the reference
+  # encoder/decoder's byte-exact round trip, the flipped-directory-bit control,
+  # and the no-block-map assertion with its must-fail control against a full
+  # container.
+  TestSpec(source: "tests/test_compact_container_layout.nim", binary: "build/test-bin/test_compact_container_layout"),
+  TestSpec(source: "tests/test_step_encoding_rule.nim", binary: "build/test-bin/test_step_encoding_rule"),
+  TestSpec(source: "tests/test_step_map_v2.nim", binary: "build/test-bin/test_step_map_v2"),
+  TestSpec(source: "tests/test_durability_publishes_sealed_chunks.nim", binary: "build/test-bin/test_durability_publishes_sealed_chunks"),
   # M61/M61b integrity hardening: the write-side null-mapping guards and the
   # duplicate-name rejection ported from the native-recorder fork.
   TestSpec(source: "tests/test_ctfs_append_null_data_block.nim", binary: "build/test-bin/test_ctfs_append_null_data_block"),
@@ -190,7 +202,10 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_multi_stream_integration.nim", binary: "build/test-bin/test_multi_stream_integration"),
   TestSpec(source: "tests/test_new_trace_reader.nim", binary: "build/test-bin/test_new_trace_reader"),
   TestSpec(source: "tests/test_paths_dat_layout_authority.nim", binary: "build/test-bin/test_paths_dat_layout_authority"),
+  TestSpec(source: "tests/test_column_table_decided_at_first_mention.nim", binary: "build/test-bin/test_column_table_decided_at_first_mention"),
   TestSpec(source: "tests/test_line_only_position_space.nim", binary: "build/test-bin/test_line_only_position_space"),
+  TestSpec(source: "tests/test_path_registration_scales_linearly.nim", binary: "build/test-bin/test_path_registration_scales_linearly"),
+  TestSpec(source: "tests/test_per_step_location_cost.nim", binary: "build/test-bin/test_per_step_location_cost"),
   TestSpec(source: "tests/test_mixed_column_aware_position_space.nim", binary: "build/test-bin/test_mixed_column_aware_position_space"),
   TestSpec(source: "tests/test_reader_calls_events.nim", binary: "build/test-bin/test_reader_calls_events"),
   TestSpec(source: "tests/test_reader_integration.nim", binary: "build/test-bin/test_reader_integration"),
@@ -264,7 +279,14 @@ package codetracer_trace_format_nim:
     # back-end ``nim c`` shells out to.
     "nim >=2.2 <3.0"
     "nimble"
-    "gcc >=12"
+    when defined(macosx):
+      "clang"
+    else:
+      "gcc >=12"
+    when defined(windows):
+      "vccexe"
+      "cl"
+      "link"
 
   devEnv:
     when not defined(windows):
@@ -288,24 +310,12 @@ package codetracer_trace_format_nim:
     # -p:src -o:ct-print src/codetracer_ct_print.nim``). The output is the
     # repo-root ``ct-print`` so downstream recorder tests find it at the
     # fixed sibling path ``../codetracer-trace-format-nim/ct-print``.
-    const binarySuffix = (when defined(windows): ".exe" else: "")
-    const ctPrintBinary = "ct-print" & binarySuffix
-
-    let ctPrintBuild = nim.c(
-      source = "src/codetracer_ct_print.nim",
-      output = ctPrintBinary,
-      mm = "arc",
-      defines = @["release"],
-      paths = @["src"],
-      actionId = "codetracer-trace-format-nim.ct-print.nim-c",
-      extraInputs = @[
-        "src",
-        "codetracer_trace_format.nimble",
-        "nim.cfg",
-      ],
-      extraOutputs = @[ctPrintBinary])
+    let ctPrintBuild = buildCtPrint(".")
 
     discard collect("default", @[ctPrintBuild])
+
+    # Opt-in owning producer; no shipping/default or test corpus expansion.
+    discard collect("sharedLib", @[buildSharedLib(".")])
 
     # ---- Test corpus (the `test` / `test-builds` collections) --------
     #

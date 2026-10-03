@@ -55,6 +55,18 @@ type
     blockSize: uint32
     maxEntries: uint32
 
+    # The address space step positions are encoded in, built once at open:
+    # it is a prefix sum over every path, and `globalPositionSpace` is called
+    # per step by a host that resolves steps one call at a time.
+    posSpace: GlobalLineIndex
+
+    # The absolute positions of the last exec chunk `stepAbsoluteGlobalLineIndex`
+    # decoded, one per event (a non-step event carries the running position).
+    # A host resolving consecutive steps one call at a time decodes each chunk
+    # once instead of once per step.
+    gliChunk: int              ## index of the cached chunk, or -1
+    gliCache: seq[uint64]
+
     # Metadata
     meta*: MetaDatContents
 
@@ -70,7 +82,8 @@ type
     # is set.  ``lineLengths[fileId][line]`` is the addressable column
     # count of line (0-indexed) in file ``fileId``.  When the trace is
     # not column-aware, this stays empty and column queries return
-    # ``none``.
+    # ``none``.  An EMPTY entry is a ``line_count = 0`` record: the
+    # conventional table (100000 lines of 1024), held as that rule.
     lineLengths: seq[seq[uint32]]
     # Per-file line counts, parsed from the line-count-table paths.dat
     # records when `meta.hasLineCountTable` is set.  ``lineCounts[fileId]``
@@ -556,18 +569,20 @@ proc openNewTraceFromBytes*(data: seq[byte],
       return err("meta.dat present but not readable: " & metaRes.error)
     reader.meta = metaRes.get()
 
-  # Load interning tables (these are small, load at startup)
-  let pathRes = initInterningTableReader(data, "paths", blockSize, maxEntries)
-  if pathRes.isOk: reader.pathReader = pathRes.get()
-
-  let funcRes = initInterningTableReader(data, "funcs", blockSize, maxEntries)
-  if funcRes.isOk: reader.funcReader = funcRes.get()
-
-  let typeRes = initInterningTableReader(data, "types", blockSize, maxEntries)
-  if typeRes.isOk: reader.typeReader = typeRes.get()
-
-  let vnRes = initInterningTableReader(data, "varnames", blockSize, maxEntries)
-  if vnRes.isOk: reader.varnameReader = vnRes.get()
+  # Load interning tables (these are small, load at startup). A table that
+  # is absent is empty; a table that is present but does not read is refused,
+  # not answered as empty (`ctfs-container.md` §4, "A null is not an absence").
+  template loadTable(name: string, dest: untyped) =
+    if hasInternalFile(data, name & ".dat", maxEntries) or
+        hasInternalFile(data, name & ".off", maxEntries):
+      let tr = initInterningTableReader(data, name, blockSize, maxEntries)
+      if tr.isErr:
+        return err(name & ".dat: " & tr.error)
+      dest = tr.get()
+  loadTable("paths", reader.pathReader)
+  loadTable("funcs", reader.funcReader)
+  loadTable("types", reader.typeReader)
+  loadTable("varnames", reader.varnameReader)
 
   # P6.5 / Layout A — the shape of a ``paths.dat`` record is decided by
   # ``meta.dat`` bit 4 (``FlagHasColumnAwareSteps``).  When it is set
@@ -628,11 +643,12 @@ proc openNewTraceFromBytes*(data: seq[byte],
         parseLayoutAPathRecords(reader.pathReader, probe = true).isOk
 
   # Alternate source views (spec §"Alternate Source Views
-  # (Deminification Support)").  When the writer set bit 5 we eagerly
-  # decode every record so the per-view accessors below run in O(1).
-  # When the bit is clear we don't touch the container — pre-extension
-  # traces have no such files.
-  if reader.meta.hasAlternateSourceViews:
+  # (Deminification Support)").  Found by the member's presence, not by
+  # meta.dat bit 5: `meta.dat` is written at open, before a view is
+  # registered, so the bit cannot say (`internal-files.md` §"Stream-presence
+  # flags are a hint, not a gate").  Every record is decoded eagerly so the
+  # per-view accessors below run in O(1).
+  if hasInternalFile(data, "srcviews.dat", maxEntries):
     # See the writer's note on the abbreviated 12-char base name:
     # ``source_views.dat`` (spec name, 16 chars) collides with
     # ``source_views.off`` in the base40 filename encoding, so the
@@ -711,6 +727,10 @@ proc openNewTraceFromBytes*(data: seq[byte],
   if ordRes.isErr:
     return err(ordRes.error)
 
+  reader.gliChunk = -1
+  reader.posSpace = buildGlobalLineIndex(positionSpaceCounts(
+    reader.lineLengths, reader.lineCounts, int(reader.pathReader.count()),
+    reader.meta.hasColumnAwareSteps))
   ok(reader)
 
 when ctHasFilesystem:
@@ -998,6 +1018,34 @@ proc varnameCount*(r: NewTraceReader): uint64 = r.varnameReader.count()
 #                                            Addressing")
 # ---------------------------------------------------------------------------
 
+type
+  PathTableKind* = enum
+    ## What ``paths.dat`` records about a file's size, by the layout
+    ## ``meta.dat`` declares (``internal-files.md`` §"Interning Tables").
+    ptkBare = 0          ## no size: a bare record (neither bit 4 nor 14)
+    ptkLineCount = 1     ## a line count (bit 14)
+    ptkLines = 2         ## a per-line table (bit 4, ``line_count > 0``)
+    ptkConventional = 3  ## the conventional table, 100000 lines of 1024
+                         ## (bit 4, ``line_count = 0``)
+
+proc pathTableKind*(r: NewTraceReader, fileId: uint64): Option[PathTableKind] =
+  ## Which kind of size ``paths.dat`` records for ``fileId``; ``none`` when
+  ## there is no such path. A column-aware record of ``line_count = 0`` is
+  ## ``ptkConventional`` — never "no table" — so a caller can tell it from
+  ## a file with no Layout A data without reading its line lengths.
+  if fileId >= r.pathCount():
+    return none(PathTableKind)
+  if fileId < uint64(r.lineLengths.len):
+    if r.lineLengths[fileId].len == 0:
+      return some(ptkConventional)
+    return some(ptkLines)
+  if r.meta.hasLineCountTable:
+    return some(ptkLineCount)
+  some(ptkBare)
+
+proc lineLengthRaw*(r: NewTraceReader, fileId: uint64,
+    lineIndex0: uint32): Option[uint32]
+
 proc lineLength*(r: NewTraceReader, fileId: uint64,
     lineIndex0: uint32): Option[uint32] =
   ## Return the addressable column count of ``lineIndex0`` (0-indexed,
@@ -1005,21 +1053,16 @@ proc lineLength*(r: NewTraceReader, fileId: uint64,
   ## ``fileId``.  Returns ``none`` when the trace is not column-aware,
   ## when ``fileId`` is out of range, when the line index is past the
   ## file's known line table, or when the recorder did not surface a
-  ## per-line table (``line_count = 0`` in paths.dat).  The back-compat
-  ## default is "no per-line data" → ``none``, matching the spec
-  ## contract for pre-extension traces.
+  ## per-line table.  A ``line_count = 0`` record is the conventional
+  ## table: every line up to ``DefaultLinesPerFile`` has
+  ## ``ConventionalLineLength`` columns.
   ##
   ## Note: callers that have a 1-indexed line number (per the spec
   ## convention used by AbsoluteStep / DeltaStep cursor tracking) must
   ## subtract 1 before calling.
   if not r.meta.hasColumnAwareSteps:
     return none(uint32)
-  if fileId >= uint64(r.lineLengths.len):
-    return none(uint32)
-  let lls = r.lineLengths[fileId]
-  if int(lineIndex0) >= lls.len:
-    return none(uint32)
-  some(lls[int(lineIndex0)])
+  r.lineLengthRaw(fileId, lineIndex0)
 
 proc lineLengthRaw*(r: NewTraceReader, fileId: uint64,
     lineIndex0: uint32): Option[uint32] =
@@ -1030,10 +1073,15 @@ proc lineLengthRaw*(r: NewTraceReader, fileId: uint64,
   ## steps and for one opened with ``assumeColumnAwarePaths = true``;
   ## on a trace opened normally that declares line-only steps there is
   ## no table and every query is ``none``.  Also ``none`` when ``fileId``
-  ## is out of range or ``lineIndex0`` is past the file's line table.
+  ## is out of range or ``lineIndex0`` is past the file's line table.  A
+  ## ``line_count = 0`` record answers by the conventional table's rule.
   if fileId >= uint64(r.lineLengths.len):
     return none(uint32)
   let lls = r.lineLengths[fileId]
+  if lls.len == 0:
+    if uint64(lineIndex0) < DefaultLinesPerFile:
+      return some(ConventionalLineLength)
+    return none(uint32)
   if int(lineIndex0) >= lls.len:
     return none(uint32)
   some(lls[int(lineIndex0)])
@@ -1043,13 +1091,14 @@ proc lineCountRaw*(r: NewTraceReader, fileId: uint64): uint64 =
   ## paths.dat Layout A for ``fileId``.  Returns ``0`` when this handle
   ## parsed no Layout A table for the file — which includes every trace
   ## that declares line-only steps and was opened without
-  ## ``assumeColumnAwarePaths`` (the legitimate "no per-line data"
-  ## sentinel — see spec §"paths.dat per-line offset table").
+  ## ``assumeColumnAwarePaths``. A ``line_count = 0`` record is the
+  ## conventional table, so its count is ``DefaultLinesPerFile``.
   if fileId >= uint64(r.lineLengths.len):
     return 0'u64
-  uint64(r.lineLengths[fileId].len)
+  let lls = r.lineLengths[fileId]
+  if lls.len == 0: DefaultLinesPerFile else: uint64(lls.len)
 
-proc globalPositionSpace*(r: NewTraceReader): GlobalLineIndex =
+proc globalPositionSpace*(r: NewTraceReader): lent GlobalLineIndex =
   ## The address space this trace's ``global_position_index`` values were
   ## encoded in, laid out by the rule the writer used
   ## (``global_line_index.positionSpaceCounts``).
@@ -1069,9 +1118,7 @@ proc globalPositionSpace*(r: NewTraceReader): GlobalLineIndex =
   ## Inverting through it is still an assumption about the producer's
   ## packing — see the ``global_line_index`` module header — so callers
   ## must go through ``tryResolve``, not ``resolve``.
-  buildGlobalLineIndex(positionSpaceCounts(
-    r.lineLengths, r.lineCounts, int(r.pathCount()),
-    r.meta.hasColumnAwareSteps))
+  r.posSpace
 
 proc recordedLineCount*(r: NewTraceReader, fileId: uint64): uint64 =
   ## The line count this trace RECORDS for ``fileId``, or 0 when it
@@ -1092,13 +1139,12 @@ proc ensurePositionTables(r: var NewTraceReader) =
   ## Idempotent: callable from every per-step resolution.
   ##
   ## A file's slot is sized by ``global_line_index.fileAddressCount``, the
-  ## same rule the writer's ``rebuildGli`` lays the space out with. That
-  ## matters for the files with no line-length table: they occupy
-  ## ``DefaultLinesPerFile`` addresses in the space the positions were
-  ## encoded in, so sizing them ``0`` here would put every later file's
-  ## base that much too low and land the file search in the file before
-  ## the right one — which then answers with a line number that is the
-  ## next file's base, in range and indistinguishable from a real one.
+  ## same rule the writer's ``rebuildGli`` lays the space out with
+  ## (``positionSpaceCount``). That matters for a ``line_count = 0``
+  ## record: it is the conventional table and occupies
+  ## ``ConventionalFileSize`` addresses, so sizing it ``0`` here would put
+  ## every later file's base that much too low and land the file search in
+  ## the file before the right one.
   if r.posTablesBuilt:
     return
   let fileCount = r.lineLengths.len
@@ -1107,6 +1153,8 @@ proc ensurePositionTables(r: var NewTraceReader) =
   r.fileSize = newSeq[uint64](fileCount)
   var runningGlobal: uint64 = 0
   for fid in 0 ..< fileCount:
+    # A file with the conventional table (an empty entry) keeps an empty
+    # line base: its lines are resolved by the rule, not by a table.
     let lls = r.lineLengths[fid]
     var lb = newSeq[uint64](lls.len)
     var sum: uint64 = 0
@@ -1115,7 +1163,7 @@ proc ensurePositionTables(r: var NewTraceReader) =
       sum += uint64(lls[i])
     r.lineBase[fid] = lb
     r.fileBase[fid] = runningGlobal
-    r.fileSize[fid] = fileAddressCount(lls)
+    r.fileSize[fid] = positionSpaceCount(r.lineLengths, [], fid, true)
     runningGlobal += r.fileSize[fid]
   r.posTablesBuilt = true
 
@@ -1158,7 +1206,10 @@ proc decodeGlobalPositionIndex*(r: var NewTraceReader,
   let q = p - r.fileBase[fid]
   let lb = r.lineBase[fid]
   if lb.len == 0:
-    return err("file " & $fid & " has no line-length table")
+    # The conventional table: every line has ConventionalLineLength columns.
+    let width = uint64(ConventionalLineLength)
+    return ok((file: uint64(fid), line: uint32(q div width + 1),
+      column: uint32(q mod width + 1)))
 
   # Binary search for the line: largest l with lb[l] <= q.
   lo = 0
@@ -1211,46 +1262,31 @@ proc stepAbsoluteGlobalLineIndex*(r: var NewTraceReader,
     n: uint64): Result[uint64, string] =
   ## Return the absolute global line index for step N.
   ##
-  ## The exec stream stores steps as a mix of AbsoluteStep and DeltaStep
-  ## events. Each chunk starts with an AbsoluteStep, and subsequent events
-  ## may be DeltaStep (relative to the previous). This method scans from
-  ## the start of the chunk containing step N, accumulating deltas, to
-  ## produce the absolute global line index.
+  ## The exec stream stores positions as AbsoluteStep and DeltaStep records;
+  ## each chunk's first position record is an AbsoluteStep and a reader
+  ## decodes a chunk by itself (`resolveChunkPositions`), refusing a delta
+  ## before the chunk's anchor.
   ?r.ensureExecReader()
 
   let chunkSize = uint64(r.execReader.chunkSize)
   let chunkIdx = int(n div chunkSize)
   let eventInChunk = int(n mod chunkSize)
-  var currentGli: uint64 = 0
-
-  # Decode the containing chunk in one pass via readChunkEvents (O(N)
-  # per chunk) rather than looping ``readEvent(i)`` (O(N²) per chunk
-  # because each readEvent re-scans from chunk start).  When ct-print
-  # calls this proc once per step in a for-loop the difference is
-  # cubic vs quadratic — a 1000-event trace went from ~45s to <1s.
+  if chunkIdx == r.gliChunk:
+    if eventInChunk >= r.gliCache.len:
+      return err("step " & $n & " is past the end of its exec chunk")
+    return ok(r.gliCache[eventInChunk])
+  # Decode the containing chunk once, in one pass, and keep every event's
+  # absolute position: a caller that resolves steps one call at a time
+  # (ct-print, the C ABI's `ct_reader_step_location`) asks for the next step
+  # of the same chunk next.
   var chunkBuf: seq[StepEvent]
   discard ?r.execReader.readChunkEvents(chunkIdx, chunkBuf)
-  for i in 0 .. eventInChunk:
-    let ev = chunkBuf[i]
-    case ev.kind
-    of sekAbsoluteStep:
-      currentGli = ev.globalLineIndex
-    of sekDeltaStep:
-      currentGli = uint64(int64(currentGli) + ev.lineDelta)
-    of sekDeltaColumn:
-      # P6.5: in column-aware traces ``global_position_index`` is
-      # one-dimensional, so a column-only delta is also a position
-      # delta.  Apply it to the running GLI so callers that decode the
-      # absolute position see the post-column-delta cursor.  In
-      # line-only traces this branch never fires because writers
-      # cannot emit tag 0x07 without the column flag and the meta-dat
-      # strict-rejection check guards against mismatches.
-      currentGli = uint64(int64(currentGli) + ev.columnDelta)
-    else:
-      # Non-step events (raise, catch, thread_switch) don't change GLI
-      discard
-
-  ok(currentGli)
+  if eventInChunk >= chunkBuf.len:
+    return err("step " & $n & " is past the end of its exec chunk")
+  r.gliChunk = -1
+  ? resolveChunkPositions(chunkBuf, chunkIdx, r.gliCache)
+  r.gliChunk = chunkIdx
+  ok(r.gliCache[eventInChunk])
 
 proc stepCount*(r: var NewTraceReader): Result[uint64, string] =
   ?r.ensureExecReader()
@@ -1408,8 +1444,8 @@ proc stepAbsoluteGlobalLineIndices*(r: var NewTraceReader,
   if chunkSize == 0'u64:
     return err("execReader has zero chunkSize")
 
-  var currentGli: uint64 = 0
   var events: seq[StepEvent] = @[]
+  var positions: seq[uint64] = @[]
   var n = startN
   while n < stopN:
     let chunkIdx = int(n div chunkSize)
@@ -1421,22 +1457,11 @@ proc stepAbsoluteGlobalLineIndices*(r: var NewTraceReader,
       return err(firstIdxRes.error)
     let firstIdx = firstIdxRes.get()
 
-    for offset, ev in events:
+    ? resolveChunkPositions(events, chunkIdx, positions)
+    for offset in 0 ..< events.len:
       let absIdx = firstIdx + uint64(offset)
-      case ev.kind
-      of sekAbsoluteStep:
-        currentGli = ev.globalLineIndex
-      of sekDeltaStep:
-        currentGli = uint64(int64(currentGli) + ev.lineDelta)
-      of sekDeltaColumn:
-        # P6.5: see ``stepAbsoluteGlobalLineIndex`` for rationale —
-        # column deltas advance ``global_position_index`` in the
-        # one-dimensional column-aware position space.
-        currentGli = uint64(int64(currentGli) + ev.columnDelta)
-      else:
-        discard
       if absIdx >= n and absIdx < stopN:
-        output[int(absIdx - startN)] = currentGli
+        output[int(absIdx - startN)] = positions[offset]
 
     # Advance ``n`` to the next chunk boundary so the outer loop picks
     # the correct chunk on the next iteration.
@@ -1470,6 +1495,12 @@ proc ensureValueReader(r: var NewTraceReader): Result[void, string] =
 proc values*(r: var NewTraceReader, n: uint64): Result[seq[VariableValue], string] =
   ?r.ensureValueReader()
   r.valueReader.readStepValues(n)
+
+proc valueEvents*(r: var NewTraceReader,
+    n: uint64): Result[seq[DecodedValueEvent], string] =
+  ## Every value-stream event of exec record ``n`` — tags 0-9, in wire order.
+  ?r.ensureValueReader()
+  r.valueReader.readStepEvents(n)
 
 iterator valuesIter*(r: var NewTraceReader, n: uint64): VariableValue =
   ## Yields variable values one at a time for a given step.

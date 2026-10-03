@@ -77,8 +77,8 @@ proc test_small_container_unchanged() =
   var f = c.addFile("a.bin").get()
   doAssert c.writeToFile(f, [1'u8, 2, 3]).isOk
   let data = c.toBytes()
-  doAssert u64le(data, 16 + 8) == 1'u64,
-    "the first member's mapping block is block 1, as before"
+  doAssert u64le(data, 16 + 8) == (CtfsDirect or 1'u64),
+    "the first member's only data block is block 1, stored direct"
   echo "PASS: test_small_container_unchanged"
 
 const Declared = 400  # root_blocks = ceil((16 + 9600) / 4096) = 3
@@ -105,7 +105,7 @@ proc checkContainer(data: seq[byte], label: string) =
   var inBlock1, inBlock2, straddles = 0
   for i in 0 ..< Declared:
     let off = 16 + i * 24
-    let mapBlock = u64le(data, off + 8)
+    let mapBlock = u64le(data, off + 8) and not CtfsDirect
     doAssert mapBlock >= rootBlocks,
       label & ": entry " & $i & "'s mapping block " & $mapBlock &
       " lies inside the " & $rootBlocks & "-block root region"

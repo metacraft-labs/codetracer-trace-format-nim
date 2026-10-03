@@ -16,11 +16,28 @@ when defined(nimPreviewSlimSystem):
 import results
 import ./types
 
+proc markDirty(c: var Ctfs, offset: int, size: int) =
+  if size <= 0:
+    return
+  let bs = int(c.blockSize)
+  let first = offset div bs
+  let last = (offset + size - 1) div bs
+  if c.dirtyMark.len <= last:
+    c.dirtyMark.setLen(last + 1 + c.dirtyMark.len div 2)
+  for b in first .. last:
+    if not c.dirtyMark[b]:
+      c.dirtyMark[b] = true
+      c.dirtyBlocks.add(uint64(b))
+
 proc flushBlockRange*(c: var Ctfs, offset: int, size: int) =
-  ## Write a range of in-memory data to the streaming file.
+  ## Write a range of in-memory data to the streaming file — or, in deferred
+  ## mode, note it for the next `publish`.
   if not c.streaming:
     return
   if offset + size > c.data.len:
+    return
+  if c.deferWrites:
+    c.markDirty(offset, size)
     return
   try:
     c.streamFile.setFilePos(int64(offset))

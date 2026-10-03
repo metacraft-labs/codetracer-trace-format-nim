@@ -753,7 +753,7 @@ proc buildFullDocument*(reader: var NewTraceReader,
         if sid == stepIdx:
           var ioObj = newJObject()
           ioObj["kind"] = newJString("io")
-          ioObj["io_kind"] = newJString($ev.kind)
+          ioObj["io_kind"] = newJString(eventLogKindName(ev.kind))
           ioObj["io_index"] = newJInt(int64(idx))
           ioObj["step_id"] = newJInt(int64(ev.stepId))
           # Surface both UTF-8 (best-effort) and base64 (exact bytes) so

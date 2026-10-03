@@ -116,6 +116,7 @@
 
               # The C back-end `nim c` shells out to.
               pkgs.gcc
+              pkgs.bash # Declared non-SIP monitored launch shell.
 
               # `codetracer_ctfs` links libzstd; several tests resolve its
               # include/lib dirs through pkg-config.
@@ -151,14 +152,46 @@
             # pcre directly instead of relying on a run-time library search.
             CT_PCRE_LIB_DIR = "${pkgs.pcre.out}/lib";
 
-            shellHook = preCommit.shellHook + ''
-              # Seed a project-local, writable NIMBLE_DIR from the pinned
-              # sources above.  nimble needs to write (nimbledata2.json), so
-              # the store copy is materialised once into `.nimble/` rather
-              # than used in place.  Honour an NIMBLE_DIR the caller already
-              # set (CI may point at a shared cache).
+            # EVERYTHING THIS HOOK WRITES IS ANCHORED TO THIS REPOSITORY, never
+            # to the directory the shell happens to be entered from.
+            # git-hooks.nix's `shellHook` installs `.pre-commit-config.yaml`
+            # and a pre-commit hook into whatever git repository encloses
+            # `$PWD`: entered from a sibling checkout (`nix develop
+            # ../codetracer-trace-format-nim`, or a captured `print-dev-env`
+            # sourced elsewhere) it planted this repo's `just lint` hook in
+            # that sibling and blocked its commits. So it runs only when the
+            # enclosing repository is this one, recognised by files only this
+            # repository has at its top level; elsewhere it is skipped and
+            # nothing is written. `tests/test_dev_shell_writes_nothing_elsewhere.sh`.
+            shellHook = ''
+              ct_tfn_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+              if [ -n "$ct_tfn_root" ] \
+                && [ -f "$ct_tfn_root/codetracer_trace_format.nimble" ] \
+                && [ -f "$ct_tfn_root/src/codetracer_trace_writer_ffi.nim" ]; then
+                ( cd "$ct_tfn_root" && ${preCommit.shellHook} )
+                # git-hooks.nix's installer leaves core.hooksPath as the RELATIVE
+                # `.git/hooks`, in the config every worktree shares. A linked worktree
+                # cannot resolve it (there `.git` is a file), so git silently runs no
+                # hooks there. Point it at the common hooks directory instead.
+                if [ "$(git -C "$ct_tfn_root" config --local --get core.hooksPath 2>/dev/null)" = .git/hooks ]; then
+                  git -C "$ct_tfn_root" config --local core.hooksPath "$(git -C "$ct_tfn_root" rev-parse --path-format=absolute --git-common-dir)/hooks"
+                fi
+              else
+                ct_tfn_root=""
+              fi
+
+              # Seed a writable NIMBLE_DIR from the pinned sources above.
+              # nimble needs to write (nimbledata2.json), so the store copy is
+              # materialised once rather than used in place: into this
+              # repository's `.nimble/` when the shell is entered from inside
+              # it, into the user cache otherwise. Honour an NIMBLE_DIR the
+              # caller already set (CI may point at a shared cache).
               if [ -z "''${NIMBLE_DIR:-}" ]; then
-                export NIMBLE_DIR="$PWD/.nimble"
+                if [ -n "$ct_tfn_root" ]; then
+                  export NIMBLE_DIR="$ct_tfn_root/.nimble"
+                else
+                  export NIMBLE_DIR="''${XDG_CACHE_HOME:-$HOME/.cache}/codetracer-trace-format-nim/nimble"
+                fi
               fi
               if [ ! -d "$NIMBLE_DIR/pkgs2" ]; then
                 mkdir -p "$NIMBLE_DIR"
@@ -170,6 +203,77 @@
               # knows where it lives.
               export LD_LIBRARY_PATH="${pkgs.pcre.out}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
               export DYLD_FALLBACK_LIBRARY_PATH="${pkgs.pcre.out}/lib''${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
+            '';
+          };
+
+          # The C FFI of the trace writer, as the static archive
+          # `nimble buildStaticLib` produces plus its headers: what a
+          # recorder written in another language (the Go wasm recorder's cgo
+          # writer, for one) links to emit `.ct` containers.  `lib/` and
+          # `include/` mirror the source-tree locations the sibling-checkout
+          # builds read.  Consumers also link libzstd.
+          packages.trace-writer-ffi = pkgs.stdenv.mkDerivation {
+            pname = "codetracer-trace-writer-ffi";
+            version = "0.1.0";
+            src = ./.;
+
+            nativeBuildInputs = [ nim ];
+            buildInputs = [ pkgs.zstd ];
+
+            # build_ffi.nims holds the flags; every producer of the archive
+            # runs it, so this one cannot drift from the others.
+            buildPhase = ''
+              runHook preBuild
+              export HOME=$TMPDIR
+              nim e --hints:off build_ffi.nims --nimcache:$TMPDIR/nimcache \
+                --out:$PWD/libcodetracer_trace_writer.a -- --hints:off \
+                ${pkgs.lib.concatMapStringsSep " " (p: "--path:${p}") nimDepPaths}
+              runHook postBuild
+            '';
+
+            installPhase = ''
+              runHook preInstall
+              mkdir -p $out/lib $out/include
+              cp libcodetracer_trace_writer.a $out/lib/
+              cp include/*.h $out/include/
+              runHook postInstall
+            '';
+
+            # An archive that does not define the entry points the headers
+            # declare links nothing; fail the build rather than the consumer.
+            doInstallCheck = true;
+            installCheckPhase = ''
+              # The symbol table goes to a file first: `nm | grep -q` under
+              # stdenv's pipefail fails whenever grep exits at its match while
+              # nm still has output to write (nm dies of SIGPIPE), which makes
+              # the check depend on where in the archive the symbol sits.
+              # nm's stderr is kept.  Its exit status already aborts the phase
+              # under `set -e`, so `2>/dev/null` did not make a failing nm
+              # survivable -- it made it mute: the phase died after printing
+              # nothing at all, neither nm's error nor this check's own
+              # message.  Measured on aarch64-darwin by pointing nm at a
+              # missing path with and without the redirect.
+              ${pkgs.stdenv.cc.bintools.bintools}/bin/nm -g --defined-only \
+                  $out/lib/libcodetracer_trace_writer.a > defined-symbols.txt
+
+              # Reduce nm's `<address> <type> <name>` lines to bare names, less
+              # the leading underscore Mach-O prefixes every C symbol with and
+              # ELF prefixes none with.  `_` is itself a word character, so
+              # `grep -w trace_writer_new` cannot match `_trace_writer_new`:
+              # the word-boundary form of this check could never pass on
+              # darwin, whatever the archive held.  Comparing whole names
+              # rather than substrings keeps the check able to refuse -- the
+              # internal `_ffiImpl_trace_writer_new__*` wrapper is present
+              # either way and must not be mistaken for the exported symbol.
+              awk '{ print $NF }' defined-symbols.txt | sed 's/^_//' \
+                  | sort -u > defined-names.txt
+
+              for sym in trace_writer_new trace_writer_free trace_writer_last_error trace_writer_build_config; do
+                if ! grep -qxF "$sym" defined-names.txt; then
+                  echo "libcodetracer_trace_writer.a does not define $sym" >&2
+                  exit 1
+                fi
+              done
             '';
           };
 

@@ -16,7 +16,7 @@
 ## through ``openNewTraceFromBytes`` — the same two objects a recorder and
 ## a debugger use.  The one hand-built artefact is the negative fixture of
 ## gate 2, and it is not a mock: it is the real container, with its real
-## ``meta.dat`` header rewritten to schema version 4 in place, because
+## ``meta.dat`` ``flags_ext`` bit 0 cleared in place, because
 ## constructing a container the writer REFUSES to produce is the only way
 ## to reach the reader's refusal path at all.
 ##
@@ -137,6 +137,10 @@ proc buildTwoMarkerContainer(): BuiltContainer =
   var w = newWriter("gdh2-markers", "01890000-0000-7000-8000-00000000d002")
   let en = w.enableLineCountTable()
   check(en.isOk, "enableLineCountTable: " & en.error)
+  # A recorder that can observe a reload declares it before the first
+  # record (`internal-files.md` §"Extended flags", bit 0).
+  let dec = w.declareSourceReload()
+  check(dec.isOk, "declareSourceReload: " & dec.error)
 
   let v1 = w.registerPath(ProbePath, lineCount = V1Lines)
   check(v1.isOk, "registerPath v1: " & v1.error)
@@ -249,9 +253,9 @@ proc gate_reload_marker_round_trips() =
     "the container does not declare FlagExtHasSourceReload, so the " &
     "reader will refuse every marker and this gate would measure a " &
     "refusal rather than a round trip")
-  check(r.meta.version == MetaDatVersionExtendedFlags,
-    "a container carrying a marker must be at meta.dat schema version " &
-    $MetaDatVersionExtendedFlags & "; it is at " & $r.meta.version)
+  check(r.meta.version == MetaDatVersion,
+    "the container must be at meta.dat schema version " & $MetaDatVersion &
+    "; it is at " & $r.meta.version)
 
   let markersRes = r.sourceReloads()
   check(markersRes.isOk, "sourceReloads: " & markersRes.error)
@@ -407,10 +411,11 @@ proc gate_reload_marker_round_trips() =
   let plain = buildNoMarkerContainer()
   var pr = openContainer(plain)
   check(pr.meta.version == MetaDatVersion,
-    "CONTROL ARM: a container with no reload must stay at meta.dat " &
-    "schema version " & $MetaDatVersion & "; it is at " & $pr.meta.version)
+    "CONTROL ARM: meta.dat schema version " & $MetaDatVersion &
+    " expected; it is at " & $pr.meta.version)
   check(not pr.meta.hasSourceReload,
-    "CONTROL ARM: a container with no reload declares the extended flag")
+    "CONTROL ARM: a recording that did not declare reloads declares the " &
+    "extended flag")
   let plainTotal = pr.stepCount()
   check(plainTotal.isOk, "CONTROL ARM: stepCount: " & plainTotal.error)
   check(plainTotal.get() > 0'u64,
@@ -429,45 +434,29 @@ proc gate_reload_marker_round_trips() =
 # Gate 2 — tag 0x08 without the declaration is refused BY NAME
 # ---------------------------------------------------------------------------
 
-proc downgradeMetaDatToV4(bytes: seq[byte]): seq[byte] =
-  ## Rewrite the container's ``meta.dat`` header from schema version 5 to
-  ## version 4, IN PLACE, by dropping the ``flags_ext`` word.
+proc undeclareSourceReload(bytes: seq[byte]): seq[byte] =
+  ## Clear ``flags_ext`` bit 0 in the container's ``meta.dat``, IN PLACE.
   ##
   ## The result is a real container — real CTFS framing, real streams,
   ## real interning tables — whose step stream carries tag 0x08 and whose
   ## header does not declare it.  The writer refuses to produce that
-  ## combination, which is precisely why it has to be built here: a
-  ## reader's refusal path is not reachable from any input the writer can
-  ## make.
-  ##
-  ## The rewrite keeps meta.dat's LENGTH unchanged (the four bytes are
-  ## shifted out at the front and the tail is left as trailing bytes,
-  ## which ``readMetaDat`` ignores), so no CTFS size or block mapping
-  ## moves.  The alternative — rebuilding the container — would be a
-  ## reimplementation of the writer inside its own test.
+  ## combination (``registerSourceReload`` fails in an undeclared trace),
+  ## which is precisely why it has to be built here: a reader's refusal path
+  ## is not reachable from any input the writer can make.  Nothing moves:
+  ## four bytes of one member change value.
   result = bytes
-  # Locate the meta.dat payload by its magic.  There is exactly one
-  # "CTMD" followed by a version word of 5 in a container this small; the
-  # search asserts it found exactly one so a miss cannot pass silently.
   var hits: seq[int] = @[]
   for i in 0 .. result.len - 12:
     if result[i] == 0x43 and result[i+1] == 0x54 and
        result[i+2] == 0x4D and result[i+3] == 0x44 and
-       result[i+4] == 5'u8 and result[i+5] == 0'u8:
+       result[i+4] == byte(MetaDatVersion) and result[i+5] == 0'u8 and
+       (result[i+8] and 1'u8) != 0:
       hits.add(i)
   check(hits.len == 1,
-    "expected exactly one v5 CTMD header in the container, found " &
-    $hits.len & ". A fixture builder that cannot find its subject must " &
-    "die rather than return the bytes unchanged — an unmodified " &
-    "container would make the refusal below impossible and the gate " &
-    "would report a pass it never earned")
-  let at = hits[0]
-  # version 5 -> 4
-  result[at + 4] = 4'u8
-  # drop the 4-byte flags_ext word: shift the remainder of the payload
-  # left over it.  The last 4 bytes of the region become trailing bytes.
-  for i in at + 8 ..< result.len - 4:
-    result[i] = result[i + 4]
+    "expected exactly one CTMD header declaring source reloads in the " &
+    "container, found " & $hits.len & ". A fixture builder that cannot " &
+    "find its subject must die rather than return the bytes unchanged")
+  result[hits[0] + 8] = result[hits[0] + 8] and not 1'u8
 
 proc gate_unknown_tag_is_refused_by_name() =
   currentGate = "gdh2_unknown_tag_is_refused_by_name"
@@ -489,7 +478,7 @@ proc gate_unknown_tag_is_refused_by_name() =
       "CONTROL ARM: the unmodified container decodes to " & $sc.get() &
       " records, expected " & $built.execEvents)
 
-  let downgraded = downgradeMetaDatToV4(built.bytes)
+  let downgraded = undeclareSourceReload(built.bytes)
   check(downgraded.len == built.bytes.len,
     "the downgraded fixture changed length (" & $downgraded.len & " vs " &
     $built.bytes.len & "), so the CTFS framing no longer matches the " &
@@ -511,7 +500,7 @@ proc gate_unknown_tag_is_refused_by_name() =
     "the downgraded fixture still declares the source-reload flag, so " &
     "the reader would accept the tag and there is nothing to refuse")
   check(r.meta.flagsExt == 0'u32,
-    "the downgraded fixture still carries a flags_ext word")
+    "the downgraded fixture still sets a flags_ext bit")
   check(r.pathCount() >= 2,
     "the downgraded fixture's paths.dat did not survive the rewrite (" &
     $r.pathCount() & " entries); the header did not really parse")

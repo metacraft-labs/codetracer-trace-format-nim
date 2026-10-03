@@ -134,7 +134,7 @@ proc main() =
 
   # ----- Step 5: emit stdout, then enter `compute(n=7)` -----
   doAssert w.registerStep(p0.get(), 6'u64, @[]).isOk
-  doAssert w.registerIOEvent(ioStdout, "computing...\n".toBytesAscii).isOk
+  doAssert w.registerIOEvent(elkWrite, "computing...\n".toBytesAscii).isOk
 
   let argN = ValueRecord(kind: vrkInt, intVal: 7, intTypeId: TypeId(tInt))
   let argEnc = encodeValue(argN)
@@ -172,7 +172,7 @@ proc main() =
 
   # ----- Step 8: stderr write, then return from `compute` with int 49 -----
   doAssert w.registerStep(p1.get(), 3'u64, @[]).isOk
-  doAssert w.registerIOEvent(ioStderr, "warning: nothing\n".toBytesAscii).isOk
+  doAssert w.registerIOEvent(elkWriteOther, "warning: nothing\n".toBytesAscii).isOk
   let computeRet = encodeValue(
     ValueRecord(kind: vrkInt, intVal: 49, intTypeId: TypeId(tInt)))
   doAssert w.registerReturn(computeRet).isOk

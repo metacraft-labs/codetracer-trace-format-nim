@@ -84,7 +84,7 @@ proc test_v4_basic_round_trip() =
   doAssert w.registerStep(1, 5, @[]).isOk
 
   # An IO event (stdout)
-  doAssert w.registerIOEvent(ioStdout, "hi\n".toOpenArrayByte(0, 2)).isOk
+  doAssert w.registerIOEvent(elkWrite, "hi\n".toOpenArrayByte(0, 2)).isOk
 
   doAssert w.close().isOk
 

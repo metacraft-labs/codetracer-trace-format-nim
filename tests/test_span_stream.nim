@@ -259,7 +259,7 @@ proc span_stream_roundtrip_both_bindings() {.raises: [].} =
   var metaFile = metaFileRes.get()
   let meta = TraceMetadata(
     recordingId: TestRecordingId, program: "server", workdir: "/srv")
-  doAssert ctfs.writeMetaDat(metaFile, meta, [], hasSpanStream = true).isOk
+  doAssert ctfs.writeMetaDat(metaFile, meta, hasSpanStream = true).isOk
 
   let raw = ctfs.toBytes()
 
@@ -576,7 +576,7 @@ proc span_stream_ignored_without_feature_bit() {.raises: [].} =
   let meta1 = TraceMetadata(
     recordingId: TestRecordingId, program: "server", workdir: "/srv")
   doAssert withSpans.writeMetaDat(
-    metaFile1, meta1, [], hasSpanStream = true).isOk
+    metaFile1, meta1, hasSpanStream = true).isOk
   let withSpansBytes = withSpans.toBytes()
 
   let metaRaw1 = readInternalFile(withSpansBytes, "meta.dat")
@@ -594,7 +594,7 @@ proc span_stream_ignored_without_feature_bit() {.raises: [].} =
   var metaFile2 = mf2.get()
   let meta2 = TraceMetadata(
     recordingId: TestRecordingId, program: "server", workdir: "/srv")
-  doAssert noSpans.writeMetaDat(metaFile2, meta2, []).isOk
+  doAssert noSpans.writeMetaDat(metaFile2, meta2).isOk
   let noSpansBytes = noSpans.toBytes()
 
   let parsed2 = readMetaDat(readInternalFile(noSpansBytes, "meta.dat").get())
@@ -1277,11 +1277,11 @@ proc span_stream_multi_stream_writer_gating() {.raises: [].} =
   ## The path a real recorder takes: `registerSpan` on the production
   ## `MultiStreamTraceWriter`, then `close()`.
   ##
-  ## Also pins the byte-compatibility contract that makes bit 13 safe to
-  ## allocate at all: the span files and the flag bit appear ONLY when a span
-  ## was actually registered. Because bit 13 is REJECTING for older readers,
-  ## a writer that stamped it unconditionally would break every container it
-  ## produced.
+  ## Also pins that the span files appear ONLY when a span was actually
+  ## registered, and that meta.dat bit 13 is never set by this writer: meta.dat
+  ## is written at the first record, before a span can be known, and a reader
+  ## finds the span stream by its presence (`internal-files.md`
+  ## §"Stream-presence flags are a hint, not a gate").
   block with_spans:
     let wRes = initMultiStreamWriter("spans.ct", "server",
       recordingId = TestRecordingId)
@@ -1301,8 +1301,8 @@ proc span_stream_multi_stream_writer_gating() {.raises: [].} =
 
     let meta = readMetaDat(readInternalFile(bytes, "meta.dat").get())
     doAssert meta.isOk, "readMetaDat failed: " & meta.error
-    doAssert meta.get().hasSpanStream,
-      "registering a span must set meta.dat bit 13"
+    doAssert not meta.get().hasSpanStream,
+      "meta.dat is written before the first span, so bit 13 stays clear"
     doAssert hasSpanStreamFiles(bytes), "spans.dat must be present"
     doAssert hasInternalFile(bytes, "spans.idx"), "spans.idx must be present"
     doAssert hasInternalFile(bytes, "spantype.ns"),

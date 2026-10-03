@@ -1,14 +1,14 @@
 === CTFS Header ===
 magic: c0de72ace2
-version: 4
+version: 5
 encryption: emNone
 max_shards: 0
 block_size: 4096
 max_root_entries: 31
 
 === File Entries ===
-[0] name: "hello.txt" size: 12 map_block: 1
-[1] name: "data.bin" size: 256 map_block: 3
+[0] name: "hello.txt" size: 12 map_block: direct 1
+[1] name: "data.bin" size: 256 map_block: direct 2
 
 === Internal File: hello.txt ===
 48656c6c6f2c204354465321

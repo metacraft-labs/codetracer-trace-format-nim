@@ -93,7 +93,7 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
   )
   let paths = @["/src/main.py", "/src/helper.py"]
 
-  let metaRes = ctfs.writeMetaDat(metaFile, meta, paths, recorderId = "integration-test")
+  let metaRes = ctfs.writeMetaDat(metaFile, meta, recorderId = "integration-test")
   doAssert metaRes.isOk, "writeMetaDat failed: " & metaRes.error
 
   # ------ 3. Init interning tables ------
@@ -215,7 +215,7 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
 
   # IO event: stdout "52"
   let ioWr0 = ctfs.writeEvent(ioWriter, IOEvent(
-    kind: ioStdout, stepId: 3, data: "52\n".toBytes))
+    kind: elkWrite, stepId: 3, data: "52\n".toBytes))
   doAssert ioWr0.isOk, "ioEvent0 failed: " & ioWr0.error
 
   # Step 4: DeltaStep(+1) at main.py:5 — entering try block
@@ -332,9 +332,6 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
   doAssert mc.args[0] == "--run", "arg0 mismatch: " & mc.args[0]
   doAssert mc.recorderId == "integration-test",
     "recorderId mismatch: " & mc.recorderId
-  doAssert mc.paths.len == 2, "paths len mismatch"
-  doAssert mc.paths[0] == "/src/main.py", "path0 mismatch: " & mc.paths[0]
-  doAssert mc.paths[1] == "/src/helper.py", "path1 mismatch: " & mc.paths[1]
   doAssert mc.mcrFields.isNone, "mcrFields should be none"
 
   # 14b. Interning tables
@@ -397,29 +394,37 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
   doAssert ev0.get().globalLineIndex == 0, "event0 gli mismatch: " &
     $ev0.get().globalLineIndex
 
-  # Event 1: DeltaStep(+1)
+  # Event 1: written DeltaStep(+1), position 1
   let ev1 = er.readEvent(1)
   doAssert ev1.isOk, "readEvent 1 failed: " & ev1.error
-  doAssert ev1.get().kind == sekDeltaStep, "event1 kind mismatch"
-  doAssert ev1.get().lineDelta == 1, "event1 delta mismatch"
+  # Positions below 128 are one varint byte, as long as any delta, so the
+  # normative rule writes them absolute (a tie goes to the AbsoluteStep).
+  doAssert ev1.get().kind == sekAbsoluteStep, "event1 kind mismatch"
+  doAssert ev1.get().globalLineIndex == 1, "event1 position mismatch"
 
   # Event 2: DeltaStep(+1)
   let ev2 = er.readEvent(2)
   doAssert ev2.isOk, "readEvent 2 failed: " & ev2.error
-  doAssert ev2.get().kind == sekDeltaStep, "event2 kind mismatch"
-  doAssert ev2.get().lineDelta == 1, "event2 delta mismatch"
+  # Positions below 128 are one varint byte, as long as any delta, so the
+  # normative rule writes them absolute (a tie goes to the AbsoluteStep).
+  doAssert ev2.get().kind == sekAbsoluteStep, "event2 kind mismatch"
+  doAssert ev2.get().globalLineIndex == 2, "event2 position mismatch"
 
   # Event 3: DeltaStep(+1)
   let ev3 = er.readEvent(3)
   doAssert ev3.isOk, "readEvent 3 failed: " & ev3.error
-  doAssert ev3.get().kind == sekDeltaStep, "event3 kind mismatch"
-  doAssert ev3.get().lineDelta == 1, "event3 delta mismatch"
+  # Positions below 128 are one varint byte, as long as any delta, so the
+  # normative rule writes them absolute (a tie goes to the AbsoluteStep).
+  doAssert ev3.get().kind == sekAbsoluteStep, "event3 kind mismatch"
+  doAssert ev3.get().globalLineIndex == 3, "event3 position mismatch"
 
   # Event 4: DeltaStep(+1)
   let ev4 = er.readEvent(4)
   doAssert ev4.isOk, "readEvent 4 failed: " & ev4.error
-  doAssert ev4.get().kind == sekDeltaStep, "event4 kind mismatch"
-  doAssert ev4.get().lineDelta == 1, "event4 delta mismatch"
+  # Positions below 128 are one varint byte, as long as any delta, so the
+  # normative rule writes them absolute (a tie goes to the AbsoluteStep).
+  doAssert ev4.get().kind == sekAbsoluteStep, "event4 kind mismatch"
+  doAssert ev4.get().globalLineIndex == 4, "event4 position mismatch"
 
   # Event 5: Raise
   let ev5 = er.readEvent(5)
@@ -438,8 +443,10 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
   # Event 7: DeltaStep(+1)
   let ev7 = er.readEvent(7)
   doAssert ev7.isOk, "readEvent 7 failed: " & ev7.error
-  doAssert ev7.get().kind == sekDeltaStep, "event7 kind mismatch"
-  doAssert ev7.get().lineDelta == 1, "event7 delta mismatch"
+  # Positions below 128 are one varint byte, as long as any delta, so the
+  # normative rule writes them absolute (a tie goes to the AbsoluteStep).
+  doAssert ev7.get().kind == sekAbsoluteStep, "event7 kind mismatch"
+  doAssert ev7.get().globalLineIndex == 5, "event7 position mismatch"
 
   # 14d. Value stream
   let valReaderRes = initValueStreamReader(ctfsBytes)
@@ -532,7 +539,7 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
   let io0 = ioReader.readEvent(0)
   doAssert io0.isOk, "readEvent io0 failed: " & io0.error
   let ioEv = io0.get()
-  doAssert ioEv.kind == ioStdout, "io0 kind mismatch"
+  doAssert ioEv.kind == elkWrite, "io0 kind mismatch"
   doAssert ioEv.stepId == 3, "io0 stepId mismatch: " & $ioEv.stepId
   doAssert ioEv.data == "52\n".toBytes, "io0 data mismatch"
 
@@ -560,7 +567,7 @@ proc bench_multi_stream_write_throughput() {.raises: [].} =
   let meta = TraceMetadata(
     recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb",
     program: "bench", args: @[], workdir: "/tmp")
-  let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/bench.py"])
+  let metaWr = ctfs.writeMetaDat(metaFile, meta)
   doAssert metaWr.isOk
 
   # Interning
@@ -627,7 +634,7 @@ proc bench_multi_stream_write_throughput() {.raises: [].} =
   # Write IO events
   for i in 0 ..< totalIOEvents:
     let ioEvt = ctfs.writeEvent(ioW, IOEvent(
-      kind: ioStdout, stepId: uint64(i * 100),
+      kind: elkWrite, stepId: uint64(i * 100),
       data: "output\n".toBytes))
     doAssert ioEvt.isOk
 
@@ -669,7 +676,7 @@ proc bench_multi_stream_trace_size() {.raises: [].} =
   let meta = TraceMetadata(
     recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb",
     program: "bench_size", args: @[], workdir: "/tmp")
-  let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/bench.py"])
+  let metaWr = ctfs.writeMetaDat(metaFile, meta)
   doAssert metaWr.isOk
 
   let tabRes = initTraceInterningTables(ctfs)

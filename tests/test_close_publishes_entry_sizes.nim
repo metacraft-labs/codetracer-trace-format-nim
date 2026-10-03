@@ -17,7 +17,9 @@
 ## discipline of every caller remembering `closeCtfs`.
 ##
 ## No mocks: a real streaming container on a real filesystem, read back from
-## the path with the canonical reader.
+## the path with the canonical reader. The before-closeCtfs snapshot keeps
+## its owning Result alive through the exact byte comparison; borrowing from
+## a block-local temporary would compare freed storage under Nim 2.2.4.
 
 import std/os
 import results
@@ -71,6 +73,8 @@ proc test_close_then_close_ctfs_agrees() =
   let path = getTempDir() / "test_close_publishes_meta_full.ct"
   removeFile(path)
 
+  # Keep the Result that owns the snapshot alive through the comparison.
+  var afterCloseSnapshot: Result[seq[byte], string]
   var afterClose: seq[byte]
   block:
     var w = initMultiStreamWriter(path, "entry_sizes",
@@ -78,7 +82,8 @@ proc test_close_then_close_ctfs_agrees() =
     doAssert w.registerPath("/src/app.py").isOk
     doAssert w.registerStep(0, 1, []).isOk
     doAssert w.close().isOk
-    afterClose = member(readCtfsFromFile(path).get(), "meta.dat").get()
+    afterCloseSnapshot = member(readCtfsFromFile(path).get(), "meta.dat")
+    afterClose = afterCloseSnapshot.get()
     doAssert w.closeCtfs().isOk, "closeCtfs must report its own I/O failures"
 
   let afterCloseCtfs = member(readCtfsFromFile(path).get(), "meta.dat").get()

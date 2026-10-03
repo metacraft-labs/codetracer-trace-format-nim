@@ -55,6 +55,12 @@ proc countFileBlocks(
     data: openArray[byte], mapBlock: uint64,
     blockSize: int): int =
   ## Count how many data blocks a file uses by walking the mapping chain.
+  ## An empty member uses none and a direct one exactly one
+  ## (`ctfs-container.md` §2).
+  if mapBlock == 0:
+    return 0
+  if isDirectMapBlock(mapBlock):
+    return 1
   let usable = uint64(blockSize) div 8 - 1
   var count = 0
   var blockIdx: uint64 = 0
@@ -127,6 +133,9 @@ proc analyzeCtfs*(data: openArray[byte],
 
   if not hasCtfsMagic(data):
     return err("invalid CTFS magic")
+  let versionErr = ctfsVersionError(data)
+  if versionErr.len > 0:
+    return err(versionErr)
 
   # Read max root entries from extended header.
   var maxEntries = int(DefaultMaxRootEntries)

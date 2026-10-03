@@ -66,7 +66,7 @@ proc test_basic_round_trip() {.raises: [].} =
   # Write 5 IO events (at various points)
   for i in 0 ..< 5:
     let msg = "output_" & $i & "\n"
-    let res = w.registerIOEvent(ioStdout, msg.toBytes)
+    let res = w.registerIOEvent(elkWrite, msg.toBytes)
     doAssert res.isOk, "registerIOEvent " & $i & " failed: " & res.error
 
   doAssert w.stepCount == 100, "stepCount should be 100, got " & $w.stepCount
@@ -92,10 +92,6 @@ proc test_basic_round_trip() {.raises: [].} =
     "workdir mismatch: " & reader.meta.workdir
   doAssert reader.meta.args.len == 1 and reader.meta.args[0] == "--verbose",
     "args mismatch"
-  doAssert reader.meta.paths.len == 2,
-    "paths len: " & $reader.meta.paths.len
-  doAssert reader.meta.paths[0] == "/src/main.py", "path 0 mismatch"
-  doAssert reader.meta.paths[1] == "/src/helper.py", "path 1 mismatch"
 
   # Verify interning tables
   doAssert reader.pathCount() == 2, "pathCount: " & $reader.pathCount()
@@ -114,11 +110,17 @@ proc test_basic_round_trip() {.raises: [].} =
   doAssert ev0.isOk, "step 0 failed: " & ev0.error
   doAssert ev0.get().kind == sekAbsoluteStep, "step 0 should be absolute"
 
-  # Verify step 1 is delta (sequential line in same file)
+  # Step 1 (main.py line 2, position 1) is one varint byte, as long as its
+  # delta, so the normative rule writes it absolute; step 51 (helper.py line
+  # 2, position 100001) is three bytes against a one-byte delta, so it is a
+  # delta (`trace-events.md` §"Encoding Rules").
   let ev1 = reader.step(1)
   doAssert ev1.isOk, "step 1 failed: " & ev1.error
-  doAssert ev1.get().kind == sekDeltaStep, "step 1 should be delta"
-  doAssert ev1.get().lineDelta == 1, "step 1 delta should be +1"
+  doAssert ev1.get().kind == sekAbsoluteStep, "step 1 should be absolute"
+  let ev51 = reader.step(51)
+  doAssert ev51.isOk, "step 51 failed: " & ev51.error
+  doAssert ev51.get().kind == sekDeltaStep, "step 51 should be delta"
+  doAssert ev51.get().lineDelta == 1, "step 51 delta should be +1"
 
   # Verify step at file boundary (step 50 switches to helper.py)
   let ev50 = reader.step(50)
@@ -148,7 +150,7 @@ proc test_basic_round_trip() {.raises: [].} =
 
   let io0 = reader.ioEvent(0)
   doAssert io0.isOk, "ioEvent 0 failed: " & io0.error
-  doAssert io0.get().kind == ioStdout, "io 0 kind"
+  doAssert io0.get().kind == elkWrite, "io 0 kind"
   doAssert io0.get().data == "output_0\n".toBytes, "io 0 data"
 
   echo "PASS: test_basic_round_trip"

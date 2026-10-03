@@ -50,10 +50,10 @@ when defined(nimPreviewSlimSystem):
 ##   - **The container must be quiescent.** No other process may be writing
 ##     it. The trace writer has closed it by the time a derived stream is
 ##     attached.
-##   - **v4 only.** v2/v3 headers spell bytes 6 and 7 differently
-##     (`container.nim`'s `readEncryptionMethod`), and this writer only ever
-##     produced v4. Appending into a header whose fields mean something else
-##     is refused rather than guessed at.
+##   - **Version 5 only.** Older headers are refused by name
+##     (`ctfs-container.md` §2), as every reader of this library refuses them;
+##     appending into a container no reader here would open
+##     is refused rather than attempted.
 ##   - **Never overwrites.** CTFS is append-only; a name that already exists
 ##     is an error, because a stale-but-present stream is exactly the
 ##     "returns the wrong bytes" failure the format's consumers cannot see.

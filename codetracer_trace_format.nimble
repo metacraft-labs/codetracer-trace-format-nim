@@ -14,6 +14,10 @@ task test, "Run all tests":
   exec "nim c -r tests/test_nimcache_is_worktree_local.nim"
   exec "nim c -r tests/test_base40.nim"
   exec "nim c -r tests/test_container.nim"
+  # Container version 5: a member's MapBlock is 0 (empty), its only data
+  # block tagged with bit 63, or a mapping block; readers refuse every
+  # other container version, naming it.
+  exec "nim c -r -p:src tests/test_ctfs_v5_member_forms.nim"
   # M61/M61b integrity hardening: the write-side null-mapping guards and the
   # duplicate-name rejection ported from the native-recorder fork.
   exec "nim c -r tests/test_ctfs_append_null_data_block.nim"
@@ -36,6 +40,10 @@ task test, "Run all tests":
   # stream. -d:release because one fixture is a 512-block two-level file.
   exec "nim c -r -d:release tests/test_write_null_data_block.nim"
   exec "nim c -r tests/test_streaming.nim"
+  # Durability: a recording read while its writer is still open (what a
+  # killed process leaves) has meta.dat, every sealed chunk and every interning
+  # record registered before the seal.
+  exec "nim c -r -d:release -p:src tests/test_durability_publishes_sealed_chunks.nim"
   exec "nim c -r tests/test_root_directory_overflow.nim"
   exec "nim c -r tests/test_chunk_index.nim"
   exec "nim c -r tests/test_fixed_record_table.nim"
@@ -79,6 +87,9 @@ task test, "Run all tests":
   exec "nim c -r -p:src tests/test_interning_table.nim"
   exec "nim c -r -p:src tests/test_qualified_interning.nim"
   exec "nim c -r -p:src tests/test_exec_stream.nim"
+  # The normative AbsoluteStep/DeltaStep rule and the reader's refusal of a
+  # delta before a chunk's first AbsoluteStep.
+  exec "nim c -r -d:release -p:src tests/test_step_encoding_rule.nim"
   exec "nim c -r -p:src tests/test_value_stream.nim"
   exec "nim c -r -p:src tests/test_call_stream.nim"
   exec "nim c -r -p:src tests/test_io_event_stream.nim"
@@ -98,6 +109,10 @@ task test, "Run all tests":
   # the bytes answers a line-only trace with a truncated path, a fabricated
   # per-file line table and the wrong step line — with no error.
   exec "nim c -r -d:release -p:src tests/test_paths_dat_layout_authority.nim"
+  # A column-aware file's table is decided by the writer at the file's first
+  # mention: all-zero tables get one position, a missing table the
+  # conventional one, whose columns are clamped and lines bounded.
+  exec "nim c -r -d:release -p:src tests/test_column_table_decided_at_first_mention.nim"
   # A line-only global_position_index says nothing about how its integers were
   # apportioned between files, and the two writers of this container format
   # disagree — prefixSum[path_id] + (line - 1) here, (path_id shl 32) or line
@@ -111,6 +126,13 @@ task test, "Run all tests":
   # into the next file's range — invisible behind an oversized stride,
   # a wrong answer at every boundary once slots are sized to real counts.
   exec "nim c -r -d:release -p:src tests/test_global_line_index_boundary.nim"
+  # Registering a path extends that space by one base; it must not rebuild
+  # every base. Asserted as growth (N vs 4N paths), not as a time.
+  exec "nim c -r -d:release -p:src tests/test_path_registration_scales_linearly.nim"
+  # A host resolving steps one call at a time (the C ABI's
+  # `ct_reader_step_location`) pays about one sequential decode, not one chunk
+  # decode and one position-space rebuild per step.
+  exec "nim c -r -d:release -p:src tests/test_per_step_location_cost.nim"
   # The per-file line-count table (meta.dat bit 14): a line-only container
   # that STATES how large each of its files is instead of leaving a reader
   # to assume DefaultLinesPerFile. With the sizes recorded, a step past a
@@ -134,16 +156,39 @@ task test, "Run all tests":
   # which needs a SECOND build of the writer (from the pinned pre-campaign
   # revision) and so cannot be a corpus member.
   exec "nim c -r -d:release -p:src tests/test_gdh2_reload_marker.nim"
-  # The schema break that carries the corrected encode. A container written
-  # under the superseded prefixSum[path_id] + line reads one line high under
-  # the current decode -- silently, because the address is INSIDE the space
-  # and tryResolve has nothing to refuse. meta.dat's version is the only
-  # field that can tell the two apart, so v3 and below are refused by name.
-  # Carries its own mutation control: resolving the same container's
-  # addresses without the gate is what puts every step one line high.
-  # `include`s codetracer_trace_writer_ffi to drive ct_reader_open, so it
-  # needs --mm:arc and the --nimMainPrefix the FFI's NimMain importc expects.
-  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_meta_dat_v3_global_index_refusal.nim"
+  # Every reader door refuses meta.dat versions other than 6 and containers
+  # other than version 5, naming both; the current versions open at the
+  # recorded lines. `include`s codetracer_trace_writer_ffi to drive
+  # ct_reader_open, so it needs --mm:arc and the FFI's --nimMainPrefix.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_older_versions_are_refused.nim"
+  # The same rule in the other direction, for the version AFTER 5: a container
+  # declaring the version-6 header (a profile and a whole-file compression
+  # scheme, both closed sets -- ctfs-container.md §1a, §1b) is refused by name,
+  # and the two fields' parsers refuse an unknown or absent value rather than
+  # reading it as the permissive default. Carries its control: the same reader
+  # opens a FULL container of the same recording and succeeds.
+  exec "nim c -r -d:release -p:src tests/test_compact_profile_header_refusal.nim"
+  # The compact profile's BODY (ctfs-container.md §1d): the reference encoder
+  # and decoder round-trip every member of a real recording BYTE-EXACTLY and
+  # name the same members the full profile does; a single flipped bit in the
+  # directory is detected rather than silently answered with a short or
+  # shifted member; and the layout is asserted against the bytes to carry no
+  # mapping block and no padding, with the same assertion run against a FULL
+  # container of the same recording and required to FAIL. Also prints CCP-2's
+  # deliverable-4 overhead figures against a VERSION-5 baseline.
+  exec "nim c -r -d:release -p:src tests/test_compact_container_layout.nim"
+  # CCP-4: the writer chooses the profile from a measured RAW-BYTE threshold.
+  # The default is 1 MiB of raw stream bytes; the switchover to the streaming
+  # full profile replays the buffered prefix, which is the one place in this
+  # campaign where a bug is SILENT (a valid full container missing part of the
+  # recording), so the arm compares against the same recording written always
+  # full and carries a PLANTED DROP that must make it fail; the boundary is
+  # asserted one event under and one event over; two recordings of equal RAW
+  # size and 1,452x different compressibility must take the same path, with a
+  # compressed-size rule shown to SPLIT them; and a writer-produced compact
+  # container is asserted to carry NO zstd frame, with its raw events.log equal
+  # to the full profile's own events.log inflated.
+  exec "nim c -r -d:release -p:src tests/test_profile_threshold_choice.nim"
   # The column-aware step encoding end to end: the writer's opt-in, the
   # DeltaColumn round-trip, Layout A paths.dat, the position decoder, and the
   # meta.dat unknown-flag-bit rejection that keeps the extension clean.
@@ -176,6 +221,9 @@ task test, "Run all tests":
   exec "nim c -r -p:src tests/test_streaming_value_encoder.nim"
   exec "nim c -r -p:src tests/test_value_ref.nim"
   exec "nim c -r -d:release -p:src tests/test_multi_stream_writer.nim"
+  # A recursion's returns reach the call buffer innermost first; flushing them
+  # in call_key order must not cost a pass over the buffer per record.
+  exec "nim c -r -d:release -p:src tests/test_deep_call_nesting_flush.nim"
   # MT7-5a: the exported, ABI-stable, per-thread crossing block that mirrors the
   # writer's `pendingCrossings` seq (read back via the C symbols the reader uses).
   exec "nim c -r -d:release -p:src tests/test_crossing_state.nim"
@@ -187,6 +235,9 @@ task test, "Run all tests":
   exec "nim c -r -d:release -p:src tests/test_linehits_reader.nim"
   exec "nim c -r -d:release -p:src tests/test_memwrites_builder.nim"
   exec "nim c -r -d:release -p:src tests/test_step_map_builder.nim"
+  # step-map.ns version 2: the specified bytes, 64 KiB chunking, line 0 keyed
+  # as line 1, and the reader's refusals.
+  exec "nim c -r -d:release -p:src tests/test_step_map_v2.nim"
   exec "nim c -r -p:src tests/test_partial_trace_cache.nim"
   exec "nim c -r -d:release -p:src tests/test_ram_cache.nim"
   exec "nim c -r -d:release -p:src tests/test_file_access.nim"
@@ -234,6 +285,13 @@ task test, "Run all tests":
   # every value lookup was refused, and the refusal was turned into an empty
   # string that the assertions read as "no values".
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_reader_ffi.nim"
+  # An empty type, variable or function name is a name: the reader's C ABI
+  # returns it as a non-nil zero-length buffer, nil only on failure.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_reader_ffi_empty_names.nim"
+  # The 2026-10 revision through the C ABI: every value tag 0-9, every
+  # EventLogKind exactly, record framing, meta.dat v6 written once at the
+  # first record and the declared source-reload capability.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_fmt_2026_10.nim"
   # Every test file is reachable from this task. Two were not, for months
   # each, and both described behaviour that had moved on without them.
   exec "nim c -r -d:release -p:src tests/test_every_test_is_listed.nim"
@@ -261,6 +319,15 @@ task test, "Run all tests":
   # count, and must be refused by name rather than silently dropping the step.
   # Same FFI-`include` compile requirements as the tests above.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_line_count_table.nim"
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_column_table_decided_at_first_mention.nim"
+  # A path or variable name registered through the C ABI is interned when it
+  # is registered, as the native API interns it, not when a record first
+  # refers to it. Same FFI-`include` compile requirements as the tests above.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_register_path_and_varname.nim"
+  # Values staged when a recording ends go to the last STEP's value record,
+  # not to a thread-switch record after it, even across a value-chunk boundary.
+  # Same FFI-`include` compile requirements as the tests above.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_trailing_values_attach_to_the_last_step.nim"
   # A reload marker written through the C ABI follows the step registered
   # before it (the pending step is flushed first). Same FFI-`include` compile
   # requirements as the tests above.
@@ -321,6 +388,7 @@ task bench, "Run benchmarks":
   # Both measure the host — see the header of tests/bench_chunked_table.nim.
   exec "nim c -d:release -r tests/bench_chunked_table.nim"
   exec "nim c -d:release -r tests/bench_varint.nim"
+  exec "nim c -d:release -r -p:src tests/bench_streaming_writer.nim"
   exec "nim c -d:release -r -p:src tests/test_exec_stream.nim"
 
 task benchSuite, "Run unified benchmark regression suite":
@@ -339,30 +407,60 @@ task testReader, "Run trace reader tests":
   exec "nim c -r -p:src tests/test_trace_reader.nim"
 
 task buildStaticLib, "Build static library (C FFI)":
-  # --passC:"-fPIC" is required so the static lib can be linked into shared
-  # objects (e.g. Python's .so extension via maturin/PyO3).
-  # --nimMainPrefix keeps the Nim runtime entry points uniquely named so
-  # this lib can be embedded next to another Nim-compiled artifact (the MCR
-  # emulator) without a duplicate-`NimMain` link error. It MUST match the
-  # `proc codetracerTraceWriterNimMain` importc in codetracer_trace_writer_ffi.nim.
-  when hostOS == "windows":
-    # The Godot/CodeTracer Windows build is MSVC, so the embedded archive must
-    # use the same compiler, CRT, and .lib format. Run from a VS developer
-    # environment; zstd_bindings.nim selects C:\zstd for this compiler.
-    exec "nim c --cc:vcc --app:staticlib --mm:arc --noMain -d:release --nimMainPrefix:codetracerTraceWriter -p:src -o:codetracer_trace_writer.lib src/codetracer_trace_writer_ffi.nim"
-  else:
-    exec "nim c --app:staticlib --mm:arc --noMain -d:release --nimMainPrefix:codetracerTraceWriter --passC:\"-fPIC\" -p:src -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim"
+  # The flags live in build_ffi.nims, the one build every producer of the
+  # archive runs (this task, the flake's trace-writer-ffi package, and the
+  # Rust `codetracer_trace_writer_nim` crate's build.rs).
+  exec "nim e --hints:off build_ffi.nims"
 
 task buildSharedLib, "Build shared library (C FFI)":
-  # See buildStaticLib for why --nimMainPrefix is required.
-  exec "nim c --app:lib --mm:arc --noMain -d:release --nimMainPrefix:codetracerTraceWriter -p:src -o:libcodetracer_trace_writer.so src/codetracer_trace_writer_ffi.nim"
+  exec "nim e --hints:off build_ffi.nims --app:lib"
+
+task testFfiThreads, "C hosts: close after the recording thread exited; concurrent writers":
+  # The host library is built --threads:off with a process lock around every
+  # entry point (src/codetracer_trace_writer_ffi_runtime.c). Two hosts, each
+  # with a control that proves it still reaches the defect it guards:
+  #
+  #  * test_ffi_worker_thread_exit.c must PASS against the shipped flags and
+  #    CRASH against an archive built --threads:on (per-thread heaps);
+  #  * test_ffi_concurrent_writers.c must PASS against the shipped flags and
+  #    FAIL against one built -d:ffiNoProcessLock (one heap, no lock).
+  when hostOS == "windows":
+    echo "SKIP: testFfiThreads uses pthreads and mmap"
+  else:
+    let dir = "build/ffi-threads"
+    mkDir(dir)
+    # The shipped archive is build_ffi.nims's; the two controls are the same
+    # build with one override each, passed after `--` so it wins.
+    let build = "nim e --hints:off build_ffi.nims"
+    exec build & " --nimcache:" & dir & "/nc-ship --out:" & dir & "/lib-ship.a -- --hints:off"
+    exec build & " --nimcache:" & dir & "/nc-tls --out:" & dir & "/lib-tls.a -- --hints:off --threads:on --warnings:off"
+    exec build & " --nimcache:" & dir & "/nc-nolock --out:" & dir & "/lib-nolock.a -- --hints:off --warnings:off -d:ffiNoProcessLock"
+    let extra = when hostOS == "macosx": " -framework Security -framework CoreFoundation" else: ""
+    for t in ["worker_thread_exit", "concurrent_writers"]:
+      for v in ["ship", "tls", "nolock"]:
+        exec "gcc -O1 -o " & dir & "/" & t & "-" & v & " tests/test_ffi_" & t & ".c " & dir & "/lib-" & v & ".a -lzstd -lm -lpthread -I include" & extra
+    exec dir & "/worker_thread_exit-ship"
+    exec dir & "/concurrent_writers-ship"
+    let (_, tlsCode) = gorgeEx(dir & "/worker_thread_exit-tls")
+    if tlsCode == 0:
+      raise newException(AssertionDefect, "the worker-thread host PASSED against a --threads:on " &
+        "archive: the test no longer reaches the cross-thread free it guards")
+    var lockCaught = false
+    for attempt in 0 ..< 5:
+      let (_, code) = gorgeEx(dir & "/concurrent_writers-nolock")
+      if code != 0:
+        lockCaught = true
+        break
+    if not lockCaught:
+      raise newException(AssertionDefect, "the concurrent-writers host PASSED 5 times against an " &
+        "archive without the process lock: it no longer exercises concurrent entry")
+    echo "PASS: --threads:on crashes the worker-exit host (exit " & $tlsCode &
+      "); no lock fails the concurrent host; the shipped flags pass both"
 
 task testFfi, "Build and run C FFI test":
-  # --nimMainPrefix keeps the Nim runtime entry points uniquely named so
-  # this lib can be embedded next to another Nim-compiled artifact (the MCR
-  # emulator) without a duplicate-`NimMain` link error. It MUST match the
-  # `proc codetracerTraceWriterNimMain` importc in codetracer_trace_writer_ffi.nim.
-  exec "nim c --app:staticlib --mm:arc --noMain -d:release --nimMainPrefix:codetracerTraceWriter --passC:\"-fPIC\" -p:src -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim"
+  # The archive every producer builds (see build_ffi.nims); test_ffi.c checks
+  # it reports that build's configuration.
+  exec "nim e --hints:off build_ffi.nims"
   # MT1: the three replay-observation chokepoints must be exported symbols so a
   # replay-time observer (MCR) can interpose on them — guard it explicitly.
   exec "bash tests/check_chokepoint_symbols.sh libcodetracer_trace_writer.a"

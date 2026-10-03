@@ -123,7 +123,7 @@ proc buildFixtureBytes(): seq[byte] =
   doAssert w.registerStep(p0, 5'u64, step4Vals).isOk
 
   doAssert w.registerStep(p0, 6'u64, @[]).isOk
-  doAssert w.registerIOEvent(ioStdout, "computing...\n".toBytesAscii).isOk
+  doAssert w.registerIOEvent(elkWrite, "computing...\n".toBytesAscii).isOk
   let argN = ValueRecord(kind: vrkInt, intVal: 7, intTypeId: TypeId(tInt))
   let argEnc = encodeValue(argN)
   let callArgs = @[CallArg(varnameId: vnArg, value: argEnc)]
@@ -157,7 +157,7 @@ proc buildFixtureBytes(): seq[byte] =
   doAssert w.registerStep(p1, 2'u64, step7Vals).isOk
 
   doAssert w.registerStep(p1, 3'u64, @[]).isOk
-  doAssert w.registerIOEvent(ioStderr, "warning: nothing\n".toBytesAscii).isOk
+  doAssert w.registerIOEvent(elkWriteOther, "warning: nothing\n".toBytesAscii).isOk
   let computeRet = encodeValue(
     ValueRecord(kind: vrkInt, intVal: 49, intTypeId: TypeId(tInt)))
   doAssert w.registerReturn(computeRet).isOk
@@ -364,11 +364,11 @@ proc test_io_events_present() =
   let root = buildFullDocument(reader, FullOpts(stripPaths: false))
   let events = root["events"]
   let stdoutEv = findEvent(events, proc(j: JsonNode): bool =
-    j["kind"].getStr == "io" and j["io_kind"].getStr == "ioStdout")
+    j["kind"].getStr == "io" and j["io_kind"].getStr == "Write")
   doAssert stdoutEv["text"].getStr == "computing...\n"
   doAssert stdoutEv["bytes_len"].getInt == 13
   let stderrEv = findEvent(events, proc(j: JsonNode): bool =
-    j["kind"].getStr == "io" and j["io_kind"].getStr == "ioStderr")
+    j["kind"].getStr == "io" and j["io_kind"].getStr == "WriteOther")
   doAssert stderrEv["text"].getStr == "warning: nothing\n"
   echo "[ok] test_io_events_present"
 
@@ -496,7 +496,7 @@ proc test_trace_filter_provenance_materialized() =
   entries[1].path = "/etc/codetracer/override.toml"
   for i in 0 ..< 32:
     entries[1].sha256[i] = byte(255 - i)
-  w.setFilterProvenance(entries)
+  doAssert w.setFilterProvenance(entries).isOk
   doAssert w.close().isOk
   let bytes = w.toBytes()
   w.closeCtfs()

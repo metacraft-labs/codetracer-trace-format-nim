@@ -56,7 +56,9 @@ canonical reader. Those tests contain a source-level SKIP arm for
 environments that have neither `cargo` nor `direnv`. Shipping the Rust
 toolchain in this shell is what keeps the cross-read proof actually running
 instead of silently skipping. **Never** "fix" a cross-read failure by
-removing the toolchain so the SKIP arm engages.
+removing the toolchain so the SKIP arm engages. To cross-check against a Rust
+checkout that is not the sibling (a worktree on the branch being ported),
+point `CODETRACER_TRACE_FORMAT_DIR` at it.
 
 ## Commands
 

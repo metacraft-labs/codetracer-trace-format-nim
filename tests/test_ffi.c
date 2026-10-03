@@ -23,6 +23,14 @@ int main(void) {
 
     printf("=== C FFI Test for codetracer_trace_writer ===\n\n");
 
+    /* The archive this test links is the one build_ffi.nims produces, and it
+     * must say so: a host library built any other way (--threads:on, no
+     * process lock) is not safe to call from several host threads. */
+    ASSERT(strcmp(trace_writer_build_config(),
+                  "app:staticlib;threads:off;mm:arc;release:on;processLock:on") == 0,
+           "the shipped archive must report the build_ffi.nims configuration");
+    printf("[OK] trace_writer_build_config: %s\n", trace_writer_build_config());
+
     /* Create a trace writer */
     trace_writer_t writer = trace_writer_new("test_program", FFI_TRACE_FORMAT_BINARY);
     ASSERT(writer != NULL, "trace_writer_new should return non-NULL");
@@ -133,13 +141,6 @@ int main(void) {
         };
         size_t arg_lens[] = { strlen(arg_strs[0]), strlen(arg_strs[1]), strlen(arg_strs[2]) };
 
-        const char* path_strs[] = { "/src/main.c", "/src/util.c" };
-        const uint8_t* path_ptrs[] = {
-            (const uint8_t*)path_strs[0],
-            (const uint8_t*)path_strs[1]
-        };
-        size_t path_lens[] = { strlen(path_strs[0]), strlen(path_strs[1]) };
-
         const char* rec_id = "test-recorder-v1";
         /* M-REC-1: canonical UUIDv7.  Hard-coded so the test
          * exercises caller-supplied id rather than the mint path. */
@@ -152,7 +153,6 @@ int main(void) {
             (const uint8_t*)prog, strlen(prog),
             (const uint8_t*)wd, strlen(wd),
             arg_ptrs, arg_lens, 3,
-            path_ptrs, path_lens, 2,
             (const uint8_t*)rec_id, strlen(rec_id),
             (const uint8_t*)recording_id, strlen(recording_id),
             &buf, &buf_len);
@@ -161,9 +161,11 @@ int main(void) {
         ASSERT(buf_len > 8, "output buffer should have at least header bytes");
         printf("[OK] ct_write_meta_dat_to_buffer (len=%zu)\n", buf_len);
 
-        /* Check magic bytes */
+        /* Check magic bytes, and version 6 (meta.dat carries no path list:
+         * a trace's source paths are paths.dat's records). */
         ASSERT(buf[0] == 'C' && buf[1] == 'T' && buf[2] == 'M' && buf[3] == 'D',
             "magic bytes should be CTMD");
+        ASSERT(buf[4] == 6 && buf[5] == 0, "meta.dat version should be 6");
         printf("[OK] magic bytes\n");
 
         /* Read back */
@@ -193,24 +195,14 @@ int main(void) {
             printf("[OK] arg[%zu] = \"%.*s\"\n", i, (int)len, (const char*)p);
         }
 
-        /* Verify paths */
-        ASSERT(ct_meta_dat_paths_count(reader) == 2, "paths count should be 2");
-        for (size_t i = 0; i < 2; i++) {
-            p = ct_meta_dat_path(reader, i, &len);
-            ASSERT(p != NULL && len == strlen(path_strs[i]), "path length mismatch");
-            ASSERT(memcmp(p, path_strs[i], len) == 0, "path content mismatch");
-            printf("[OK] path[%zu] = \"%.*s\"\n", i, (int)len, (const char*)p);
-        }
-
         /* Verify recorder_id */
         p = ct_meta_dat_recorder_id(reader, &len);
         ASSERT(p != NULL && len == strlen(rec_id), "recorder_id length mismatch");
         ASSERT(memcmp(p, rec_id, len) == 0, "recorder_id content mismatch");
         printf("[OK] recorder_id = \"%.*s\"\n", (int)len, (const char*)p);
 
-        /* Out of bounds arg/path should return NULL */
+        /* Out of bounds arg should return NULL */
         ASSERT(ct_meta_dat_arg(reader, 99, &len) == NULL, "out-of-bounds arg should be NULL");
-        ASSERT(ct_meta_dat_path(reader, 99, &len) == NULL, "out-of-bounds path should be NULL");
         printf("[OK] out-of-bounds safety\n");
 
         /* Free reader and buffer */

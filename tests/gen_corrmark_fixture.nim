@@ -56,6 +56,8 @@ proc main() =
   var w = initMultiStreamWriter(ctPath, "corrmark_fixture",
     recordingId = "01949fcc-7d92-7e9c-aaaa-c04414a4c000").get()
   doAssert w.registerPath("/src/service.py").isOk
+  # Span `i` is registered after step `i` (0-based), so its enclosing step,
+  # the index entry's `geid`, is `i`.
   for i, s in Spans:
     doAssert w.registerStep(0, uint64(i + 1), []).isOk
     let r = w.registerSpanCoverageHex(
@@ -72,7 +74,7 @@ proc main() =
   for i, s in Spans:
     json.add("    {\"traceId\": \"" & s.traceIdHex & "\", \"spanId\": \"" &
       s.spanIdHex & "\", \"wallTimeUnixNs\": " & $s.wallNs &
-      ", \"monotonicTimeNs\": " & $s.monotonicNs & ", \"geid\": " & $(i + 1) & "}")
+      ", \"monotonicTimeNs\": " & $s.monotonicNs & ", \"geid\": " & $i & "}")
     if i < Spans.high:
       json.add(",")
     json.add("\n")
