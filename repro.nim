@@ -69,6 +69,7 @@ import repro_dsl_stdlib/foreign_env
 import ct_test_nim_unittest
 
 import std/os
+import build_writer_artifacts
 
 type
   TestSpec = object
@@ -278,7 +279,14 @@ package codetracer_trace_format_nim:
     # back-end ``nim c`` shells out to.
     "nim >=2.2 <3.0"
     "nimble"
-    "gcc >=12"
+    when defined(macosx):
+      "clang"
+    else:
+      "gcc >=12"
+    when defined(windows):
+      "vccexe"
+      "cl"
+      "link"
 
   devEnv:
     when not defined(windows):
@@ -302,24 +310,12 @@ package codetracer_trace_format_nim:
     # -p:src -o:ct-print src/codetracer_ct_print.nim``). The output is the
     # repo-root ``ct-print`` so downstream recorder tests find it at the
     # fixed sibling path ``../codetracer-trace-format-nim/ct-print``.
-    const binarySuffix = (when defined(windows): ".exe" else: "")
-    const ctPrintBinary = "ct-print" & binarySuffix
-
-    let ctPrintBuild = nim.c(
-      source = "src/codetracer_ct_print.nim",
-      output = ctPrintBinary,
-      mm = "arc",
-      defines = @["release"],
-      paths = @["src"],
-      actionId = "codetracer-trace-format-nim.ct-print.nim-c",
-      extraInputs = @[
-        "src",
-        "codetracer_trace_format.nimble",
-        "nim.cfg",
-      ],
-      extraOutputs = @[ctPrintBinary])
+    let ctPrintBuild = buildCtPrint(".")
 
     discard collect("default", @[ctPrintBuild])
+
+    # Opt-in owning producer; no shipping/default or test corpus expansion.
+    discard collect("sharedLib", @[buildSharedLib(".")])
 
     # ---- Test corpus (the `test` / `test-builds` collections) --------
     #
