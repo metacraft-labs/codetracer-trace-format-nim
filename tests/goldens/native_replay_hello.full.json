@@ -9,7 +9,7 @@
     "tick_source": "none",
     "tick_definition": "edge",
     "hook_profile": "test",
-    "ctfs_version": "4",
+    "ctfs_version": "6",
     "hook_strategies": ["ldpreload"]
   },
   "paths": [],
