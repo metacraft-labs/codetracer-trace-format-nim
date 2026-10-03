@@ -25,7 +25,7 @@ proc buildSharedLib*(projectRoot: string): BuildActionDef =
   let call = publicCliCall("nim", "nim", "c", "nim.nim.c", @[
     cliArgSeq("canonicalFlags", ffiCompilerFlags("lib", target),
               cpkPositional, 0),
-    cliArg("parallelBuild", 4, alias = "--parallelBuild:", format = cafConcat),
+    cliArg("parallelBuild", 2, alias = "--parallelBuild:", format = cafConcat),
     cliArg("paths", projectRoot / "src", alias = "--path:", format = cafConcat),
     cliArg("nimcache", projectRoot / ".repro/build/shared-writer/nimcache",
            alias = "--nimcache:", format = cafConcat),
@@ -54,7 +54,7 @@ proc buildCtPrint*(projectRoot: string): BuildActionDef =
     cliArg("mm", "arc", alias = "--mm:", format = cafConcat),
     cliArgSeq("defines", @["release"], alias = "-d:",
               format = cafConcat, repeated = true),
-    cliArg("parallelBuild", 4, alias = "--parallelBuild:", format = cafConcat),
+    cliArg("parallelBuild", 2, alias = "--parallelBuild:", format = cafConcat),
     cliArg("paths", projectRoot / "src", alias = "--path:", format = cafConcat),
     cliArg("nimcache", projectRoot / ".repro/build/ct-print/nimcache",
            alias = "--nimcache:", format = cafConcat),
