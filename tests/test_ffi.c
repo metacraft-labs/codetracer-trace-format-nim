@@ -389,6 +389,41 @@ int main(void) {
             printf("[OK] ms: file size = %ld bytes\n", (long)st.st_size);
         }
 
+        /* Read it back through the reader ABI the header declares: from the
+         * path, and from the bytes, which the caller frees straight away. */
+        {
+            ct_reader_t from_path = ct_reader_open("/tmp/ms_test.ct");
+            ASSERT(from_path != NULL, "ct_reader_open");
+            FILE* f = fopen("/tmp/ms_test.ct", "rb");
+            ASSERT(f != NULL, "fopen ms_test.ct");
+            fseek(f, 0, SEEK_END);
+            long n = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            uint8_t* bytes = malloc((size_t)n);
+            ASSERT(bytes != NULL && fread(bytes, 1, (size_t)n, f) == (size_t)n,
+                   "read ms_test.ct");
+            fclose(f);
+            ct_reader_t from_bytes = ct_reader_open_bytes(bytes, (size_t)n);
+            memset(bytes, 0xFF, (size_t)n);
+            free(bytes);
+            ASSERT(from_bytes != NULL, "ct_reader_open_bytes");
+            uint64_t steps = ct_reader_step_count(from_bytes);
+            ASSERT(steps > 0 && steps == ct_reader_step_count(from_path),
+                   "the two handles count the same steps");
+            uint64_t p0 = 0, l0 = 0, p1 = 0, l1 = 0;
+            ASSERT(ct_reader_step_location(from_bytes, 0, &p0, &l0) == 0 &&
+                   ct_reader_step_location(from_path, 0, &p1, &l1) == 0 &&
+                   p0 == p1 && l0 == l1, "the two handles locate step 0 alike");
+            size_t len = 0;
+            uint8_t* prog = ct_reader_program(from_bytes, &len);
+            ASSERT(prog != NULL && len == strlen("ms_test") &&
+                   memcmp(prog, "ms_test", len) == 0, "ct_reader_program");
+            ct_free_buffer(prog);
+            ct_reader_close(from_bytes);
+            ct_reader_close(from_path);
+            printf("[OK] ms: read back from the path and from bytes\n");
+        }
+
         trace_writer_free(w);
         remove("/tmp/ms_test.ct");
     }

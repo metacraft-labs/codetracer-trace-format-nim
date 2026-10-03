@@ -26,13 +26,11 @@
 ## precisely why the check has to be mechanical rather than remembered.
 ##
 ## SCOPE, stated because it bounds the claim. This gate covers the
-## `trace_writer_*` surface only: that is the writer C ABI, it is what
-## `include/codetracer_trace_writer.h` is the header FOR, and it is the
-## surface all three incidents were on. The `ct_reader_*` / `ct_value_*` /
-## `ct_meta_dat_*` families are exported by the same FFI module but are not
-## declared in this header at all and never were — they are reached through
-## other bindings — so folding them in would make this test a list of 50
-## permanent exceptions, which is a list nobody reads.
+## `trace_writer_*` surface, the writer C ABI and the surface all three
+## incidents were on, and the `ct_reader_*` surface, the reader C ABI, which
+## the header declares in full and with no backlog: a C host can open a trace
+## from a path or from bytes and read all of it. The `ct_value_*` and
+## `ct_meta_dat_*` families are declared in part and are not gated here.
 ##
 ## NO MOCKS. This reads the real `src/codetracer_trace_writer_ffi.nim` and the
 ## real `include/codetracer_trace_writer.h` off disk.
@@ -123,12 +121,13 @@ proc stripComments(src: string): string =
   result = src.replace(re(r"/\*(.|\n)*?\*/", {reStudy}), " ")
   result = result.replace(re(r"//[^\n]*"), " ")
 
-proc declaredNames(headerText: string): HashSet[string] =
+proc declaredNames(headerText: string,
+    prefix = "trace_writer_"): HashSet[string] =
   ## Names that appear as `name(` outside any comment — a declaration or a
   ## definition, which for a header is the same claim: a caller that includes
   ## this file can call it.
   result = initHashSet[string]()
-  for m in headerText.findAll(re(r"\btrace_writer_[a-z0-9_]+\s*\(")):
+  for m in headerText.findAll(re(r"\b" & prefix & r"[a-z0-9_]+\s*\(")):
     result.incl m.strip().strip(chars = {'('}).strip()
 
 suite "the C header declares the writer ABI":
@@ -185,3 +184,22 @@ suite "the C header declares the writer ABI":
     # ("every listed name is still undeclared") is what stops the list
     # outliving the gap it records.
     check undeclared == expected
+
+  test "every exported ct_reader_* entry point is declared":
+    let declared = declaredNames(stripComments(readFile(Header)), "ct_reader_")
+    var exported: seq[string] = @[]
+    for name in exportcNames():
+      if name.startsWith("ct_reader_"):
+        exported.add name
+    exported = exported.deduplicate()
+    # The two ways to get a handle, positive controls for the matcher.
+    check "ct_reader_open" in exported
+    check "ct_reader_open_bytes" in exported
+    check exported.len >= 40                  # 43 on 2026-10-03
+    var undeclared: seq[string] = @[]
+    for name in exported:
+      if name notin declared:
+        undeclared.add name
+    check undeclared.len == 0
+    if undeclared.len > 0:
+      echo "exported, not declared: ", undeclared

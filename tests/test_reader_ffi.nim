@@ -456,6 +456,40 @@ proc test_reader_ffi_structured_accessors() =
   removeFile(tmpPath)
   echo "PASS: test_reader_ffi_structured_accessors (complete)"
 
+proc test_reader_ffi_open_bytes() =
+  ## `ct_reader_open_bytes` reads what `ct_reader_open` reads, from bytes the
+  ## caller may free as soon as the call returns.
+  let tmpPath = "/tmp/test_reader_ffi_bytes.ct"
+  writeTestTrace(tmpPath)
+  let fromPath = ct_reader_open(cstring(tmpPath))
+  doAssert fromPath != nil, "ct_reader_open failed: " & $trace_writer_last_error()
+
+  var bytes = toBytes(readFile(tmpPath))
+  let h = ct_reader_open_bytes(addr bytes[0], csize_t(bytes.len))
+  doAssert h != nil, "ct_reader_open_bytes failed: " & $trace_writer_last_error()
+  # The handle owns a copy: overwrite and release the caller's buffer.
+  for b in bytes.mitems: b = 0xFF
+  bytes = @[]
+
+  doAssert ffiGetMeta(h, ct_reader_program) == "test_ffi_prog"
+  doAssert ct_reader_step_count(h) == ct_reader_step_count(fromPath)
+  doAssert ct_reader_call_count(h) == ct_reader_call_count(fromPath)
+  doAssert ct_reader_event_count(h) == ct_reader_event_count(fromPath)
+  doAssert ffiGetStr(h, 1, ct_reader_path) == "/src/util.py"
+  for n in 0'u64 ..< ct_reader_step_count(h):
+    doAssert ffiGetJson(h, n, ct_reader_step) == ffiGetJson(fromPath, n, ct_reader_step)
+    doAssert ffiGetJson(h, n, ct_reader_values) ==
+      ffiGetJson(fromPath, n, ct_reader_values)
+  ct_reader_close(h)
+  ct_reader_close(fromPath)
+
+  # A NULL buffer that claims bytes is refused, with a reason.
+  trace_writer_clear_last_error()
+  doAssert ct_reader_open_bytes(nil, 4) == nil
+  doAssert ($trace_writer_last_error()).len > 0
+  removeFile(tmpPath)
+  echo "PASS: test_reader_ffi_open_bytes"
+
 proc test_reader_ffi_null_safety() =
   # NimMain already called by Nim's own startup for this executable
 
@@ -504,5 +538,6 @@ proc test_reader_ffi_null_safety() =
 
 test_reader_ffi_lifecycle()
 test_reader_ffi_structured_accessors()
+test_reader_ffi_open_bytes()
 test_reader_ffi_null_safety()
 echo "ALL PASS: test_reader_ffi"

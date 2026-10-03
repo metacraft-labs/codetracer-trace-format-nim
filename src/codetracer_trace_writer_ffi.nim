@@ -4766,6 +4766,29 @@ when ctHasFilesystem:
       return 1
     return 0
 
+proc ct_reader_open_bytes(data: ptr uint8,
+    len: csize_t): pointer {.exportc, cdecl, dynlib, ffiGuard.} =
+  ## Open a container that is already in memory: the `len` bytes at `data`.
+  ## The bytes are copied, so the caller may free them as soon as this
+  ## returns. Returns an opaque reader handle, or nil on failure with the
+  ## reason in `trace_writer_last_error`.
+  ##
+  ## The one way to open a reader on a target without a filesystem, such as
+  ## a browser's wasm32 module, which is handed bytes and has no path.
+  if data.isNil and len > 0:
+    setError("NULL data with a non-zero length")
+    return nil
+  var bytes = newSeq[byte](int(len))
+  if len > 0:
+    copyMem(addr bytes[0], data, int(len))
+  var res = openNewTraceFromBytes(move bytes)
+  if res.isErr:
+    setError(res.error)
+    return nil
+  let h = cast[TraceReaderHandle](alloc0(sizeof(NewTraceReader)))
+  h[] = move res.get()
+  return cast[pointer](h)
+
 proc ct_reader_close(h: pointer) {.exportc, cdecl, dynlib, ffiGuard.} =
   ## Close and free a reader handle. Passing NULL is a no-op.
   if h.isNil:

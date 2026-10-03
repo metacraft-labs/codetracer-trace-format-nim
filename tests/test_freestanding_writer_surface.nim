@@ -104,7 +104,20 @@ suite "freestanding writer surface":
           emitted.add readFile(p)
       check emitted.len > 0
 
-      let missing = names.filterIt(it notin emitted).sorted()
+      # A whole identifier, not a substring: `ct_reader_open` is a prefix of
+      # `ct_reader_open_bytes`, which a freestanding build keeps.
+      proc emits(name: string): bool =
+        var at = emitted.find(name)
+        while at >= 0:
+          let after = at + name.len
+          if after >= emitted.len or emitted[after] notin IdentChars:
+            if at == 0 or emitted[at - 1] notin IdentChars:
+              return true
+          at = emitted.find(name, after)
+        false
+      let missing = names.filterIt(not emits(it)).sorted()
+      # What a freestanding host opens a reader with instead.
+      check emits("ct_reader_open_bytes")
       echo "freestanding C ABI: ", names.len - missing.len, " of ", names.len,
         " exportc functions present; ", missing.len, " missing"
       if missing != @ExpectedMissing.sorted():

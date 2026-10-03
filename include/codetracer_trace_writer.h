@@ -996,6 +996,133 @@ int ct_value_write_bigint(value_encoder_t h, const uint8_t* data, size_t len, in
 
 const uint8_t* ct_value_get_bytes(value_encoder_t h, size_t* out_len);
 
+/* --------------------------------------------------------------------------
+ * Trace reader
+ *
+ * A reader handle is an opened `.ct` container.  It comes from a path
+ * (`ct_reader_open`, hosts with a filesystem only) or from bytes already in
+ * memory (`ct_reader_open_bytes`, every target, including freestanding
+ * wasm32).  Close it with `ct_reader_close`.
+ *
+ * Conventions, for every function below:
+ *   - A NULL handle is refused; the failure value is the one stated.
+ *   - Failures set trace_writer_last_error().
+ *   - A returned `uint8_t*` and every `*out_data` buffer is a heap copy the
+ *     caller frees with ct_free_buffer.  The JSON accessors (`ct_reader_step`,
+ *     `_values`, `_call`, `_call_for_step`, `_event`) return NULL on failure;
+ *     the name accessors return a non-NULL buffer even for an empty name
+ *     (`*out_len = 0`), so NULL from them is always a failure.
+ *   - A handle is not thread-safe; use one per thread or serialise calls.
+ * -------------------------------------------------------------------------- */
+
+typedef void* ct_reader_t;
+
+/* Open the container at `path`.  NULL on failure. */
+ct_reader_t ct_reader_open(const char* path);
+/* As ct_reader_open, reading paths.dat records as column-aware (Layout A)
+ * even when meta.dat bit 4 is clear.  An assertion by the caller, never a
+ * guess: on a trace whose records are not Layout A the open fails. */
+ct_reader_t ct_reader_open_assume_column_aware_paths(const char* path);
+/* Open a container held in memory.  The `len` bytes at `data` are copied,
+ * so the caller may free them as soon as this returns.  NULL on failure. */
+ct_reader_t ct_reader_open_bytes(const uint8_t* data, size_t len);
+/* Re-read a growing container at `path` into `h`.  0 on success. */
+int ct_reader_refresh(ct_reader_t h, const char* path);
+/* Close and free a handle.  NULL is a no-op. */
+void ct_reader_close(ct_reader_t h);
+
+/* Counts.  0 on failure. */
+uint64_t ct_reader_step_count(ct_reader_t h);
+uint64_t ct_reader_call_count(ct_reader_t h);
+uint64_t ct_reader_event_count(ct_reader_t h);
+uint64_t ct_reader_path_count(ct_reader_t h);
+uint64_t ct_reader_function_count(ct_reader_t h);
+uint64_t ct_reader_type_count(ct_reader_t h);
+uint64_t ct_reader_varname_count(ct_reader_t h);
+
+/* Interned names by id. */
+uint8_t* ct_reader_path(ct_reader_t h, uint64_t id, size_t* out_len);
+uint8_t* ct_reader_function(ct_reader_t h, uint64_t id, size_t* out_len);
+uint8_t* ct_reader_type_name(ct_reader_t h, uint64_t id, size_t* out_len);
+uint8_t* ct_reader_varname(ct_reader_t h, uint64_t id, size_t* out_len);
+
+/* meta.dat's program and working directory. */
+uint8_t* ct_reader_program(ct_reader_t h, size_t* out_len);
+uint8_t* ct_reader_workdir(ct_reader_t h, size_t* out_len);
+
+/* Records as JSON documents. */
+uint8_t* ct_reader_step(ct_reader_t h, uint64_t n, size_t* out_len);
+uint8_t* ct_reader_values(ct_reader_t h, uint64_t n, size_t* out_len);
+uint8_t* ct_reader_call(ct_reader_t h, uint64_t key, size_t* out_len);
+/* The innermost call enclosing step `step_id`. */
+uint8_t* ct_reader_call_for_step(ct_reader_t h, uint64_t step_id, size_t* out_len);
+uint8_t* ct_reader_event(ct_reader_t h, uint64_t index, size_t* out_len);
+
+/* Step N's source location.  0 on success; non-zero when the step's position
+ * is not one the trace's line-only address space can address. */
+int ct_reader_step_location(ct_reader_t h, uint64_t n,
+                            uint64_t* out_path_id, uint64_t* out_line);
+/* Steps [start_n, start_n + count) into caller buffers of `count` entries.
+ * Returns the number written, min(count, step_count - start_n), or
+ * UINT64_MAX on failure.  Columns are 0 on a line-only trace. */
+uint64_t ct_reader_step_locations(ct_reader_t h, uint64_t start_n, uint64_t count,
+                                  uint64_t* out_path_ids, uint64_t* out_lines);
+uint64_t ct_reader_step_locations_with_columns(
+    ct_reader_t h, uint64_t start_n, uint64_t count,
+    uint64_t* out_path_ids, uint64_t* out_lines, uint64_t* out_columns);
+/* The raw global_position_index of each step, uninterpreted. */
+uint64_t ct_reader_step_global_line_indices(ct_reader_t h, uint64_t start_n,
+                                            uint64_t count, uint64_t* out_glis);
+
+/* paths.dat per-file size tables.  The line-length accessors return 0 and
+ * write *out_value when a value is available, 1 otherwise; the _raw form
+ * ignores meta.dat bit 4.  ct_reader_line_count_raw is 0 for a file with no
+ * Layout A table.  ct_reader_path_table_kind: 0 bare record, 1 line count
+ * (bit 14), 2 per-line table (bit 4), 3 the conventional table; -1 for a
+ * NULL handle or an unknown file. */
+int ct_reader_line_length(ct_reader_t h, uint64_t file_id, uint32_t line_index0,
+                          uint32_t* out_value);
+int ct_reader_line_length_raw(ct_reader_t h, uint64_t file_id, uint32_t line_index0,
+                              uint32_t* out_value);
+uint64_t ct_reader_line_count_raw(ct_reader_t h, uint64_t file_id);
+int ct_reader_path_table_kind(ct_reader_t h, uint64_t file_id);
+
+/* meta.dat flags: 1 set, 0 clear, -1 for a NULL handle.
+ * ct_reader_column_aware_paths_suspected is a report, not a verdict: the
+ * trace declares line-only records, yet every one also parses as Layout A. */
+int ct_reader_has_column_aware_steps(ct_reader_t h);
+int ct_reader_column_aware_paths_suspected(ct_reader_t h);
+int ct_reader_supports_column_breakpoints(ct_reader_t h);
+int ct_reader_supports_column_motions(ct_reader_t h);
+
+/* Step N's variable values, one at a time.  `*out_data` is the value's CBOR.
+ * ct_reader_step_value returns 0 on success. */
+uint64_t ct_reader_step_value_count(ct_reader_t h, uint64_t n);
+int ct_reader_step_value(ct_reader_t h, uint64_t n, uint64_t value_idx,
+                         uint64_t* out_varname_id, uint64_t* out_type_id,
+                         uint8_t** out_data, size_t* out_data_len);
+
+/* Call `key`'s fields.  0 on success.  ct_reader_call_child returns the
+ * child's key, UINT64_MAX on failure; ct_reader_call_arg's `*out_data` is
+ * the argument's CBOR. */
+int ct_reader_call_fields(ct_reader_t h, uint64_t key,
+                          uint64_t* out_function_id, int64_t* out_parent_key,
+                          uint64_t* out_entry_step, uint64_t* out_exit_step,
+                          uint32_t* out_depth, uint64_t* out_children_count);
+uint64_t ct_reader_call_child(ct_reader_t h, uint64_t key, uint64_t child_idx);
+uint64_t ct_reader_call_arg_count(ct_reader_t h, uint64_t key);
+int ct_reader_call_arg(ct_reader_t h, uint64_t key, uint64_t arg_idx,
+                       uint64_t* out_varname_id,
+                       uint8_t** out_data, size_t* out_data_len);
+
+/* IO event `index`.  `*out_kind` is its EventLogKind (0-13).  0 on success.
+ * An empty metadata slot is NULL with length 0, not a failure. */
+int ct_reader_event_fields(ct_reader_t h, uint64_t index,
+                           uint8_t* out_kind, uint64_t* out_step_id,
+                           uint8_t** out_data, size_t* out_data_len);
+int ct_reader_event_metadata(ct_reader_t h, uint64_t index,
+                             uint8_t** out_data, size_t* out_data_len);
+
 #ifdef __cplusplus
 }
 #endif
