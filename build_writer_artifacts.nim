@@ -6,6 +6,9 @@
 ## select vccexe.exe, whose compiler/linker subprocesses are cl.exe/link.exe.
 ## The owning recipe and each consumer must declare these tools in uses:;
 ## action refs both measure their identities and place them on the scoped PATH.
+## Optional consumer-declared compiler SDK refs precede the canonical backend
+## refs, so its measured compiler wrapper supplies native headers/link inputs.
+## Empty SDK refs preserve the owning recipe and existing consumers unchanged.
 
 import std/os
 import repro_project_dsl
@@ -18,7 +21,8 @@ proc sharedLibraryPath*(projectRoot: string): string =
 proc ctPrintPath*(projectRoot: string): string =
   projectRoot / (when defined(windows): "ct-print.exe" else: "ct-print")
 
-proc buildSharedLib*(projectRoot: string): BuildActionDef =
+proc buildSharedLib*(projectRoot: string;
+                     compilerSdkRefs: seq[string] = @[]): BuildActionDef =
   doAssert projectRoot.len > 0 and not projectRoot.isAbsolute
   const target = (when defined(windows): "msvc" else: "posix")
   let output = sharedLibraryPath(projectRoot)
@@ -40,6 +44,7 @@ proc buildSharedLib*(projectRoot: string): BuildActionDef =
       projectRoot / "build_writer_artifacts.nim", projectRoot / "nim.cfg",
       projectRoot / "config.nims", projectRoot / "codetracer_trace_format.nimble"],
     extraOutputs = @[output], dependencyPolicy = automaticMonitorPolicy())
+  appendRegisteredActionToolIdentityRefs(result.id, compilerSdkRefs)
   when defined(windows):
     appendRegisteredActionToolIdentityRefs(result.id, ["vccexe", "cl", "link"])
   elif defined(macosx):
@@ -47,7 +52,8 @@ proc buildSharedLib*(projectRoot: string): BuildActionDef =
   else:
     appendRegisteredActionToolIdentityRefs(result.id, ["gcc"])
 
-proc buildCtPrint*(projectRoot: string): BuildActionDef =
+proc buildCtPrint*(projectRoot: string;
+                   compilerSdkRefs: seq[string] = @[]): BuildActionDef =
   doAssert projectRoot.len > 0 and not projectRoot.isAbsolute
   let output = ctPrintPath(projectRoot)
   let call = publicCliCall("nim", "nim", "c", "nim.nim.c", @[
@@ -67,6 +73,7 @@ proc buildCtPrint*(projectRoot: string): BuildActionDef =
       projectRoot / "nim.cfg", projectRoot / "config.nims",
       projectRoot / "build_writer_artifacts.nim"],
     extraOutputs = @[output], dependencyPolicy = automaticMonitorPolicy())
+  appendRegisteredActionToolIdentityRefs(result.id, compilerSdkRefs)
   when defined(macosx):
     appendRegisteredActionToolIdentityRefs(result.id, ["clang"])
   else:
