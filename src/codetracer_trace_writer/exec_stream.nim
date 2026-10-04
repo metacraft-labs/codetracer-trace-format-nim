@@ -58,6 +58,7 @@ import ../codetracer_ctfs/container
 import ../codetracer_ctfs/streaming
 import ../codetracer_ctfs/zstd_bindings
 import ../codetracer_ctfs/chunk_cache
+import ../codetracer_ctfs/member_view
 import ./step_encoding
 import ./gdh2_arms
 import ./varint
@@ -116,7 +117,8 @@ type
       ## starts without a cursor (`trace-events.md` §"Encoding Rules").
 
   ExecStreamReader* = object
-    data: seq[byte]            ## raw steps.dat content
+    data: MemberView           ## steps.dat, in place
+    frameScratch: seq[byte]    ## a chunk's frame when it straddles two runs
     chunkSize*: uint32
     offsets: seq[uint64]       ## chunk byte offsets from steps.idx
     totalEventsVal: uint64
@@ -386,39 +388,10 @@ proc countSpecChunkRecords(raw: openArray[byte],
       inc count
   ok(count)
 
-proc initExecStreamReader*(ctfsBytes: openArray[byte],
-    blockSize: int = 4096,
-    maxEntries: int = 170,
-    legacy: bool = false,
-    cacheBytes: uint64 = DefaultStreamChunkCacheBytes,
-    allowSourceReload: bool = false): Result[ExecStreamReader, string] =
-  ## Read an execution stream from CTFS bytes.
-  ##
-  ## ``legacy`` selects the on-disk framing (see module docs):
-  ##   * ``false`` (default) — SPEC layout: ``steps.idx`` is
-  ##     ``[chunk_size: u32][offset_0: u64]...`` (no ``total_events``) and each
-  ##     chunk's uncompressed payload is header-less.  Byte-compatible with the
-  ##     Rust ``StepStreamReader``.
-  ##   * ``true`` — legacy Nim-v4 layout: ``steps.idx`` has a ``total_events``
-  ##     placeholder after the header plus a trailing ``total_events`` u64, and
-  ##     each chunk's uncompressed data starts with a ``u32`` event count.
-  ##
-  ## The FFI reader passes ``legacy = not meta.hasStepStream``: pre-M24a-1
-  ## bundles never set the ``has_step_stream`` flag, so a clear flag selects the
-  ## legacy reader and a set flag the SPEC reader.
-  let stored = isCompactContainer(ctfsBytes)
-  var datRes = readInternalFile(ctfsBytes, "steps.dat",
-      uint32(blockSize), uint32(maxEntries))
-  if datRes.isErr:
-    return err("failed to read steps.dat: " & datRes.error)
-  var datData = move datRes.get()
-
-  let idxRes = readInternalFile(ctfsBytes, "steps.idx",
-      uint32(blockSize), uint32(maxEntries))
-  if idxRes.isErr:
-    return err("failed to read steps.idx: " & idxRes.error)
-  let idxData = idxRes.get()
-
+proc openExecStream(datData: sink MemberView, idxData: seq[byte],
+    stored, legacy: bool, cacheBytes: uint64,
+    allowSourceReload: bool): Result[ExecStreamReader, string] =
+  ## The reader of a `steps.dat` (held in place) and its parsed `steps.idx`.
   if idxData.len < 4:
     return err("index file too small for chunk_size header")
 
@@ -482,8 +455,11 @@ proc initExecStreamReader*(ctfsBytes: openArray[byte],
       let endOff = datData.len
       if startOff > endOff:
         return err("last chunk offset past end of steps.dat")
-      let lastCount = ?decodeSpecChunkRecordCount(
-        datData.toOpenArray(startOff, endOff - 1), allowSourceReload, stored)
+      var scratch: seq[byte]
+      var lastCount = 0
+      datData.withSpan(startOff, endOff - startOff, scratch, frame):
+        lastCount = ?decodeSpecChunkRecordCount(frame, allowSourceReload,
+          stored)
       totalEvents = uint64(lastChunk) * uint64(chunkSize) + uint64(lastCount)
 
   # Sized before `offsets` is handed to the reader: a field initialiser that
@@ -501,6 +477,55 @@ proc initExecStreamReader*(ctfsBytes: openArray[byte],
     payloadStart: payloadStart,
     stored: stored,
   ))
+
+proc initExecStreamReader*(ctfsBytes: openArray[byte],
+    blockSize: int = 4096,
+    maxEntries: int = 170,
+    legacy: bool = false,
+    cacheBytes: uint64 = DefaultStreamChunkCacheBytes,
+    allowSourceReload: bool = false): Result[ExecStreamReader, string] =
+  ## Read an execution stream from CTFS bytes.
+  ##
+  ## ``legacy`` selects the on-disk framing (see module docs):
+  ##   * ``false`` (default) — SPEC layout: ``steps.idx`` is
+  ##     ``[chunk_size: u32][offset_0: u64]...`` (no ``total_events``) and each
+  ##     chunk's uncompressed payload is header-less.  Byte-compatible with the
+  ##     Rust ``StepStreamReader``.
+  ##   * ``true`` — legacy Nim-v4 layout: ``steps.idx`` has a ``total_events``
+  ##     placeholder after the header plus a trailing ``total_events`` u64, and
+  ##     each chunk's uncompressed data starts with a ``u32`` event count.
+  ##
+  ## The FFI reader passes ``legacy = not meta.hasStepStream``: pre-M24a-1
+  ## bundles never set the ``has_step_stream`` flag, so a clear flag selects the
+  ## legacy reader and a set flag the SPEC reader.
+  var datRes = readInternalFile(ctfsBytes, "steps.dat",
+      uint32(blockSize), uint32(maxEntries))
+  if datRes.isErr:
+    return err("failed to read steps.dat: " & datRes.error)
+  let idxRes = readInternalFile(ctfsBytes, "steps.idx",
+      uint32(blockSize), uint32(maxEntries))
+  if idxRes.isErr:
+    return err("failed to read steps.idx: " & idxRes.error)
+  openExecStream(viewBytes(move datRes.get()), idxRes.get(),
+    isCompactContainer(ctfsBytes), legacy, cacheBytes, allowSourceReload)
+
+proc initExecStreamReader*(image: ContainerImage,
+    blockSize: int = 4096,
+    maxEntries: int = 170,
+    legacy: bool = false,
+    cacheBytes: uint64 = DefaultStreamChunkCacheBytes,
+    allowSourceReload: bool = false): Result[ExecStreamReader, string] =
+  ## As above, over a container image it shares: `steps.dat` is read in place.
+  var datRes = viewMember(image, "steps.dat", uint32(blockSize),
+    uint32(maxEntries))
+  if datRes.isErr:
+    return err("failed to read steps.dat: " & datRes.error)
+  let idxRes = viewMember(image, "steps.idx", uint32(blockSize),
+    uint32(maxEntries))
+  if idxRes.isErr:
+    return err("failed to read steps.idx: " & idxRes.error)
+  openExecStream(move datRes.get(), idxRes.get().copyOut(0, idxRes.get().len),
+    isCompactContainer(image.bytes), legacy, cacheBytes, allowSourceReload)
 
 proc totalEvents*(r: ExecStreamReader): uint64 = r.totalEventsVal
 
@@ -557,16 +582,15 @@ proc chunkSlot(r: var ExecStreamReader,
   let compressedLen = endOff - startOff
   if compressedLen == 0:
     return err("chunk " & $chunkIdx & " has zero compressed size")
+  let frame = r.data.span(int(startOff), int(compressedLen), r.frameScratch)
 
   if r.stored:
     let slot = r.cache.acquire()
     r.cache.prepare(slot, int(compressedLen))
-    copyMem(addr r.cache.data(slot)[0], unsafeAddr r.data[int(startOff)],
-      int(compressedLen))
+    copyMem(addr r.cache.data(slot)[0], frame, int(compressedLen))
     return r.commitChunk(slot, chunkIdx)
 
-  let frameSize = ZSTD_getFrameContentSize(
-    unsafeAddr r.data[int(startOff)], csize_t(compressedLen))
+  let frameSize = ZSTD_getFrameContentSize(frame, csize_t(compressedLen))
   if frameSize == ZSTD_CONTENTSIZE_UNKNOWN or frameSize == ZSTD_CONTENTSIZE_ERROR:
     return err("cannot determine decompressed size for chunk " & $chunkIdx)
   if frameSize == 0:
@@ -579,7 +603,7 @@ proc chunkSlot(r: var ExecStreamReader,
   r.cache.prepare(slot, int(frameSize))
   let decompSize = zstdDecompressShared(
     addr r.cache.data(slot)[0], csize_t(frameSize),
-    unsafeAddr r.data[int(startOff)], csize_t(compressedLen))
+    frame, csize_t(compressedLen))
 
   if ZSTD_isError(decompSize) != 0:
     # The slot was never committed, so it stays free for the next acquire.

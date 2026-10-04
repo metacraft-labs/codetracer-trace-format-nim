@@ -171,6 +171,7 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_chunk_index.nim", binary: "build/test-bin/test_chunk_index"),
   TestSpec(source: "tests/test_fixed_record_table.nim", binary: "build/test-bin/test_fixed_record_table"),
   TestSpec(source: "tests/test_variable_record_table.nim", binary: "build/test-bin/test_variable_record_table"),
+  TestSpec(source: "tests/test_member_view.nim", binary: "build/test-bin/test_member_view"),
   TestSpec(source: "tests/test_seekable_zstd.nim", binary: "build/test-bin/test_seekable_zstd"),
   TestSpec(source: "tests/test_chunked_compressed_table.nim", binary: "build/test-bin/test_chunked_compressed_table", debugOnly: true),
   TestSpec(source: "tests/test_trace_types.nim", binary: "build/test-bin/test_trace_types"),

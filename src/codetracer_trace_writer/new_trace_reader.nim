@@ -52,7 +52,9 @@ type
     sourcemapV3*: seq[byte]
 
   NewTraceReader* = object
-    data: seq[byte]            ## raw .ct file bytes (mmap later)
+    image: ContainerImage
+      ## The container's bytes, which the interning tables and stream readers
+      ## share and read their members out of in place.
     blockSize: uint32
     maxEntries: uint32
 
@@ -544,7 +546,7 @@ proc openNewTraceFromBytes*(data: sink seq[byte],
   ## instead of returning misdecoded positions.
 
   var reader: NewTraceReader
-  reader.data = data
+  var bytes = data
   # Versions 5 and 6 in both profiles are read (`ctfs-container.md` §1a); a
   # container stored under a whole-file scheme is reconstructed first, as
   # `header || decompress(rest)`. The reconstructed image keeps its header,
@@ -552,13 +554,13 @@ proc openNewTraceFromBytes*(data: sink seq[byte],
   # copy that byte is set to `none`, the true statement about the bytes it
   # holds, so every member read below refuses a stored compressed body and
   # needs no word that this one has been undone.
-  if reader.data.len > V6CompressionOffset and
-      reader.data[5] == CtfsVersionV6 and
-      reader.data[V6CompressionOffset] != uint8(ord(wfcNone)):
-    var image = ? reconstructImage(reader.data)
+  if bytes.len > V6CompressionOffset and bytes[5] == CtfsVersionV6 and
+      bytes[V6CompressionOffset] != uint8(ord(wfcNone)):
+    var image = ? reconstructImage(bytes)
     image[V6CompressionOffset] = uint8(ord(wfcNone))
-    reader.data = move image
-  ? checkReadableContainer(reader.data)
+    bytes = move image
+  ? checkReadableContainer(bytes)
+  reader.image = newContainerImage(move bytes)
   reader.blockSize = blockSize
   reader.maxEntries = maxEntries
   reader.assumedColumnAwarePaths = assumeColumnAwarePaths
@@ -577,7 +579,7 @@ proc openNewTraceFromBytes*(data: sink seq[byte],
   # It used to be the case that such a container was read through the
   # legacy `paths.json` sidecar; that sidecar is retired, so a container
   # without meta.dat is now read entirely from the binary tables.
-  let metaDataRes = readInternalFile(reader.data, "meta.dat", blockSize, maxEntries)
+  let metaDataRes = readInternalFile(reader.image.bytes, "meta.dat", blockSize, maxEntries)
   if metaDataRes.isOk:
     let metaRes = readMetaDat(metaDataRes.get())
     if metaRes.isErr:
@@ -588,9 +590,10 @@ proc openNewTraceFromBytes*(data: sink seq[byte],
   # is absent is empty; a table that is present but does not read is refused,
   # not answered as empty (`ctfs-container.md` §4, "A null is not an absence").
   template loadTable(name: string, dest: untyped) =
-    if hasInternalFile(reader.data, name & ".dat", maxEntries) or
-        hasInternalFile(reader.data, name & ".off", maxEntries):
-      var tr = initInterningTableReader(reader.data, name, blockSize, maxEntries)
+    if hasInternalFile(reader.image.bytes, name & ".dat", maxEntries) or
+        hasInternalFile(reader.image.bytes, name & ".off", maxEntries):
+      var tr = initInterningTableReader(reader.image, name, blockSize,
+        maxEntries)
       if tr.isErr:
         return err(name & ".dat: " & tr.error)
       dest = move tr.get()
@@ -663,13 +666,13 @@ proc openNewTraceFromBytes*(data: sink seq[byte],
   # registered, so the bit cannot say (`internal-files.md` §"Stream-presence
   # flags are a hint, not a gate").  Every record is decoded eagerly so the
   # per-view accessors below run in O(1).
-  if hasInternalFile(reader.data, "srcviews.dat", maxEntries):
+  if hasInternalFile(reader.image.bytes, "srcviews.dat", maxEntries):
     # See the writer's note on the abbreviated 12-char base name:
     # ``source_views.dat`` (spec name, 16 chars) collides with
     # ``source_views.off`` in the base40 filename encoding, so the
     # on-disk files are ``srcviews.dat`` / ``srcviews.off``.
     let svRes = initVariableRecordTableReader(
-      reader.data, "srcviews", blockSize, maxEntries)
+      reader.image.bytes, "srcviews", blockSize, maxEntries)
     if svRes.isErr:
       return err("source_views.dat: " & svRes.error)
     let svReader = svRes.get()
@@ -1263,7 +1266,7 @@ proc loadExecReader(r: var NewTraceReader): Result[void, string] =
     # ``StepStreamReader`` reads byte-for-byte.  Pre-M24a-1 Nim-v4 bundles
     # never set the flag and use the legacy framing (per-chunk u32 count +
     # total_events trailer); ``legacy = not hasStepStream`` keeps them readable.
-    var res = initExecStreamReader(r.data, int(r.blockSize), int(r.maxEntries),
+    var res = initExecStreamReader(r.image, int(r.blockSize), int(r.maxEntries),
       legacy = not r.meta.hasStepStream,
       # GDH-M2: tag 0x08 is decodable only where the container declares
       # it.  A container that carries the tag with the flag clear is
@@ -1498,7 +1501,7 @@ proc loadValueReader(r: var NewTraceReader): Result[void, string] =
     # layout that the Rust ``ValueStreamReader`` reads byte-for-byte.  Pre-M24a-2
     # Nim-v4 bundles never set the flag and use the legacy ``.off`` VRT framing;
     # ``legacy = not hasValueStream`` keeps them readable.
-    var res = initValueStreamReader(r.data, r.blockSize, r.maxEntries,
+    var res = initValueStreamReader(r.image, r.blockSize, r.maxEntries,
       legacy = not r.meta.hasValueStream)
     if res.isErr: return err(res.error)
     r.valueReader = move res.get()
@@ -1567,7 +1570,7 @@ proc skippedValueTagCounts*(r: NewTraceReader): seq[(uint8, int)] =
 
 proc loadCallReader(r: var NewTraceReader): Result[void, string] =
   if not r.callLoaded:
-    var res = initCallStreamReader(r.data, r.blockSize, r.maxEntries)
+    var res = initCallStreamReader(r.image, r.blockSize, r.maxEntries)
     if res.isErr: return err(res.error)
     r.callReader = move res.get()
     r.callLoaded = true
@@ -1694,7 +1697,7 @@ proc loadIOEventReader(r: var NewTraceReader): Result[void, string] =
     # layout that the Rust ``IoEventStreamReader`` reads byte-for-byte.
     # Pre-M24a-3 Nim-v4 bundles never set the flag and use the legacy ``.off``
     # VRT framing; ``legacy = not hasIoEventStream`` keeps them readable.
-    var res = initIOEventStreamReader(r.data, r.blockSize, r.maxEntries,
+    var res = initIOEventStreamReader(r.image, r.blockSize, r.maxEntries,
       legacy = not r.meta.hasIoEventStream)
     if res.isErr: return err(res.error)
     r.ioEventReader = move res.get()

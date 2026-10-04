@@ -199,14 +199,9 @@ type
       ## compression until a later step makes it final.
 
   ValueStreamReader* = object
-    data: seq[byte]            ## raw values.dat content (SPEC mode)
-    chunkSize: uint32
-    offsets: seq[uint64]       ## chunk byte offsets from values.idx (SPEC mode)
-    totalRecordsVal: uint64
+    spec: ChunkedRecords       ## values.dat + values.idx (SPEC mode)
     legacy: bool               ## true ⇒ legacy .off VRT layout; false ⇒ SPEC
     legacyTable: VariableRecordTableReader  ## only valid when legacy == true
-    chunk: RecordChunk         ## the SPEC chunk the last read inflated
-    stored: bool               ## chunks are stored as content (compact, §1f)
     lastSkippedTags*: seq[uint8]  ## tags >= 10 skipped in the most recent readStepValues / readStepAssignments
     skippedTags*: seq[uint8]      ## distinct tags >= 10 skipped across all reads
     skippedTagCounts*: seq[(uint8, int)] ## cumulative count per tag
@@ -900,72 +895,43 @@ proc initValueStreamReader*(ctfsBytes: openArray[byte],
         blockSize, maxEntries)
     if tableRes.isErr:
       return err(tableRes.error)
-    return ok(ValueStreamReader(
-      legacy: true,
-      legacyTable: tableRes.get(),
-      chunk: initRecordChunk()))
-
-  let stored = isCompactContainer(ctfsBytes)
+    return ok(ValueStreamReader(legacy: true, legacyTable: tableRes.get()))
   var datRes = readInternalFile(ctfsBytes, "values.dat", blockSize, maxEntries)
   if datRes.isErr:
     return err("failed to read values.dat: " & datRes.error)
-  var datData = move datRes.get()
-
   let idxRes = readInternalFile(ctfsBytes, "values.idx", blockSize, maxEntries)
   if idxRes.isErr:
     return err("failed to read values.idx: " & idxRes.error)
-  template idxData: untyped = idxRes.get()
+  ok(ValueStreamReader(spec: ? openChunkedRecords(viewBytes(move datRes.get()),
+    idxRes.get(), "values", "value", isCompactContainer(ctfsBytes))))
 
-  if idxData.len < 4:
-    return err("values.idx too small for chunk_size header")
-  var cs4: array[4, byte]
-  for i in 0 ..< 4:
-    cs4[i] = idxData[i]
-  let chunkSize = fromBytesLE(uint32, cs4)
-  if chunkSize == 0:
-    return err("chunkSize in values.idx is 0")
-
-  let offsetRegionBytes = idxData.len - 4
-  if offsetRegionBytes mod 8 != 0:
-    return err("values.idx has trailing bytes in offset region")
-  let numChunks = offsetRegionBytes div 8
-  var offsets = newSeq[uint64](numChunks)
-  for i in 0 ..< numChunks:
-    var o8: array[8, byte]
-    for j in 0 ..< 8:
-      o8[j] = idxData[4 + i * 8 + j]
-    offsets[i] = fromBytesLE(uint64, o8)
-
-  # Recover total record count: all chunks but the last hold exactly chunk_size
-  # records; the last holds whatever decodes out of it (Rust parity).
-  # The last chunk, inflated to count its records, stays held for the reads
-  # that follow.
-  var totalRecords: uint64 = 0
-  var chunk = initRecordChunk()
-  if numChunks > 0:
-    let lastChunk = numChunks - 1
-    let startOff = int(offsets[lastChunk])
-    let endOff = datData.len
-    if startOff > endOff:
-      return err("last value chunk offset past end of values.dat")
-    ? chunk.load(lastChunk, datData.toOpenArray(startOff, endOff - 1), "value",
-      stored)
-    totalRecords = uint64(lastChunk) * uint64(chunkSize) + uint64(? chunk.count("value"))
-
-  ok(ValueStreamReader(
-    legacy: false,
-    stored: stored,
-    data: move datData,
-    chunkSize: chunkSize,
-    offsets: move offsets,
-    totalRecordsVal: totalRecords,
-    chunk: move chunk))
+proc initValueStreamReader*(image: ContainerImage,
+    blockSize: uint32 = DefaultBlockSize,
+    maxEntries: uint32 = DefaultMaxRootEntries,
+    legacy: bool = false): Result[ValueStreamReader, string] =
+  ## As above, over a container image it shares: `values.dat` is read in
+  ## place.
+  if legacy:
+    let tableRes = initVariableRecordTableReader(image, "values",
+        blockSize, maxEntries)
+    if tableRes.isErr:
+      return err(tableRes.error)
+    return ok(ValueStreamReader(legacy: true, legacyTable: tableRes.get()))
+  var datRes = viewMember(image, "values.dat", blockSize, maxEntries)
+  if datRes.isErr:
+    return err("failed to read values.dat: " & datRes.error)
+  let idxRes = viewMember(image, "values.idx", blockSize, maxEntries)
+  if idxRes.isErr:
+    return err("failed to read values.idx: " & idxRes.error)
+  ok(ValueStreamReader(spec: ? openChunkedRecords(move datRes.get(),
+    idxRes.get().copyOut(0, idxRes.get().len), "values", "value",
+    isCompactContainer(image.bytes))))
 
 proc count*(r: ValueStreamReader): uint64 =
   if r.legacy:
     r.legacyTable.count()
   else:
-    r.totalRecordsVal
+    r.spec.count
 
 proc readLegacyRecord(data: openArray[byte]): Result[seq[VariableValue], string] =
   ## Decode a legacy ``.off`` VRT value record (pre-M24a-2 framing):
@@ -991,34 +957,17 @@ proc readLegacyRecord(data: openArray[byte]): Result[seq[VariableValue], string]
 
 proc cacheRecordFor(r: var ValueStreamReader,
     stepIndex: uint64): Result[int, string] =
-  ## Inflate whichever chunk holds ``stepIndex`` into ``r.chunk``
+  ## Inflate whichever chunk holds ``stepIndex``
   ## (reusing the cache when it already holds that chunk) and return the
   ## record's index WITHIN the chunk.
   ##
   ## Shared by the three per-step accessors so they cannot disagree about
   ## which bytes a step's record occupies — each one then differs only in
   ## which tagged events it decodes out of those bytes.
-  if stepIndex >= r.totalRecordsVal:
+  if stepIndex >= r.spec.count:
     return err("value step index " & $stepIndex & " out of range (count " &
-      $r.totalRecordsVal & ")")
-  let chunkNumber = int(stepIndex div uint64(r.chunkSize))
-  let within = int(stepIndex mod uint64(r.chunkSize))
-
-  if r.chunk.held != chunkNumber:
-    let startOff = int(r.offsets[chunkNumber])
-    let endOff =
-      if chunkNumber + 1 < r.offsets.len: int(r.offsets[chunkNumber + 1])
-      else: r.data.len
-    if startOff > endOff or endOff > r.data.len:
-      return err("value chunk offsets out of range")
-    ? r.chunk.load(chunkNumber, r.data.toOpenArray(startOff, endOff - 1),
-      "value", r.stored)
-
-  if within >= r.chunk.framed:
-    let framing = r.chunk.frameTo(within)
-    if framing != foHas:
-      return err(r.chunk.refusal(framing, within, "value"))
-  ok(within)
+      $r.spec.count & ")")
+  r.spec.locate(stepIndex)
 
 proc noteSkippedTags(r: var ValueStreamReader, skipped: seq[uint8]) =
   ## Fold the tags one decode walked over into the reader's cumulative
@@ -1052,7 +1001,7 @@ proc readStepValues*(r: var ValueStreamReader,
 
   let within = ?r.cacheRecordFor(stepIndex)
   var skipped: seq[uint8] = @[]
-  let res = decodeRecord(r.chunk.record(within), skipped)
+  let res = decodeRecord(r.spec.record(within), skipped)
   r.noteSkippedTags(skipped)
   res
 
@@ -1068,7 +1017,7 @@ proc readStepDropVariable*(r: var ValueStreamReader,
 
   let within = ?r.cacheRecordFor(stepIndex)
   var skipped: seq[uint8] = @[]
-  let res = decodeRecordDropVariable(r.chunk.record(within), skipped)
+  let res = decodeRecordDropVariable(r.spec.record(within), skipped)
   r.noteSkippedTags(skipped)
   res
 
@@ -1084,7 +1033,7 @@ proc readStepDropVariables*(r: var ValueStreamReader,
 
   let within = ?r.cacheRecordFor(stepIndex)
   var skipped: seq[uint8] = @[]
-  let res = decodeRecordDropVariables(r.chunk.record(within), skipped)
+  let res = decodeRecordDropVariables(r.spec.record(within), skipped)
   r.noteSkippedTags(skipped)
   res
 
@@ -1099,7 +1048,7 @@ proc readStepAssignments*(r: var ValueStreamReader,
 
   let within = ?r.cacheRecordFor(stepIndex)
   var skipped: seq[uint8] = @[]
-  let res = decodeRecordAssignments(r.chunk.record(within), skipped)
+  let res = decodeRecordAssignments(r.spec.record(within), skipped)
   r.noteSkippedTags(skipped)
   res
 
@@ -1114,7 +1063,7 @@ proc readStepEvents*(r: var ValueStreamReader,
     return ok(@[DecodedValueEvent(kind: veStepValues, values: vals)])
   let within = ?r.cacheRecordFor(stepIndex)
   var skipped: seq[uint8] = @[]
-  let res = decodeRecordEvents(r.chunk.record(within), skipped)
+  let res = decodeRecordEvents(r.spec.record(within), skipped)
   r.noteSkippedTags(skipped)
   if res.isErr:
     return err("values.dat record " & $stepIndex & ": " & res.error)

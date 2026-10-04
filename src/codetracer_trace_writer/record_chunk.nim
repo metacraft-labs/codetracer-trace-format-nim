@@ -18,8 +18,9 @@
 import results
 import ../codetracer_ctfs/zstd_bindings
 import ./varint
+import ../codetracer_ctfs/member_view
 
-export results
+export results, member_view
 
 type
   RecordChunk* = object
@@ -160,3 +161,83 @@ proc fieldBytes*(data: openArray[byte], first, len: int): seq[byte] =
       dst[i] = src[i]
   else:
     copyMem(addr result[0], src, len)
+
+# ---------------------------------------------------------------------------
+# A stream of records in chunks (`values.dat`, `calls.dat`, `events.dat`)
+# ---------------------------------------------------------------------------
+
+type
+  ChunkedRecords* = object
+    ## A chunked compressed table of length-prefixed records
+    ## (`ctfs-container.md` §7): its data member read in place, its index
+    ## parsed, and the chunk the last read reached held inflated.
+    data: MemberView
+    scratch: seq[byte]       ## a chunk's frame when it straddles two runs
+    offsets: seq[uint64]     ## each chunk's first byte in the data member
+    chunkSize*: int          ## records per chunk, every chunk but the last
+    count*: uint64           ## records in the stream
+    stored: bool             ## chunks are their content (compact, §1f)
+    chunk: RecordChunk
+    what: string             ## "value", "call", ... for refusals
+
+proc loadChunk(r: var ChunkedRecords, c: int): Result[void, string] =
+  let startOff = int(r.offsets[c])
+  let endOff =
+    if c + 1 < r.offsets.len: int(r.offsets[c + 1])
+    else: r.data.len
+  if startOff > endOff or endOff > r.data.len:
+    return err(r.what & " chunk offsets out of range")
+  r.data.withSpan(startOff, endOff - startOff, r.scratch, frame):
+    ? r.chunk.load(c, frame, r.what, r.stored)
+  ok()
+
+proc openChunkedRecords*(data: sink MemberView, idx: openArray[byte],
+    name, what: string, stored: bool,
+    trailingIndexBytes = false): Result[ChunkedRecords, string] =
+  ## The stream whose data member is `data` and whose index member is `idx`
+  ## (`[chunk_size: u32][offset: u64]...`), named `name` (`"values"`) in
+  ## refusals. All chunks but the last hold `chunk_size` records; the last is
+  ## inflated to count its own, and stays held for the reads that follow.
+  ## `trailingIndexBytes` tolerates a partial entry after the last whole one,
+  ## which a reader of a container still being written can meet.
+  if idx.len < 4:
+    return err(name & ".idx too small for chunk_size header")
+  let chunkSize = int(uint32(idx[0]) or (uint32(idx[1]) shl 8) or
+    (uint32(idx[2]) shl 16) or (uint32(idx[3]) shl 24))
+  if chunkSize == 0:
+    return err("chunkSize in " & name & ".idx is 0")
+  if (idx.len - 4) mod 8 != 0 and not trailingIndexBytes:
+    return err(name & ".idx has trailing bytes in offset region")
+  let numChunks = (idx.len - 4) div 8
+  var r = ChunkedRecords(data: data, chunkSize: chunkSize, stored: stored,
+    chunk: initRecordChunk(), what: what)
+  r.offsets = newSeqUninit[uint64](numChunks)  # every entry written below
+  for i in 0 ..< numChunks:
+    var v = 0'u64
+    for j in 0 ..< 8:
+      v = v or (uint64(idx[4 + i * 8 + j]) shl (8 * j))
+    r.offsets[i] = v
+  if numChunks > 0:
+    let last = numChunks - 1
+    if int(r.offsets[last]) > r.data.len:
+      return err("last " & what & " chunk offset past end of " & name & ".dat")
+    ? r.loadChunk(last)
+    r.count = uint64(last) * uint64(chunkSize) + uint64(? r.chunk.count(what))
+  ok(r)
+
+proc locate*(r: var ChunkedRecords, index: uint64): Result[int, string] =
+  ## Hold the chunk with record `index`, which is below `count`, framed as far
+  ## as the record, and answer the record's index within the chunk.
+  let c = int(index div uint64(r.chunkSize))
+  let within = int(index mod uint64(r.chunkSize))
+  if r.chunk.held != c:
+    ? r.loadChunk(c)
+  if within >= r.chunk.framed:
+    let framing = r.chunk.frameTo(within)
+    if framing != foHas:
+      return err(r.chunk.refusal(framing, within, r.what))
+  ok(within)
+
+template record*(r: ChunkedRecords, within: int): untyped =
+  ## Record `within` of the held chunk, in place (see `locate`).
+  r.chunk.record(within)

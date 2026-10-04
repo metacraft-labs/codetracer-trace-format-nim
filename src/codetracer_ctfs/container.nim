@@ -506,10 +506,17 @@ proc truncatedContainerNote(wholeBlocks: uint64, blockSize: uint32,
     "-byte blocks in " & $len &
     " bytes, so it is truncated or its tail write was interrupted"
 
-proc readMemberBytes*(data: openArray[byte], name: string,
+type
+  MemberRun* = tuple[at: int, len: int]
+    ## `len` bytes of a member, stored at `at` in the container image.
+
+proc memberRuns*(data: openArray[byte], name: string,
     fileSize: uint64, mapBlock: uint64,
-    blockSize: uint32): Result[seq[byte], string] =
-  ## Read a member's `fileSize` bytes given its entry's `MapBlock`, in any of
+    blockSize: uint32): Result[seq[MemberRun], string] =
+  ## Where a member's `fileSize` bytes lie in the container image `data`, in
+  ## member order, given its entry's `MapBlock`: runs of physically
+  ## consecutive blocks, the last cut to the member's size. `readMemberBytes`
+  ## copies them out; a `MemberView` reads them in place. Any of
   ## the three forms `ctfs-container.md` §2 defines: `0` (empty), tagged with
   ## `CtfsDirect` (its only data block) or a level-1 mapping block (§4).
   ##
@@ -543,7 +550,7 @@ proc readMemberBytes*(data: openArray[byte], name: string,
 
   if mapBlock == 0'u64:
     if fileSize == 0:
-      return ok(newSeq[byte](0))
+      return ok(newSeq[MemberRun](0))
     return err("internal file " & name & " has size " & $fileSize &
       " and a null MapBlock (its mapping root): the member's block was never " &
       "published or has been overwritten; block 0 is the container's root directory and no " &
@@ -561,22 +568,18 @@ proc readMemberBytes*(data: openArray[byte], name: string,
       return err("internal file " & name & " is stored in one direct block " &
         "but declares " & $fileSize & " bytes, more than one " & $blockSize &
         "-byte block holds")
-    var direct = newSeqUninit[byte](int(fileSize))  # every byte copied below
-    if fileSize > 0:
-      copyMem(addr direct[0], unsafeAddr data[int(b) * int(blockSize)],
-        int(fileSize))
-    return ok(direct)
+    if fileSize == 0:
+      return ok(newSeq[MemberRun](0))
+    return ok(@[(at: int(b) * int(blockSize), len: int(fileSize))])
 
   # Path 1 of 3: the entry's mapping root.
   if mapBlock >= wholeBlocks:
     return err("mapping root block " & $mapBlock & " of internal file " & name &
       " is out of bounds" & truncatedNote)
   if fileSize == 0:
-    return ok(newSeq[byte](0))
+    return ok(newSeq[MemberRun](0))
 
-  # Every byte is copied in by the loop below, which fails rather than stops
-  # short, so the buffer is not zeroed first.
-  var fileBytes = newSeqUninit[byte](int(fileSize))
+  var runs: seq[MemberRun]
   let usable = uint64(blockSize) div 8 - 1
 
   var remaining = int(fileSize)
@@ -661,13 +664,29 @@ proc readMemberBytes*(data: openArray[byte], name: string,
     let toCopy = min(remaining, int(blockSize))
     if blockOff + toCopy > data.len:
       return err("data block content out of bounds")
-    copyMem(addr fileBytes[destPos], unsafeAddr data[blockOff], toCopy)
+    if runs.len > 0 and runs[^1].at + runs[^1].len == blockOff:
+      runs[^1].len += toCopy
+    else:
+      runs.add((at: blockOff, len: toCopy))
 
     destPos += toCopy
     remaining -= toCopy
     blockIdx += 1
 
-  ok(fileBytes)
+  ok(runs)
+
+proc readMemberBytes*(data: openArray[byte], name: string,
+    fileSize: uint64, mapBlock: uint64,
+    blockSize: uint32): Result[seq[byte], string] =
+  ## A member's `fileSize` bytes, copied out of the image (`memberRuns` says
+  ## where they are and applies every bound).
+  let runs = ? memberRuns(data, name, fileSize, mapBlock, blockSize)
+  var bytes = newSeqUninit[byte](int(fileSize))  # every byte copied below
+  var dest = 0
+  for r in runs:
+    copyMem(addr bytes[dest], unsafeAddr data[r.at], r.len)
+    dest += r.len
+  ok(bytes)
 
 proc hasCtfsMagic*(data: openArray[byte]): bool =
   ## Check whether the first bytes match the CTFS magic.
@@ -1047,32 +1066,47 @@ proc isCompactContainer*(data: openArray[byte]): bool =
   data.len > V6ProfileOffset and data[5] == CtfsVersionV6 and
     data[V6ProfileOffset] == uint8(ord(cpCompact))
 
-proc readInternalFile*(data: openArray[byte], name: string,
+proc locateMember*(data: openArray[byte], name: string,
     blockSize: uint32 = DefaultBlockSize,
-    maxEntries: uint32 = DefaultMaxRootEntries): Result[seq[byte], string] =
-  ## Read the complete content of an internal CTFS file.
+    maxEntries: uint32 = DefaultMaxRootEntries):
+    Result[seq[MemberRun], string] =
+  ## Where an internal file's bytes lie in the container image `data`.
   ##
   ## Reads versions 5 and 6 in both profiles, and refuses every other version
   ## before it resolves anything (`ctfs-container.md` §2, "Older versions are
   ## refused", and §1c). A full body's member is resolved through its entry's
-  ## `MapBlock` (`readMemberBytes`); a compact body's through its directory,
-  ## which is checked against all six of §1d's rules first.
+  ## `MapBlock` (`memberRuns`); a compact body's through its directory, which
+  ## is checked against all six of §1d's rules first, and is one run.
   case ?containerBody(data)
   of cbFull:
     let entry = findFileEntry(data, name, maxEntries)
     if not entry.found:
       return err("internal file not found: " & name)
-    readMemberBytes(data, name, entry.size, entry.mapBlock, blockSize)
+    memberRuns(data, name, entry.size, entry.mapBlock, blockSize)
   of cbCompact:
     let dir = ?readCompactDirectory(data)
     let idx = findCompactMember(dir, name)
     if idx < 0:
       return err("internal file not found: " & name)
     let e = dir.entries[idx]
-    var bytes = newSeqUninit[byte](int(e.length))  # every byte copied below
-    if e.length > 0:
-      copyMem(addr bytes[0], unsafeAddr data[int(e.offset)], int(e.length))
-    ok(bytes)
+    if e.length == 0:
+      return ok(newSeq[MemberRun](0))
+    ok(@[(at: int(e.offset), len: int(e.length))])
+
+proc readInternalFile*(data: openArray[byte], name: string,
+    blockSize: uint32 = DefaultBlockSize,
+    maxEntries: uint32 = DefaultMaxRootEntries): Result[seq[byte], string] =
+  ## Read the complete content of an internal CTFS file, copied out of the
+  ## image: `locateMember` says where it is and applies every check.
+  let runs = ? locateMember(data, name, blockSize, maxEntries)
+  var total = 0
+  for r in runs: total += r.len
+  var bytes = newSeqUninit[byte](total)  # every byte copied below
+  var dest = 0
+  for r in runs:
+    copyMem(addr bytes[dest], unsafeAddr data[r.at], r.len)
+    dest += r.len
+  ok(bytes)
 
 proc hasInternalFile*(data: openArray[byte], name: string,
     maxEntries: uint32 = DefaultMaxRootEntries): bool =

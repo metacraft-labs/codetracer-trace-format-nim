@@ -111,12 +111,8 @@ type
     ##   * LEGACY (pre-M20): `calls.dat` + `calls.off` VariableRecordTable.
     ##     Selected when `calls.idx` is absent. This keeps bundles recorded by
     ##     the pre-M20 Nim writer (flag clear) reading byte-for-byte unchanged.
-    chunkSize: int
-    chunkOffsets: seq[uint64]      ## byte offset of each chunk within calls.dat
-    dat: seq[byte]                 ## raw calls.dat content (new format)
+    spec: ChunkedRecords           ## calls.dat + calls.idx (new format)
     recordCount: uint64
-    chunk: RecordChunk             ## the chunk the last read inflated
-    stored: bool                   ## chunks stored as content (compact, §1f)
     legacy: Option[VariableRecordTableReader]
       ## Present iff the bundle uses the legacy `calls.dat` + `calls.off`
       ## VariableRecordTable layout (no `calls.idx`).
@@ -341,20 +337,23 @@ proc count*(w: CallStreamWriter): uint64 = w.recordCount
 # Reader
 # ---------------------------------------------------------------------------
 
-proc parseCallsIdx(idx: openArray[byte]): Result[(int, seq[uint64]), string] {.raises: [].} =
-  ## Parse calls.idx → (chunkSize, chunkOffsets).
-  if idx.len < 4:
-    return err("calls.idx: too short for chunk_size header")
-  let chunkSize = int(uint32(idx[0]) or (uint32(idx[1]) shl 8) or
-                      (uint32(idx[2]) shl 16) or (uint32(idx[3]) shl 24))
-  if chunkSize == 0:
-    return err("calls.idx: chunk_size is zero")
-  var offsets: seq[uint64] = @[]
-  var pos = 4
-  while pos + 8 <= idx.len:
-    offsets.add(readU64LE(idx, pos))
-    pos += 8
-  ok((chunkSize, offsets))
+proc legacyCallStream(table: Result[VariableRecordTableReader, string]):
+    Result[CallStreamReader, string] =
+  ## A pre-M20 legacy bundle has no calls.idx: its calls.dat is a
+  ## VariableRecordTable (calls.dat + calls.off), read as such so old
+  ## (flag-clear) bundles keep reading byte-for-byte unchanged.
+  if table.isErr:
+    return err("failed to read legacy calls table: " & table.error)
+  ok(CallStreamReader(recordCount: table.get().count(), legacy: some(table.get())))
+
+proc openCallStream(dat: sink MemberView, idx: openArray[byte],
+    stored: bool): Result[CallStreamReader, string] =
+  # A reader of a container still being written can meet a partial index
+  # entry after the last whole one; it is not read.
+  var spec = ? openChunkedRecords(dat, idx, "calls", "call", stored,
+    trailingIndexBytes = true)
+  let count = spec.count
+  ok(CallStreamReader(spec: move spec, recordCount: count))
 
 proc initCallStreamReader*(ctfsBytes: openArray[byte],
     blockSize: uint32 = DefaultBlockSize,
@@ -362,49 +361,29 @@ proc initCallStreamReader*(ctfsBytes: openArray[byte],
   ## Initialize a seekable reader from raw CTFS container bytes. Reads
   ## calls.dat + calls.idx. Computes the total record count by decoding only
   ## the last chunk.
-  let stored = isCompactContainer(ctfsBytes)
   var datRes = readInternalFile(ctfsBytes, "calls.dat", blockSize, maxEntries)
   if datRes.isErr:
     return err("failed to read calls.dat: " & datRes.error)
   let idxRes = readInternalFile(ctfsBytes, "calls.idx", blockSize, maxEntries)
   if idxRes.isErr:
-    # No calls.idx ⇒ a pre-M20 legacy bundle whose calls.dat is a
-    # VariableRecordTable (calls.dat + calls.off). Fall back to the legacy
-    # reader so old (flag-clear) bundles keep reading byte-for-byte unchanged.
-    let legacyRes = initVariableRecordTableReader(ctfsBytes, "calls",
-        blockSize, maxEntries)
-    if legacyRes.isErr:
-      return err("failed to read legacy calls table: " & legacyRes.error)
-    let lr = legacyRes.get()
-    return ok(CallStreamReader(
-      chunkSize: 1,
-      recordCount: lr.count(),
-      chunk: initRecordChunk(),
-      legacy: some(lr)))
+    return legacyCallStream(initVariableRecordTableReader(ctfsBytes, "calls",
+      blockSize, maxEntries))
+  openCallStream(viewBytes(move datRes.get()), idxRes.get(),
+    isCompactContainer(ctfsBytes))
 
-  var (chunkSize, chunkOffsets) = ?parseCallsIdx(idxRes.get())
-  var dat = move datRes.get()
-
-  # The last chunk, inflated to count its records, stays held for the reads
-  # that follow.
-  var recordCount: uint64 = 0
-  var chunk = initRecordChunk()
-  if chunkOffsets.len > 0:
-    let lastChunk = chunkOffsets.len - 1
-    let start = int(chunkOffsets[lastChunk])
-    if start > dat.len:
-      return err("calls.idx: last chunk offset past end of calls.dat")
-    ? chunk.load(lastChunk, dat.toOpenArray(start, dat.len - 1), "call", stored)
-    recordCount = uint64(lastChunk * chunkSize + ? chunk.count("call"))
-
-  ok(CallStreamReader(
-    chunkSize: chunkSize,
-    chunkOffsets: move chunkOffsets,
-    dat: move dat,
-    recordCount: recordCount,
-    chunk: move chunk,
-    stored: stored,
-  ))
+proc initCallStreamReader*(image: ContainerImage,
+    blockSize: uint32 = DefaultBlockSize,
+    maxEntries: uint32 = DefaultMaxRootEntries): Result[CallStreamReader, string] =
+  ## As above, over a container image it shares: `calls.dat` is read in place.
+  var datRes = viewMember(image, "calls.dat", blockSize, maxEntries)
+  if datRes.isErr:
+    return err("failed to read calls.dat: " & datRes.error)
+  let idxRes = viewMember(image, "calls.idx", blockSize, maxEntries)
+  if idxRes.isErr:
+    return legacyCallStream(initVariableRecordTableReader(image, "calls",
+      blockSize, maxEntries))
+  openCallStream(move datRes.get(), idxRes.get().copyOut(0, idxRes.get().len),
+    isCompactContainer(image.bytes))
 
 proc readCall*(r: var CallStreamReader,
     callKey: uint64): Result[CallRecord, string] =
@@ -418,24 +397,8 @@ proc readCall*(r: var CallStreamReader,
     return decodeCallRecord(dataRes.get())
   if callKey >= r.recordCount:
     return err("call_key " & $callKey & " out of range (count " & $r.recordCount & ")")
-  let chunkNumber = int(callKey) div r.chunkSize
-  let within = int(callKey) mod r.chunkSize
-
-  if r.chunk.held != chunkNumber:
-    let start = int(r.chunkOffsets[chunkNumber])
-    let endOff =
-      if chunkNumber + 1 < r.chunkOffsets.len: int(r.chunkOffsets[chunkNumber + 1])
-      else: r.dat.len
-    if start > endOff or endOff > r.dat.len:
-      return err("calls.dat: chunk offsets out of range")
-    ? r.chunk.load(chunkNumber, r.dat.toOpenArray(start, endOff - 1), "call",
-      r.stored)
-
-  if within >= r.chunk.framed:
-    let framing = r.chunk.frameTo(within)
-    if framing != foHas:
-      return err(r.chunk.refusal(framing, within, "call"))
-  let rec = decodeCallRecord(r.chunk.record(within))
+  let within = ? r.spec.locate(callKey)
+  let rec = decodeCallRecord(r.spec.record(within))
   if rec.isErr:
     return err("calls.dat record " & $callKey & ": " & rec.error)
   rec

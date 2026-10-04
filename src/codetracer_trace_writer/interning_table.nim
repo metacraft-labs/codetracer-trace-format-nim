@@ -302,6 +302,16 @@ proc initInterningTableReader*(ctfsBytes: openArray[byte], baseName: string,
     return err(tableRes.error)
   ok(InterningTableReader(table: move tableRes.get()))
 
+proc initInterningTableReader*(image: ContainerImage, baseName: string,
+                                blockSize: uint32 = DefaultBlockSize,
+                                maxEntries: uint32 = DefaultMaxRootEntries): Result[InterningTableReader, string] =
+  ## Initialize a reader over a container image it shares, reading the
+  ## table's members in place.
+  var tableRes = initVariableRecordTableReader(image, baseName, blockSize, maxEntries)
+  if tableRes.isErr:
+    return err(tableRes.error)
+  ok(InterningTableReader(table: move tableRes.get()))
+
 proc readById*(r: InterningTableReader, id: uint64): Result[string, string] =
   ## Read the interned string by its ID.
   let dataRes = r.table.read(id)
