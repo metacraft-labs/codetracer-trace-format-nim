@@ -155,8 +155,13 @@ proc encodeCallRecord*(rec: CallRecord): seq[byte] {.raises: [].} =
 
 proc decodeCallRecord*(data: openArray[byte]): Result[CallRecord, string] {.raises: [].} =
   ## Decode a CallRecord from its wire format.
+  ##
+  ## Decoded into the result in place: a call record is 104 bytes, and a
+  ## local copied into the result costs a zeroing and a copy of it per
+  ## record, which a WebAssembly build makes two calls into the host.
   var pos = 0
-  var rec: CallRecord
+  result.ok(CallRecord())
+  template rec: untyped = result.unsafeGet()
 
   rec.functionId = varintOrReturn(data, pos)
   rec.parentCallKey = signedVarintOrReturn(data, pos)
@@ -202,8 +207,6 @@ proc decodeCallRecord*(data: openArray[byte]): Result[CallRecord, string] {.rais
   if pos != data.len:
     return err("call record's fields end at byte " & $pos & " of its " &
       $data.len & "-byte frame")
-
-  ok(rec)
 
 # ---------------------------------------------------------------------------
 # Zstd helpers

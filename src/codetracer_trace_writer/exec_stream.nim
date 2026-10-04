@@ -646,17 +646,18 @@ proc decodeNext(r: var ExecStreamReader, slot: int,
   template m: untyped = mp[]
   let i = m.known
   var pos = m.nextPos
-  let ev = decodeStepEvent(r.cache.data(slot), pos, r.allowSourceReload)
-  if ev.isErr:
+  # Decoded into the result, which is returned as it is.
+  result = decodeStepEvent(r.cache.data(slot), pos, r.allowSourceReload)
+  if result.isErr:
     return err("failed to decode event " & $i & " of chunk " & $chunkIdx &
-      ": " & ev.error)
+      ": " & result.error)
   if i >= m.starts.len:
     let cap = max(256, 2 * m.starts.len)
     m.starts.setLenUninit(cap)
     m.positions.setLenUninit(cap)
   m.starts[i] = int32(m.nextPos)
   if m.posRefusedAt == high(int):
-    let adv = advanceCursor(ev.get(), i, chunkIdx, m.cursor, m.anchored)
+    let adv = advanceCursor(result.get(), i, chunkIdx, m.cursor, m.anchored)
     if adv.isErr:
       m.posRefusedAt = i
       m.posRefusal = adv.error
@@ -670,7 +671,6 @@ proc decodeNext(r: var ExecStreamReader, slot: int,
   if atEnd:
     m.complete = true
     m.eventCount = uint32(m.known)
-  ev
 
 proc decodeThrough(r: var ExecStreamReader, slot: int, chunkIdx: int,
     i: int): Result[void, string] =
