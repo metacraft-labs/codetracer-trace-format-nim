@@ -56,6 +56,7 @@ import codetracer_trace_writer/span_stream
 import codetracer_trace_writer/step_encoding
 import codetracer_trace_writer/streaming_value_encoder
 import codetracer_trace_writer/new_trace_reader
+import codetracer_trace_writer/compact_profile
 import std/tables
 import std/os
 import std/options
@@ -258,6 +259,12 @@ type
     inMemory: bool
     containerData: seq[byte]
     containerReady: bool
+
+    compactThreshold: uint64
+      ## `trace_writer_set_compact_threshold`: when non-zero, the container
+      ## is converted to the compact profile at close if its compact members
+      ## total fewer raw bytes (`ctfs-container.md` §1e). 0 writes the full
+      ## profile always.
 
     programName: string  # stored from trace_writer_new, used when creating .ct
     interningQualifier: string
@@ -1126,6 +1133,22 @@ proc trace_writer_start(
   # Write the first step at pathId 0 (first registered path)
   failIfErr handle.writer.writeStep(0'u64, line)
   handle.started = true
+
+proc trace_writer_set_compact_threshold(
+    handle: TraceWriterHandle,
+    raw_bytes: uint64,
+): cint {.exportc, cdecl, dynlib, ffiGuard.} =
+  ## Choose the container profile at close: compact when the compact
+  ## container's members total fewer than `raw_bytes` (`ctfs-container.md`
+  ## §1e), full otherwise; 0 writes the full profile always. See the header.
+  if handle.isNil:
+    setError("NULL handle")
+    return 1.cint
+  if not handle.useMultiStream:
+    setError("the container profile is chosen only in CTFS multi-stream mode")
+    return 1.cint
+  handle.compactThreshold = raw_bytes
+  0.cint
 
 proc trace_writer_set_workdir(
     handle: TraceWriterHandle,
@@ -3817,7 +3840,24 @@ proc closeHandle(handle: TraceWriterHandle): cint =
     if closeRes.isErr:
       setError(closeRes.error)
       return 1.cint
-    if handle.inMemory:
+    # The profile is chosen on the finished full container (§1e); a compact
+    # one replaces it below, once the full one is finalized.
+    var compactImage: seq[byte]
+    var compactChosen = false
+    if handle.compactThreshold > 0:
+      let sel = selectProfile(handle.msWriter.toBytes(),
+        handle.compactThreshold)
+      if sel.isErr:
+        setError("trace_writer_close: choosing the container profile: " &
+          sel.error)
+        return 1.cint
+      if sel.get()[0] == cpCompact:
+        compactImage = sel.get()[1]
+        compactChosen = true
+    if compactChosen and handle.inMemory:
+      handle.containerData = move compactImage
+      handle.containerReady = true
+    elif handle.inMemory:
       # A writer with no file to stream into holds the whole container in
       # RAM, so the finished image has to be lifted out of it here.
       #
@@ -3841,6 +3881,22 @@ proc closeHandle(handle: TraceWriterHandle): cint =
       # complete.
       setError(ctfsRes.error)
       return 1.cint
+    if compactChosen and not handle.inMemory:
+      when ctHasFilesystem:
+        # Through a sibling temporary, so the file holds the full container
+        # or the compact one and never a partial write.
+        let tmp = handle.ctFilePath & ".compact.tmp"
+        try:
+          writeFile(tmp, cast[string](compactImage))
+          moveFile(tmp, handle.ctFilePath)
+        except CatchableError:
+          setError("trace_writer_close: replacing " & handle.ctFilePath &
+            " with its compact container: " & getCurrentExceptionMsg())
+          return 1.cint
+        except Exception:
+          setError("trace_writer_close: replacing " & handle.ctFilePath &
+            " with its compact container")
+          return 1.cint
     return 0.cint
 
   if not handle.writerReady:

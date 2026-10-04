@@ -111,6 +111,7 @@ type
     legacy: bool               ## true ⇒ legacy .off VRT layout; false ⇒ SPEC
     legacyTable: VariableRecordTableReader  ## only valid when legacy == true
     chunk: RecordChunk         ## the SPEC chunk the last read inflated
+    stored: bool               ## chunks stored as content (compact, §1f)
 
 proc eventLogKindName*(k: EventLogKind): string =
   ## The kind's name as `trace-events.md` §"EventLogKind (u8 enum)" spells it.
@@ -362,6 +363,7 @@ proc initIOEventStreamReader*(ctfsBytes: openArray[byte],
       legacyTable: tableRes.get(),
       chunk: initRecordChunk()))
 
+  let stored = isCompactContainer(ctfsBytes)
   var datRes = readInternalFile(ctfsBytes, "events.dat", blockSize, maxEntries)
   if datRes.isErr:
     return err("failed to read events.dat: " & datRes.error)
@@ -403,11 +405,12 @@ proc initIOEventStreamReader*(ctfsBytes: openArray[byte],
     if startOff > endOff:
       return err("last io event chunk offset past end of events.dat")
     ? chunk.load(lastChunk, datData.toOpenArray(startOff, endOff - 1),
-      "io event")
+      "io event", stored)
     totalRecords = uint64(lastChunk) * uint64(chunkSize) + uint64(? chunk.count("io event"))
 
   ok(IOEventStreamReader(
     legacy: false,
+    stored: stored,
     data: move datData,
     chunkSize: chunkSize,
     offsets: move offsets,
@@ -443,7 +446,7 @@ proc readEvent*(r: var IOEventStreamReader,
     if startOff > endOff or endOff > r.data.len:
       return err("io event chunk offsets out of range")
     ? r.chunk.load(chunkNumber, r.data.toOpenArray(startOff, endOff - 1),
-      "io event")
+      "io event", r.stored)
 
   if within >= r.chunk.framed:
     let framing = r.chunk.frameTo(within)

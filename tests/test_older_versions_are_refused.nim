@@ -5,8 +5,9 @@
 ##   History", v6: "Readers refuse every other version, naming it") — the
 ##   bytes after `recorder_id` were a path list up to version 5, and versions
 ##   3 and below also packed line-only positions one line higher;
-## * the CTFS container at any version but 5 (`ctfs-container.md` §2,
-##   "Older versions are refused").
+## * the CTFS container at any version but 5 and 6 (`ctfs-container.md` §2,
+##   "Older versions are refused"); version 6 is read by `NewTraceReader` and
+##   the C ABI, and refused by the legacy reader, which reads 5 only.
 ##
 ## Checked through `readMetaDat`, `openNewTraceFromBytes`, `openNewTrace`,
 ## `openTrace` and the C ABI's `ct_reader_open` (the door the db-backend takes),
@@ -84,7 +85,7 @@ proc test_meta_dat_versions_other_than_6_are_refused_by_name() =
   echo "PASS: test_meta_dat_versions_other_than_6_are_refused_by_name"
 
 proc test_container_versions_other_than_5_are_refused_by_name() =
-  for v in [2, 3, 4, 6]:
+  for v in [2, 3, 4, 7]:
     let f = TmpDir / ("ctfs_v" & $v & ".ct")
     writeCurrent(f)
     stamp(f, ctfsVersion = v)
@@ -92,6 +93,21 @@ proc test_container_versions_other_than_5_are_refused_by_name() =
       doAssert e.len > 0, "reader door " & $i & " opened a CTFS v" & $v
       doAssert ("version " & $v) in e and "version 5" in e,
         "door " & $i & " must name version " & $v & " and version 5: " & e
+  # A version-5 body under a version-6 stamp. The doors that read version 6
+  # (`NewTraceReader`, and the C ABI over it) find the first entry's bytes
+  # where the profile is and refuse that value by name; the legacy reader,
+  # which reads version 5 only, refuses the version.
+  let f = TmpDir / "ctfs_v6_stamp.ct"
+  writeCurrent(f)
+  stamp(f, ctfsVersion = 6)
+  for i, e in refusalsOf(f):
+    doAssert e.len > 0, "reader door " & $i & " opened a version-5 body " &
+      "stamped version 6"
+    if i == 2:
+      doAssert "version 6" in e and "version 5" in e, "door 2: " & e
+    else:
+      doAssert "profile" in e or "compression" in e or "reserved" in e or
+        "Reserved" in e, "door " & $i & " must name the header field: " & e
   echo "PASS: test_container_versions_other_than_5_are_refused_by_name"
 
 proc test_the_current_versions_open_at_the_recorded_lines() =

@@ -116,6 +116,7 @@ type
     dat: seq[byte]                 ## raw calls.dat content (new format)
     recordCount: uint64
     chunk: RecordChunk             ## the chunk the last read inflated
+    stored: bool                   ## chunks stored as content (compact, §1f)
     legacy: Option[VariableRecordTableReader]
       ## Present iff the bundle uses the legacy `calls.dat` + `calls.off`
       ## VariableRecordTable layout (no `calls.idx`).
@@ -361,6 +362,7 @@ proc initCallStreamReader*(ctfsBytes: openArray[byte],
   ## Initialize a seekable reader from raw CTFS container bytes. Reads
   ## calls.dat + calls.idx. Computes the total record count by decoding only
   ## the last chunk.
+  let stored = isCompactContainer(ctfsBytes)
   var datRes = readInternalFile(ctfsBytes, "calls.dat", blockSize, maxEntries)
   if datRes.isErr:
     return err("failed to read calls.dat: " & datRes.error)
@@ -392,7 +394,7 @@ proc initCallStreamReader*(ctfsBytes: openArray[byte],
     let start = int(chunkOffsets[lastChunk])
     if start > dat.len:
       return err("calls.idx: last chunk offset past end of calls.dat")
-    ? chunk.load(lastChunk, dat.toOpenArray(start, dat.len - 1), "call")
+    ? chunk.load(lastChunk, dat.toOpenArray(start, dat.len - 1), "call", stored)
     recordCount = uint64(lastChunk * chunkSize + ? chunk.count("call"))
 
   ok(CallStreamReader(
@@ -401,6 +403,7 @@ proc initCallStreamReader*(ctfsBytes: openArray[byte],
     dat: move dat,
     recordCount: recordCount,
     chunk: move chunk,
+    stored: stored,
   ))
 
 proc readCall*(r: var CallStreamReader,
@@ -425,7 +428,8 @@ proc readCall*(r: var CallStreamReader,
       else: r.dat.len
     if start > endOff or endOff > r.dat.len:
       return err("calls.dat: chunk offsets out of range")
-    ? r.chunk.load(chunkNumber, r.dat.toOpenArray(start, endOff - 1), "call")
+    ? r.chunk.load(chunkNumber, r.dat.toOpenArray(start, endOff - 1), "call",
+      r.stored)
 
   if within >= r.chunk.framed:
     let framing = r.chunk.frameTo(within)

@@ -318,6 +318,9 @@ type
 
   SpanStreamReader* = object
     data: seq[byte]          ## raw (still COMPRESSED) spans.dat content
+    stored: bool
+      ## Chunks are stored as their content, not compressed: the container is
+      ## compact (`ctfs-container.md` §1f).
     chunkSize: uint32        ## the header's upper-bound hint, not an invariant
     offsets: seq[uint64]     ## chunk byte offsets, column 1 of spans.idx
     cumulative: seq[uint64]
@@ -873,6 +876,8 @@ proc resetSpanChunkDecodeCount*() =
   ## Zero the chunk-decompression counter.  Tests only.
   spanChunkDecodes = 0
 
+proc splitChunkRecords(raw: openArray[byte]): Result[seq[seq[byte]], string]
+
 proc decompressChunkRecords(compressed: openArray[byte]):
     Result[seq[seq[byte]], string] =
   ## Decompress one chunk and split it into its length-prefixed records.
@@ -892,7 +897,10 @@ proc decompressChunkRecords(compressed: openArray[byte]):
       return err("zstd decompress failed for span chunk: " &
         $ZSTD_getErrorName(decompSize))
     raw.setLen(int(decompSize))
+  splitChunkRecords(raw)
 
+proc splitChunkRecords(raw: openArray[byte]): Result[seq[seq[byte]], string] =
+  ## One chunk's content split into its length-prefixed records.
   var records: seq[seq[byte]] = @[]
   var pos = 0
   while pos < raw.len:
@@ -927,8 +935,10 @@ proc chunkByteRange(r: SpanStreamReader,
     if endOff < startOff or endOff > r.data.len:
       return err("span chunk offsets out of range")
     return ok((startOff, endOff))
-  if startOff == r.data.len:
-    return ok((startOff, startOff))
+  if startOff == r.data.len or r.stored:
+    # A compact container's last chunk is its content to the end of the
+    # member (`ctfs-container.md` §1f): it is written whole, never tailed.
+    return ok((startOff, r.data.len))
   let frameLen = ZSTD_findFrameCompressedSize(
     unsafeAddr r.data[startOff], csize_t(r.data.len - startOff))
   if ZSTD_isError(frameLen) != 0:
@@ -944,6 +954,9 @@ proc decodeChunk(r: SpanStreamReader,
   let (startOff, endOff) = ?r.chunkByteRange(chunkNumber)
   if startOff == endOff:
     return ok(newSeq[seq[byte]]())
+  if r.stored:
+    spanChunkDecodes += 1
+    return splitChunkRecords(r.data.toOpenArray(startOff, endOff - 1))
   decompressChunkRecords(r.data.toOpenArray(startOff, endOff - 1))
 
 proc initSpanStreamReader*(ctfsBytes: openArray[byte],
@@ -1022,6 +1035,7 @@ proc initSpanStreamReader*(ctfsBytes: openArray[byte],
           "monotonic at entry " & $i)
 
   ok(SpanStreamReader(
+    stored: isCompactContainer(ctfsBytes),
     data: move(datData),
     chunkSize: chunkSize,
     offsets: move(offsets),

@@ -19,17 +19,17 @@ const
     ## those eight bytes, so everything §2 says about `MapBlock`'s three forms
     ## holds in a version-6 full-profile container unchanged.
     ##
-    ## **This library does NOT read version 6, and that is deliberate.**
-    ## `CtfsVersion` is 5 and `ctfsVersionError` refuses everything else by
-    ## name, version 6 included. A version-6 container's `FileEntry` array
-    ## starts at `24 + R` rather than `16 + R`, so a reader that accepted the
-    ## version without implementing the body would resolve every entry out of
-    ## the reserved bytes — the same shape of defect as reading a
-    ## pre-correction container because its version stamp was trusted
-    ## (`meta_dat.nim`'s `LastShiftedGlobalIndexVersion`). The compact body is
-    ## the next milestone's work; the constant exists so the refusal, the
-    ## header offsets below and the parsers in `container.nim` all name one
-    ## number from one place.
+    ## **Which doors read it.** `readInternalFile` and `hasInternalFile` read
+    ## version 6 in both profiles, and so do the stream readers built on them
+    ## and `NewTraceReader`; their gate is `ctfsReadableVersionError`. The
+    ## doors that implement version 5 only — the legacy `events.log` reader,
+    ## the MCR native-bundle detector, the space analyzer — keep
+    ## `ctfsVersionError`, which refuses everything else by name. A reader that
+    ## accepted the version without implementing the body would resolve every
+    ## `FileEntry` out of the reserved bytes, since a version-6 container's
+    ## array starts at `24 + R` rather than `16 + R` — the same shape of defect
+    ## as reading a pre-correction container because its version stamp was
+    ## trusted (`meta_dat.nim`'s `LastShiftedGlobalIndexVersion`).
   V6HeaderSize* = 24
     ## Size of the version-6 container header, in bytes: the 16 bytes every
     ## earlier version has, plus `profile`, `compression` and six reserved
@@ -197,6 +197,21 @@ proc isDirectMapBlock*(mapBlock: uint64): bool {.inline.} =
 proc directDataBlock*(mapBlock: uint64): uint64 {.inline.} =
   ## The data block a tagged `MapBlock` names.
   mapBlock and not CtfsDirect
+
+proc ctfsReadableVersionError*(data: openArray[byte]): string =
+  ## Empty when `data` carries a CTFS version a member can be read out of —
+  ## 5, or 6 in either profile (`ctfs-container.md` §1a); otherwise the
+  ## refusal, naming the version found and the ones read. The readers that
+  ## implement version 6 gate on this; `ctfsVersionError` is the gate of those
+  ## that read version 5 only.
+  if data.len < 6:
+    return "CTFS container too short for a header (" & $data.len & " bytes)"
+  if data[5] != CtfsVersion and data[5] != CtfsVersionV6:
+    return "CTFS container version " & $data[5] & " is not supported: this " &
+      "reader reads version " & $CtfsVersion & " and version " & $CtfsVersionV6 &
+      " (older containers are re-recorded; ctfs-container.md §2, \"Older " &
+      "versions are refused\")"
+  ""
 
 proc ctfsVersionError*(data: openArray[byte]): string =
   ## Empty when `data` carries the CTFS version this library reads (5);

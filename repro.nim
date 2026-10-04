@@ -150,6 +150,11 @@ const testSpecs: seq[TestSpec] = @[
   # and the no-block-map assertion with its must-fail control against a full
   # container.
   TestSpec(source: "tests/test_compact_container_layout.nim", binary: "build/test-bin/test_compact_container_layout"),
+  # `ctfs-container.md` §1a/§1f: NewTraceReader reads a recording in five
+  # forms alike (version 5, version-6 full, compact, each of the last two
+  # under whole-file zstd); the profile writer chooses on raw member bytes.
+  TestSpec(source: "tests/test_version_6_containers_read.nim", binary: "build/test-bin/test_version_6_containers_read"),
+  TestSpec(source: "tests/test_profile_threshold_choice.nim", binary: "build/test-bin/test_profile_threshold_choice"),
   TestSpec(source: "tests/test_step_encoding_rule.nim", binary: "build/test-bin/test_step_encoding_rule"),
   TestSpec(source: "tests/test_step_map_v2.nim", binary: "build/test-bin/test_step_map_v2"),
   TestSpec(source: "tests/test_durability_publishes_sealed_chunks.nim", binary: "build/test-bin/test_durability_publishes_sealed_chunks"),

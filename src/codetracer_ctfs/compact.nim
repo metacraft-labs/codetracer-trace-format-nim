@@ -44,22 +44,16 @@ import results
 import ./types
 import ./base40
 import ./container
+import ./zstd_bindings
 
 export results
-
-const
-  CompactMemberCountOffset* = V6HeaderSize
-    ## Offset of the u32 LE member count: 24, immediately after the header.
-  CompactDirectoryOffset* = V6HeaderSize + 4
-    ## Offset of the first directory entry: 28.
-  CompactDirEntrySize* = 24
-    ## `(name: u64, offset: u64, length: u64)` — the same 24 bytes a
-    ## `FileEntry` occupies, carrying a different three fields.
-  CompactDirNameOffset* = 0
-  CompactDirOffsetOffset* = 8
-  CompactDirLengthOffset* = 16
-  CompactEmptySize* = CompactDirectoryOffset
-    ## The size of a compact container with no members: 28 bytes.
+export container.CompactDirEntry, container.CompactDirectory,
+  container.compactDirEntryOffset, container.nameIsWellFormed,
+  container.readCompactDirectory, container.findCompactMember,
+  container.CompactMemberCountOffset, container.CompactDirectoryOffset,
+  container.CompactDirEntrySize, container.CompactDirNameOffset,
+  container.CompactDirOffsetOffset, container.CompactDirLengthOffset,
+  container.CompactEmptySize
 
 type
   CompactMember* = object
@@ -70,22 +64,6 @@ type
     encodedName*: uint64
     payload*: seq[byte]
 
-  CompactDirEntry* = object
-    name*: string
-    encodedName*: uint64
-    offset*: uint64
-    length*: uint64
-
-  CompactDirectory* = object
-    ## A validated directory. Constructing one of these is the only way to get
-    ## at a member, so every read goes through §1d's six checks.
-    entries*: seq[CompactDirEntry]
-    size*: uint64  ## the container image's length, as checked
-
-proc compactDirEntryOffset*(index: int): int =
-  ## Byte offset of directory entry `index` from the start of the image.
-  CompactDirectoryOffset + index * CompactDirEntrySize
-
 proc compactContainerSize*(members: openArray[CompactMember]): uint64 =
   ## `ctfs-container.md` §1d: `Size = 28 + 24*N + sum(length)`. This is the
   ## layout's whole claim, so the encoder and the measurement tooling compute it
@@ -95,22 +73,6 @@ proc compactContainerSize*(members: openArray[CompactMember]): uint64 =
   for m in members:
     total += uint64(m.payload.len)
   total
-
-proc nameIsWellFormed*(encoded: uint64): bool =
-  ## §1d check 5: a name is non-zero and round-trips through §3's packing.
-  ##
-  ## Two things this refuses that a bare `base40Decode` does not. A `u64` at or
-  ## above `40^12` names nothing — the 12 base-40 digits cannot represent it —
-  ## and re-encoding the 12 digits it does carry does not reproduce it. And a
-  ## packing with a padding digit before a non-padding one decodes to a string
-  ## with an embedded NUL, which §3's encoder cannot produce and which DOES
-  ## re-encode to itself (the encoder maps anything outside the alphabet to
-  ## index 0), so the round-trip alone misses it and `base40Encodable` is what
-  ## catches it.
-  if encoded == 0'u64:
-    return false
-  let decoded = base40Decode(encoded)
-  base40Encodable(decoded) and base40Encode(decoded) == encoded
 
 # ---------------------------------------------------------------------------
 # The encoder
@@ -193,136 +155,6 @@ proc encodeCompactContainer*(members: openArray[CompactMember],
 # ---------------------------------------------------------------------------
 # The decoder
 # ---------------------------------------------------------------------------
-
-proc readCompactDirectory*(data: openArray[byte],
-    bodyReconstructed = false): Result[CompactDirectory, string] =
-  ## Parse and VALIDATE the directory of a compact container, applying all six
-  ## of `ctfs-container.md` §1d's checks and naming the offending value.
-  ##
-  ## The header gate comes first and comes through the §1c parsers, so a
-  ## container that is not a version-6 compact one is refused here rather than
-  ## read as a directory that is not one.
-  ##
-  ## `bodyReconstructed` exists because of a subtlety in §1a that is easy to get
-  ## backwards, and this function did get it backwards once. A reader of a
-  ## container under a whole-file scheme reconstructs the image as
-  ## `header || decompress(rest)`, and the reconstructed image KEEPS the
-  ## original 24-byte header — so it still declares its scheme. A decoder that
-  ## refused any container declaring `wfcZstd` would therefore refuse the
-  ## legitimately reconstructed image as well as the stored one, which is the
-  ## opposite of the intended safety. So the field is not the gate: the caller
-  ## states whether it has done the reconstruction, and the DEFAULT is that it
-  ## has not, so handing this function stored compressed bytes is still a
-  ## refusal that names the reason rather than a directory read out of a
-  ## compressed body.
-  if not hasCtfsMagic(data):
-    return err("not a CTFS container: the first five bytes are not the magic")
-  let profile = ?readCtfsProfile(data)
-  if profile != cpCompact:
-    return err("container declares profile " & $profile &
-      ", not compact: ctfs-container.md §1d describes the compact body only")
-  ?checkV6Reserved(data)
-  # Parsed unconditionally, because an UNKNOWN scheme is §1c's refusal whether
-  # or not the caller claims to have reconstructed anything.
-  let scheme = ?readWholeFileCompression(data)
-  if scheme != wfcNone and not bodyReconstructed:
-    return err("compact container declares whole-file compression scheme " &
-      $scheme & ": its body must be reconstructed as header || " &
-      "decompress(rest) before the directory is read (ctfs-container.md §1a), " &
-      "and the caller says it has not been")
-
-  let blockSize = readU32LE(data, 8)
-  if blockSize != 0'u32:
-    return err("compact container declares BlockSize " & $blockSize &
-      ", not 0: §1d requires 0 because the profile has no blocks, and a " &
-      "block size in a layout with no blocks is a second spelling of one state")
-  let maxRootEntries = readU32LE(data, 12)
-  if maxRootEntries != 0'u32:
-    return err("compact container declares MaxRootEntries " &
-      $maxRootEntries & ", not 0: §1d requires 0 because there is no " &
-      "FileEntry array for a maximum to bound")
-  let maxShards = readMaxShards(data)
-  if maxShards != 0'u8:
-    return err("compact container declares MaxShards " & $maxShards &
-      ", not 0: §1a requires 0 because the profile has no block-number space " &
-      "to partition")
-
-  if data.len < CompactDirectoryOffset:
-    return err("compact container is " & $data.len & " bytes, short of the " &
-      $CompactDirectoryOffset & " a header and member count occupy")
-
-  let count = readU32LE(data, CompactMemberCountOffset)
-  # §1d check 1: the directory itself fits.
-  let dirEnd = uint64(CompactDirectoryOffset) +
-    uint64(count) * uint64(CompactDirEntrySize)
-  if dirEnd > uint64(data.len):
-    return err("compact container declares " & $count & " members, whose " &
-      "directory would end at byte " & $dirEnd & " of a " & $data.len &
-      "-byte container (§1d check 1)")
-
-  var dir = CompactDirectory(size: uint64(data.len))
-  var expected = dirEnd  # §1d check 2: the first member starts right here.
-  for i in 0 ..< int(count):
-    let e = compactDirEntryOffset(i)
-    let encoded = readU64LE(data, e + CompactDirNameOffset)
-    let offset = readU64LE(data, e + CompactDirOffsetOffset)
-    let length = readU64LE(data, e + CompactDirLengthOffset)
-
-    # §1d check 5.
-    if not nameIsWellFormed(encoded):
-      return err("compact directory entry " & $i & " carries name word " &
-        $encoded & ", which does not round-trip through the base40 packing " &
-        "of ctfs-container.md §3 (§1d check 5)")
-    let name = base40Decode(encoded)
-
-    # §1d checks 2 and 3, as one: the member begins where its predecessor
-    # ended, and the first begins where the directory ended.
-    if offset != expected:
-      return err("compact directory entry " & $i & " ('" & name &
-        "') declares offset " & $offset & " but the members are contiguous " &
-        "and the previous one ended at " & $expected &
-        " (§1d check " & (if i == 0: "2" else: "3") &
-        "): a gap would be padding and an overlap or a jump would serve a " &
-        "shifted member")
-    if length > uint64(data.len) or offset + length > uint64(data.len):
-      return err("compact directory entry " & $i & " ('" & name &
-        "') declares " & $length & " bytes at offset " & $offset &
-        ", past the end of a " & $data.len & "-byte container")
-
-    # §1d check 6.
-    for prev in dir.entries:
-      if prev.encodedName == encoded:
-        return err("compact directory names '" & name &
-          "' twice, at entries " & $i & " and earlier (§1d check 6)")
-
-    dir.entries.add(CompactDirEntry(name: name, encodedName: encoded,
-                                    offset: offset, length: length))
-    expected = offset + length
-
-  # §1d check 4: nothing follows the last member. This is the check that makes
-  # "no padding" an assertion against the bytes rather than a restatement of
-  # the encoder's intent, and it is also what refuses a truncated container
-  # whose directory happens to be intact.
-  if expected != uint64(data.len):
-    return err("compact container is " & $data.len &
-      " bytes but its " & $count & " members end at " & $expected &
-      ": §1d requires Size = 28 + 24*N + sum(length), so the " &
-      $(int64(data.len) - int64(expected)) &
-      "-byte difference is padding or truncation (§1d check 4)")
-
-  ok(dir)
-
-proc findCompactMember*(dir: CompactDirectory, name: string): int =
-  ## Index of `name` in a validated directory, or -1. A linear search over one
-  ## `u64` per member: §1d states the directory is NOT sorted, so this is the
-  ## only correct lookup.
-  if not base40Encodable(name):
-    return -1
-  let encoded = base40Encode(name)
-  for i, e in dir.entries.pairs:
-    if e.encodedName == encoded:
-      return i
-  -1
 
 proc compactMemberBytes*(data: openArray[byte], dir: CompactDirectory,
     name: string): Result[seq[byte], string] =
@@ -417,3 +249,69 @@ proc collectFullProfileMembers*(full: openArray[byte]):
     members.add(CompactMember(name: name, encodedName: encoded,
                               payload: bytes.get()))
   ok(members)
+
+# ---------------------------------------------------------------------------
+# A zstd frame's content
+# ---------------------------------------------------------------------------
+
+proc appendFrameContent*(frame: openArray[byte], what: string,
+    output: var seq[byte]): Result[void, string] =
+  ## Append the content of the one zstd frame `frame` to `output`. The frame
+  ## must declare its content size, as every frame this format writes does.
+  if frame.len == 0:
+    return err(what & ": an empty frame")
+  let size = ZSTD_getFrameContentSize(unsafeAddr frame[0], csize_t(frame.len))
+  if size == ZSTD_CONTENTSIZE_UNKNOWN or size == ZSTD_CONTENTSIZE_ERROR:
+    return err(what & ": the frame does not declare its content size")
+  let start = output.len
+  output.setLenUninit(start + int(size))
+  if size > 0:
+    let got = zstdDecompressShared(addr output[start], csize_t(size),
+      unsafeAddr frame[0], csize_t(frame.len))
+    if ZSTD_isError(got) != 0 or int(got) != int(size):
+      return err(what & ": the frame does not decode to its declared " &
+        $size & " bytes")
+  ok()
+
+# ---------------------------------------------------------------------------
+# Whole-file compression (§1a, §1b)
+# ---------------------------------------------------------------------------
+
+proc reconstructImage*(stored: openArray[byte]): Result[seq[byte], string] =
+  ## The container image a stored object holds: `header || decompress(rest)`
+  ## for a version-6 container under the zstd whole-file scheme
+  ## (`ctfs-container.md` §1a), the bytes as they are otherwise. The image
+  ## keeps the header, which still declares the scheme it was stored under.
+  let scheme = ? readWholeFileCompression(stored)
+  if scheme == wfcNone:
+    return ok(@stored)
+  if stored.len <= V6HeaderSize:
+    return err("a container under whole-file zstd carries no body after its " &
+      "header")
+  var image = @(stored.toOpenArray(0, V6HeaderSize - 1))
+  ? appendFrameContent(stored.toOpenArray(V6HeaderSize, stored.len - 1),
+    "the whole-file zstd body", image)
+  ok(image)
+
+proc compressImage*(image: openArray[byte], level = 3):
+    Result[seq[byte], string] =
+  ## A version-6 container image stored under the zstd whole-file scheme: its
+  ## header with the scheme declared, and the rest as one zstd frame that
+  ## declares its content size. `reconstructImage` undoes it.
+  if image.len < V6HeaderSize or image[5] != CtfsVersionV6:
+    return err("whole-file compression is declared in a version-6 header, " &
+      "and this image has none")
+  let bodyLen = image.len - V6HeaderSize
+  var stored = newSeqUninit[byte](V6HeaderSize +
+    int(ZSTD_compressBound(csize_t(bodyLen))))
+  copyMem(addr stored[0], unsafeAddr image[0], V6HeaderSize)
+  stored[V6CompressionOffset] = uint8(ord(wfcZstd))
+  let n = ZSTD_compress(addr stored[V6HeaderSize],
+    csize_t(stored.len - V6HeaderSize),
+    if bodyLen > 0: unsafeAddr image[V6HeaderSize] else: nil, csize_t(bodyLen),
+    cint(level))
+  if ZSTD_isError(n) != 0:
+    return err("whole-file zstd compression failed: " & $ZSTD_getErrorName(n))
+  stored.setLen(V6HeaderSize + int(n))
+  ok(stored)
+

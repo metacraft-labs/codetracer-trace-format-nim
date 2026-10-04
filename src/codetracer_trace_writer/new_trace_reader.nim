@@ -21,6 +21,7 @@ import ./io_event_stream
 import ./step_encoding
 import ./varint
 import ./global_line_index
+import ../codetracer_ctfs/compact
 
 const ctHasFilesystem* = defined(posix) or defined(windows)
   ## Whether the target this reader is being compiled for has an
@@ -544,6 +545,20 @@ proc openNewTraceFromBytes*(data: sink seq[byte],
 
   var reader: NewTraceReader
   reader.data = data
+  # Versions 5 and 6 in both profiles are read (`ctfs-container.md` §1a); a
+  # container stored under a whole-file scheme is reconstructed first, as
+  # `header || decompress(rest)`. The reconstructed image keeps its header,
+  # which still declares the scheme it was stored under; in the reader's own
+  # copy that byte is set to `none`, the true statement about the bytes it
+  # holds, so every member read below refuses a stored compressed body and
+  # needs no word that this one has been undone.
+  if reader.data.len > V6CompressionOffset and
+      reader.data[5] == CtfsVersionV6 and
+      reader.data[V6CompressionOffset] != uint8(ord(wfcNone)):
+    var image = ? reconstructImage(reader.data)
+    image[V6CompressionOffset] = uint8(ord(wfcNone))
+    reader.data = move image
+  ? checkReadableContainer(reader.data)
   reader.blockSize = blockSize
   reader.maxEntries = maxEntries
   reader.assumedColumnAwarePaths = assumeColumnAwarePaths

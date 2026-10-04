@@ -164,11 +164,12 @@ task test, "Run all tests":
   # recorded lines. `include`s codetracer_trace_writer_ffi to drive
   # ct_reader_open, so it needs --mm:arc and the FFI's --nimMainPrefix.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_older_versions_are_refused.nim"
-  # The same rule in the other direction, for the version AFTER 5: a container
-  # declaring the version-6 header (a profile and a whole-file compression
-  # scheme, both closed sets -- ctfs-container.md §1a, §1b) is refused by name,
-  # and the two fields' parsers refuse an unknown or absent value rather than
-  # reading it as the permissive default. Carries its control: the same reader
+  # The same rule in the other direction, for the version AFTER 5: the doors
+  # that read version 5 only (the legacy reader, the native-bundle detector)
+  # refuse a container declaring the version-6 header by name, and the two
+  # fields' parsers (a profile and a whole-file compression scheme, both closed
+  # sets -- ctfs-container.md §1a, §1b) refuse an unknown or absent value
+  # rather than reading it as the permissive default. Carries its control: the same reader
   # opens a FULL container of the same recording and succeeds.
   exec "nim c -r -d:release -p:src tests/test_compact_profile_header_refusal.nim"
   # The compact profile's BODY (ctfs-container.md §1d): the reference encoder
@@ -180,18 +181,20 @@ task test, "Run all tests":
   # container of the same recording and required to FAIL. Also prints CCP-2's
   # deliverable-4 overhead figures against a VERSION-5 baseline.
   exec "nim c -r -d:release -p:src tests/test_compact_container_layout.nim"
-  # CCP-4: the writer chooses the profile from a measured RAW-BYTE threshold.
-  # The default is 1 MiB of raw stream bytes; the switchover to the streaming
-  # full profile replays the buffered prefix, which is the one place in this
-  # campaign where a bug is SILENT (a valid full container missing part of the
-  # recording), so the arm compares against the same recording written always
-  # full and carries a PLANTED DROP that must make it fail; the boundary is
-  # asserted one event under and one event over; two recordings of equal RAW
-  # size and 1,452x different compressibility must take the same path, with a
-  # compressed-size rule shown to SPLIT them; and a writer-produced compact
-  # container is asserted to carry NO zstd frame, with its raw events.log equal
-  # to the full profile's own events.log inflated.
+  # The writer chooses the profile from a measured RAW-BYTE threshold
+  # (ctfs-container.md §1e), over the split-stream writer: it records the full
+  # profile and converts at close, every frame inflated (§1f). The quantity is
+  # the compact container's member bytes; the boundary is asserted from both
+  # sides against the same recording written full, with a one-step-shorter
+  # recording shown to answer differently; a stored-size rule is shown to
+  # choose differently; and every chunk of the compact container is the full
+  # container's frame inflated, with the full container's frames as control.
   exec "nim c -r -d:release -p:src tests/test_profile_threshold_choice.nim"
+  # NewTraceReader reads version 6 in both profiles and under whole-file zstd:
+  # one recording in five forms answers every query alike, a compact container
+  # carrying frames does not (the control), and the version-6 header's values
+  # are refused by name.
+  exec "nim c -r -d:release -p:src tests/test_version_6_containers_read.nim"
   # The column-aware step encoding end to end: the writer's opt-in, the
   # DeltaColumn round-trip, Layout A paths.dat, the position decoder, and the
   # meta.dat unknown-flag-bit rejection that keeps the extension clean.

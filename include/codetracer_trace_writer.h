@@ -170,6 +170,25 @@ int      trace_writer_container_ready(trace_writer_t handle);
 size_t   trace_writer_container_len(trace_writer_t handle);
 uint8_t* trace_writer_container_ptr(trace_writer_t handle);
 
+/*
+ * The container profile, chosen at close (ctfs-container.md §1e, §1f).
+ *
+ * The writer always records the FULL profile, streamed to its file as it
+ * goes.  With a non-zero threshold, trace_writer_close then converts the
+ * finished container: when the members of a compact container of it -- every
+ * zstd frame inflated -- total fewer than `raw_bytes` bytes, the compact
+ * container replaces the full one (in the file, or in the in-memory
+ * container).  0, the default, writes the full profile always.  The Rust
+ * CtfsTraceWriter's `with_compact_threshold` makes the same choice, and the
+ * two writers' compact containers are byte-identical.
+ *
+ * May be called at any time before trace_writer_close.  Returns 0, or
+ * non-zero for a NULL handle or a writer that is not in CTFS multi-stream
+ * mode.
+ */
+int      trace_writer_set_compact_threshold(trace_writer_t handle,
+                                            uint64_t raw_bytes);
+
 /* --------------------------------------------------------------------------
  * Tracing primitives
  * -------------------------------------------------------------------------- */

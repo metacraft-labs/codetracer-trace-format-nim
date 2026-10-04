@@ -482,9 +482,17 @@ type
 proc findFileEntry*(data: openArray[byte], name: string,
     maxEntries: uint32 = DefaultMaxRootEntries): CtfsEntryLookup =
   ## Find `name` in the root directory of the container image `data`.
+  ##
+  ## The entry array starts after the header: 16 bytes at version 5, 24 at
+  ## version 6 (`ctfs-container.md` §1a). A compact container has no entry
+  ## array; `readInternalFile` and `hasInternalFile` look its members up in
+  ## its directory.
   let encoded = base40Encode(name)
+  let base =
+    if data.len > 5 and data[5] == CtfsVersionV6: V6HeaderSize
+    else: HeaderSize + ExtHeaderSize
   for i in 0 ..< int(maxEntries):
-    let off = HeaderSize + ExtHeaderSize + i * FileEntrySize
+    let off = base + i * FileEntrySize
     if off + FileEntrySize > data.len:
       break
     if readU64LE(data, off + 16) == encoded:
@@ -661,29 +669,6 @@ proc readMemberBytes*(data: openArray[byte], name: string,
 
   ok(fileBytes)
 
-proc readInternalFile*(data: openArray[byte], name: string,
-    blockSize: uint32 = DefaultBlockSize,
-    maxEntries: uint32 = DefaultMaxRootEntries): Result[seq[byte], string] =
-  ## Read the complete content of an internal CTFS file.
-  ##
-  ## Refuses a container whose version is not 5 before it resolves anything
-  ## (`ctfs-container.md` §2, "Older versions are refused"). See
-  ## `readMemberBytes` for the three `MapBlock` forms and the bounds applied.
-  let versionErr = ctfsVersionError(data)
-  if versionErr.len > 0:
-    return err(versionErr)
-  let entry = findFileEntry(data, name, maxEntries)
-  if not entry.found:
-    return err("internal file not found: " & name)
-  readMemberBytes(data, name, entry.size, entry.mapBlock, blockSize)
-
-proc hasInternalFile*(data: openArray[byte], name: string,
-    maxEntries: uint32 = DefaultMaxRootEntries): bool =
-  ## Return true iff the CTFS root directory carries an internal file with
-  ## the given name — including an EMPTY one, whose entry is `(0, 0)` with its
-  ## name (`ctfs-container.md` §2). Presence is the name's, not the size's.
-  findFileEntry(data, name, maxEntries).found
-
 proc hasCtfsMagic*(data: openArray[byte]): bool =
   ## Check whether the first bytes match the CTFS magic.
   if data.len < 5:
@@ -695,12 +680,11 @@ proc hasCtfsMagic*(data: openArray[byte]): bool =
   data[4] == CtfsMagic[4]
 
 proc hasValidVersion*(data: openArray[byte]): bool =
-  ## True when the version byte is 5, the only version this library reads
-  ## (`ctfs-container.md` §2, "Older versions are refused"). Callers that
-  ## report a refusal use `ctfsVersionError`, which names the version found.
-  ##
-  ## Version 6 is NOT read here, and the omission is the gate the compact
-  ## profile rests on: see `CtfsVersionV6`.
+  ## True when the version byte is 5, the version every door of this library
+  ## reads (`ctfs-container.md` §2, "Older versions are refused"). Callers
+  ## that report a refusal use `ctfsVersionError`, which names the version
+  ## found. Version 6 is read by the doors listed at `CtfsVersionV6`, which
+  ## gate on `ctfsReadableVersionError` instead.
   ctfsVersionError(data).len == 0
 
 # ---------------------------------------------------------------------------
@@ -825,3 +809,285 @@ proc readMaxShards*(data: openArray[byte]): uint8 =
   if data.len < 8:
     return DefaultMaxShards
   data[7]
+
+# ---------------------------------------------------------------------------
+# The compact profile's directory (`ctfs-container.md` §1d)
+# ---------------------------------------------------------------------------
+#
+# Here rather than in `compact.nim` because a member is looked up by name
+# through `readInternalFile` whatever the profile, and that lookup lives in
+# this module; `compact.nim` re-exports all of it.
+
+const
+  CompactMemberCountOffset* = V6HeaderSize
+    ## Offset of the u32 LE member count: 24, immediately after the header.
+  CompactDirectoryOffset* = V6HeaderSize + 4
+    ## Offset of the first directory entry: 28.
+  CompactDirEntrySize* = 24
+    ## `(name: u64, offset: u64, length: u64)` — the same 24 bytes a
+    ## `FileEntry` occupies, carrying a different three fields.
+  CompactDirNameOffset* = 0
+  CompactDirOffsetOffset* = 8
+  CompactDirLengthOffset* = 16
+  CompactEmptySize* = CompactDirectoryOffset
+    ## The size of a compact container with no members: 28 bytes.
+
+type
+  CompactDirEntry* = object
+    name*: string
+    encodedName*: uint64
+    offset*: uint64
+    length*: uint64
+
+  CompactDirectory* = object
+    ## A validated directory. Constructing one of these is the only way to get
+    ## at a member, so every read goes through §1d's six checks.
+    entries*: seq[CompactDirEntry]
+    size*: uint64  ## the container image's length, as checked
+
+proc compactDirEntryOffset*(index: int): int =
+  ## Byte offset of directory entry `index` from the start of the image.
+  CompactDirectoryOffset + index * CompactDirEntrySize
+
+proc nameIsWellFormed*(encoded: uint64): bool =
+  ## §1d check 5: a name is non-zero and round-trips through §3's packing.
+  ##
+  ## Two things this refuses that a bare `base40Decode` does not. A `u64` at or
+  ## above `40^12` names nothing — the 12 base-40 digits cannot represent it —
+  ## and re-encoding the 12 digits it does carry does not reproduce it. And a
+  ## packing with a padding digit before a non-padding one decodes to a string
+  ## with an embedded NUL, which §3's encoder cannot produce and which DOES
+  ## re-encode to itself (the encoder maps anything outside the alphabet to
+  ## index 0), so the round-trip alone misses it and `base40Encodable` is what
+  ## catches it.
+  if encoded == 0'u64:
+    return false
+  let decoded = base40Decode(encoded)
+  base40Encodable(decoded) and base40Encode(decoded) == encoded
+
+proc readCompactDirectory*(data: openArray[byte],
+    bodyReconstructed = false): Result[CompactDirectory, string] =
+  ## Parse and VALIDATE the directory of a compact container, applying all six
+  ## of `ctfs-container.md` §1d's checks and naming the offending value.
+  ##
+  ## The header gate comes first and comes through the §1c parsers, so a
+  ## container that is not a version-6 compact one is refused here rather than
+  ## read as a directory that is not one.
+  ##
+  ## `bodyReconstructed` exists because of a subtlety in §1a that is easy to get
+  ## backwards, and this function did get it backwards once. A reader of a
+  ## container under a whole-file scheme reconstructs the image as
+  ## `header || decompress(rest)`, and the reconstructed image KEEPS the
+  ## original 24-byte header — so it still declares its scheme. A decoder that
+  ## refused any container declaring `wfcZstd` would therefore refuse the
+  ## legitimately reconstructed image as well as the stored one, which is the
+  ## opposite of the intended safety. So the field is not the gate: the caller
+  ## states whether it has done the reconstruction, and the DEFAULT is that it
+  ## has not, so handing this function stored compressed bytes is still a
+  ## refusal that names the reason rather than a directory read out of a
+  ## compressed body.
+  if not hasCtfsMagic(data):
+    return err("not a CTFS container: the first five bytes are not the magic")
+  let profile = ?readCtfsProfile(data)
+  if profile != cpCompact:
+    return err("container declares profile " & $profile &
+      ", not compact: ctfs-container.md §1d describes the compact body only")
+  ?checkV6Reserved(data)
+  # Parsed unconditionally, because an UNKNOWN scheme is §1c's refusal whether
+  # or not the caller claims to have reconstructed anything.
+  let scheme = ?readWholeFileCompression(data)
+  if scheme != wfcNone and not bodyReconstructed:
+    return err("compact container declares whole-file compression scheme " &
+      $scheme & ": its body must be reconstructed as header || " &
+      "decompress(rest) before the directory is read (ctfs-container.md §1a), " &
+      "and the caller says it has not been")
+
+  let blockSize = readU32LE(data, 8)
+  if blockSize != 0'u32:
+    return err("compact container declares BlockSize " & $blockSize &
+      ", not 0: §1d requires 0 because the profile has no blocks, and a " &
+      "block size in a layout with no blocks is a second spelling of one state")
+  let maxRootEntries = readU32LE(data, 12)
+  if maxRootEntries != 0'u32:
+    return err("compact container declares MaxRootEntries " &
+      $maxRootEntries & ", not 0: §1d requires 0 because there is no " &
+      "FileEntry array for a maximum to bound")
+  let maxShards = readMaxShards(data)
+  if maxShards != 0'u8:
+    return err("compact container declares MaxShards " & $maxShards &
+      ", not 0: §1a requires 0 because the profile has no block-number space " &
+      "to partition")
+
+  if data.len < CompactDirectoryOffset:
+    return err("compact container is " & $data.len & " bytes, short of the " &
+      $CompactDirectoryOffset & " a header and member count occupy")
+
+  let count = readU32LE(data, CompactMemberCountOffset)
+  # §1d check 1: the directory itself fits.
+  let dirEnd = uint64(CompactDirectoryOffset) +
+    uint64(count) * uint64(CompactDirEntrySize)
+  if dirEnd > uint64(data.len):
+    return err("compact container declares " & $count & " members, whose " &
+      "directory would end at byte " & $dirEnd & " of a " & $data.len &
+      "-byte container (§1d check 1)")
+
+  var dir = CompactDirectory(size: uint64(data.len))
+  var expected = dirEnd  # §1d check 2: the first member starts right here.
+  for i in 0 ..< int(count):
+    let e = compactDirEntryOffset(i)
+    let encoded = readU64LE(data, e + CompactDirNameOffset)
+    let offset = readU64LE(data, e + CompactDirOffsetOffset)
+    let length = readU64LE(data, e + CompactDirLengthOffset)
+
+    # §1d check 5.
+    if not nameIsWellFormed(encoded):
+      return err("compact directory entry " & $i & " carries name word " &
+        $encoded & ", which does not round-trip through the base40 packing " &
+        "of ctfs-container.md §3 (§1d check 5)")
+    let name = base40Decode(encoded)
+
+    # §1d checks 2 and 3, as one: the member begins where its predecessor
+    # ended, and the first begins where the directory ended.
+    if offset != expected:
+      return err("compact directory entry " & $i & " ('" & name &
+        "') declares offset " & $offset & " but the members are contiguous " &
+        "and the previous one ended at " & $expected &
+        " (§1d check " & (if i == 0: "2" else: "3") &
+        "): a gap would be padding and an overlap or a jump would serve a " &
+        "shifted member")
+    if length > uint64(data.len) or offset + length > uint64(data.len):
+      return err("compact directory entry " & $i & " ('" & name &
+        "') declares " & $length & " bytes at offset " & $offset &
+        ", past the end of a " & $data.len & "-byte container")
+
+    # §1d check 6.
+    for prev in dir.entries:
+      if prev.encodedName == encoded:
+        return err("compact directory names '" & name &
+          "' twice, at entries " & $i & " and earlier (§1d check 6)")
+
+    dir.entries.add(CompactDirEntry(name: name, encodedName: encoded,
+                                    offset: offset, length: length))
+    expected = offset + length
+
+  # §1d check 4: nothing follows the last member. This is the check that makes
+  # "no padding" an assertion against the bytes rather than a restatement of
+  # the encoder's intent, and it is also what refuses a truncated container
+  # whose directory happens to be intact.
+  if expected != uint64(data.len):
+    return err("compact container is " & $data.len &
+      " bytes but its " & $count & " members end at " & $expected &
+      ": §1d requires Size = 28 + 24*N + sum(length), so the " &
+      $(int64(data.len) - int64(expected)) &
+      "-byte difference is padding or truncation (§1d check 4)")
+
+  ok(dir)
+
+proc findCompactMember*(dir: CompactDirectory, name: string): int =
+  ## Index of `name` in a validated directory, or -1. A linear search over one
+  ## `u64` per member: §1d states the directory is NOT sorted, so this is the
+  ## only correct lookup.
+  if not base40Encodable(name):
+    return -1
+  let encoded = base40Encode(name)
+  for i, e in dir.entries.pairs:
+    if e.encodedName == encoded:
+      return i
+  -1
+
+# ---------------------------------------------------------------------------
+# Members by name, in either profile
+# ---------------------------------------------------------------------------
+
+type
+  ContainerBody = enum
+    cbFull      ## block 0, the entry array and the block map (version 5, or 6
+                ## at profile 0)
+    cbCompact   ## the compact directory (version 6, profile 1)
+
+proc containerBody(data: openArray[byte]): Result[ContainerBody, string] =
+  ## Which body `data` carries, refusing every version this library does not
+  ## read and, at version 6, every header value §1c has a reader refuse.
+  ##
+  ## A container declaring a whole-file scheme is refused too: §1a's body
+  ## under the scheme is not the image any offset in it addresses, so the
+  ## caller reconstructs `header || decompress(rest)` first
+  ## (`compact.reconstructImage`) and reads members out of that.
+  let versionErr = ctfsReadableVersionError(data)
+  if versionErr.len > 0:
+    return err(versionErr)
+  if data[5] != CtfsVersionV6:
+    return ok(cbFull)
+  let profile = ?readCtfsProfile(data)
+  ?checkV6Reserved(data)
+  let scheme = ?readWholeFileCompression(data)
+  if scheme != wfcNone:
+    return err("CTFS container declares whole-file compression scheme " &
+      $scheme & ": its body is read after it is reconstructed as header || " &
+      "decompress(rest) (ctfs-container.md §1a), and these bytes are the " &
+      "stored body")
+  ok(if profile == cpCompact: cbCompact else: cbFull)
+
+proc checkReadableContainer*(data: openArray[byte]): Result[void, string] =
+  ## Refuse, naming the value, a container whose members this library cannot
+  ## read: a version other than 5 and 6, a version-6 header §1c refuses, a
+  ## body still under a whole-file scheme, or a compact directory that fails
+  ## one of §1d's checks. A reader opening a container calls it first, so a
+  ## container it cannot read is refused rather than read as one with no
+  ## members.
+  if not hasCtfsMagic(data):
+    return err("not a CTFS container: the first five bytes are not the magic")
+  if ? containerBody(data) == cbCompact:
+    discard ? readCompactDirectory(data)
+  ok()
+
+proc isCompactContainer*(data: openArray[byte]): bool =
+  ## True for a container whose header declares the compact profile, whose
+  ## framed members store their chunks as content (`ctfs-container.md` §1f).
+  data.len > V6ProfileOffset and data[5] == CtfsVersionV6 and
+    data[V6ProfileOffset] == uint8(ord(cpCompact))
+
+proc readInternalFile*(data: openArray[byte], name: string,
+    blockSize: uint32 = DefaultBlockSize,
+    maxEntries: uint32 = DefaultMaxRootEntries): Result[seq[byte], string] =
+  ## Read the complete content of an internal CTFS file.
+  ##
+  ## Reads versions 5 and 6 in both profiles, and refuses every other version
+  ## before it resolves anything (`ctfs-container.md` §2, "Older versions are
+  ## refused", and §1c). A full body's member is resolved through its entry's
+  ## `MapBlock` (`readMemberBytes`); a compact body's through its directory,
+  ## which is checked against all six of §1d's rules first.
+  case ?containerBody(data)
+  of cbFull:
+    let entry = findFileEntry(data, name, maxEntries)
+    if not entry.found:
+      return err("internal file not found: " & name)
+    readMemberBytes(data, name, entry.size, entry.mapBlock, blockSize)
+  of cbCompact:
+    let dir = ?readCompactDirectory(data)
+    let idx = findCompactMember(dir, name)
+    if idx < 0:
+      return err("internal file not found: " & name)
+    let e = dir.entries[idx]
+    var bytes = newSeqUninit[byte](int(e.length))  # every byte copied below
+    if e.length > 0:
+      copyMem(addr bytes[0], unsafeAddr data[int(e.offset)], int(e.length))
+    ok(bytes)
+
+proc hasInternalFile*(data: openArray[byte], name: string,
+    maxEntries: uint32 = DefaultMaxRootEntries): bool =
+  ## Return true iff the container carries an internal file with the given
+  ## name — including an EMPTY one, whose entry is `(0, 0)` with its name
+  ## (`ctfs-container.md` §2). Presence is the name's, not the size's. A
+  ## container this library cannot read carries nothing it can name.
+  let body = containerBody(data)
+  if body.isErr:
+    # The version-5 answer did not depend on the version byte; keep it so for
+    # every container that is not version 6.
+    return data.len > 5 and data[5] != CtfsVersionV6 and
+      findFileEntry(data, name, maxEntries).found
+  case body.get()
+  of cbFull: findFileEntry(data, name, maxEntries).found
+  of cbCompact:
+    let dir = readCompactDirectory(data)
+    dir.isOk and findCompactMember(dir.get(), name) >= 0

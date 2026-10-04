@@ -47,10 +47,17 @@ proc reset(c: var RecordChunk) =
   c.framed = 0
   c.framedTo = 0
 
+proc loadStored*(c: var RecordChunk, index: int, content: openArray[byte])
+
 proc load*(c: var RecordChunk, index: int, frame: openArray[byte],
-    what: string): Result[void, string] =
-  ## Inflate `frame`, chunk `index` of a stream of `what` records. On failure
-  ## nothing is held. An empty frame is a chunk with no records.
+    what: string, stored = false): Result[void, string] =
+  ## Inflate `frame`, chunk `index` of a stream of `what` records — or, when
+  ## the chunk is `stored` as its content (a compact container,
+  ## `ctfs-container.md` §1f), hold it as it is. On failure nothing is held.
+  ## An empty frame is a chunk with no records.
+  if stored:
+    c.loadStored(index, frame)
+    return ok()
   c.reset()
   c.raw.setLen(0)
   if frame.len > 0:

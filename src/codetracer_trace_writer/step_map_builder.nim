@@ -53,6 +53,9 @@
 import std/[tables, algorithm]
 import results
 import ../codetracer_ctfs/zstd_bindings
+import ../codetracer_ctfs/container
+import ../codetracer_ctfs/compact
+import ../codetracer_ctfs/types
 import ./varint
 
 export results
@@ -235,6 +238,9 @@ type
     pathCount*: uint32
     lineCount*: uint32
     stepCount*: uint64
+    stored: bool
+      ## Chunks are stored as their content, not as zstd frames: the map is a
+      ## member of a compact container (`ctfs-container.md` §1f).
     held: int            ## the chunk `raw` holds, -1 when none
     raw: seq[byte]       ## its inflated content
     heldKeys: seq[StepMapKey]
@@ -256,9 +262,13 @@ proc rdU32(d: openArray[byte], o: int): uint32 =
 proc rdU64(d: openArray[byte], o: int): uint64 =
   for i in 0 ..< 8: result = result or (uint64(d[o + i]) shl (8 * i))
 
-proc openStepMap*(data: sink seq[byte]): Result[StepMapReader, string] =
+proc openStepMap*(data: sink seq[byte],
+    stored = false): Result[StepMapReader, string] =
   ## Parse a `step-map.ns` header and chunk table. Refuses any version but 2.
   ## The reader keeps `data`; pass it by its last use and it is not copied.
+  ## `stored` says the chunks are their content rather than zstd frames, as
+  ## in a compact container (`ctfs-container.md` §1f); `openStepMapIn` reads
+  ## the member and the profile out of a container.
   if data.len < StepMapHeaderSize:
     return err("step-map.ns: " & $data.len & " bytes, shorter than the " &
       $StepMapHeaderSize & "-byte header")
@@ -269,7 +279,7 @@ proc openStepMap*(data: sink seq[byte]): Result[StepMapReader, string] =
     return err("step-map.ns: version " & $version & " is not supported; " &
       "this reader reads version " & $StepMapVersion & " only")
   let n = int(rdU32(data, 6))
-  var r = StepMapReader(held: -1)
+  var r = StepMapReader(held: -1, stored: stored)
   r.pathCount = rdU32(data, 10)
   r.lineCount = rdU32(data, 14)
   r.stepCount = rdU64(data, 18)
@@ -300,14 +310,32 @@ proc openStepMap*(data: sink seq[byte]): Result[StepMapReader, string] =
   r.data = data
   ok(r)
 
-proc openStepMap*(data: openArray[byte]): Result[StepMapReader, string] =
+proc openStepMap*(data: openArray[byte],
+    stored = false): Result[StepMapReader, string] =
   ## As above, over a copy of `data`.
-  openStepMap(@data)
+  openStepMap(@data, stored)
+
+proc openStepMapIn*(container: openArray[byte]): Result[StepMapReader, string] =
+  ## The `step-map.ns` of a container, in either profile, and stored under a
+  ## whole-file scheme or not (`ctfs-container.md` §1a).
+  if container.len > V6CompressionOffset and container[5] == CtfsVersionV6 and
+      container[V6CompressionOffset] != uint8(ord(wfcNone)):
+    var image = ? reconstructImage(container)
+    image[V6CompressionOffset] = uint8(ord(wfcNone))
+    return openStepMapIn(image)
+  var bytes = readInternalFile(container, StepMapFileName)
+  if bytes.isErr:
+    return err(StepMapFileName & ": " & bytes.error)
+  openStepMap(move bytes.get(), isCompactContainer(container))
 
 proc inflateChunk(r: StepMapReader, c: int,
     raw: var seq[byte]): Result[void, string] =
-  ## Inflate chunk `c` into `raw`.
+  ## Inflate chunk `c` into `raw` — or copy it, when it is stored as content.
   let ch = r.chunks[c]
+  if r.stored:
+    raw.setLenUninit(ch.frameEnd - ch.frameStart)
+    copyMem(addr raw[0], unsafeAddr r.data[ch.frameStart], raw.len)
+    return ok()
   let src = unsafeAddr r.data[ch.frameStart]
   let srcLen = csize_t(ch.frameEnd - ch.frameStart)
   let size = ZSTD_getFrameContentSize(src, srcLen)

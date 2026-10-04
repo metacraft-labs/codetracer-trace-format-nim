@@ -145,6 +145,9 @@ type
       ## accepted only where the header says it may appear.  Default
       ## FALSE, so a caller that has not been taught about the flag
       ## refuses the tag rather than decoding it.
+    stored: bool
+      ## The chunks are stored as their content rather than as zstd frames:
+      ## the container is compact (`ctfs-container.md` §1f).
     payloadStart: int          ## byte offset within a decompressed chunk where
                                ## the first encoded event begins: 4 in legacy
                                ## mode (past the u32 count header), 0 in SPEC
@@ -329,12 +332,21 @@ proc totalEvents*(w: ExecStreamWriter): uint64 = w.totalEvents
 # Reader
 # ---------------------------------------------------------------------------
 
+proc countSpecChunkRecords(raw: openArray[byte],
+    allowSourceReload: bool): Result[int, string]
+
 proc decodeSpecChunkRecordCount(compressed: openArray[byte],
-    allowSourceReload: bool): Result[int, string] =
-  ## Decompress a SPEC-layout chunk (header-less payload) and count its
-  ## records by decoding forward to the end of the chunk.  Used to recover the
-  ## last chunk's record count (the SPEC ``steps.idx`` carries no
-  ## ``total_events``), mirroring the Rust ``StepStreamReader::open`` logic.
+    allowSourceReload: bool, stored: bool): Result[int, string] =
+  ## Count a SPEC-layout chunk's (header-less payload) records by decoding
+  ## forward to the end of the chunk, decompressing it first unless it is
+  ## ``stored`` as its content (a compact container, `ctfs-container.md`
+  ## §1f).  Used to recover the last chunk's record count (the SPEC
+  ## ``steps.idx`` carries no ``total_events``), mirroring the Rust
+  ## ``StepStreamReader::open`` logic.
+  if stored:
+    if compressed.len == 0:
+      return err("step chunk is empty")
+    return countSpecChunkRecords(compressed, allowSourceReload)
   if compressed.len == 0:
     return err("step chunk has zero compressed size")
   let frameSize = ZSTD_getFrameContentSize(
@@ -349,6 +361,10 @@ proc decodeSpecChunkRecordCount(compressed: openArray[byte],
     return err("zstd decompress failed for last step chunk: " &
       $ZSTD_getErrorName(decompSize))
   raw.setLen(int(decompSize))
+  countSpecChunkRecords(raw, allowSourceReload)
+
+proc countSpecChunkRecords(raw: openArray[byte],
+    allowSourceReload: bool): Result[int, string] =
   var pos = 0
   var count = 0
   while pos < raw.len:
@@ -390,6 +406,7 @@ proc initExecStreamReader*(ctfsBytes: openArray[byte],
   ## The FFI reader passes ``legacy = not meta.hasStepStream``: pre-M24a-1
   ## bundles never set the ``has_step_stream`` flag, so a clear flag selects the
   ## legacy reader and a set flag the SPEC reader.
+  let stored = isCompactContainer(ctfsBytes)
   var datRes = readInternalFile(ctfsBytes, "steps.dat",
       uint32(blockSize), uint32(maxEntries))
   if datRes.isErr:
@@ -466,7 +483,7 @@ proc initExecStreamReader*(ctfsBytes: openArray[byte],
       if startOff > endOff:
         return err("last chunk offset past end of steps.dat")
       let lastCount = ?decodeSpecChunkRecordCount(
-        datData.toOpenArray(startOff, endOff - 1), allowSourceReload)
+        datData.toOpenArray(startOff, endOff - 1), allowSourceReload, stored)
       totalEvents = uint64(lastChunk) * uint64(chunkSize) + uint64(lastCount)
 
   # Sized before `offsets` is handed to the reader: a field initialiser that
@@ -482,6 +499,7 @@ proc initExecStreamReader*(ctfsBytes: openArray[byte],
     cache: move cache,
     allowSourceReload: allowSourceReload,
     payloadStart: payloadStart,
+    stored: stored,
   ))
 
 proc totalEvents*(r: ExecStreamReader): uint64 = r.totalEventsVal
@@ -514,6 +532,9 @@ proc advanceCursor(ev: StepEvent, i: int, chunkIdx: int, cursor: var uint64,
     discard
   ok()
 
+proc commitChunk(r: var ExecStreamReader, slot: int,
+    chunkIdx: int): Result[int, string]
+
 proc chunkSlot(r: var ExecStreamReader,
     chunkIdx: int): Result[int, string] =
   ## Return the cache slot holding chunk ``chunkIdx``, inflating it first if it
@@ -536,6 +557,13 @@ proc chunkSlot(r: var ExecStreamReader,
   let compressedLen = endOff - startOff
   if compressedLen == 0:
     return err("chunk " & $chunkIdx & " has zero compressed size")
+
+  if r.stored:
+    let slot = r.cache.acquire()
+    r.cache.prepare(slot, int(compressedLen))
+    copyMem(addr r.cache.data(slot)[0], unsafeAddr r.data[int(startOff)],
+      int(compressedLen))
+    return r.commitChunk(slot, chunkIdx)
 
   let frameSize = ZSTD_getFrameContentSize(
     unsafeAddr r.data[int(startOff)], csize_t(compressedLen))
@@ -562,7 +590,11 @@ proc chunkSlot(r: var ExecStreamReader,
   # Account a distinct chunk inflation: we only reach here on a cache miss, so
   # each increment is a genuinely new inflation.
   r.chunkDecompressions += 1
+  r.commitChunk(slot, chunkIdx)
 
+proc commitChunk(r: var ExecStreamReader, slot: int,
+    chunkIdx: int): Result[int, string] =
+  ## Make the chunk just put in ``slot`` resident, nothing of it decoded yet.
   template m: untyped = r.cache.meta(slot)
   m.nextPos = r.payloadStart
   m.posRefusedAt = high(int)
