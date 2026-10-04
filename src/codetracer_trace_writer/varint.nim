@@ -35,32 +35,50 @@ proc encodeVarintTo*(val: uint64, output: var openArray[byte], pos: var int) {.r
     if v == 0:
       break
 
-proc readVarintMultiByte(data: openArray[byte], pos: var int,
+proc readVarintMultiByte*(data: openArray[byte], pos: var int,
     value: var uint64): bool {.raises: [].} =
+  ## `readVarint` past its one-byte case.
+  let p = pos
+  if p < 0 or p >= data.len:
+    return false
+  if data.len - p >= 10:
+    # Every byte a varint may take is in range: read them unchecked.
+    let d = cast[ptr UncheckedArray[byte]](unsafeAddr data[p])
+    var v = 0'u64
+    for k in 0 ..< 10:
+      let b = d[k]
+      v = v or (uint64(b and 0x7F) shl (7 * k))
+      if (b and 0x80) == 0:
+        value = v
+        pos = p + k + 1
+        return true
+    return false
   var v = 0'u64
   var shift = 0
-  var p = pos
-  while p < data.len:
-    let b = data[p]
-    inc p
+  var q = p
+  while q < data.len:
+    let b = data[q]
+    inc q
     v = v or (uint64(b and 0x7F) shl shift)
     if (b and 0x80) == 0:
       value = v
-      pos = p
+      pos = q
       return true
     shift += 7
     if shift >= 64:
       return false
   false
 
-proc readVarint*(data: openArray[byte], pos: var int,
-    value: var uint64): bool {.inline, raises: [].} =
+template readVarint*(data: openArray[byte], pos: var int,
+    value: var uint64): bool =
   ## `decodeVarint` for a hot loop: no `Result` to build. True with `value`
   ## set and `pos` advanced; false, with `pos` unchanged, where
   ## `decodeVarint` refuses (a truncated varint or one over ten bytes).
   ##
-  ## The one-byte case is decided here, small enough to be inlined into the
-  ## decoder that calls it; longer varints take the out-of-line loop.
+  ## A template, so the one-byte case — most lengths, ids and deltas — is
+  ## decided in the decoder that reads it; longer varints take
+  ## `readVarintMultiByte`. `data` and `pos` must be plain locations: they
+  ## are evaluated more than once.
   if pos >= 0 and pos < data.len and data[pos] < 0x80'u8:
     value = uint64(data[pos])
     inc pos
