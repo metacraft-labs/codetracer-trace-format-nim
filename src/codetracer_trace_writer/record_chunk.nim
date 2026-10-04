@@ -1,15 +1,19 @@
 {.push raises: [].}
 
-## One inflated chunk of a stream whose chunks are zstd frames of
-## varint-length-prefixed records (`values.dat`, `calls.dat`, `events.dat`),
-## held for repeated reads.
+## One chunk of a stream whose chunks are zstd frames of varint-length-prefixed
+## records (`values.dat`, `calls.dat`, `events.dat`), held for repeated reads.
 ##
 ## A stream reader keeps one `RecordChunk`. Loading a chunk inflates its frame
 ## into a buffer the `RecordChunk` keeps from one load to the next, through the
-## thread's shared decompression context, and frames the records by noting
-## where each one starts and ends. A record is then read in place with
-## `record`, so a point read decodes the one record it wants and allocates
-## nothing to reach it.
+## thread's shared decompression context. A chunk of a compact container
+## (`ctfs-container.md` §1d) is stored as its content rather than as a frame,
+## and `loadStored` takes it as it is.
+##
+## Records are framed lazily: `frame` notes where records start and end only
+## as far as the record asked for, so a point read near the start of a chunk
+## does not walk the rest of it, and a walk over the chunk frames each record
+## once. A record is then read in place with `record`, so a read decodes the
+## one record it wants and allocates nothing to reach it.
 
 import results
 import ../codetracer_ctfs/zstd_bindings
@@ -21,26 +25,33 @@ type
   RecordChunk* = object
     index: int          ## the chunk held, -1 when none
     raw: seq[byte]      ## its inflated bytes
-    bounds: seq[int]    ## record `i` is `raw[bounds[2*i] ..< bounds[2*i + 1]]`
+    bounds: seq[int]    ## record `i` is `raw[bounds[2*i] ..< bounds[2*i + 1]]`,
+                        ## for `i` below `framed`; the rest is spare capacity
+    framed: int         ## how many records are framed
+    framedTo: int       ## where the next record's length prefix starts
 
 proc initRecordChunk*(): RecordChunk =
   RecordChunk(index: -1)
 
-proc held*(c: RecordChunk): int =
+proc held*(c: RecordChunk): int {.inline.} =
   ## The chunk this holds, or -1.
   c.index
 
-proc len*(c: RecordChunk): int =
-  ## How many records the held chunk frames.
-  c.bounds.len div 2
+proc framed*(c: RecordChunk): int {.inline.} =
+  ## How many records of the held chunk are framed so far: `record(i)` may be
+  ## read for every `i` below it.
+  c.framed
+
+proc reset(c: var RecordChunk) =
+  c.index = -1
+  c.framed = 0
+  c.framedTo = 0
 
 proc load*(c: var RecordChunk, index: int, frame: openArray[byte],
     what: string): Result[void, string] =
-  ## Inflate `frame`, chunk `index` of a stream of `what` records, and frame
-  ## its records. On failure nothing is held. An empty frame is a chunk with
-  ## no records.
-  c.index = -1
-  c.bounds.setLen(0)
+  ## Inflate `frame`, chunk `index` of a stream of `what` records. On failure
+  ## nothing is held. An empty frame is a chunk with no records.
+  c.reset()
   c.raw.setLen(0)
   if frame.len > 0:
     let size = ZSTD_getFrameContentSize(unsafeAddr frame[0], csize_t(frame.len))
@@ -55,21 +66,72 @@ proc load*(c: var RecordChunk, index: int, frame: openArray[byte],
         return err("zstd decompress failed for " & what & " chunk: " &
           $ZSTD_getErrorName(got))
       c.raw.setLen(int(got))
-  var pos = 0
-  while pos < c.raw.len:
-    var recLen: uint64
-    if not readVarint(c.raw, pos, recLen):
-      c.bounds.setLen(0)
-      return err(decodeVarint(c.raw, pos).error)
-    if recLen > uint64(c.raw.len - pos):
-      c.bounds.setLen(0)
-      return err(what & " record length extends past chunk")
-    c.bounds.add(pos)
-    pos += int(recLen)
-    c.bounds.add(pos)
   c.index = index
   ok()
 
+proc loadStored*(c: var RecordChunk, index: int, content: openArray[byte]) =
+  ## Hold chunk `index` whose records are `content` as stored, uncompressed.
+  c.reset()
+  c.raw.setLenUninit(content.len)
+  if content.len > 0:
+    copyMem(addr c.raw[0], unsafeAddr content[0], content.len)
+  c.index = index
+
+type
+  FrameOutcome* = enum
+    foHas          ## the record is framed
+    foEnded        ## the chunk ends before it
+    foBadLength    ## a length prefix does not decode
+    foOverrun      ## a record's length runs past the chunk
+
+proc frameTo*(c: var RecordChunk, i: int): FrameOutcome =
+  ## Frame the held chunk's records up to record `i`, and say how that went.
+  ## `frame` is the same, as a `Result`; this is the shape for a reader's hot
+  ## path, which builds a refusal (`refusal`) only when there is one.
+  while c.framed <= i:
+    if c.framedTo >= c.raw.len:
+      return foEnded
+    var pos = c.framedTo
+    var recLen: uint64
+    if not readVarint(c.raw, pos, recLen):
+      return foBadLength
+    if recLen > uint64(c.raw.len - pos):
+      return foOverrun
+    if 2 * c.framed + 2 > c.bounds.len:
+      c.bounds.setLenUninit(max(128, 2 * c.bounds.len))
+    c.bounds[2 * c.framed] = pos
+    c.framedTo = pos + int(recLen)
+    c.bounds[2 * c.framed + 1] = c.framedTo
+    inc c.framed
+  foHas
+
+proc refusal*(c: RecordChunk, outcome: FrameOutcome, i: int,
+    what: string): string =
+  ## Why record `i` could not be framed, for an outcome other than `foHas`.
+  case outcome
+  of foHas: ""
+  of foEnded: what & " record " & $i & " missing in chunk " & $c.index
+  of foBadLength:
+    var pos = c.framedTo
+    decodeVarint(c.raw, pos).error
+  of foOverrun: what & " record length extends past chunk"
+
+proc frame*(c: var RecordChunk, i: int, what: string): Result[bool, string] =
+  ## Frame the held chunk's records up to record `i`. True when the chunk has
+  ## a record `i`, false when it ends before it. A record whose length runs
+  ## past the chunk, or whose length prefix does not decode, is refused when
+  ## framing reaches it.
+  let o = c.frameTo(i)
+  case o
+  of foHas: ok(true)
+  of foEnded: ok(false)
+  else: err(c.refusal(o, i, what))
+
+proc count*(c: var RecordChunk, what: string): Result[int, string] =
+  ## How many records the held chunk holds, framing all of them.
+  discard ? c.frame(high(int) - 1, what)
+  ok(c.framed)
+
 template record*(c: RecordChunk, i: int): untyped =
-  ## Record `i` of the held chunk, in place. `i` must be below `len`.
+  ## Record `i` of the held chunk, in place. `i` must be below `framed`.
   c.raw.toOpenArray(c.bounds[2 * i], c.bounds[2 * i + 1] - 1)

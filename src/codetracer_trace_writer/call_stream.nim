@@ -393,7 +393,7 @@ proc initCallStreamReader*(ctfsBytes: openArray[byte],
     if start > dat.len:
       return err("calls.idx: last chunk offset past end of calls.dat")
     ? chunk.load(lastChunk, dat.toOpenArray(start, dat.len - 1), "call")
-    recordCount = uint64(lastChunk * chunkSize + chunk.len)
+    recordCount = uint64(lastChunk * chunkSize + ? chunk.count("call"))
 
   ok(CallStreamReader(
     chunkSize: chunkSize,
@@ -427,8 +427,10 @@ proc readCall*(r: var CallStreamReader,
       return err("calls.dat: chunk offsets out of range")
     ? r.chunk.load(chunkNumber, r.dat.toOpenArray(start, endOff - 1), "call")
 
-  if within >= r.chunk.len:
-    return err("call record " & $within & " missing in chunk " & $chunkNumber)
+  if within >= r.chunk.framed:
+    let framing = r.chunk.frameTo(within)
+    if framing != foHas:
+      return err(r.chunk.refusal(framing, within, "call"))
   let rec = decodeCallRecord(r.chunk.record(within))
   if rec.isErr:
     return err("calls.dat record " & $callKey & ": " & rec.error)

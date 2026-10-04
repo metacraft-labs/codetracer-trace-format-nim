@@ -721,6 +721,59 @@ proc test_value_stream_forward_compat_truncated_payload_refused() {.raises: [].}
 
   echo "PASS: test_value_stream_forward_compat_truncated_payload_refused"
 
+proc test_value_stream_values_walk_agrees_with_events_walk() {.raises: [].} =
+  ## `decodeRecord` builds only the tag-0 values and steps over the rest;
+  ## `decodeRecordEvents` builds every event. Over a record holding every tag,
+  ## two `StepValues` events and a skippable tag, the values must be the
+  ## `StepValues` events' values concatenated, the skipped tags the same, and
+  ## every truncated prefix of the record refused by both with one message.
+  proc stepValues(vals: openArray[(uint64, seq[byte])], buf: var seq[byte]) =
+    buf.add(0'u8)
+    encodeVarint(uint64(vals.len), buf)
+    for (vn, d) in vals:
+      encodeVarint(vn, buf)
+      encodeVarint(uint64(d.len), buf)
+      buf.add(d)
+  # CBOR maps with a top-level `type_id`, so `typeId` is exercised too.
+  let intVal = @[0xa2'u8, 0x64, 0x6b, 0x69, 0x6e, 0x64, 0x63, 0x49, 0x6e, 0x74,
+    0x67, 0x74, 0x79, 0x70, 0x65, 0x5f, 0x69, 0x64, 0x07]
+  var rec: seq[byte]
+  stepValues([(3'u64, intVal), (300'u64, newSeq[byte]())], rec)
+  encodeBindVariableEvent(5, -2, rec)
+  encodeDropVariableEvent(6, rec)
+  encodeDropVariablesEvent([7'u64, 8], rec)
+  encodeCellValueEvent(9, [0x01'u8], rec)
+  encodeCompoundValueEvent(10, [0x02'u8, 0x03], rec)
+  encodeAssignCellEvent(11, [0x04'u8], rec)
+  encodeAssignCompoundItemEvent(12, 1, 13, rec)
+  encodeVariableCellEvent(14, 15, rec)
+  encodeAssignmentEvent(16, 1, [0x05'u8], rec)
+  encodeLengthPrefixedEvent(12'u8, [0xEE'u8, 0xEE], rec)
+  stepValues([(17'u64, intVal)], rec)
+
+  var skA, skB: seq[uint8]
+  let events = decodeRecordEvents(rec, skA)
+  doAssert events.isOk, events.error
+  var fromEvents: seq[VariableValue]
+  for ev in events.get():
+    if ev.kind == veStepValues:
+      fromEvents.add(ev.values)
+  let values = decodeRecord(rec, skB)
+  doAssert values.isOk, values.error
+  doAssert values.get() == fromEvents
+  doAssert values.get().len == 3 and values.get()[0].typeId == 7 and
+    values.get()[2].varnameId == 17
+  doAssert skA == skB and skA == @[12'u8]
+  for cut in 0 ..< rec.len:
+    var a, b: seq[uint8]
+    let ev = decodeRecordEvents(rec.toOpenArray(0, cut - 1), a)
+    let va = decodeRecord(rec.toOpenArray(0, cut - 1), b)
+    doAssert ev.isOk == va.isOk, "prefix " & $cut & " decided differently"
+    if ev.isErr:
+      doAssert ev.error == va.error, "prefix " & $cut & ": " & ev.error &
+        " / " & va.error
+  echo "PASS: test_value_stream_values_walk_agrees_with_events_walk"
+
 # Run all tests
 test_value_stream_write_read()
 test_value_stream_empty_record()
@@ -732,4 +785,4 @@ test_value_stream_drop_variable_events()
 test_value_stream_unknown_tag_is_refused_by_name()
 test_value_stream_forward_compat_tag_skipped()
 test_value_stream_forward_compat_truncated_payload_refused()
-
+test_value_stream_values_walk_agrees_with_events_walk()

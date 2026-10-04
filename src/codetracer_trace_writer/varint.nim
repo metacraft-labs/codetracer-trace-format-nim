@@ -35,11 +35,8 @@ proc encodeVarintTo*(val: uint64, output: var openArray[byte], pos: var int) {.r
     if v == 0:
       break
 
-proc readVarint*(data: openArray[byte], pos: var int,
-    value: var uint64): bool {.inline, raises: [].} =
-  ## `decodeVarint` for a hot loop: no `Result` to build. True with `value`
-  ## set and `pos` advanced; false, with `pos` unchanged, where
-  ## `decodeVarint` refuses (a truncated varint or one over ten bytes).
+proc readVarintMultiByte(data: openArray[byte], pos: var int,
+    value: var uint64): bool {.raises: [].} =
   var v = 0'u64
   var shift = 0
   var p = pos
@@ -55,6 +52,21 @@ proc readVarint*(data: openArray[byte], pos: var int,
     if shift >= 64:
       return false
   false
+
+proc readVarint*(data: openArray[byte], pos: var int,
+    value: var uint64): bool {.inline, raises: [].} =
+  ## `decodeVarint` for a hot loop: no `Result` to build. True with `value`
+  ## set and `pos` advanced; false, with `pos` unchanged, where
+  ## `decodeVarint` refuses (a truncated varint or one over ten bytes).
+  ##
+  ## The one-byte case is decided here, small enough to be inlined into the
+  ## decoder that calls it; longer varints take the out-of-line loop.
+  if pos >= 0 and pos < data.len and data[pos] < 0x80'u8:
+    value = uint64(data[pos])
+    inc pos
+    true
+  else:
+    readVarintMultiByte(data, pos, value)
 
 proc decodeVarintMultiByte(data: openArray[byte],
     pos: var int): Result[uint64, string] {.raises: [].} =

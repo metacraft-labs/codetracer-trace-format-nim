@@ -404,7 +404,7 @@ proc initIOEventStreamReader*(ctfsBytes: openArray[byte],
       return err("last io event chunk offset past end of events.dat")
     ? chunk.load(lastChunk, datData.toOpenArray(startOff, endOff - 1),
       "io event")
-    totalRecords = uint64(lastChunk) * uint64(chunkSize) + uint64(chunk.len)
+    totalRecords = uint64(lastChunk) * uint64(chunkSize) + uint64(? chunk.count("io event"))
 
   ok(IOEventStreamReader(
     legacy: false,
@@ -445,9 +445,10 @@ proc readEvent*(r: var IOEventStreamReader,
     ? r.chunk.load(chunkNumber, r.data.toOpenArray(startOff, endOff - 1),
       "io event")
 
-  if within >= r.chunk.len:
-    return err("io event record " & $within & " missing in chunk " &
-      $chunkNumber)
+  if within >= r.chunk.framed:
+    let framing = r.chunk.frameTo(within)
+    if framing != foHas:
+      return err(r.chunk.refusal(framing, within, "io event"))
   let ev = decodeIOEvent(r.chunk.record(within))
   if ev.isErr:
     return err("events.dat record " & $index & ": " & ev.error)

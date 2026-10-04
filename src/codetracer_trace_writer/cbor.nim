@@ -921,7 +921,8 @@ proc cborTopLevelTypeId*(data: openArray[byte]): uint64 =
   ## without decoding the value. The map's other entries are stepped over,
   ## not built. 0 when the record has no top-level `type_id` (`Cell`, a
   ## tagged `ValueRef`) or does not parse as far as it.
-  const typeIdKey = "type_id"
+  const typeIdKey = [byte('t'), byte('y'), byte('p'), byte('e'), byte('_'),
+    byte('i'), byte('d')]
   var pos = 0
   var major: byte
   var arg: uint64
@@ -932,20 +933,28 @@ proc cborTopLevelTypeId*(data: openArray[byte]): uint64 =
     if not cborHead(data, pos, major, arg) or major != 3 or
         arg > uint64(data.len - pos):
       return 0
-    let keyStart = pos
+    let isTypeId = arg == uint64(typeIdKey.len) and
+      equalMem(unsafeAddr data[pos], unsafeAddr typeIdKey[0], typeIdKey.len)
     pos += int(arg)
-    var isTypeId = arg == uint64(typeIdKey.len)
-    if isTypeId:
-      for i in 0 ..< typeIdKey.len:
-        if data[keyStart + i] != byte(typeIdKey[i]):
-          isTypeId = false
-          break
     if isTypeId:
       if not cborHead(data, pos, major, arg) or major != 0:
         return 0
       return arg
-    if not cborSkip(data, pos):
+    # The values a `ValueRecord` map holds besides nested ones are integers,
+    # text and byte strings: stepped over here, the rest by `cborSkip`.
+    let valueStart = pos
+    if not cborHead(data, pos, major, arg):
       return 0
+    case major
+    of 0, 1, 7: discard
+    of 2, 3:
+      if arg > uint64(data.len - pos):
+        return 0
+      pos += int(arg)
+    else:
+      pos = valueStart
+      if not cborSkip(data, pos):
+        return 0
   0
 
 # ---- TypeRecord ----
