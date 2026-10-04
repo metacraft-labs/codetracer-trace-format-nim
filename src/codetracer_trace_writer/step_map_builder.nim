@@ -50,7 +50,7 @@
 ## at line 0 is keyed under line 1 (§"Global Line Index", "Line 0 is line 1,
 ## everywhere"). All integers outside the frames are little-endian.
 
-import std/[tables, algorithm, options]
+import std/[tables, algorithm]
 import results
 import ../codetracer_ctfs/zstd_bindings
 import ./varint
@@ -237,6 +237,11 @@ type
     stepCount*: uint64
     held: int            ## the chunk `raw` holds, -1 when none
     raw: seq[byte]       ## its inflated content
+    heldKeys: seq[StepMapKey]
+      ## Every line record of the held chunk, in key order: the index the
+      ## first lookup into the chunk builds while it checks the whole chunk.
+    heldStarts: seq[int]
+      ## Where each of those records' `count` field starts in `raw`.
 
   StepMapLine* = tuple[pathId: uint64, line: uint32, steps: seq[int64]]
 
@@ -321,13 +326,14 @@ proc inflateChunk(r: StepMapReader, c: int,
 
 proc scanChunk(r: StepMapReader, c: int, raw: openArray[byte],
     prevKey: var StepMapKey,
-    havePrev: var bool, target: Option[StepMapKey],
-    lines: var seq[StepMapLine]): Result[void, string] =
+    havePrev: var bool, collect: bool,
+    lines: var seq[StepMapLine],
+    keys: var seq[StepMapKey], starts: var seq[int]): Result[void, string] =
   ## Decode the inflated chunk `c`, checking everything the spec has a reader
-  ## refuse. With no `target`, every line record is appended to `lines`. With
-  ## one, the records before it are checked without building their step ids,
-  ## the record with its key is appended, and the scan stops at the first key
-  ## past it.
+  ## refuse. With `collect`, every line record is appended to `lines`.
+  ## Without it, no step id list is built, and each record's key and the
+  ## position of its `count` field are appended to `keys` and `starts`: the
+  ## index `lookup` answers from.
   var pos = 0
   template next(v: var uint64) =
     if not readVarint(raw, pos, v):
@@ -361,9 +367,10 @@ proc scanChunk(r: StepMapReader, c: int, raw: openArray[byte],
         ", " & $line & ")")
     prevKey = key
     havePrev = true
-    if target.isSome and key > target.get():
-      return ok()
-    let take = target.isNone or key == target.get()
+    let take = collect
+    if not collect:
+      keys.add(key)
+      starts.add(pos)
     next(count)
     if count == 0:
       return err("step-map.ns: line (" & $path & ", " & $line & ") has count 0")
@@ -381,16 +388,37 @@ proc scanChunk(r: StepMapReader, c: int, raw: openArray[byte],
       if rep > count - n:
         return err("step-map.ns: line (" & $path & ", " & $line &
           ")'s runs overshoot its count " & $count)
-      n += rep
       if take:
+        # Grown a run at a time and filled by index: `rep` was just checked
+        # against what is left of `count`.
+        var i = int(n)
+        ids.setLen(int(n + rep))
         for k in 0'u64 ..< rep:
           prev += int64(gap)
-          ids.add(prev)
+          ids[i] = prev
+          inc i
+      n += rep
     if take:
       lines.add((path, line, move ids))
-      if target.isSome:
-        return ok()
   ok()
+
+proc decodeIds(raw: openArray[byte], pos: int): seq[int64] =
+  ## The step ids of the record whose `count` field starts at `pos`, in a
+  ## chunk `scanChunk` has already checked.
+  var p = pos
+  var count, gap, rep: uint64
+  discard readVarint(raw, p, count)
+  # The scan checked that the runs' repeats add up to `count` exactly.
+  result = newSeqUninit[int64](int(count))
+  var prev = -1'i64
+  var n = 0
+  while n < int(count):
+    discard readVarint(raw, p, gap)
+    discard readVarint(raw, p, rep)
+    for k in 0 ..< int(rep):
+      prev += int64(gap)
+      result[n] = prev
+      inc n
 
 proc loadAll*(r: StepMapReader): Result[seq[StepMapLine], string] =
   ## Every line's step ids, in key order. Refuses a map whose decoded counts
@@ -399,9 +427,11 @@ proc loadAll*(r: StepMapReader): Result[seq[StepMapLine], string] =
   var prevKey = (0'u64, 0'u32)
   var havePrev = false
   var raw: seq[byte]
+  var noKeys: seq[StepMapKey]
+  var noStarts: seq[int]
   for c in 0 ..< r.chunks.len:
     ? r.inflateChunk(c, raw)
-    ? r.scanChunk(c, raw, prevKey, havePrev, none(StepMapKey), lines)
+    ? r.scanChunk(c, raw, prevKey, havePrev, true, lines, noKeys, noStarts)
   var paths = 0'u32
   var steps = 0'u64
   var last = high(uint64)
@@ -436,13 +466,28 @@ proc lookup*(r: var StepMapReader, pathId: uint64,
     return ok(newSeq[int64]())
   let c = lo - 1
   if r.held != c:
+    # The whole chunk is checked once, when it is inflated, and indexed; a
+    # defect anywhere in it refuses every lookup into it.
     r.held = -1
+    r.heldKeys.setLen(0)
+    r.heldStarts.setLen(0)
     ? r.inflateChunk(c, r.raw)
+    var prevKey = (0'u64, 0'u32)
+    var havePrev = false
+    var noLines: seq[StepMapLine]
+    let scanned = r.scanChunk(c, r.raw, prevKey, havePrev, false, noLines,
+      r.heldKeys, r.heldStarts)
+    if scanned.isErr:
+      r.heldKeys.setLen(0)
+      r.heldStarts.setLen(0)
+      return err(scanned.error)
     r.held = c
-  var found: seq[StepMapLine]
-  var prevKey = (0'u64, 0'u32)
-  var havePrev = false
-  ? r.scanChunk(c, r.raw, prevKey, havePrev, some(key), found)
-  if found.len == 0:
+  var a = 0
+  var b = r.heldKeys.len
+  while a < b:
+    let mid = (a + b) div 2
+    if r.heldKeys[mid] < key: a = mid + 1
+    else: b = mid
+  if a == r.heldKeys.len or r.heldKeys[a] != key:
     return ok(newSeq[int64]())
-  ok(move found[0].steps)
+  ok(decodeIds(r.raw, r.heldStarts[a]))

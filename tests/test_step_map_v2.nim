@@ -98,6 +98,15 @@ block chunks_close_after_the_record_that_reaches_64_KiB:
     doAssert expect[(ln.pathId, ln.line)] == ln.steps
   for key in [(0'u64, 3'u32), (1'u64, 29_998'u32), (2'u64, 15_002'u32)]:
     doAssert r.lookup(key[0], uint64(key[1])).get() == expect[key]
+  # Every key, visited in an order that leaves and re-enters chunks, and the
+  # keys between them, answer as `loadAll` does.
+  var probe = 1'u64
+  for _ in 0 ..< 20_000:
+    probe = (probe * 7919 + 13) mod 30_001
+    for path in 0'u64 .. 2:
+      let got = r.lookup(path, probe).get()
+      let want = expect.getOrDefault((path, uint32(probe)), @[])
+      doAssert got == want, "lookup (" & $path & ", " & $probe & ")"
   echo "PASS chunks_close_after_the_record_that_reaches_64_KiB"
 
 block an_empty_map_is_the_header_alone:
@@ -125,6 +134,29 @@ block readers_refuse_damaged_maps:
   let rk = openStepMap(badKey).get().loadAll()
   doAssert rk.isErr and "table key" in rk.error, $rk
   echo "PASS readers_refuse_damaged_maps"
+
+block a_lookup_checks_its_whole_chunk:
+  # One chunk, two line records; the SECOND has a run with gap 0, which the
+  # spec has a reader refuse. A lookup of the first line, before the defect,
+  # is refused too: the chunk is checked whole when a lookup inflates it.
+  let content = @[0'u8, 3, 1, 1, 1,   0, 2, 1, 0, 1]
+  var frame = newSeq[byte](int(ZSTD_compressBound(csize_t(content.len))))
+  let flen = ZSTD_compress(addr frame[0], csize_t(frame.len),
+    unsafeAddr content[0], csize_t(content.len), 3)
+  doAssert ZSTD_isError(flen) == 0
+  frame.setLen(int(flen))
+  var m: seq[byte]
+  proc put(m: var seq[byte], v: uint64, n: int) =
+    for i in 0 ..< n: m.add(byte((v shr (8 * i)) and 0xff))
+  m.put(0x53544D50'u64, 4); m.put(2, 2); m.put(1, 4); m.put(1, 4)
+  m.put(2, 4); m.put(2, 8)
+  m.put(0, 8); m.put(0, 8); m.put(3, 4)
+  m.add(frame)
+  var r = openStepMap(m).get()
+  let first = r.lookup(0, 3)
+  doAssert first.isErr and "gap 0" in first.error, $first
+  doAssert r.lookup(0, 3).isErr, "a refused chunk is not held"
+  echo "PASS a_lookup_checks_its_whole_chunk"
 
 block the_writer_keys_exec_record_ids_and_line_0_as_1:
   var w = initMultiStreamWriter("", "stepmap").get()
