@@ -135,3 +135,21 @@ proc count*(c: var RecordChunk, what: string): Result[int, string] =
 template record*(c: RecordChunk, i: int): untyped =
   ## Record `i` of the held chunk, in place. `i` must be below `framed`.
   c.raw.toOpenArray(c.bounds[2 * i], c.bounds[2 * i + 1] - 1)
+
+proc fieldBytes*(data: openArray[byte], first, len: int): seq[byte] =
+  ## `data[first ..< first + len]`, copied out of a record into a value of
+  ## its own. The caller has checked the range. A short field — most CBOR
+  ## values a record carries are a few bytes — is copied byte by byte, which
+  ## a WebAssembly build compiles to plain loads and stores where `copyMem`
+  ## becomes a call into the host's `memory.copy`.
+  if len <= 0:
+    return
+  result = newSeqUninit[byte](len)
+  let src = cast[ptr UncheckedArray[byte]](unsafeAddr data[first])
+  doAssert first + len <= data.len
+  if len <= 32:
+    let dst = cast[ptr UncheckedArray[byte]](addr result[0])
+    for i in 0 ..< len:
+      dst[i] = src[i]
+  else:
+    copyMem(addr result[0], src, len)

@@ -176,21 +176,21 @@ proc decodeCallRecord*(data: openArray[byte]): Result[CallRecord, string] {.rais
     if argLen < 0 or pos + argLen > data.len:
       return err("truncated arg data")
     rec.args[i] = CallArg(varnameId: varnameId,
-      value: @(data.toOpenArray(pos, pos + argLen - 1)))
+      value: fieldBytes(data, pos, argLen))
     pos += argLen
 
   # return value
   let retLen = int(varintOrReturn(data, pos))
   if retLen < 0 or pos + retLen > data.len:
     return err("truncated return value data")
-  rec.returnValue = @(data.toOpenArray(pos, pos + retLen - 1))
+  rec.returnValue = fieldBytes(data, pos, retLen)
   pos += retLen
 
   # exception
   let excLen = int(varintOrReturn(data, pos))
   if excLen < 0 or pos + excLen > data.len:
     return err("truncated exception data")
-  rec.exception = @(data.toOpenArray(pos, pos + excLen - 1))
+  rec.exception = fieldBytes(data, pos, excLen)
   pos += excLen
 
   # children

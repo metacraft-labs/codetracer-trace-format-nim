@@ -451,7 +451,7 @@ proc decodeOneValueEvent(data: openArray[byte], pos: var int, tag: uint8,
         return err("truncated value data in StepValues record")
       template d: untyped = data.toOpenArray(pos, pos + dLen - 1)
       let v = VariableValue(varnameId: vnId, typeId: decodeCborTopLevelTypeId(d),
-        data: @d)
+        data: fieldBytes(data, pos, dLen))
       when target == wtValues:
         values[i] = v
       else:
@@ -476,7 +476,7 @@ proc decodeOneValueEvent(data: openArray[byte], pos: var int, tag: uint8,
     if vLen > uint64(data.len - pos):
       return err("truncated CBOR value in value-stream event tag " & $tag)
     when target == wtEvents:
-      let blob = @(data.toOpenArray(pos, pos + int(vLen) - 1))
+      let blob = fieldBytes(data, pos, int(vLen))
       case tag
       of TagCellValue:
         events.add(DecodedValueEvent(kind: veCellValue, place: place,
@@ -521,7 +521,7 @@ proc decodeOneValueEvent(data: openArray[byte], pos: var int, tag: uint8,
     if fromLen < 0 or fromLen > data.len - pos:
       return err("truncated RValue payload in Assignment value-stream event")
     when target == wtEvents:
-      let blob = @(data.toOpenArray(pos, pos + fromLen - 1))
+      let blob = fieldBytes(data, pos, fromLen)
       events.add(DecodedValueEvent(kind: veAssignment,
         assignment: AssignmentEventEntry(
           varnameId: vnId, passBy: passBy, rvalueCbor: blob)))
