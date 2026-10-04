@@ -2,7 +2,7 @@
 
 ## Tests for binary meta.dat writer and reader.
 
-import std/[hashes, options, os, strutils]
+import std/[options, os, strutils]
 import results
 import codetracer_ctfs
 import codetracer_trace_types
@@ -704,8 +704,8 @@ proc test_meta_dat_recording_id_malformed_rejected() {.raises: [].} =
     "01949fcc-7d92-7e9c-caaa-bbbbbbbbbbbb",        # variant 'c' (= 11b, wrong)
     "01949fcc7d927e9caaaabbbbbbbbbbbbbbbb",        # missing hyphens
   ]
-  for bad in badCases:
-    let fileRes = c.addFile("bad_" & $hash(bad))
+  for i, bad in badCases:
+    let fileRes = c.addFile("bad" & $i)
     doAssert fileRes.isOk
     var f = fileRes.get()
     let meta = TraceMetadata(

@@ -13,6 +13,7 @@ import results
 import codetracer_ctfs/types
 import codetracer_ctfs/container
 import codetracer_ctfs/member_view
+import codetracer_ctfs/base40
 
 const
   Refused* = ["", "event_log.dat", "Meta.dat", "abcdefghijklm", "a b",
@@ -47,3 +48,26 @@ block a_reader_does_not_answer_for_a_mangled_name:
   doAssert not hasInternalFile(image, "abcdefghijklm")
   doAssert viewMember(newContainerImage(image), "abcdefghijklm").isErr
   echo "PASS a_reader_does_not_answer_for_a_mangled_name"
+
+block a_legacy_name_word_is_found_by_the_word:
+  # A recording made before a writer refused unpackable names carries the
+  # packing it stored. A reader that has to find such a member — the native
+  # recorder's `event_log.dat` before its rename — looks the word up.
+  var c = createCtfs()
+  var f = c.addFile("eventlog.dat").get()
+  doAssert c.writeToFile(f, [7'u8]).isOk
+  var image = c.toBytes()
+  let now = base40Encode("eventlog.dat")
+  let legacy = base40Encode("event_log.dat")
+  var planted = false
+  for off in countup(16 + 16, 4096 - 8, 24):
+    if readU64LE(image, off) == now:
+      writeU64LE(image, off, legacy)
+      planted = true
+  doAssert planted
+  doAssert readInternalFile(image, "event_log.dat").isErr
+  let e = findFileEntryKey(image, legacy)
+  doAssert e.found and e.size == 1
+  doAssert readMemberBytes(image, "event_log.dat", e.size, e.mapBlock,
+    DefaultBlockSize).get() == @[7'u8]
+  echo "PASS a_legacy_name_word_is_found_by_the_word"
