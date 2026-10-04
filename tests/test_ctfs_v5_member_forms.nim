@@ -150,13 +150,20 @@ block readers_refuse_every_other_version:
   var c = createCtfs()
   var f = c.addFile("x.dat").get()
   doAssert c.writeToFile(f, bytesOf(10, 1)).isOk
-  for v in [0'u8, 2, 3, 4, 6, 255]:
+  for v in [0'u8, 2, 3, 4, 7, 255]:
     var img = c.toBytes()
     img[5] = v
     let r = readInternalFile(img, "x.dat")
     doAssert r.isErr, "version " & $v & " was read"
-    doAssert ("version " & $v) in r.error and "version 5" in r.error,
-      "the refusal must name the version found and the one read: " & r.error
+    doAssert ("version " & $v) in r.error and "version 5" in r.error and
+      "version 6" in r.error,
+      "the refusal must name the version found and the ones read: " & r.error
+  # Version 6 is read, so a version-5 body under its stamp is refused by the
+  # header field it misreads: the first entry's bytes where the profile is.
+  var img = c.toBytes()
+  img[5] = 6
+  let r6 = readInternalFile(img, "x.dat")
+  doAssert r6.isErr and "profile" in r6.error, $r6
   echo "PASS readers_refuse_every_other_version"
 
 echo "ALL PASS test_ctfs_v5_member_forms"
