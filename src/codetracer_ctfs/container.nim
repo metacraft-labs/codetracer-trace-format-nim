@@ -884,6 +884,11 @@ proc nameIsWellFormed*(encoded: uint64): bool =
   let decoded = base40Decode(encoded)
   base40Encodable(decoded) and base40Encode(decoded) == encoded
 
+proc compactRefusal(what: string, value: uint64, rule: string): string =
+  ## A compact container's refusal, naming the offending value and the rule
+  ## (`ctfs-container.md` §1c).
+  "compact container " & what & " " & $value & " (ctfs-container.md " & rule & ")"
+
 proc readCompactDirectory*(data: openArray[byte],
     bodyReconstructed = false): Result[CompactDirectory, string] =
   ## Parse and VALIDATE the directory of a compact container, applying all six
@@ -910,45 +915,39 @@ proc readCompactDirectory*(data: openArray[byte],
   let profile = ?readCtfsProfile(data)
   if profile != cpCompact:
     return err("container declares profile " & $profile &
-      ", not compact: ctfs-container.md §1d describes the compact body only")
+      ", not compact (ctfs-container.md §1d)")
   ?checkV6Reserved(data)
   # Parsed unconditionally, because an UNKNOWN scheme is §1c's refusal whether
   # or not the caller claims to have reconstructed anything.
   let scheme = ?readWholeFileCompression(data)
   if scheme != wfcNone and not bodyReconstructed:
-    return err("compact container declares whole-file compression scheme " &
-      $scheme & ": its body must be reconstructed as header || " &
-      "decompress(rest) before the directory is read (ctfs-container.md §1a), " &
-      "and the caller says it has not been")
-
+    return err(compactRefusal("declares whole-file compression", uint64(ord(scheme)),
+      "§1a: its body is read after it is reconstructed"))
+  # §1d: there are no blocks, no FileEntry array and no block-number space,
+  # so a block size, a root-entry maximum or a shard count other than 0 would
+  # be a second spelling of one state.
   let blockSize = readU32LE(data, 8)
   if blockSize != 0'u32:
-    return err("compact container declares BlockSize " & $blockSize &
-      ", not 0: §1d requires 0 because the profile has no blocks, and a " &
-      "block size in a layout with no blocks is a second spelling of one state")
+    return err(compactRefusal("declares BlockSize", blockSize, "§1d: 0"))
   let maxRootEntries = readU32LE(data, 12)
   if maxRootEntries != 0'u32:
-    return err("compact container declares MaxRootEntries " &
-      $maxRootEntries & ", not 0: §1d requires 0 because there is no " &
-      "FileEntry array for a maximum to bound")
+    return err(compactRefusal("declares MaxRootEntries", maxRootEntries,
+      "§1d: 0"))
   let maxShards = readMaxShards(data)
   if maxShards != 0'u8:
-    return err("compact container declares MaxShards " & $maxShards &
-      ", not 0: §1a requires 0 because the profile has no block-number space " &
-      "to partition")
+    return err(compactRefusal("declares MaxShards", maxShards, "§1a: 0"))
 
   if data.len < CompactDirectoryOffset:
-    return err("compact container is " & $data.len & " bytes, short of the " &
-      $CompactDirectoryOffset & " a header and member count occupy")
+    return err(compactRefusal("is too short for a member count, in bytes",
+      uint64(data.len), "§1d"))
 
   let count = readU32LE(data, CompactMemberCountOffset)
   # §1d check 1: the directory itself fits.
   let dirEnd = uint64(CompactDirectoryOffset) +
     uint64(count) * uint64(CompactDirEntrySize)
   if dirEnd > uint64(data.len):
-    return err("compact container declares " & $count & " members, whose " &
-      "directory would end at byte " & $dirEnd & " of a " & $data.len &
-      "-byte container (§1d check 1)")
+    return err(compactRefusal("declares more members than its size holds",
+      count, "§1d check 1"))
 
   var dir = CompactDirectory(size: uint64(data.len))
   var expected = dirEnd  # §1d check 2: the first member starts right here.
@@ -960,30 +959,26 @@ proc readCompactDirectory*(data: openArray[byte],
 
     # §1d check 5.
     if not nameIsWellFormed(encoded):
-      return err("compact directory entry " & $i & " carries name word " &
-        $encoded & ", which does not round-trip through the base40 packing " &
-        "of ctfs-container.md §3 (§1d check 5)")
+      return err(compactRefusal("entry " & $i & " carries name word", encoded,
+        "§1d check 5"))
     let name = base40Decode(encoded)
 
     # §1d checks 2 and 3, as one: the member begins where its predecessor
-    # ended, and the first begins where the directory ended.
+    # ended, and the first begins where the directory ended. A gap would be
+    # padding, and an overlap or a jump would serve a shifted member.
     if offset != expected:
-      return err("compact directory entry " & $i & " ('" & name &
-        "') declares offset " & $offset & " but the members are contiguous " &
-        "and the previous one ended at " & $expected &
-        " (§1d check " & (if i == 0: "2" else: "3") &
-        "): a gap would be padding and an overlap or a jump would serve a " &
-        "shifted member")
+      return err(compactRefusal("entry " & $i & " ('" & name &
+        "') declares offset", offset,
+        if i == 0: "§1d check 2" else: "§1d check 3"))
     if length > uint64(data.len) or offset + length > uint64(data.len):
-      return err("compact directory entry " & $i & " ('" & name &
-        "') declares " & $length & " bytes at offset " & $offset &
-        ", past the end of a " & $data.len & "-byte container")
+      return err(compactRefusal("entry " & $i & " ('" & name &
+        "') runs past the container with length", length, "§1d check 4"))
 
     # §1d check 6.
     for prev in dir.entries:
       if prev.encodedName == encoded:
-        return err("compact directory names '" & name &
-          "' twice, at entries " & $i & " and earlier (§1d check 6)")
+        return err(compactRefusal("names '" & name & "' twice, at entry",
+          uint64(i), "§1d check 6"))
 
     dir.entries.add(CompactDirEntry(name: name, encodedName: encoded,
                                     offset: offset, length: length))
@@ -992,13 +987,10 @@ proc readCompactDirectory*(data: openArray[byte],
   # §1d check 4: nothing follows the last member. This is the check that makes
   # "no padding" an assertion against the bytes rather than a restatement of
   # the encoder's intent, and it is also what refuses a truncated container
-  # whose directory happens to be intact.
+  # whose directory happens to be intact: Size = 28 + 24*N + sum(length).
   if expected != uint64(data.len):
-    return err("compact container is " & $data.len &
-      " bytes but its " & $count & " members end at " & $expected &
-      ": §1d requires Size = 28 + 24*N + sum(length), so the " &
-      $(int64(data.len) - int64(expected)) &
-      "-byte difference is padding or truncation (§1d check 4)")
+    return err(compactRefusal("has its members end at " & $expected &
+      " and its size is", uint64(data.len), "§1d check 4"))
 
   ok(dir)
 
