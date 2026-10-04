@@ -137,9 +137,9 @@ proc test_line_zero_does_not_wrap_below_the_file_base() =
   let gli = buildGlobalLineIndex(@[10'u64, 10'u64])
   for fileId in 0 .. 1:
     let p = gli.globalIndex(fileId, 0)
-    doAssert p == gli.prefixSum[fileId],
+    doAssert p == gli.fileBase(fileId),
       "line 0 of file " & $fileId & " must not address below the file's " &
-      "own base " & $gli.prefixSum[fileId] & "; got " & $p
+      "own base " & $gli.fileBase(fileId) & "; got " & $p
     doAssert p < gli.totalLines,
       "line 0 of file " & $fileId & " encoded to " & $p &
       ", outside a space of " & $gli.totalLines & " — the subtraction wrapped"
@@ -250,6 +250,48 @@ proc test_stride_boundary_end_to_end() =
 
   echo "PASS: test_stride_boundary_end_to_end"
 
+proc test_runs_agree_with_a_spelled_out_prefix_sum() =
+  ## The index holds its trailing run of equal sizes as a size and a count.
+  ## Over count sequences mixing runs, single files, empty files and long
+  ## default runs, every base, every address's resolution and the derived
+  ## equality must match a prefix sum spelled out per file, whether the index
+  ## was built in one pass, file by file, or by `positionSpace`.
+  var x = 12345'u64
+  proc next(x: var uint64): uint64 =
+    x = x * 6364136223846793005'u64 + 1442695040888963407'u64
+    x shr 33
+  for trial in 0 ..< 200:
+    var counts: seq[uint64]
+    while counts.len < int(next(x) mod 40):
+      let size = [1'u64, 3, 7, 10, DefaultLinesPerFile][int(next(x) mod 5)]
+      for _ in 0 ..< int(next(x) mod 6) + 1:
+        counts.add(size)
+    var prefix = @[0'u64]
+    for c in counts: prefix.add(prefix[^1] + c)
+    let built = buildGlobalLineIndex(counts)
+    var grown = buildGlobalLineIndex([])
+    for c in counts: grown.appendFile(c)
+    doAssert built == grown, "trial " & $trial
+    doAssert built.fileCount == counts.len and built.totalLines == prefix[^1]
+    for f in 0 .. counts.len:
+      doAssert built.fileBase(f) == prefix[f], "trial " & $trial & " file " & $f
+    for f in 0 ..< counts.len:
+      for p in [prefix[f], prefix[f] + counts[f] div 2, prefix[f + 1] - 1]:
+        if counts[f] == 0: continue
+        let (rf, line) = built.tryResolve(p).get()
+        doAssert rf == f and line == p - prefix[f] + 1,
+          "trial " & $trial & ": " & $p & " -> " & $(rf, line)
+    if counts.len > 0:
+      doAssert built.tryResolve(prefix[^1]).isErr
+  # `positionSpace` equals the index built from the per-file sizes.
+  let lls = @[@[3'u32, 4], newSeq[uint32](), @[9'u32]]
+  for columnAware in [false, true]:
+    for lcs in [newSeq[uint64](), @[5'u64, 0, 8, 2]]:
+      for n in [0, 1, 3, 5, 50]:
+        doAssert positionSpace(lls, lcs, n, columnAware) ==
+          buildGlobalLineIndex(positionSpaceCounts(lls, lcs, n, columnAware))
+  echo "PASS: test_runs_agree_with_a_spelled_out_prefix_sum"
+
 removeDir(dir)
 createDir(dir)
 
@@ -258,6 +300,7 @@ test_line_zero_does_not_wrap_below_the_file_base()
 test_round_trip_over_every_registered_line()
 test_stride_boundary_arithmetic()
 test_stride_boundary_end_to_end()
+test_runs_agree_with_a_spelled_out_prefix_sum()
 
 removeDir(dir)
 echo "ALL PASS: test_global_line_index_boundary"

@@ -60,13 +60,6 @@ type
     # per step by a host that resolves steps one call at a time.
     posSpace: GlobalLineIndex
 
-    # The absolute positions of the last exec chunk `stepAbsoluteGlobalLineIndex`
-    # decoded, one per event (a non-step event carries the running position).
-    # A host resolving consecutive steps one call at a time decodes each chunk
-    # once instead of once per step.
-    gliChunk: int              ## index of the cached chunk, or -1
-    gliCache: seq[uint64]
-
     # Metadata
     meta*: MetaDatContents
 
@@ -727,10 +720,8 @@ proc openNewTraceFromBytes*(data: sink seq[byte],
       if pathId < pathCount:
         reader.sourceViewsByPath[int(pathId)].add(i)
 
-  reader.gliChunk = -1
-  reader.posSpace = buildGlobalLineIndex(positionSpaceCounts(
-    reader.lineLengths, reader.lineCounts, int(reader.pathReader.count()),
-    reader.meta.hasColumnAwareSteps))
+  reader.posSpace = positionSpace(reader.lineLengths, reader.lineCounts,
+    int(reader.pathReader.count()), reader.meta.hasColumnAwareSteps)
   ok(reader)
 
 when ctHasFilesystem:
@@ -1248,7 +1239,7 @@ proc decodeGlobalPositionIndex*(r: var NewTraceReader,
 # Step access (lazy init exec reader)
 # ---------------------------------------------------------------------------
 
-proc ensureExecReader(r: var NewTraceReader): Result[void, string] =
+proc loadExecReader(r: var NewTraceReader): Result[void, string] =
   if not r.execLoaded:
     # M24a-1: select the steps.dat/steps.idx framing by the meta.dat
     # ``has_step_stream`` flag.  Bundles written by the current Nim writer
@@ -1270,8 +1261,14 @@ proc ensureExecReader(r: var NewTraceReader): Result[void, string] =
     r.execLoaded = true
   ok()
 
+template ensureExecReader(r: var NewTraceReader) =
+  ## `loadExecReader` on first use, its refusal returned from the enclosing
+  ## proc; a check of one flag afterwards.
+  if not r.execLoaded:
+    ? r.loadExecReader()
+
 proc step*(r: var NewTraceReader, n: uint64): Result[StepEvent, string] =
-  ?r.ensureExecReader()
+  r.ensureExecReader()
   r.execReader.readEvent(n)
 
 proc stepAbsoluteGlobalLineIndex*(r: var NewTraceReader,
@@ -1282,28 +1279,15 @@ proc stepAbsoluteGlobalLineIndex*(r: var NewTraceReader,
   ## each chunk's first position record is an AbsoluteStep and a reader
   ## decodes a chunk by itself (`resolveChunkPositions`), refusing a delta
   ## before the chunk's anchor.
-  ?r.ensureExecReader()
-
-  let chunkSize = uint64(r.execReader.chunkSize)
-  let chunkIdx = int(n div chunkSize)
-  let eventInChunk = int(n mod chunkSize)
-  if chunkIdx == r.gliChunk:
-    if eventInChunk >= r.gliCache.len:
-      return err("step " & $n & " is past the end of its exec chunk")
-    return ok(r.gliCache[eventInChunk])
-  # Decode the containing chunk once, in one pass, and keep every event's
-  # absolute position: a caller that resolves steps one call at a time
-  # (ct-print, the C ABI's `ct_reader_step_location`) asks for the next step
-  # of the same chunk next.
-  r.gliChunk = -1
-  ? r.execReader.chunkPositions(chunkIdx, r.gliCache)
-  if eventInChunk >= r.gliCache.len:
-    return err("step " & $n & " is past the end of its exec chunk")
-  r.gliChunk = chunkIdx
-  ok(r.gliCache[eventInChunk])
+  r.ensureExecReader()
+  # The exec reader keeps each decoded chunk's positions, as far as reads
+  # have reached: a caller that resolves steps one call at a time
+  # (ct-print, the C ABI's `ct_reader_step_location`) decodes each record
+  # once.
+  r.execReader.eventPosition(n)
 
 proc stepCount*(r: var NewTraceReader): Result[uint64, string] =
-  ?r.ensureExecReader()
+  r.ensureExecReader()
   ok(r.execReader.totalEvents)
 
 proc logicalStepCount*(r: var NewTraceReader): Result[uint64, string] =
@@ -1326,7 +1310,7 @@ proc logicalStepCount*(r: var NewTraceReader): Result[uint64, string] =
   ## (O(N) total decode cost — chunks are decompressed once each,
   ## events read in bulk).  Looping ``readEvent`` is O(N²) because
   ## each call re-scans from the chunk start.
-  ?r.ensureExecReader()
+  r.ensureExecReader()
   if not r.meta.hasColumnAwareSteps and not r.meta.hasSourceReload:
     return ok(r.execReader.totalEvents)
   var n: uint64 = 0
@@ -1368,7 +1352,7 @@ proc sourceReloadCount*(r: var NewTraceReader): Result[uint64, string] =
   ## (HLX-M1's resolver answered "not found" when it could not read the
   ## table), and it would have been reachable through ``ct-print`` on
   ## EVERY container written to date, since they are all v4.
-  ?r.ensureExecReader()
+  r.ensureExecReader()
   if not r.meta.hasSourceReload:
     return ok(0'u64)
   var n: uint64 = 0
@@ -1400,7 +1384,7 @@ proc sourceReloads*(r: var NewTraceReader): Result[seq[SourceReloadMarker], stri
   ## undeclared-container early return: an empty seq must mean "this
   ## stream carries no markers", never "this stream could not be read".
   var markers: seq[SourceReloadMarker] = @[]
-  ?r.ensureExecReader()
+  r.ensureExecReader()
   if not r.meta.hasSourceReload:
     return ok(markers)
   var chunkBuf: seq[StepEvent]
@@ -1438,7 +1422,7 @@ proc stepAbsoluteGlobalLineIndices*(r: var NewTraceReader,
   ## entirely.  Non-step events (Raise, Catch, ThreadStart/Exit/Switch)
   ## carry no GLI delta so the running GLI is left untouched, mirroring
   ## [stepAbsoluteGlobalLineIndex].
-  ?r.ensureExecReader()
+  r.ensureExecReader()
 
   if count == 0'u64 or output.len == 0:
     return ok(0'u64)
@@ -1491,7 +1475,7 @@ proc stepAbsoluteGlobalLineIndices*(r: var NewTraceReader,
 # Value access (lazy init)
 # ---------------------------------------------------------------------------
 
-proc ensureValueReader(r: var NewTraceReader): Result[void, string] =
+proc loadValueReader(r: var NewTraceReader): Result[void, string] =
   if not r.valueLoaded:
     # M24a-2: select the values.dat/values.idx framing by the meta.dat
     # ``has_value_stream`` flag.  Bundles written by the current Nim writer
@@ -1506,14 +1490,20 @@ proc ensureValueReader(r: var NewTraceReader): Result[void, string] =
     r.valueLoaded = true
   ok()
 
+template ensureValueReader(r: var NewTraceReader) =
+  ## `loadValueReader` on first use, its refusal returned from the enclosing
+  ## proc; a check of one flag afterwards.
+  if not r.valueLoaded:
+    ? r.loadValueReader()
+
 proc values*(r: var NewTraceReader, n: uint64): Result[seq[VariableValue], string] =
-  ?r.ensureValueReader()
+  r.ensureValueReader()
   r.valueReader.readStepValues(n)
 
 proc valueEvents*(r: var NewTraceReader,
     n: uint64): Result[seq[DecodedValueEvent], string] =
   ## Every value-stream event of exec record ``n`` — tags 0-9, in wire order.
-  ?r.ensureValueReader()
+  r.ensureValueReader()
   r.valueReader.readStepEvents(n)
 
 iterator valuesIter*(r: var NewTraceReader, n: uint64): VariableValue =
@@ -1534,7 +1524,7 @@ proc values*(r: var NewTraceReader, n: uint64, output: var openArray[VariableVal
   count
 
 proc valueCount*(r: var NewTraceReader): Result[uint64, string] =
-  ?r.ensureValueReader()
+  r.ensureValueReader()
   ok(r.valueReader.count())
 
 proc lastSkippedValueTags*(r: NewTraceReader): seq[uint8] =
@@ -1560,7 +1550,7 @@ proc skippedValueTagCounts*(r: NewTraceReader): seq[(uint8, int)] =
 # Call access (lazy init)
 # ---------------------------------------------------------------------------
 
-proc ensureCallReader(r: var NewTraceReader): Result[void, string] =
+proc loadCallReader(r: var NewTraceReader): Result[void, string] =
   if not r.callLoaded:
     var res = initCallStreamReader(r.data, r.blockSize, r.maxEntries)
     if res.isErr: return err(res.error)
@@ -1568,12 +1558,18 @@ proc ensureCallReader(r: var NewTraceReader): Result[void, string] =
     r.callLoaded = true
   ok()
 
+template ensureCallReader(r: var NewTraceReader) =
+  ## `loadCallReader` on first use, its refusal returned from the enclosing
+  ## proc; a check of one flag afterwards.
+  if not r.callLoaded:
+    ? r.loadCallReader()
+
 proc call*(r: var NewTraceReader, callKey: uint64): Result[CallRecord, string] =
-  ?r.ensureCallReader()
+  r.ensureCallReader()
   r.callReader.readCall(callKey)
 
 proc callCount*(r: var NewTraceReader): Result[uint64, string] =
-  ?r.ensureCallReader()
+  r.ensureCallReader()
   ok(r.callReader.count())
 
 proc callForStep*(r: var NewTraceReader, stepId: uint64): Result[CallRecord, string] =
@@ -1608,7 +1604,7 @@ proc callForStep*(r: var NewTraceReader, stepId: uint64): Result[CallRecord, str
   ## that physically sits after the inlined call returns -- was reported
   ## as "not found in any call", emitting a step with no `function`,
   ## `function_id`, or `depth` attribution.
-  ?r.ensureCallReader()
+  r.ensureCallReader()
   let totalCalls = r.callReader.count()
   if totalCalls == 0:
     return err("no call records")
@@ -1651,7 +1647,7 @@ proc callForStep*(r: var NewTraceReader, stepId: uint64): Result[CallRecord, str
 
 iterator callRange*(r: var NewTraceReader, start, count: uint64): CallRecord =
   ## Yields call records in [start, start+count).
-  let _ = r.ensureCallReader()
+  discard r.loadCallReader()
   for i in start ..< start + count:
     let res = r.callReader.readCall(i)
     if res.isOk:
@@ -1661,7 +1657,7 @@ proc callRange*(r: var NewTraceReader, start, count: uint64,
                 output: var openArray[CallRecord]): int =
   ## Fill output buffer with call records starting at `start`.
   ## Returns the number of records written.
-  let _ = r.ensureCallReader()
+  discard r.loadCallReader()
   var written = 0
   for i in start ..< start + count:
     if written >= output.len: break
@@ -1675,7 +1671,7 @@ proc callRange*(r: var NewTraceReader, start, count: uint64,
 # IO event access (lazy init)
 # ---------------------------------------------------------------------------
 
-proc ensureIOEventReader(r: var NewTraceReader): Result[void, string] =
+proc loadIOEventReader(r: var NewTraceReader): Result[void, string] =
   if not r.ioEventLoaded:
     # M24a-3: select the events.dat/events.idx framing by the meta.dat
     # ``has_io_event_stream`` flag.  Bundles written by the current Nim writer
@@ -1690,17 +1686,23 @@ proc ensureIOEventReader(r: var NewTraceReader): Result[void, string] =
     r.ioEventLoaded = true
   ok()
 
+template ensureIOEventReader(r: var NewTraceReader) =
+  ## `loadIOEventReader` on first use, its refusal returned from the enclosing
+  ## proc; a check of one flag afterwards.
+  if not r.ioEventLoaded:
+    ? r.loadIOEventReader()
+
 proc ioEvent*(r: var NewTraceReader, index: uint64): Result[IOEvent, string] =
-  ?r.ensureIOEventReader()
+  r.ensureIOEventReader()
   r.ioEventReader.readEvent(index)
 
 proc ioEventCount*(r: var NewTraceReader): Result[uint64, string] =
-  ?r.ensureIOEventReader()
+  r.ensureIOEventReader()
   ok(r.ioEventReader.count())
 
 iterator events*(r: var NewTraceReader, start, count: uint64): IOEvent =
   ## Yields IO events in [start, start+count).
-  let _ = r.ensureIOEventReader()
+  discard r.loadIOEventReader()
   for i in start ..< start + count:
     let res = r.ioEventReader.readEvent(i)
     if res.isOk:
@@ -1711,7 +1713,7 @@ proc events*(
     output: var openArray[IOEvent]): int =
   ## Fill output buffer with IO events starting at `start`.
   ## Returns the number of events written.
-  let _ = r.ensureIOEventReader()
+  discard r.loadIOEventReader()
   var written = 0
   for i in start ..< start + count:
     if written >= output.len: break

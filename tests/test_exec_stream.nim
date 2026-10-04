@@ -500,7 +500,66 @@ proc test_exec_stream_legacy_back_compat() {.raises: [].} =
 
   echo "PASS: test_exec_stream_legacy_back_compat"
 
+proc test_exec_stream_reads_in_any_order() {.raises: [].} =
+  ## A chunk is decoded only as far as reads reach, so a read can find its
+  ## chunk partly decoded. Reads in order, backwards, in a pseudo-random walk
+  ## that crosses chunks, and position reads interleaved with event reads,
+  ## must agree with the whole-chunk decoders (`readChunkEvents`,
+  ## `resolveChunkPositions`) on every record, from fresh readers each time.
+  proc enc(ev: StepEvent): seq[byte] =
+    encodeStepEvent(ev, result)
+  var ctfs = createCtfs()
+  var writer = initExecStreamWriter(ctfs, chunkSize = 97).get()
+  for i in 0 ..< 1000:
+    let ev =
+      if i mod 37 == 5: StepEvent(kind: sekThreadSwitch, threadId: uint64(i))
+      elif i mod 11 == 0: StepEvent(kind: sekAbsoluteStep,
+        globalLineIndex: uint64(10_000 + i * 7))
+      else: StepEvent(kind: sekDeltaStep, lineDelta: int64(i mod 5) - 2)
+    doAssert ctfs.writeEvent(writer, ev).isOk
+  doAssert ctfs.flush(writer).isOk
+  let bytes = ctfs.toBytes()
+
+  var whole = initExecStreamReader(bytes).get()
+  var events: seq[StepEvent]
+  var positions: seq[uint64]
+  var allEvents: seq[StepEvent]
+  var allPositions: seq[uint64]
+  for c in 0 ..< whole.chunkCount:
+    discard whole.readChunkEvents(c, events).get()
+    doAssert resolveChunkPositions(events, c, positions).isOk
+    allEvents.add(events)
+    allPositions.add(positions)
+  doAssert allEvents.len == 1000
+
+  var orders: seq[seq[int]]
+  orders.add(@[])
+  for i in 0 ..< 1000: orders[^1].add(i)
+  orders.add(@[])
+  for i in countdown(999, 0): orders[^1].add(i)
+  orders.add(@[])
+  var x = 7
+  for _ in 0 ..< 3000:
+    x = (x * 1103 + 12345) mod 1000
+    orders[^1].add(x)
+  for order in orders:
+    var r = initExecStreamReader(bytes).get()
+    var k = 0
+    for i in order:
+      if k mod 2 == 0:
+        doAssert r.eventPosition(uint64(i)).get() == allPositions[i],
+          "position of record " & $i
+      let ev = r.readEvent(uint64(i))
+      doAssert ev.isOk, ev.error
+      doAssert enc(ev.get()) == enc(allEvents[i]), "record " & $i
+      doAssert r.eventPosition(uint64(i)).get() == allPositions[i],
+        "position of record " & $i
+      inc k
+    doAssert r.readEvent(1000).isErr
+  echo "PASS: test_exec_stream_reads_in_any_order"
+
 test_exec_stream_write_read()
+test_exec_stream_reads_in_any_order()
 test_exec_stream_raise_catch()
 test_exec_stream_thread_switch()
 test_exec_stream_delta_column_chunk_boundary()

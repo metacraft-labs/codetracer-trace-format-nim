@@ -91,7 +91,7 @@ proc test_incremental_index_addresses_match_a_one_pass_build() =
   doAssert r.isOk, r.error
   var reader = r.get()
   let space = reader.globalPositionSpace()
-  doAssert space.prefixSum == expected.prefixSum,
+  doAssert space == expected,
     "the reader's position space differs from a one-pass prefix sum"
   let n = reader.stepCount().get()
   doAssert n >= uint64(written.len),

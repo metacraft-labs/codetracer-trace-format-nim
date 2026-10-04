@@ -230,36 +230,87 @@ proc positionSpaceCounts*(lineLengths: openArray[seq[uint32]],
 
 type
   GlobalLineIndex* = object
-    prefixSum*: seq[uint64]  # prefixSum[file_id] = cumulative line count before this file
+    ## The base address of every file, as prefix sums of their sizes.
+    ##
+    ## The trailing run of files that share one size is held as that size and
+    ## a count rather than a sum per file. A trace that states no line counts
+    ## gives every file `DefaultLinesPerFile` addresses, so its whole space is
+    ## one run: built, extended and inverted in constant time and memory
+    ## however many paths it registers, where a sum per file cost a table of
+    ## that many words at every open and a binary search per resolution.
+    bases: seq[uint64]
+      ## `bases[f]` is file `f`'s first address for `f < bases.len - 1`, and
+      ## `bases[^1]` is where the run starts. Empty until built.
+    runFiles: int       ## how many files the run holds
+    runSize: uint64     ## the size of each of them
     totalLines*: uint64
 
-proc buildGlobalLineIndex*(lineCounts: openArray[uint64]): GlobalLineIndex =
-  ## Build prefix sum from per-file line counts.
-  var prefix = newSeq[uint64](lineCounts.len + 1)
-  prefix[0] = 0
-  for i in 0 ..< lineCounts.len:
-    prefix[i + 1] = prefix[i] + lineCounts[i]
-  let total = prefix[^1]
-  GlobalLineIndex(prefixSum: move prefix, totalLines: total)
+proc fileCount*(gli: GlobalLineIndex): int =
+  ## How many files the space holds.
+  max(gli.bases.len - 1, 0) + gli.runFiles
 
-proc appendFile*(gli: var GlobalLineIndex, count: uint64) =
-  ## Extend the space by one file of `count` addresses, placed after every
-  ## file already in it. No existing base moves, so this is O(1) and leaves
-  ## the index equal to `buildGlobalLineIndex` over the extended counts.
+proc fileBase*(gli: GlobalLineIndex, fileId: int): uint64 =
+  ## File `fileId`'s first address: the cumulative size of the files before
+  ## it. `fileId` may be `fileCount`, which answers `totalLines`.
+  let explicit = gli.bases.len - 1
+  if fileId < explicit:
+    gli.bases[fileId]
+  else:
+    gli.bases[explicit] + uint64(fileId - explicit) * gli.runSize
+
+proc appendFiles*(gli: var GlobalLineIndex, count: uint64, n: int) =
+  ## Extend the space by `n` files of `count` addresses each, placed after
+  ## every file already in it. No existing base moves.
   ##
   ## `gli` must already be an index (at least `buildGlobalLineIndex([])`):
   ## the default-initialised object has no base for file 0.
-  doAssert gli.prefixSum.len > 0,
+  doAssert gli.bases.len > 0,
     "appendFile on an index that was never built"
-  gli.totalLines += count
-  gli.prefixSum.add(gli.totalLines)
+  if n <= 0:
+    return
+  if gli.runFiles > 0 and count != gli.runSize:
+    # The run ends: its files get a base each, and a new run starts.
+    for _ in 0 ..< gli.runFiles:
+      gli.bases.add(gli.bases[^1] + gli.runSize)
+    gli.runFiles = 0
+  gli.runSize = count
+  gli.runFiles += n
+  gli.totalLines += count * uint64(n)
+
+proc appendFile*(gli: var GlobalLineIndex, count: uint64) =
+  ## Extend the space by one file of `count` addresses, placed after every
+  ## file already in it. No existing base moves, so this is amortised O(1)
+  ## and leaves the index equal to `buildGlobalLineIndex` over the extended
+  ## counts.
+  gli.appendFiles(count, 1)
+
+proc buildGlobalLineIndex*(lineCounts: openArray[uint64]): GlobalLineIndex =
+  ## The space of files whose sizes are `lineCounts`, in order.
+  result.bases = @[0'u64]
+  for c in lineCounts:
+    result.appendFile(c)
+
+proc positionSpace*(lineLengths: openArray[seq[uint32]],
+    lineCounts: openArray[uint64],
+    fileCount: int, columnAware: bool): GlobalLineIndex =
+  ## `buildGlobalLineIndex(positionSpaceCounts(...))`, without a size per
+  ## file: the files past every stated table and count all take the one
+  ## conventional size, and are appended as one run.
+  result.bases = @[0'u64]
+  let stated = min(fileCount, max(lineLengths.len, lineCounts.len))
+  for i in 0 ..< stated:
+    result.appendFile(positionSpaceCount(lineLengths, lineCounts, i,
+      columnAware))
+  if fileCount > stated:
+    result.appendFiles(positionSpaceCount([], [], 0, columnAware),
+      fileCount - stated)
 
 proc globalIndex*(gli: GlobalLineIndex, fileId: int, line: uint64): uint64 =
   ## Convert a 1-based `(file_id, line)` to a global line index:
-  ## `prefixSum[fileId] + (line - 1)`. Inverted by `resolve`.
+  ## `fileBase(fileId) + (line - 1)`. Inverted by `resolve`.
   ##
   ## Line 0 is not a source line, and the offset is clamped at 0 for it.
-  ## Unclamped it would be `prefixSum[fileId] - 1`, which wraps to
+  ## Unclamped it would be `fileBase(fileId) - 1`, which wraps to
   ## `2^64 - 1` for file 0 — a ten-byte varint on the wire — and lands in
   ## the previous file's last line for every other file. The clamp costs
   ## injectivity for an input that is not a location anyway: line 0 gets
@@ -267,13 +318,14 @@ proc globalIndex*(gli: GlobalLineIndex, fileId: int, line: uint64): uint64 =
   ## `multi_stream_writer.toGlobalLineIndex` clamps to the same address,
   ## so the two modes agree on what a caller's 0 means.
   let inFileOffset = if line == 0: 0'u64 else: line - 1
-  gli.prefixSum[fileId] + inFileOffset
+  gli.fileBase(fileId) + inFileOffset
 
 proc resolve*(gli: GlobalLineIndex, globalIdx: uint64): (int, uint64) =
-  ## Convert global line index back to (file_id, line): binary-search the
-  ## prefix sums for the file, then `line = globalIdx - prefixSum[f] + 1`
-  ## because the in-file offset is 0-based and lines are 1-based. Inverse
-  ## of `globalIndex` over every line a file has.
+  ## Convert global line index back to (file_id, line): find the last file
+  ## whose base is at or below it — by division inside the run, by binary
+  ## search before it — then `line = globalIdx - fileBase(f) + 1` because
+  ## the in-file offset is 0-based and lines are 1-based. Inverse of
+  ## `globalIndex` over every line a file has.
   ##
   ## Unchecked: `globalIdx` is assumed to be an address of this index, i.e.
   ## below `totalLines`. An index above the top of the space is answered by
@@ -281,16 +333,27 @@ proc resolve*(gli: GlobalLineIndex, globalIdx: uint64): (int, uint64) =
   ## line number that is arithmetic rather than evidence. Callers that
   ## handle positions from a container — where the producer's packing is
   ## not known — must use `tryResolve` instead.
-  # Find the largest fileId where prefixSum[fileId] <= globalIdx
-  var lo = 0
-  var hi = gli.prefixSum.len - 2  # last valid fileId
-  while lo < hi:
-    let mid = (lo + hi + 1) div 2
-    if gli.prefixSum[mid] <= globalIdx:
-      lo = mid
+  let explicit = gli.bases.len - 1
+  let last = gli.fileCount - 1
+  var f: int
+  if gli.runFiles > 0 and globalIdx >= gli.bases[explicit]:
+    if gli.runSize == 0:
+      f = last
     else:
-      hi = mid - 1
-  (lo, globalIdx - gli.prefixSum[lo] + 1)
+      f = explicit + int(min((globalIdx - gli.bases[explicit]) div gli.runSize,
+        uint64(gli.runFiles - 1)))
+  else:
+    # The largest fileId below the run whose base is <= globalIdx.
+    var lo = 0
+    var hi = max(explicit - 1, 0)
+    while lo < hi:
+      let mid = (lo + hi + 1) div 2
+      if gli.bases[mid] <= globalIdx:
+        lo = mid
+      else:
+        hi = mid - 1
+    f = lo
+  (f, globalIdx - gli.fileBase(f) + 1)
 
 proc tryResolve*(gli: GlobalLineIndex,
     globalIdx: uint64): Result[(int, uint64), string] =
@@ -319,13 +382,13 @@ proc tryResolve*(gli: GlobalLineIndex,
   ## writer, which refuses a step past a file's recorded line count
   ## (`multi_stream_writer.registerStep`) rather than emitting an address
   ## that lands in the next file.
-  if gli.prefixSum.len < 2:
+  if gli.fileCount == 0:
     return err("line-only global_position_index " & $globalIdx &
       " cannot be resolved to (file, line): the trace registers no paths")
   if globalIdx >= gli.totalLines:
     return err("line-only global_position_index " & $globalIdx &
       " is outside this trace's address space of " & $gli.totalLines &
-      " (" & $(gli.prefixSum.len - 1) & " path(s)). A line-only container " &
+      " (" & $gli.fileCount & " path(s)). A line-only container " &
       "records no packing discriminator, and the writers disagree: " &
       "codetracer_trace_format_nim packs prefixSum[path_id] + (line - 1), " &
       "the Rust codetracer_trace_writer packs (path_id shl 32) or line " &

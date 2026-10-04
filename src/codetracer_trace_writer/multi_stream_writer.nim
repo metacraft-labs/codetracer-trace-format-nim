@@ -488,9 +488,8 @@ proc rebuildGli(w: var MultiStreamTraceWriter) =
   ## differently there shifts the base of every file after it. Under the
   ## line-count table the reader recovers the sizes from the container;
   ## without it, neither the sizes nor the rule are recorded.
-  w.gli = buildGlobalLineIndex(
-    positionSpaceCounts(w.pathLineLengths, w.pathLineCounts,
-      w.paths.len, w.columnAwareSteps))
+  w.gli = positionSpace(w.pathLineLengths, w.pathLineCounts,
+    w.paths.len, w.columnAwareSteps)
   w.gliDirty = false
 
 proc extendGli(w: var MultiStreamTraceWriter) =
@@ -559,14 +558,14 @@ proc toGlobalLineIndex(w: var MultiStreamTraceWriter,
     if w.isConventionalPath(pathId):
       # Every line has the same length, so the sum is a product.
       let upTo = max(min(int64(line) - 1, int64(DefaultLinesPerFile)), 0'i64)
-      return w.gli.prefixSum[int(pathId)] +
+      return w.gli.fileBase(int(pathId)) +
         uint64(upTo) * uint64(ConventionalLineLength)
     let lls = w.pathLineLengths[int(pathId)]
     var lineOffset: uint64 = 0
     let upTo = min(int(line) - 1, lls.len)
     for i in 0 ..< upTo:
       lineOffset += uint64(lls[i])
-    return w.gli.prefixSum[int(pathId)] + lineOffset
+    return w.gli.fileBase(int(pathId)) + lineOffset
   w.gli.globalIndex(int(pathId), line)
 
 proc checkLineWithinFile(w: var MultiStreamTraceWriter,
