@@ -652,7 +652,7 @@ proc commitChunk(r: var ExecStreamReader, slot: int,
   ok(slot)
 
 proc decodeNext(r: var ExecStreamReader, slot: int,
-    chunkIdx: int): Result[StepEvent, string] =
+    chunkIdx: int): Result[StepEvent, string] {.inline.} =
   ## Decode the next record of the chunk in ``slot`` — record ``known`` — and
   ## note where it starts and the cursor position after it. The chunk must not
   ## be ``complete``.
