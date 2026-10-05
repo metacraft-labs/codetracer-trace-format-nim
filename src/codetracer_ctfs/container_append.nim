@@ -57,9 +57,14 @@ when defined(nimPreviewSlimSystem):
 ##   - **Never overwrites.** CTFS is append-only; a name that already exists
 ##     is an error, because a stale-but-present stream is exactly the
 ##     "returns the wrong bytes" failure the format's consumers cannot see.
-##   - **The entry array must live in block 0.** Entry arrays may in principle
-##     spill past block 0; nothing this writer produces does, and growing one
-##     is not what an append is for.
+##   - **The entry array may span several blocks** (`ctfs-container.md` §1,
+##     `root_blocks`), and an append that runs out of entries grows it
+##     (`growRootDirectory`).  A growth moves the blocks the larger root takes
+##     over to the tail and rewrites the mapping blocks that pointed to them, so
+##     such an append writes, in order: the tail, then every block between the
+##     root region and the tail, then the root region.  An interruption after
+##     the first or second phase leaves the old root resolving to intact
+##     copies.
 
 from std/posix import fsync
 import results
@@ -150,11 +155,11 @@ proc openClosedCtfs*(path: string): Result[Ctfs, string] =
     # which is why it is written down here instead of quietly relied upon.
     maxRootEntries = uint32(
       (int(blockSize) - HeaderSize - ExtHeaderSize) div FileEntrySize)
-  if HeaderSize + ExtHeaderSize + int(maxRootEntries) * FileEntrySize > int(blockSize):
+  if uint64(data.len) < rootBlockCount(blockSize, maxRootEntries, readMaxShards(data)) *
+      uint64(blockSize):
     return err(appendError(path,
-      "declares " & $maxRootEntries & " root entries, which do not fit in its " &
-      $blockSize & "-byte block 0; an entry array that spills past block 0 " &
-      "cannot be extended by this writer"))
+      "declares " & $maxRootEntries & " root entries, whose root region is " &
+      "longer than the file"))
 
   var c: Ctfs
   c.data = data
@@ -214,9 +219,13 @@ when defined(ctfsAppendFaultInjection):
     ##
     ## See `tests/test_container_append_ordering.nim`.
 
-proc writeAppendedBlocks(c: Ctfs, path: string,
-                         firstNewBlock: uint64): Result[void, string] =
-  ## Write the appended tail, then block 0. Never touches anything between.
+proc writeAppendedBlocks(c: Ctfs, path: string, firstNewBlock: uint64,
+                         oldRootBlocks: uint64): Result[void, string] =
+  ## Write the appended tail, then the root region.  Never touches anything
+  ## between -- unless the root directory grew, which moved blocks into the
+  ## tail and rewrote mapping blocks in place: then the blocks between the
+  ## (new) root region and the tail are written after the tail and before the
+  ## root.
   let bs = int(c.blockSize)
   let tailStart = int(firstNewBlock) * bs
   if tailStart > c.data.len:
@@ -246,11 +255,22 @@ proc writeAppendedBlocks(c: Ctfs, path: string,
         return err(appendError(path,
           "fault injection: abandoned between the tail write and block 0"))
 
+    let rootBlocks = c.rootBlockCount()
+    if rootBlocks > oldRootBlocks and firstNewBlock > rootBlocks:
+      let midStart = int(rootBlocks) * bs
+      let n = tailStart - midStart
+      f.setFilePos(int64(midStart))
+      if f.writeBuffer(unsafeAddr c.data[midStart], n) != n:
+        close(f)
+        return err(appendError(path, "short write rewriting moved mapping blocks"))
+      syncToDisk(f)
+
     # Only now does anything point at the blocks just written.
+    let rootBytes = int(rootBlocks) * bs
     f.setFilePos(0)
-    if f.writeBuffer(unsafeAddr c.data[0], bs) != bs:
+    if f.writeBuffer(unsafeAddr c.data[0], rootBytes) != rootBytes:
       close(f)
-      return err(appendError(path, "short write rewriting block 0"))
+      return err(appendError(path, "short write rewriting the root region"))
     syncToDisk(f)
   except IOError, OSError:
     close(f)
@@ -286,6 +306,7 @@ proc appendInternalFiles*(path: string, names: openArray[string],
 
   var c = ?openClosedCtfs(path)
   let firstNewBlock = c.nextFreeBlock
+  let oldRootBlocks = c.rootBlockCount()
 
   for i in 0 ..< names.len:
     if c.findEntrySlot(encoded[i]) >= 0:
@@ -301,4 +322,4 @@ proc appendInternalFiles*(path: string, names: openArray[string],
     if written.isErr:
       return err(appendError(path, "cannot write " & names[i] & ": " & written.error))
 
-  writeAppendedBlocks(c, path, firstNewBlock)
+  writeAppendedBlocks(c, path, firstNewBlock, oldRootBlocks)

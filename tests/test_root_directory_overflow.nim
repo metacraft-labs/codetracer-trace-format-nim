@@ -20,7 +20,9 @@
 ##     stores and reads back EVERY member — including the ones whose entries
 ##     lie in block 1 and block 2, and one whose entry straddles the
 ##     block-1/block-2 boundary — through the canonical reader;
-##   * the declared count is still a limit: one more member is refused;
+##   * (until 2026-10-05 also "the declared count is still a limit: one more
+##     member is refused"; the directory now grows instead, asserted by
+##     tests/test_root_directory_grows.nim);
 ##   * streaming mode publishes the overflow blocks too: a reader of the file
 ##     on disk sees an entry in block 2 before `closeCtfs`;
 ##   * a container that fits block 0 is byte-for-byte what it was (one root
@@ -89,9 +91,10 @@ proc fillAndCheck(c: var Ctfs, label: string) =
     doAssert h.isOk, label & ": addFile #" & $i & " failed: " & h.error
     var f = h.get()
     doAssert c.writeToFile(f, memberContent(i)).isOk, label & ": write #" & $i
-  let extra = c.addFile("one.more")
-  doAssert extra.isErr, label & ": a member past the declared " & $Declared &
-    " entries was accepted"
+  # A member past the declared count no longer fails: the root directory
+  # grows (`growRootDirectory`, 2026-10-05), which tests/
+  # test_root_directory_grows.nim asserts.  This test pins the declared layout,
+  # so it stops at the declared count.
 
 proc checkContainer(data: seq[byte], label: string) =
   let blockSize = u32le(data, 8)

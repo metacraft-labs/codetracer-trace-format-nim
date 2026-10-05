@@ -5,7 +5,7 @@ when defined(nimPreviewSlimSystem):
 
 ## CTFS container create/read/write/close operations.
 
-import std/algorithm
+import std/[algorithm, tables]
 import results
 import ./types
 import ./base40
@@ -48,6 +48,104 @@ proc createCtfs*(
 
   c
 
+proc remapMappingTree(c: var Ctfs, rootBlock: uint64,
+                      moved: Table[uint64, uint64], touched: var seq[uint64]) =
+  ## Rewrite, through `moved`, every block pointer of the member whose level-1
+  ## mapping block is `rootBlock` (already its new number): the level-1 data
+  ## pointers and chain pointer, and every level-k block the chain reaches
+  ## with the subtrees below it (`block_mapping.nim`).  Data blocks are never
+  ## read as pointers.
+  let usable = c.usableEntries()
+  proc fix(c: var Ctfs, blk: uint64, slot: uint64,
+           moved: Table[uint64, uint64]): uint64 =
+    let p = c.readPtr(blk, slot)
+    if p != 0'u64 and moved.hasKey(p):
+      let q = moved.getOrDefault(p, p)
+      c.writePtr(blk, slot, q)
+      return q
+    p
+  proc subtree(c: var Ctfs, blk: uint64, level: uint32,
+               moved: Table[uint64, uint64], touched: var seq[uint64],
+               usable: uint64) =
+    touched.add blk
+    for i in 0'u64 ..< usable:
+      let child = fix(c, blk, i, moved)
+      if level > 1'u32 and child != 0'u64:
+        subtree(c, child, level - 1, moved, touched, usable)
+    discard fix(c, blk, usable, moved)
+  subtree(c, rootBlock, 1, moved, touched, usable)
+  var cur = c.readPtr(rootBlock, usable)
+  var level = 2'u32
+  while cur != 0'u64 and level <= uint32(MaxChainLevels):
+    subtree(c, cur, level, moved, touched, usable)
+    cur = c.readPtr(cur, usable)
+    inc level
+
+proc growRootDirectory*(c: var Ctfs): Result[void, string] =
+  ## Double the root region (`ctfs-container.md` §1: the file-entry array
+  ## continues into the blocks after block 0, `root_blocks` of them, and data
+  ## allocation begins after it).  The blocks the larger region needs are
+  ## allocated already, so each is MOVED to the end of the container and every
+  ## pointer to it rewritten: entries' `MapBlock` (in any of its three forms)
+  ## and the pointers inside every member's mapping blocks.  Nothing else in a
+  ## container holds a block number.  The format does not change: the header's
+  ## `MaxRootEntries` grows, which every reader already sizes the root by.
+  ##
+  ## Order, for a reader of a streaming container: the moved copies and the
+  ## rewritten mapping blocks are written first, the root region (entries and
+  ## header) last, so the old root keeps resolving to intact blocks until the
+  ## new one replaces it.
+  let bs = uint64(c.blockSize)
+  let oldRoot = c.rootBlockCount()
+  let newRoot = max(oldRoot * 2'u64, oldRoot + 1'u64)
+  let rBytes = 7'u64 * uint64(c.maxShards) * 6'u64
+  let newMax = (newRoot * bs - uint64(HeaderSize + ExtHeaderSize) - rBytes) div
+    uint64(FileEntrySize)
+  if newMax > uint64(high(uint32)):
+    return err("the root directory cannot grow past " & $high(uint32) & " entries")
+  # 1. Move the blocks the larger root region takes over.
+  var moved = initTable[uint64, uint64]()
+  var copies: seq[uint64] = @[]
+  let allocatedEnd = c.nextFreeBlock
+  for b in oldRoot ..< min(newRoot, allocatedEnd):
+    let nb = c.allocBlock()
+    copyMem(addr c.data[c.blockOffset(nb)], addr c.data[c.blockOffset(b)], int(bs))
+    moved[b] = nb
+    copies.add nb
+  if allocatedEnd < newRoot:
+    # The new root region reaches past the allocated blocks: claim the rest
+    # so data allocation begins after it.
+    while c.nextFreeBlock < newRoot:
+      discard c.allocBlock()
+  # 2. Rewrite every pointer to a moved block.
+  var touched: seq[uint64] = @[]
+  for i in 0 ..< int(c.maxRootEntries):
+    let off = c.fileEntryOffset(i)
+    let m = readU64LE(c.data, off + 8)
+    if m == 0'u64: continue
+    if isDirectMapBlock(m):
+      let d = directDataBlock(m)
+      if moved.hasKey(d):
+        writeU64LE(c.data, off + 8, CtfsDirect or moved.getOrDefault(d, d))
+      continue
+    let nm = moved.getOrDefault(m, m)
+    if nm != m: writeU64LE(c.data, off + 8, nm)
+    c.remapMappingTree(nm, moved, touched)
+  if c.streaming:
+    for b in copies: c.flushBlock(b)
+    for b in touched: c.flushBlock(b)
+  # 3. The old blocks become root region: zero what follows the entry array,
+  #    then publish the larger directory.
+  let entriesEnd = c.fileEntryOffset(int(c.maxRootEntries))
+  let regionEnd = int(newRoot * bs)
+  for k in entriesEnd ..< regionEnd:
+    c.data[k] = 0
+  c.maxRootEntries = uint32(newMax)
+  writeU32LE(c.data, 12, c.maxRootEntries)
+  if c.streaming:
+    c.flushRootBlocks()
+  ok()
+
 proc addFile*(c: var Ctfs, name: string): Result[CtfsInternalFile, string] =
   ## Add a new named file to the container. Returns a handle for writing.
   ##
@@ -88,7 +186,19 @@ proc addFile*(c: var Ctfs, name: string): Result[CtfsInternalFile, string] =
         c.flushRootBlocks()
       return ok(CtfsInternalFile(entryIndex: i, writePos: 0, dataBlockCount: 0))
 
-  err("no free file entry slots")
+  # Every entry is taken: the root directory grows (`growRootDirectory`), so
+  # the number of members is not a limit a recording can reach.  The first new
+  # slot is the one just past the old array.
+  let firstNew = int(c.maxRootEntries)
+  let g = c.growRootDirectory()
+  if g.isErr:
+    return err("no free file entry slots, and the root directory could not " &
+               "grow: " & g.error)
+  let off = c.fileEntryOffset(firstNew)
+  writeU64LE(c.data, off + 16, encodedName)
+  if c.streaming:
+    c.flushRootBlocks()
+  ok(CtfsInternalFile(entryIndex: firstNew, writePos: 0, dataBlockCount: 0))
 
 proc resolveFileBlock*(c: Ctfs, mapBlock: uint64, blockIndex: uint64): uint64 =
   ## The data block holding block `blockIndex` of a member whose entry carries

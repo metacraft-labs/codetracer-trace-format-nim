@@ -244,7 +244,11 @@ proc test_append_refuses_an_encrypted_container() {.raises: [].} =
   dropDir(dir)
   echo "PASS: test_append_refuses_an_encrypted_container"
 
-proc test_append_refuses_when_the_entry_array_is_full() {.raises: [].} =
+proc test_append_grows_a_full_entry_array() {.raises: [].} =
+  ## Until 2026-10-05 a full entry array refused the append ("no free file
+  ## entry slots").  The root directory now grows (`growRootDirectory`), so the
+  ## append succeeds, the header's MaxRootEntries grows, and every member --
+  ## the old ones and the new one -- reads back.
   let dir = tmpDir("full")
   let path = dir / "t.ct"
   var c = createCtfs()
@@ -255,10 +259,21 @@ proc test_append_refuses_when_the_entry_array_is_full() {.raises: [].} =
     doAssert c.writeToFile(f, pattern(8, i)).isOk
   doAssert writeCtfsToFile(c, path).isOk
   let res = appendInternalFiles(path, ["one.more"], [pattern(4, 0)])
-  doAssert res.isErr, "a full entry array accepted another file"
-  doAssert "free file entry" in res.error, "unhelpful message: " & res.error
+  doAssert res.isOk, "a full entry array refused another file: " &
+    (if res.isErr: res.error else: "")
+  let data = readCtfsFromFile(path)
+  doAssert data.isOk
+  let d = data.get()
+  let maxEntries = uint32(d[12]) or (uint32(d[13]) shl 8) or
+    (uint32(d[14]) shl 16) or (uint32(d[15]) shl 24)
+  doAssert maxEntries > DefaultMaxRootEntries, "the root directory did not grow"
+  for i in 0 ..< int(DefaultMaxRootEntries):
+    let r = readInternalFile(d, "f" & $i & ".dat", 4096'u32, maxEntries)
+    doAssert r.isOk and r.get() == pattern(8, i), "member f" & $i & " lost"
+  let r = readInternalFile(d, "one.more", 4096'u32, maxEntries)
+  doAssert r.isOk and r.get() == pattern(4, 0), "the appended member lost"
   dropDir(dir)
-  echo "PASS: test_append_refuses_when_the_entry_array_is_full"
+  echo "PASS: test_append_grows_a_full_entry_array"
 
 proc test_mismatched_batch_is_refused() {.raises: [].} =
   let dir = tmpDir("mismatch")
@@ -282,6 +297,6 @@ when isMainModule:
   test_append_refuses_a_non_container()
   test_append_refuses_a_truncated_container()
   test_append_refuses_an_encrypted_container()
-  test_append_refuses_when_the_entry_array_is_full()
+  test_append_grows_a_full_entry_array()
   test_mismatched_batch_is_refused()
   echo "All container-append tests passed!"

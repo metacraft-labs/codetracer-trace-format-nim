@@ -45,6 +45,7 @@ task test, "Run all tests":
   # record registered before the seal.
   exec "nim c -r -d:release -p:src tests/test_durability_publishes_sealed_chunks.nim"
   exec "nim c -r tests/test_root_directory_overflow.nim"
+  exec "nim c -r tests/test_root_directory_grows.nim"
   exec "nim c -r tests/test_chunk_index.nim"
   exec "nim c -r tests/test_fixed_record_table.nim"
   exec "nim c -r tests/test_variable_record_table.nim"
