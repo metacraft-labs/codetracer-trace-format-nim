@@ -164,6 +164,13 @@ proc addFile*(c: var Ctfs, name: string): Result[CtfsInternalFile, string] =
   ## invisible (the write "succeeds", the read returns stale bytes), so the
   ## writer refuses it rather than letting a caller discover it downstream.
   ## An empty member is `(0, 0)` with its name, so the name alone decides.
+  ##
+  ## A name that base40 cannot pack — longer than 12 characters, or with a
+  ## character outside `0-9 a-z . / -` — is refused by name
+  ## (`ctfs-container.md` §3): packing it would store a different name.
+  let refusal = base40Refusal(name)
+  if refusal.len > 0:
+    return err(refusal)
   let encodedName = base40Encode(name)
 
   # Reject a duplicate before claiming anything.
@@ -592,15 +599,17 @@ type
     size*: uint64
     mapBlock*: uint64
 
-proc findFileEntry*(data: openArray[byte], name: string,
+proc findFileEntryKey*(data: openArray[byte], encoded: uint64,
     maxEntries: uint32 = DefaultMaxRootEntries): CtfsEntryLookup =
-  ## Find `name` in the root directory of the container image `data`.
+  ## Find the entry whose name word is `encoded` in the root directory of the
+  ## container image `data`. For a key no name of today packs to — the one a
+  ## writer stored for a name base40 could not pack, which a reader of old
+  ## recordings still has to find — and for `findFileEntry`.
   ##
   ## The entry array starts after the header: 16 bytes at version 5, 24 at
   ## version 6 (`ctfs-container.md` §1a). A compact container has no entry
   ## array; `readInternalFile` and `hasInternalFile` look its members up in
   ## its directory.
-  let encoded = base40Encode(name)
   let base =
     if data.len > 5 and data[5] == CtfsVersionV6: V6HeaderSize
     else: HeaderSize + ExtHeaderSize
@@ -612,6 +621,14 @@ proc findFileEntry*(data: openArray[byte], name: string,
       return CtfsEntryLookup(found: true, index: i,
         size: readU64LE(data, off), mapBlock: readU64LE(data, off + 8))
   CtfsEntryLookup(found: false)
+
+proc findFileEntry*(data: openArray[byte], name: string,
+    maxEntries: uint32 = DefaultMaxRootEntries): CtfsEntryLookup =
+  ## Find `name` in the root directory of the container image `data`. A name
+  ## base40 cannot pack is not found: its packing is a different name's.
+  if not base40Encodable(name):
+    return CtfsEntryLookup(found: false)
+  findFileEntryKey(data, base40Encode(name), maxEntries)
 
 proc truncatedContainerNote(wholeBlocks: uint64, blockSize: uint32,
     len: int): string =
@@ -1181,7 +1198,11 @@ proc locateMember*(data: openArray[byte], name: string,
   ## before it resolves anything (`ctfs-container.md` §2, "Older versions are
   ## refused", and §1c). A full body's member is resolved through its entry's
   ## `MapBlock` (`memberRuns`); a compact body's through its directory, which
-  ## is checked against all six of §1d's rules first, and is one run.
+  ## is checked against all six of §1d's rules first, and is one run. A name
+  ## base40 cannot pack is refused by name (`ctfs-container.md` §3).
+  let refusal = base40Refusal(name)
+  if refusal.len > 0:
+    return err(refusal)
   case ?containerBody(data)
   of cbFull:
     let entry = findFileEntry(data, name, maxEntries)

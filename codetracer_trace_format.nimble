@@ -50,6 +50,7 @@ task test, "Run all tests":
   exec "nim c -r tests/test_fixed_record_table.nim"
   exec "nim c -r tests/test_variable_record_table.nim"
   exec "nim c -r -p:src tests/test_member_view.nim"
+  exec "nim c -r -p:src tests/test_member_names_are_encodable.nim"
   exec "nim c -r tests/test_seekable_zstd.nim"
   exec "nim c -r tests/test_chunked_compressed_table.nim"
   exec "nim c -r tests/test_trace_types.nim"

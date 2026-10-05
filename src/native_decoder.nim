@@ -21,7 +21,8 @@
 ##                               frames (seekable-zstd; companion index
 ##                               `iNNNNNNNNNNN`).  Uncompressed streams are
 ##                               accepted too (auto-detected).
-##   - `event_log.dat` + `.idx`— chunk-indexed OS-event log with structured
+##   - `eventlog.dat` + `.idx` (`event_log.*` before the recorder's rename) —
+##     chunk-indexed OS-event log with structured
 ##                               (geid, tick, tid, kind, fd, returnValue,
 ##                               metadata, content) entries.
 ##   - `cpidx.idx` + `cpdata.bin` (optional) — checkpoint records
@@ -51,7 +52,7 @@
 ##   header — type / size / geid / tick / thread_id / payload_bytes / payload
 ##   length — without trying to fully decode every event-type subform (that
 ##   would duplicate the native replayer's domain knowledge).
-## * `event_log.dat` is decoded into structured OS-event records (one entry
+## * `eventlog.dat` is decoded into structured OS-event records (one entry
 ##   per write/read/open/close/...) using the writer's serializer format.
 ## * The output document is byte-deterministic given the same input bytes:
 ##   thread streams are emitted in ascending CtTid order, OS events in their
@@ -75,6 +76,16 @@ import codetracer_trace_writer/interning_table
 # ---------------------------------------------------------------------------
 # Wire-format constants (must match the native recorder)
 # ---------------------------------------------------------------------------
+
+const
+  EventLogDat* = "eventlog.dat"
+  EventLogIdx* = "eventlog.idx"
+    ## The OS event log's members, as the native recorder names them.
+  LegacyEventLogDatKey* = base40Encode("event_log.dat")
+  LegacyEventLogIdxKey* = base40Encode("event_log.idx")
+    ## The name words the recorder stored before its rename for
+    ## `event_log.dat` / `.idx`, which base40 cannot pack (13 characters, and
+    ## an underscore): what a recording made then carries, found by the word.
 
 const
   HeaderSize = 8
@@ -183,10 +194,9 @@ proc detectNativeBundle*(data: openArray[byte]): Result[NativeBundleInfo, string
     let name = base40Decode(nameVal)
     if isThreadStreamName(name):
       info.threadStreams.add((parseTidFromName(name), name))
-    elif (nameVal == base40Encode("event_log.dat")) or
-        (nameVal == base40Encode("event_log.idx")):
-      # base40 truncates names >12 chars and maps `_` to `\0`, so the
-      # decoded string contains a NUL — match by encoded value instead.
+    elif nameVal == base40Encode(EventLogDat) or
+        nameVal == base40Encode(EventLogIdx) or
+        nameVal == LegacyEventLogDatKey or nameVal == LegacyEventLogIdxKey:
       info.hasEventLog = true
     elif nameVal == base40Encode("cpidx.idx"):
       info.hasCheckpointIndex = true
@@ -454,15 +464,28 @@ proc osEventKindName*(k: uint8): string =
   of 14: "elkGetrandom"
   else: "elk_unknown_" & $k
 
+proc eventLogMember(data: openArray[byte], name: string, legacyKey: uint64,
+    blockSize, maxRoot: uint32): Result[seq[byte], string] =
+  ## An event-log member under its name, or under the name word a recording
+  ## made before the rename carries.
+  if hasInternalFile(data, name, maxRoot):
+    return readInternalFile(data, name, blockSize, maxRoot)
+  let e = findFileEntryKey(data, legacyKey, maxRoot)
+  if not e.found:
+    return err("internal file not found: " & name)
+  readMemberBytes(data, name, e.size, e.mapBlock, blockSize)
+
 proc decodeOsEventLog(data: openArray[byte], blockSize, maxRoot: uint32):
     Result[seq[OsEventLogEntry], string] =
   ## Decode `event_log.dat` (chunk-prefixed records) using `event_log.idx`
   ## for the chunk count and offsets. Returns entries in stored order.
-  let datR = readInternalFile(data, "event_log.dat", blockSize, maxRoot)
+  let datR = eventLogMember(data, EventLogDat, LegacyEventLogDatKey,
+    blockSize, maxRoot)
   if datR.isErr:
     var empty: seq[OsEventLogEntry] = @[]
     return ok(empty)  # event log file is optional (older bundles)
-  let idxR = readInternalFile(data, "event_log.idx", blockSize, maxRoot)
+  let idxR = eventLogMember(data, EventLogIdx, LegacyEventLogIdxKey,
+    blockSize, maxRoot)
   if idxR.isErr:
     return err("event_log.dat present but event_log.idx missing: " & idxR.error)
   let dat = datR.get()

@@ -179,14 +179,14 @@ proc buildSyntheticBundle(): seq[byte] =
                             kind = 0'u8, fd = 1'i32, returnValue = 3'i64,
                             metadata = "stdout", content = writePayload)
   let chunk = encodeOsEventLogChunk(@[entry])
-  var datFile = ctfs.addFile("event_log.dat").get()
+  var datFile = ctfs.addFile(EventLogDat).get()
   doAssert ctfs.writeToFile(datFile, chunk).isOk
 
   let idx = encodeOsEventLogIndex(
     entryCount = 1'u32, chunkCount = 1'u32,
     chunkOffsets = [0'u64],
     chunkGeids = [3'u64])
-  var idxFile = ctfs.addFile("event_log.idx").get()
+  var idxFile = ctfs.addFile(EventLogIdx).get()
   doAssert ctfs.writeToFile(idxFile, idx).isOk
 
   # paths.json (same empty-array placeholder the writer uses).
