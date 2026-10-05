@@ -103,6 +103,9 @@ proc growRootDirectory*(c: var Ctfs): Result[void, string] =
     uint64(FileEntrySize)
   if newMax > uint64(high(uint32)):
     return err("the root directory cannot grow past " & $high(uint32) & " entries")
+  if c.rootGrowthLimit != 0'u32 and newMax > uint64(c.rootGrowthLimit):
+    return err("the root directory may not grow past " & $c.rootGrowthLimit &
+               " entries (rootGrowthLimit)")
   # 1. Move the blocks the larger root region takes over.
   var moved = initTable[uint64, uint64]()
   var copies: seq[uint64] = @[]

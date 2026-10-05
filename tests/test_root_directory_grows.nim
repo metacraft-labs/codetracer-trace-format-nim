@@ -22,7 +22,9 @@
 ##   * the header's MaxRootEntries grew and every member reads back exactly,
 ##     through the canonical reader, from the closed file;
 ##   * `appendInternalFiles` on a sealed container whose root is full grows it
-##     too, and both the old and the appended members read back.
+##     too, and both the old and the appended members read back;
+##   * the test-only `rootGrowthLimit` seam refuses growth past it, so the
+##     writers that use it to induce a full directory really get one.
 ##
 ## No mocks: real containers, read back from disk by the canonical reader.
 
@@ -148,7 +150,18 @@ proc runAppend() =
     " members read back"
   removeFile(path)
 
+proc runLimit() =
+  var c = createCtfs()
+  c.rootGrowthLimit = c.maxRootEntries
+  for i in 0 ..< int(c.maxRootEntries):
+    doAssert c.addFile("l" & align($i, 11, '0')).isOk
+  let extra = c.addFile("one.more")
+  doAssert extra.isErr and "rootGrowthLimit" in extra.error,
+    "rootGrowthLimit did not stop the growth"
+  echo "  limit: growth past rootGrowthLimit refused"
+
 run(streaming = true)
 run(streaming = false)
 runAppend()
+runLimit()
 echo "PASS: test_root_directory_grows"

@@ -131,6 +131,11 @@ type
       ## Blocks written since the last `publish` (deferred mode).
     dirtyMark*: seq[bool]
       ## Indexed by block number: already in `dirtyBlocks`.
+    rootGrowthLimit*: uint32
+      ## The largest `maxRootEntries` `growRootDirectory` may reach; 0 (the
+      ## default) is no limit beyond the u32 field.  A FAULT-INJECTION seam for
+      ## tests of what a writer does with a member it could not store (the
+      ## recorder's member-loss accounting): production code never sets it.
 
 proc entriesPerBlock*(c: Ctfs): uint64 =
   uint64(c.blockSize) div 8
