@@ -135,8 +135,10 @@ proc read*(r: VariableRecordTableReader,
   if index >= r.count:
     return err("index out of range: " & $index)
 
+  r.offsets.ensureLoaded(int(index) * 8, 16)
   let startOff = r.offsets.readU64LE(int(index) * 8)
   let endOff = r.offsets.readU64LE(int(index + 1) * 8)
   if endOff < startOff or endOff > uint64(r.data.len):
     return err("record data out of bounds")
+  r.data.ensureLoaded(int(startOff), int(endOff - startOff))
   ok(r.data.copyOut(int(startOff), int(endOff - startOff)))

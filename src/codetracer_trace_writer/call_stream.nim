@@ -389,7 +389,7 @@ proc initCallStreamReader*(image: ContainerImage,
   if idxRes.isErr:
     return legacyCallStream(initVariableRecordTableReader(image, "calls",
       blockSize, maxEntries))
-  openCallStream(move datRes.get(), idxRes.get().copyOut(0, idxRes.get().len),
+  openCallStream(move datRes.get(), ? idxRes.get().contents(),
     isCompactContainer(image.bytes))
 
 template readCallInto*(r: var CallStreamReader, callKey: uint64) =

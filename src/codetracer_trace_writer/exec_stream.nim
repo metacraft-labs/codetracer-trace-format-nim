@@ -463,6 +463,7 @@ proc openExecStream(datData: sink MemberView, idxData: seq[byte],
         return err("last chunk offset past end of steps.dat")
       var scratch: seq[byte]
       var lastCount = 0
+      datData.ensureLoaded(startOff, endOff - startOff)
       datData.withSpan(startOff, endOff - startOff, scratch, frame):
         lastCount = ?decodeSpecChunkRecordCount(frame, allowSourceReload,
           stored)
@@ -530,7 +531,7 @@ proc initExecStreamReader*(image: ContainerImage,
     uint32(maxEntries))
   if idxRes.isErr:
     return err("failed to read steps.idx: " & idxRes.unsafeError)
-  openExecStream(move datRes.get(), idxRes.get().copyOut(0, idxRes.get().len),
+  openExecStream(move datRes.get(), ? idxRes.get().contents(),
     isCompactContainer(image.bytes), legacy, cacheBytes, allowSourceReload)
 
 proc totalEvents*(r: ExecStreamReader): uint64 = r.totalEventsVal
@@ -594,6 +595,7 @@ proc chunkSlot(r: var ExecStreamReader,
   let compressedLen = endOff - startOff
   if compressedLen == 0:
     return err("chunk " & $chunkIdx & " has zero compressed size")
+  r.data.ensureLoaded(int(startOff), int(compressedLen))
   let frame = r.data.span(int(startOff), int(compressedLen), r.frameScratch)
 
   if r.stored:

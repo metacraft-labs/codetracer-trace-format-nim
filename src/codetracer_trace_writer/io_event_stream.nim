@@ -383,7 +383,7 @@ proc initIOEventStreamReader*(image: ContainerImage,
   if idxRes.isErr:
     return err("failed to read events.idx: " & idxRes.unsafeError)
   ok(IOEventStreamReader(spec: ? openChunkedRecords(move datRes.get(),
-    idxRes.get().copyOut(0, idxRes.get().len), "events", "io event",
+    ? idxRes.get().contents(), "events", "io event",
     isCompactContainer(image.bytes))))
 
 proc count*(r: IOEventStreamReader): uint64 =

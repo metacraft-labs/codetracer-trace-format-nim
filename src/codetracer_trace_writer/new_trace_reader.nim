@@ -12,6 +12,7 @@ import std/tables
 import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
 import ../codetracer_ctfs/variable_record_table
+import ../codetracer_ctfs/member_view
 import ./meta_dat
 import ./interning_table
 import ./exec_stream
@@ -569,6 +570,10 @@ proc decodeSourceView(raw: openArray[byte], v: var SourceView,
   field(v.sourcemapV3, "map")
   true
 
+proc openNewTraceFromImage(image: ContainerImage, blockSize: uint32,
+    maxEntries: uint32, assumeColumnAwarePaths: bool):
+    Result[NewTraceReader, string]
+
 proc openNewTraceFromBytes*(data: sink seq[byte],
     blockSize: uint32 = DefaultBlockSize,
     maxEntries: uint32 = DefaultMaxRootEntries,
@@ -584,8 +589,6 @@ proc openNewTraceFromBytes*(data: sink seq[byte],
   ## caller, not a guess by the reader: on a trace whose records are not
   ## Layout A the open fails with a named ``paths.dat[N]: …`` error
   ## instead of returning misdecoded positions.
-
-  var reader: NewTraceReader
   var bytes = data
   # Versions 5 and 6 in both profiles are read (`ctfs-container.md` §1a); a
   # container stored under a whole-file scheme is reconstructed first, as
@@ -600,7 +603,17 @@ proc openNewTraceFromBytes*(data: sink seq[byte],
     image[V6CompressionOffset] = uint8(ord(wfcNone))
     bytes = move image
   ? checkReadableContainer(bytes)
-  reader.image = newContainerImage(move bytes)
+  openNewTraceFromImage(newContainerImage(move bytes), blockSize, maxEntries,
+    assumeColumnAwarePaths)
+
+proc openNewTraceFromImage(image: ContainerImage, blockSize: uint32,
+    maxEntries: uint32, assumeColumnAwarePaths: bool):
+    Result[NewTraceReader, string] =
+  ## The reader over a container image whose header has been checked
+  ## (`checkReadableContainer`): held whole, or read from its file as it is
+  ## used (`openFileImage`).
+  var reader: NewTraceReader
+  reader.image = image
   reader.blockSize = blockSize
   reader.maxEntries = maxEntries
   reader.assumedColumnAwarePaths = assumeColumnAwarePaths
@@ -619,9 +632,9 @@ proc openNewTraceFromBytes*(data: sink seq[byte],
   # It used to be the case that such a container was read through the
   # legacy `paths.json` sidecar; that sidecar is retired, so a container
   # without meta.dat is now read entirely from the binary tables.
-  let metaDataRes = readInternalFile(reader.image.bytes, "meta.dat", blockSize, maxEntries)
-  if metaDataRes.isOk:
-    let metaRes = readMetaDat(metaDataRes.get())
+  let metaView = viewMember(reader.image, "meta.dat", blockSize, maxEntries)
+  if metaView.isOk:
+    let metaRes = readMetaDat(? metaView.get().contents())
     if metaRes.isErr:
       return err("meta.dat present but not readable: " & metaRes.unsafeError)
     reader.meta = metaRes.get()
@@ -712,7 +725,7 @@ proc openNewTraceFromBytes*(data: sink seq[byte],
     # ``source_views.off`` in the base40 filename encoding, so the
     # on-disk files are ``srcviews.dat`` / ``srcviews.off``.
     let svRes = initVariableRecordTableReader(
-      reader.image.bytes, "srcviews", blockSize, maxEntries)
+      reader.image, "srcviews", blockSize, maxEntries)
     if svRes.isErr:
       return err("source_views.dat: " & svRes.unsafeError)
     let svReader = svRes.get()
@@ -750,18 +763,15 @@ when ctHasFilesystem:
 
     if not fileExists(path):
       return err("file not found: " & path)
-
-    var data: seq[byte]
-    try:
-      let f = open(path, fmRead)
-      let size = f.getFileSize()
-      data = newSeqUninit[byte](size)  # filled by the read, cut to what it read
-      data.setLen(f.readBytes(data, 0, size))
-      f.close()
-    except:
-      return err("failed to read file: " & path)
-
-    openNewTraceFromBytes(data, assumeColumnAwarePaths = assumeColumnAwarePaths)
+    # Read as it is used: the members the first answers need are read, and
+    # the rest of the file when it is asked for.
+    var image = ? openFileImage(path)
+    if not image.readsFromFile:
+      return openNewTraceFromBytes(move image.bytes,
+        assumeColumnAwarePaths = assumeColumnAwarePaths)
+    ? checkReadableContainer(image.bytes)
+    openNewTraceFromImage(image, DefaultBlockSize, DefaultMaxRootEntries,
+      assumeColumnAwarePaths)
 
   proc refresh*(r: var NewTraceReader, path: string): Result[void, string] =
     ## Re-read a growing CTFS container into this handle and invalidate every

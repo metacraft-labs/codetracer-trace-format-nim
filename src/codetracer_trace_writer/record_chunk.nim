@@ -187,6 +187,7 @@ proc loadChunk(r: var ChunkedRecords, c: int): Result[void, string] =
     else: r.data.len
   if startOff > endOff or endOff > r.data.len:
     return err(r.what & " chunk offsets out of range")
+  r.data.ensureLoaded(startOff, endOff - startOff)
   r.data.withSpan(startOff, endOff - startOff, r.scratch, frame):
     ? r.chunk.load(c, frame, r.what, r.stored)
   ok()

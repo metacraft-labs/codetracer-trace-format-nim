@@ -941,7 +941,7 @@ proc initValueStreamReader*(image: ContainerImage,
   if idxRes.isErr:
     return err("failed to read values.idx: " & idxRes.unsafeError)
   ok(ValueStreamReader(spec: ? openChunkedRecords(move datRes.get(),
-    idxRes.get().copyOut(0, idxRes.get().len), "values", "value",
+    ? idxRes.get().contents(), "values", "value",
     isCompactContainer(image.bytes))))
 
 proc count*(r: ValueStreamReader): uint64 =

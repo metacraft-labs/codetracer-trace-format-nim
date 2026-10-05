@@ -645,9 +645,15 @@ type
   MemberRun* = tuple[at: int, len: int]
     ## `len` bytes of a member, stored at `at` in the container image.
 
+type
+  BlockLoader* = proc (b: uint64): bool {.closure, raises: [], gcsafe.}
+    ## Makes block `b` of an image that is read as it is used hold its bytes
+    ## (`member_view.openFileImage`); false when it cannot.
+
 proc memberRuns*(data: openArray[byte], name: string,
     fileSize: uint64, mapBlock: uint64,
-    blockSize: uint32): Result[seq[MemberRun], string] =
+    blockSize: uint32,
+    loader: BlockLoader = nil): Result[seq[MemberRun], string] =
   ## Where a member's `fileSize` bytes lie in the container image `data`, in
   ## member order, given its entry's `MapBlock`: runs of physically
   ## consecutive blocks, the last cut to the member's size. `readMemberBytes`
@@ -740,6 +746,8 @@ proc memberRuns*(data: openArray[byte], name: string,
         let chainOff = int(currentLevelBlock) * int(blockSize) + int(usable) * 8
         if chainOff + 8 > data.len:
           return err("chain pointer out of bounds")
+        if loader != nil and not loader(currentLevelBlock):
+          return err("mapping block " & $currentLevelBlock & " not readable")
         let chainPtr = readU64LE(data, chainOff)
         if chainPtr == 0:
           return err("missing chain pointer at level " & $level &
@@ -762,6 +770,8 @@ proc memberRuns*(data: openArray[byte], name: string,
       let childOff = int(navBlock) * int(blockSize) + int(entryIdx) * 8
       if childOff + 8 > data.len:
         return err("child pointer out of bounds")
+      if loader != nil and not loader(navBlock):
+        return err("mapping block " & $navBlock & " not readable")
       let childBlock = readU64LE(data, childOff)
       if childBlock == 0:
         return err("missing child block at level " & $navLevel &
@@ -777,6 +787,8 @@ proc memberRuns*(data: openArray[byte], name: string,
     let ptrOff = int(navBlock) * int(blockSize) + int(navIdx) * 8
     if ptrOff + 8 > data.len:
       return err("data block pointer out of bounds")
+    if loader != nil and not loader(navBlock):
+      return err("mapping block " & $navBlock & " not readable")
     let dataBlock = readU64LE(data, ptrOff)
     if dataBlock == 0:
       return err("null data block at index " & $blockIdx & " of internal file " &
@@ -1193,7 +1205,8 @@ proc isCompactContainer*(data: openArray[byte]): bool =
 
 proc locateMember*(data: openArray[byte], name: string,
     blockSize: uint32 = DefaultBlockSize,
-    maxEntries: uint32 = DefaultMaxRootEntries):
+    maxEntries: uint32 = DefaultMaxRootEntries,
+    loader: BlockLoader = nil):
     Result[seq[MemberRun], string] =
   ## Where an internal file's bytes lie in the container image `data`.
   ##
@@ -1211,7 +1224,7 @@ proc locateMember*(data: openArray[byte], name: string,
     let entry = findFileEntry(data, name, maxEntries)
     if not entry.found:
       return err("internal file not found: " & name)
-    memberRuns(data, name, entry.size, entry.mapBlock, blockSize)
+    memberRuns(data, name, entry.size, entry.mapBlock, blockSize, loader)
   of cbCompact:
     let dir = ?readCompactDirectory(data)
     let idx = findCompactMember(dir, name)
