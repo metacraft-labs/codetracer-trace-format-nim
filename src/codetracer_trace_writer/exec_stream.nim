@@ -170,11 +170,11 @@ proc initExecStreamWriter*(ctfs: var Ctfs,
 
   let datRes = ctfs.addFile("steps.dat")
   if datRes.isErr:
-    return err("failed to create steps.dat: " & datRes.error)
+    return err("failed to create steps.dat: " & datRes.unsafeError)
 
   let idxRes = ctfs.addFile("steps.idx")
   if idxRes.isErr:
-    return err("failed to create steps.idx: " & idxRes.error)
+    return err("failed to create steps.idx: " & idxRes.unsafeError)
 
   var writer = ExecStreamWriter(
     dataFile: datRes.get(),
@@ -195,7 +195,7 @@ proc initExecStreamWriter*(ctfs: var Ctfs,
     hdr[i] = csLE[i]
   let hdrRes = ctfs.writeToFile(writer.indexFile, hdr)
   if hdrRes.isErr:
-    return err("failed to write idx header: " & hdrRes.error)
+    return err("failed to write idx header: " & hdrRes.unsafeError)
   ctfs.syncEntry(writer.indexFile)
 
   ok(writer)
@@ -230,7 +230,7 @@ proc flushChunk(ctfs: var Ctfs, w: var ExecStreamWriter): Result[void, string] =
   let datRes = ctfs.writeToFile(w.dataFile,
       compressed.toOpenArray(0, int(compressedSize) - 1))
   if datRes.isErr:
-    return err("failed to write compressed chunk: " & datRes.error)
+    return err("failed to write compressed chunk: " & datRes.unsafeError)
 
   var offBytes: array[8, byte]
   let offLE = toBytesLE(chunkStart)
@@ -238,7 +238,7 @@ proc flushChunk(ctfs: var Ctfs, w: var ExecStreamWriter): Result[void, string] =
     offBytes[i] = offLE[i]
   let idxRes = ctfs.writeToFile(w.indexFile, offBytes)
   if idxRes.isErr:
-    return err("failed to write offset to idx: " & idxRes.error)
+    return err("failed to write offset to idx: " & idxRes.unsafeError)
   ctfs.syncEntry(w.indexFile)
 
   w.dataOffset += uint64(compressedSize)
@@ -378,7 +378,7 @@ proc countSpecChunkRecords(raw: openArray[byte],
   while pos < raw.len:
     let ev = decodeStepEvent(raw, pos, allowSourceReload)
     if ev.isErr:
-      return err("failed to count records in last step chunk: " & ev.error)
+      return err("failed to count records in last step chunk: " & ev.unsafeError)
     # FALSIFIER (``gdh2FalsifyUncountedMarker``,
     # gdh2_reload_marker_round_trips): treat the reload marker as "not a
     # record" while still consuming its bytes.  This is the SHORTER,
@@ -507,11 +507,11 @@ proc initExecStreamReader*(ctfsBytes: openArray[byte],
   var datRes = readInternalFile(ctfsBytes, "steps.dat",
       uint32(blockSize), uint32(maxEntries))
   if datRes.isErr:
-    return err("failed to read steps.dat: " & datRes.error)
+    return err("failed to read steps.dat: " & datRes.unsafeError)
   let idxRes = readInternalFile(ctfsBytes, "steps.idx",
       uint32(blockSize), uint32(maxEntries))
   if idxRes.isErr:
-    return err("failed to read steps.idx: " & idxRes.error)
+    return err("failed to read steps.idx: " & idxRes.unsafeError)
   openExecStream(viewBytes(move datRes.get()), idxRes.get(),
     isCompactContainer(ctfsBytes), legacy, cacheBytes, allowSourceReload)
 
@@ -525,11 +525,11 @@ proc initExecStreamReader*(image: ContainerImage,
   var datRes = viewMember(image, "steps.dat", uint32(blockSize),
     uint32(maxEntries))
   if datRes.isErr:
-    return err("failed to read steps.dat: " & datRes.error)
+    return err("failed to read steps.dat: " & datRes.unsafeError)
   let idxRes = viewMember(image, "steps.idx", uint32(blockSize),
     uint32(maxEntries))
   if idxRes.isErr:
-    return err("failed to read steps.idx: " & idxRes.error)
+    return err("failed to read steps.idx: " & idxRes.unsafeError)
   openExecStream(move datRes.get(), idxRes.get().copyOut(0, idxRes.get().len),
     isCompactContainer(image.bytes), legacy, cacheBytes, allowSourceReload)
 
@@ -664,7 +664,7 @@ proc decodeNext(r: var ExecStreamReader, slot: int,
   result = decodeStepEvent(r.cache.data(slot), pos, r.allowSourceReload)
   if result.isErr:
     return err("failed to decode event " & $i & " of chunk " & $chunkIdx &
-      ": " & result.error)
+      ": " & result.unsafeError)
   if i >= m.starts.len:
     let cap = max(256, 2 * m.starts.len)
     m.starts.setLenUninit(cap)
@@ -754,7 +754,7 @@ proc readChunkEvents*(r: var ExecStreamReader,
     let evRes = decodeStepEvent(r.cache.data(slot), pos, r.allowSourceReload)
     if evRes.isErr:
       return err("failed to decode event " & $i & " while streaming chunk " &
-        $chunkIdx & ": " & evRes.error)
+        $chunkIdx & ": " & evRes.unsafeError)
     output.add(evRes.get())
 
   ok(firstEventIdx)

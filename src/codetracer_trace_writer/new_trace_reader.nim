@@ -340,6 +340,81 @@ const MaxProbeLineCount = 1_000_000
   ## own line counts, and a corrupt count there surfaces as a decode
   ## error on the line-length varints that follow.
 
+template refuse(message: string) {.dirty.} =
+  ## `return err(message)`, for the record decoders below, which answer
+  ## `bool` and name their refusal in `why`.
+  why = message
+  return false
+
+template varintField(raw: openArray[byte], pos: var int,
+    what: string): uint64 =
+  ## The varint at `pos`, or a refusal naming `what` and why it does not
+  ## decode.
+  var v {.gensym.}: uint64
+  if not readVarint(raw, pos, v):
+    refuse(what & ": " & decodeVarint(raw, pos).unsafeError)
+  v
+
+proc decodeLayoutARecord(raw: openArray[byte], probe: bool,
+    lls: var seq[uint32], why: var string): bool =
+  ## One ``paths.dat`` record as Layout A, its line lengths into `lls`; see
+  ## `parseLayoutAPathRecords` for `probe`.
+  var pos = 0
+  let pathLen = varintField(raw, pos, "column-aware path_len varint")
+  if pathLen > uint64(raw.len - pos):
+    refuse("path_bytes truncated")
+  if probe:
+    if pathLen == uint64(raw.len - pos):
+      # No room left for the line_count varint after the path bytes.
+      # A legacy record ends right after the raw path string.
+      refuse("not Layout A (no line_count)")
+    for k in pos ..< pos + int(pathLen):
+      let b = raw[k]
+      # Reject control characters except tab — paths are filesystem
+      # names which the spec keeps within printable UTF-8 / ASCII.
+      if b < 0x09'u8 or (b > 0x0D'u8 and b < 0x20'u8):
+        refuse("not Layout A (control byte in path)")
+  pos += int(pathLen)
+  let lineCount = varintField(raw, pos, "column-aware line_count varint")
+  if probe and lineCount > uint64(MaxProbeLineCount):
+    refuse("not Layout A (line_count " & $lineCount & " exceeds probe bound)")
+  lls = newSeq[uint32](int(lineCount))
+  var prev: int64 = 0
+  for l in 0 ..< int(lineCount):
+    let z = varintField(raw, pos, "line_length[" & $l & "]")
+    let d = if (z and 1) == 0: int64(z shr 1) else: not int64(z shr 1)
+    let current = if l == 0: d else: prev + d
+    if current < 0:
+      refuse("line_length[" & $l & "] negative: " & $current)
+    lls[l] = uint32(current)
+    prev = current
+  if probe and pos != raw.len:
+    refuse("not Layout A (" & $(raw.len - pos) & " trailing byte(s))")
+  true
+
+proc decodeLineCountRecord(raw: openArray[byte], payload: var string,
+    count: var uint64, why: var string): bool =
+  ## One ``paths.dat`` record as the line-count-table layout; see
+  ## `parseLineCountPathRecords`.
+  var pos = 0
+  let payloadLen = varintField(raw, pos, "line-count payload_len varint")
+  if payloadLen > uint64(raw.len - pos):
+    refuse("payload truncated (payload_len " & $payloadLen & ", " &
+      $(raw.len - pos) & " byte(s) left)")
+  payload = newString(int(payloadLen))
+  if payloadLen > 0:
+    copyMem(addr payload[0], unsafeAddr raw[pos], int(payloadLen))
+  pos += int(payloadLen)
+  count = varintField(raw, pos, "line_count varint")
+  if count == 0:
+    refuse("line_count is 0 for " & payload &
+      ". A trace that sets FLAG_HAS_LINE_COUNT_TABLE states every " &
+      "file's size, and a file sized 0 shares its base with the next " &
+      "one — the two would be indistinguishable at decode")
+  if pos != raw.len:
+    refuse($(raw.len - pos) & " trailing byte(s) after line_count")
+  true
+
 proc parseLayoutAPathRecords(pathReader: InterningTableReader,
     probe: bool): Result[seq[seq[uint32]], string] =
   ## Decode every ``paths.dat`` record as Layout A —
@@ -372,54 +447,12 @@ proc parseLayoutAPathRecords(pathReader: InterningTableReader,
   var llsAll: seq[seq[uint32]]
   for i in 0'u64 ..< pathTotal:
     let rawRes = pathReader.readRawById(i)
-    if rawRes.isErr:
-      return err("paths.dat[" & $i & "]: " & rawRes.error)
-    let raw = rawRes.get()
-    var pos = 0
-    let pathLenRes = decodeVarint(raw, pos)
-    if pathLenRes.isErr:
-      return err("paths.dat[" & $i & "]: column-aware path_len varint: " &
-        pathLenRes.error)
-    let pathLen = int(pathLenRes.get())
-    if pos + pathLen > raw.len:
-      return err("paths.dat[" & $i & "]: path_bytes truncated")
-    if probe:
-      if pos + pathLen >= raw.len:
-        # No room left for the line_count varint after the path bytes.
-        # A legacy record ends right after the raw path string.
-        return err("paths.dat[" & $i & "]: not Layout A (no line_count)")
-      for k in pos ..< pos + pathLen:
-        let b = raw[k]
-        # Reject control characters except tab — paths are filesystem
-        # names which the spec keeps within printable UTF-8 / ASCII.
-        if b < 0x09'u8 or (b > 0x0D'u8 and b < 0x20'u8):
-          return err("paths.dat[" & $i & "]: not Layout A (control byte in path)")
-    pos += pathLen
-    let lineCountRes = decodeVarint(raw, pos)
-    if lineCountRes.isErr:
-      return err("paths.dat[" & $i & "]: column-aware line_count varint: " &
-        lineCountRes.error)
-    let lineCount = int(lineCountRes.get())
-    if probe and lineCount > MaxProbeLineCount:
-      return err("paths.dat[" & $i & "]: not Layout A (line_count " &
-        $lineCount & " exceeds probe bound)")
-    var lls = newSeq[uint32](lineCount)
-    var prev: int64 = 0
-    for l in 0 ..< lineCount:
-      let dRes = decodeSignedVarint(raw, pos)
-      if dRes.isErr:
-        return err("paths.dat[" & $i & "]: line_length[" & $l & "]: " &
-          dRes.error)
-      let d = dRes.get()
-      let current = if l == 0: d else: prev + d
-      if current < 0:
-        return err("paths.dat[" & $i & "]: line_length[" & $l &
-          "] negative: " & $current)
-      lls[l] = uint32(current)
-      prev = current
-    if probe and pos != raw.len:
-      return err("paths.dat[" & $i & "]: not Layout A (" &
-        $(raw.len - pos) & " trailing byte(s))")
+    var lls: seq[uint32]
+    var why: string
+    if rawRes.isErr or not decodeLayoutARecord(rawRes.unsafeGet(), probe, lls,
+        why):
+      return err("paths.dat[" & $i & "]: " &
+        (if rawRes.isErr: rawRes.unsafeError else: why))
     llsAll.add(move lls)
   ok(llsAll)
 
@@ -449,36 +482,11 @@ proc parseLineCountPathRecords(pathReader: InterningTableReader):
   var counts = newSeq[uint64](int(pathTotal))
   for i in 0'u64 ..< pathTotal:
     let rawRes = pathReader.readRawById(i)
-    if rawRes.isErr:
-      return err("paths.dat[" & $i & "]: " & rawRes.error)
-    let raw = rawRes.get()
-    var pos = 0
-    let payloadLenRes = decodeVarint(raw, pos)
-    if payloadLenRes.isErr:
-      return err("paths.dat[" & $i & "]: line-count payload_len varint: " &
-        payloadLenRes.error)
-    let payloadLen = int(payloadLenRes.get())
-    if pos + payloadLen > raw.len:
-      return err("paths.dat[" & $i & "]: payload truncated (payload_len " &
-        $payloadLen & ", " & $(raw.len - pos) & " byte(s) left)")
-    var s = newString(payloadLen)
-    if payloadLen > 0:
-      copyMem(addr s[0], unsafeAddr raw[pos], payloadLen)
-    pos += payloadLen
-    let countRes = decodeVarint(raw, pos)
-    if countRes.isErr:
-      return err("paths.dat[" & $i & "]: line_count varint: " & countRes.error)
-    let count = countRes.get()
-    if count == 0:
-      return err("paths.dat[" & $i & "]: line_count is 0 for " & s &
-        ". A trace that sets FLAG_HAS_LINE_COUNT_TABLE states every " &
-        "file's size, and a file sized 0 shares its base with the next " &
-        "one — the two would be indistinguishable at decode")
-    if pos != raw.len:
-      return err("paths.dat[" & $i & "]: " & $(raw.len - pos) &
-        " trailing byte(s) after line_count")
-    payloads[i] = s
-    counts[i] = count
+    var why: string
+    if rawRes.isErr or not decodeLineCountRecord(rawRes.unsafeGet(),
+        payloads[i], counts[i], why):
+      return err("paths.dat[" & $i & "]: " &
+        (if rawRes.isErr: rawRes.unsafeError else: why))
   ok((payloads, counts))
 
 proc path*(r: NewTraceReader, id: uint64): Result[string, string] {.gcsafe.}
@@ -516,7 +524,7 @@ proc computePathVersionOrdinals(r: var NewTraceReader): Result[void, string] =
   for id in 0 ..< total:
     var payloadRes = r.path(uint64(id))
     if payloadRes.isErr:
-      return err("paths.dat[" & $id & "]: " & payloadRes.error)
+      return err("paths.dat[" & $id & "]: " & payloadRes.unsafeError)
     payloads[id] = move payloadRes.get()
     let n = addr seen.mgetOrPut(payloads[id], 0'u64)
     r.pathVersionOrdinals[id] = n[]
@@ -528,6 +536,38 @@ proc computePathVersionOrdinals(r: var NewTraceReader): Result[void, string] =
 # ---------------------------------------------------------------------------
 # Opening
 # ---------------------------------------------------------------------------
+
+proc decodeSourceView(raw: openArray[byte], v: var SourceView,
+    why: var string): bool =
+  ## One `source_views.dat` record (`internal-files.md` §"Alternate Source
+  ## Views"): `path_id`, `view_kind`, then the name, content and source map,
+  ## each length-prefixed. False, with `why` set, where it does not decode.
+  var pos = 0
+  template field(dest: var seq[byte] | var string, what: string) =
+    var n: uint64
+    if not readVarint(raw, pos, n):
+      why = what & "_len: " & decodeVarint(raw, pos).unsafeError
+      return false
+    if n > uint64(raw.len - pos):
+      why = what & " truncated"
+      return false
+    dest.setLen(int(n))
+    for k in 0 ..< int(n):
+      when dest is string: dest[k] = char(raw[pos + k])
+      else: dest[k] = raw[pos + k]
+    pos += int(n)
+  if not readVarint(raw, pos, v.pathId):
+    why = "path_id varint: " & decodeVarint(raw, pos).unsafeError
+    return false
+  if pos >= raw.len:
+    why = "view_kind byte missing"
+    return false
+  v.viewKind = raw[pos]
+  pos += 1
+  field(v.viewName, "view_name")
+  field(v.content, "content")
+  field(v.sourcemapV3, "map")
+  true
 
 proc openNewTraceFromBytes*(data: sink seq[byte],
     blockSize: uint32 = DefaultBlockSize,
@@ -583,7 +623,7 @@ proc openNewTraceFromBytes*(data: sink seq[byte],
   if metaDataRes.isOk:
     let metaRes = readMetaDat(metaDataRes.get())
     if metaRes.isErr:
-      return err("meta.dat present but not readable: " & metaRes.error)
+      return err("meta.dat present but not readable: " & metaRes.unsafeError)
     reader.meta = metaRes.get()
 
   # Load interning tables (these are small, load at startup). A table that
@@ -595,7 +635,7 @@ proc openNewTraceFromBytes*(data: sink seq[byte],
       var tr = initInterningTableReader(reader.image, name, blockSize,
         maxEntries)
       if tr.isErr:
-        return err(name & ".dat: " & tr.error)
+        return err(name & ".dat: " & tr.unsafeError)
       dest = move tr.get()
   loadTable("paths", reader.pathReader)
   loadTable("funcs", reader.funcReader)
@@ -639,7 +679,7 @@ proc openNewTraceFromBytes*(data: sink seq[byte],
     if reader.meta.hasColumnAwareSteps or assumeColumnAwarePaths:
       let parsed = parseLayoutAPathRecords(reader.pathReader, probe = false)
       if parsed.isErr:
-        return err(parsed.error)
+        return err(parsed.unsafeError)
       reader.lineLengths = parsed.get()
       # Only reachable via the caller's explicit override; a trace that
       # declared bit 4 already has the flag set.
@@ -653,7 +693,7 @@ proc openNewTraceFromBytes*(data: sink seq[byte],
       # and put every file back on the assumed stride.
       let parsed = parseLineCountPathRecords(reader.pathReader)
       if parsed.isErr:
-        return err(parsed.error)
+        return err(parsed.unsafeError)
       reader.lineCountPayloads = parsed.get().payloads
       reader.lineCounts = parsed.get().counts
     else:
@@ -674,7 +714,7 @@ proc openNewTraceFromBytes*(data: sink seq[byte],
     let svRes = initVariableRecordTableReader(
       reader.image.bytes, "srcviews", blockSize, maxEntries)
     if svRes.isErr:
-      return err("source_views.dat: " & svRes.error)
+      return err("source_views.dat: " & svRes.unsafeError)
     let svReader = svRes.get()
     let total = svReader.count()
     reader.sourceViews = newSeq[SourceView](int(total))
@@ -682,59 +722,12 @@ proc openNewTraceFromBytes*(data: sink seq[byte],
     reader.sourceViewsByPath = newSeq[seq[uint64]](int(pathCount))
     for i in 0'u64 ..< total:
       let rawRes = svReader.read(i)
-      if rawRes.isErr:
-        return err("source_views.dat[" & $i & "]: " & rawRes.error)
-      let raw = rawRes.get()
-      var pos = 0
-      let pathIdRes = decodeVarint(raw, pos)
-      if pathIdRes.isErr:
-        return err("source_views.dat[" & $i & "]: path_id varint: " &
-          pathIdRes.error)
-      let pathId = pathIdRes.get()
-      if pos >= raw.len:
-        return err("source_views.dat[" & $i & "]: view_kind byte missing")
-      let viewKind = raw[pos]
-      pos += 1
-      let viewNameLenRes = decodeVarint(raw, pos)
-      if viewNameLenRes.isErr:
-        return err("source_views.dat[" & $i & "]: view_name_len: " &
-          viewNameLenRes.error)
-      let viewNameLen = int(viewNameLenRes.get())
-      if pos + viewNameLen > raw.len:
-        return err("source_views.dat[" & $i & "]: view_name truncated")
-      var viewName = newString(viewNameLen)
-      for k in 0 ..< viewNameLen:
-        viewName[k] = char(raw[pos + k])
-      pos += viewNameLen
-      let contentLenRes = decodeVarint(raw, pos)
-      if contentLenRes.isErr:
-        return err("source_views.dat[" & $i & "]: content_len: " &
-          contentLenRes.error)
-      let contentLen = int(contentLenRes.get())
-      if pos + contentLen > raw.len:
-        return err("source_views.dat[" & $i & "]: content truncated")
-      var content = newSeq[byte](contentLen)
-      for k in 0 ..< contentLen:
-        content[k] = raw[pos + k]
-      pos += contentLen
-      let mapLenRes = decodeVarint(raw, pos)
-      if mapLenRes.isErr:
-        return err("source_views.dat[" & $i & "]: map_len: " &
-          mapLenRes.error)
-      let mapLen = int(mapLenRes.get())
-      if pos + mapLen > raw.len:
-        return err("source_views.dat[" & $i & "]: map truncated")
-      var smap = newSeq[byte](mapLen)
-      for k in 0 ..< mapLen:
-        smap[k] = raw[pos + k]
-      pos += mapLen
-      reader.sourceViews[int(i)] = SourceView(
-        pathId: pathId,
-        viewKind: viewKind,
-        viewName: viewName,
-        content: content,
-        sourcemapV3: smap,
-      )
+      var why: string
+      if rawRes.isErr or not decodeSourceView(rawRes.unsafeGet(),
+          reader.sourceViews[int(i)], why):
+        return err("source_views.dat[" & $i & "]: " &
+          (if rawRes.isErr: rawRes.unsafeError else: why))
+      let pathId = reader.sourceViews[int(i)].pathId
       if pathId < pathCount:
         reader.sourceViewsByPath[int(pathId)].add(i)
 
@@ -778,7 +771,7 @@ when ctHasFilesystem:
     var reopened = openNewTrace(path,
       assumeColumnAwarePaths = r.assumedColumnAwarePaths)
     if reopened.isErr:
-      return err(reopened.error)
+      return err(reopened.unsafeError)
     r = move reopened.get()
     ok()
 
@@ -794,12 +787,12 @@ proc path*(r: NewTraceReader, id: uint64): Result[string, string] =
       # only the path prefix to surface the legacy string-shaped API.
       let rawRes = r.pathReader.readRawById(id)
       if rawRes.isErr:
-        return err(rawRes.error)
+        return err(rawRes.unsafeError)
       let raw = rawRes.get()
       var pos = 0
       let pathLenRes = decodeVarint(raw, pos)
       if pathLenRes.isErr:
-        return err("paths.dat[" & $id & "]: " & pathLenRes.error)
+        return err("paths.dat[" & $id & "]: " & pathLenRes.unsafeError)
       let pathLen = int(pathLenRes.get())
       if pos + pathLen > raw.len:
         return err("paths.dat[" & $id & "]: path_bytes truncated")
@@ -848,7 +841,7 @@ proc function*(r: NewTraceReader, id: uint64): Result[string, string] =
   ## a function called `\xa6\x8dtoken::transfer`.
   let rec = r.funcReader.readFuncById(id)
   if rec.isErr:
-    return err(r.bareRecordDiagnosis("funcs.dat", id, rec.error))
+    return err(r.bareRecordDiagnosis("funcs.dat", id, rec.unsafeError))
   ok(rec.get().name)
 
 proc functionRecord*(r: NewTraceReader, id: uint64):
@@ -857,7 +850,7 @@ proc functionRecord*(r: NewTraceReader, id: uint64):
   ## the name.
   let rec = r.funcReader.readFuncById(id)
   if rec.isErr:
-    return err(r.bareRecordDiagnosis("funcs.dat", id, rec.error))
+    return err(r.bareRecordDiagnosis("funcs.dat", id, rec.unsafeError))
   rec
 
 proc typeName*(r: NewTraceReader, id: uint64): Result[string, string] =
@@ -866,7 +859,7 @@ proc typeName*(r: NewTraceReader, id: uint64): Result[string, string] =
   ## specific_info`.
   let rec = r.typeReader.readTypeById(id)
   if rec.isErr:
-    return err(r.bareRecordDiagnosis("types.dat", id, rec.error))
+    return err(r.bareRecordDiagnosis("types.dat", id, rec.unsafeError))
   ok(rec.get().langType)
 
 proc typeRecord*(r: NewTraceReader, id: uint64):
@@ -874,7 +867,7 @@ proc typeRecord*(r: NewTraceReader, id: uint64):
   ## The kind alongside the name.
   let rec = r.typeReader.readTypeById(id)
   if rec.isErr:
-    return err(r.bareRecordDiagnosis("types.dat", id, rec.error))
+    return err(r.bareRecordDiagnosis("types.dat", id, rec.unsafeError))
   rec
 
 proc varname*(r: NewTraceReader, id: uint64): Result[string, string] =
@@ -915,7 +908,7 @@ proc ensurePathVersions(r: var NewTraceReader): Result[void, string] =
     if res.isErr:
       r.pathVersionOrdinals.setLen(0)
       r.pathVersionTotals.setLen(0)
-      r.pathVersionsError = res.error
+      r.pathVersionsError = res.unsafeError
   if r.pathVersionsError.len > 0:
     return err(r.pathVersionsError)
   ok()
@@ -1274,7 +1267,7 @@ proc loadExecReader(r: var NewTraceReader): Result[void, string] =
       # `decodeStepEvent`'s `allowSourceReload` note for why skipping is
       # strictly worse than refusing.
       allowSourceReload = r.meta.hasSourceReload)
-    if res.isErr: return err(res.error)
+    if res.isErr: return err(res.unsafeError)
     r.execReader = move res.get()
     r.execLoaded = true
   ok()
@@ -1470,7 +1463,7 @@ proc stepAbsoluteGlobalLineIndices*(r: var NewTraceReader,
     # so we can map seq positions back to absolute step indices.
     let firstIdxRes = r.execReader.readChunkEvents(chunkIdx, events)
     if firstIdxRes.isErr:
-      return err(firstIdxRes.error)
+      return err(firstIdxRes.unsafeError)
     let firstIdx = firstIdxRes.get()
 
     ? resolveChunkPositions(events, chunkIdx, positions)
@@ -1503,7 +1496,7 @@ proc loadValueReader(r: var NewTraceReader): Result[void, string] =
     # ``legacy = not hasValueStream`` keeps them readable.
     var res = initValueStreamReader(r.image, r.blockSize, r.maxEntries,
       legacy = not r.meta.hasValueStream)
-    if res.isErr: return err(res.error)
+    if res.isErr: return err(res.unsafeError)
     r.valueReader = move res.get()
     r.valueLoaded = true
   ok()
@@ -1571,7 +1564,7 @@ proc skippedValueTagCounts*(r: NewTraceReader): seq[(uint8, int)] =
 proc loadCallReader(r: var NewTraceReader): Result[void, string] =
   if not r.callLoaded:
     var res = initCallStreamReader(r.image, r.blockSize, r.maxEntries)
-    if res.isErr: return err(res.error)
+    if res.isErr: return err(res.unsafeError)
     r.callReader = move res.get()
     r.callLoaded = true
   ok()
@@ -1699,7 +1692,7 @@ proc loadIOEventReader(r: var NewTraceReader): Result[void, string] =
     # VRT framing; ``legacy = not hasIoEventStream`` keeps them readable.
     var res = initIOEventStreamReader(r.image, r.blockSize, r.maxEntries,
       legacy = not r.meta.hasIoEventStream)
-    if res.isErr: return err(res.error)
+    if res.isErr: return err(res.unsafeError)
     r.ioEventReader = move res.get()
     r.ioEventLoaded = true
   ok()

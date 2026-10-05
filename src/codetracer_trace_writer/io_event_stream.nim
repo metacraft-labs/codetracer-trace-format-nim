@@ -235,10 +235,10 @@ proc initIOEventStreamWriter*(ctfs: var Ctfs,
 
   let datRes = ctfs.addFile("events.dat")
   if datRes.isErr:
-    return err("failed to add events.dat: " & datRes.error)
+    return err("failed to add events.dat: " & datRes.unsafeError)
   let idxRes = ctfs.addFile("events.idx")
   if idxRes.isErr:
-    return err("failed to add events.idx: " & idxRes.error)
+    return err("failed to add events.idx: " & idxRes.unsafeError)
 
   var writer = IOEventStreamWriter(
     dataFile: datRes.get(),
@@ -257,7 +257,7 @@ proc initIOEventStreamWriter*(ctfs: var Ctfs,
     hdr[i] = csLE[i]
   let hdrRes = ctfs.writeToFile(writer.indexFile, hdr)
   if hdrRes.isErr:
-    return err("failed to write events.idx header: " & hdrRes.error)
+    return err("failed to write events.idx header: " & hdrRes.unsafeError)
   ctfs.syncEntry(writer.indexFile)
 
   ok(writer)
@@ -288,7 +288,7 @@ proc flushChunk(ctfs: var Ctfs, w: var IOEventStreamWriter): Result[void, string
   let datRes = ctfs.writeToFile(w.dataFile,
       compressed.toOpenArray(0, int(compressedSize) - 1))
   if datRes.isErr:
-    return err("failed to write io event chunk: " & datRes.error)
+    return err("failed to write io event chunk: " & datRes.unsafeError)
 
   var offBytes: array[8, byte]
   let offLE = toBytesLE(chunkStart)
@@ -296,7 +296,7 @@ proc flushChunk(ctfs: var Ctfs, w: var IOEventStreamWriter): Result[void, string
     offBytes[i] = offLE[i]
   let offRes = ctfs.writeToFile(w.indexFile, offBytes)
   if offRes.isErr:
-    return err("failed to write events.idx offset: " & offRes.error)
+    return err("failed to write events.idx offset: " & offRes.unsafeError)
   ctfs.syncEntry(w.indexFile)
 
   w.dataOffset += uint64(compressedSize)
@@ -352,14 +352,14 @@ proc initIOEventStreamReader*(ctfsBytes: openArray[byte],
     let tableRes = initVariableRecordTableReader(ctfsBytes, "events",
         blockSize, maxEntries)
     if tableRes.isErr:
-      return err(tableRes.error)
+      return err(tableRes.unsafeError)
     return ok(IOEventStreamReader(legacy: true, legacyTable: tableRes.get()))
   var datRes = readInternalFile(ctfsBytes, "events.dat", blockSize, maxEntries)
   if datRes.isErr:
-    return err("failed to read events.dat: " & datRes.error)
+    return err("failed to read events.dat: " & datRes.unsafeError)
   let idxRes = readInternalFile(ctfsBytes, "events.idx", blockSize, maxEntries)
   if idxRes.isErr:
-    return err("failed to read events.idx: " & idxRes.error)
+    return err("failed to read events.idx: " & idxRes.unsafeError)
   ok(IOEventStreamReader(spec: ? openChunkedRecords(
     viewBytes(move datRes.get()), idxRes.get(), "events", "io event",
     isCompactContainer(ctfsBytes))))
@@ -374,14 +374,14 @@ proc initIOEventStreamReader*(image: ContainerImage,
     let tableRes = initVariableRecordTableReader(image, "events",
         blockSize, maxEntries)
     if tableRes.isErr:
-      return err(tableRes.error)
+      return err(tableRes.unsafeError)
     return ok(IOEventStreamReader(legacy: true, legacyTable: tableRes.get()))
   var datRes = viewMember(image, "events.dat", blockSize, maxEntries)
   if datRes.isErr:
-    return err("failed to read events.dat: " & datRes.error)
+    return err("failed to read events.dat: " & datRes.unsafeError)
   let idxRes = viewMember(image, "events.idx", blockSize, maxEntries)
   if idxRes.isErr:
-    return err("failed to read events.idx: " & idxRes.error)
+    return err("failed to read events.idx: " & idxRes.unsafeError)
   ok(IOEventStreamReader(spec: ? openChunkedRecords(move datRes.get(),
     idxRes.get().copyOut(0, idxRes.get().len), "events", "io event",
     isCompactContainer(image.bytes))))
@@ -398,7 +398,7 @@ proc readEvent*(r: var IOEventStreamReader,
   if r.legacy:
     let dataRes = r.legacyTable.read(index)
     if dataRes.isErr:
-      return err(dataRes.error)
+      return err(dataRes.unsafeError)
     return decodeLegacyIOEvent(dataRes.get())
 
   if index >= r.spec.count:
@@ -407,5 +407,5 @@ proc readEvent*(r: var IOEventStreamReader,
   let within = ? r.spec.locate(index)
   let ev = decodeIOEvent(r.spec.record(within))
   if ev.isErr:
-    return err("events.dat record " & $index & ": " & ev.error)
+    return err("events.dat record " & $index & ": " & ev.unsafeError)
   ev

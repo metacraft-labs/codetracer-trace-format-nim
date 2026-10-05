@@ -36,11 +36,11 @@ proc initVariableRecordTableWriter*(ctfs: var Ctfs,
   ## Creates baseName.dat (data) and baseName.off (offsets).
   let dataFileRes = ctfs.addFile(baseName & ".dat")
   if dataFileRes.isErr:
-    return err("failed to create data file: " & dataFileRes.error)
+    return err("failed to create data file: " & dataFileRes.unsafeError)
 
   let offsetWriterRes = initFixedRecordTableWriter(ctfs, baseName & ".off", 8)
   if offsetWriterRes.isErr:
-    return err("failed to create offset file: " & offsetWriterRes.error)
+    return err("failed to create offset file: " & offsetWriterRes.unsafeError)
 
   var writer = VariableRecordTableWriter(
     dataFile: dataFileRes.get(),
@@ -54,7 +54,7 @@ proc initVariableRecordTableWriter*(ctfs: var Ctfs,
   writeU64LE(offsetBytes, 0, 0'u64)
   let appendRes = ctfs.append(writer.offsetWriter, offsetBytes)
   if appendRes.isErr:
-    return err("failed to write initial offset: " & appendRes.error)
+    return err("failed to write initial offset: " & appendRes.unsafeError)
 
   ok(writer)
 
@@ -64,7 +64,7 @@ proc append*(ctfs: var Ctfs, w: var VariableRecordTableWriter,
   if record.len > 0:
     let writeRes = ctfs.writeToFile(w.dataFile, record)
     if writeRes.isErr:
-      return err("data write failed: " & writeRes.error)
+      return err("data write failed: " & writeRes.unsafeError)
 
   w.currentOffset += uint64(record.len)
   w.recordCount += 1
@@ -74,7 +74,7 @@ proc append*(ctfs: var Ctfs, w: var VariableRecordTableWriter,
   writeU64LE(offsetBytes, 0, w.currentOffset)
   let appendRes = ctfs.append(w.offsetWriter, offsetBytes)
   if appendRes.isErr:
-    return err("offset write failed: " & appendRes.error)
+    return err("offset write failed: " & appendRes.unsafeError)
 
   ok()
 
@@ -95,11 +95,11 @@ proc initVariableRecordTableReader*(ctfsBytes: openArray[byte],
   ## Reads both baseName.dat and baseName.off, copied out of `ctfsBytes`.
   var dataRes = readInternalFile(ctfsBytes, baseName & ".dat", blockSize, maxEntries)
   if dataRes.isErr:
-    return err("failed to read data file: " & dataRes.error)
+    return err("failed to read data file: " & dataRes.unsafeError)
 
   var offsetDataRes = readInternalFile(ctfsBytes, baseName & ".off", blockSize, maxEntries)
   if offsetDataRes.isErr:
-    return err("failed to read offset file: " & offsetDataRes.error)
+    return err("failed to read offset file: " & offsetDataRes.unsafeError)
 
   ? checkOffsets(offsetDataRes.get().len)
   ok(VariableRecordTableReader(
@@ -115,10 +115,10 @@ proc initVariableRecordTableReader*(image: ContainerImage,
   ## read in place, nothing is copied.
   var dataRes = viewMember(image, baseName & ".dat", blockSize, maxEntries)
   if dataRes.isErr:
-    return err("failed to read data file: " & dataRes.error)
+    return err("failed to read data file: " & dataRes.unsafeError)
   var offsetsRes = viewMember(image, baseName & ".off", blockSize, maxEntries)
   if offsetsRes.isErr:
-    return err("failed to read offset file: " & offsetsRes.error)
+    return err("failed to read offset file: " & offsetsRes.unsafeError)
   ? checkOffsets(offsetsRes.get().len)
   ok(VariableRecordTableReader(data: move dataRes.get(),
     offsets: move offsetsRes.get()))

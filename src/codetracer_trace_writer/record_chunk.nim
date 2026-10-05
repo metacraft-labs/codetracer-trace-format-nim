@@ -231,7 +231,7 @@ proc reach(r: var ChunkedRecords, c, within: int, why: var string): bool =
   if r.chunk.held != c:
     let loaded = r.loadChunk(c)
     if loaded.isErr:
-      why = loaded.error
+      why = loaded.unsafeError
       return false
   if within >= r.chunk.framed:
     let framing = r.chunk.frameTo(within)

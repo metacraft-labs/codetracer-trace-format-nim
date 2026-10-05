@@ -34,7 +34,7 @@ proc initInterningTableWriter*(ctfs: var Ctfs, baseName: string): Result[Interni
   ## Creates baseName.dat and baseName.off files.
   let tableRes = initVariableRecordTableWriter(ctfs, baseName)
   if tableRes.isErr:
-    return err(tableRes.error)
+    return err(tableRes.unsafeError)
   ok(InterningTableWriter(
     table: tableRes.get(),
     lookup: initTable[string, uint64](),
@@ -78,7 +78,7 @@ proc ensureQualifiedId*(ctfs: var Ctfs, it: var InterningTableWriter,
       let appendRes = ctfs.append(it.table,
         payload.toOpenArrayByte(0, payload.len - 1))
       if appendRes.isErr:
-        err(appendRes.error)
+        err(appendRes.unsafeError)
       else:
         it.lookup[payload] = id
         ok(id)
@@ -166,7 +166,7 @@ proc ensurePathIdColumnAware*(ctfs: var Ctfs, it: var InterningTableWriter,
 
   let appendRes = ctfs.append(it.table, record)
   if appendRes.isErr:
-    return err(appendRes.error)
+    return err(appendRes.unsafeError)
 
   it.lookup[path] = id
   ok(id)
@@ -225,7 +225,7 @@ proc appendQualifiedPathWithLineCount*(ctfs: var Ctfs,
 
   let appendRes = ctfs.append(it.table, record)
   if appendRes.isErr:
-    return err(appendRes.error)
+    return err(appendRes.unsafeError)
 
   it.lookup[payload] = id
   ok(id)
@@ -284,7 +284,7 @@ proc ensureQualifiedPathIdWithLineCount*(ctfs: var Ctfs,
 
   let appendRes = ctfs.append(it.table, record)
   if appendRes.isErr:
-    return err(appendRes.error)
+    return err(appendRes.unsafeError)
 
   it.lookup[payload] = id
   ok(id)
@@ -299,7 +299,7 @@ proc initInterningTableReader*(ctfsBytes: openArray[byte], baseName: string,
   ## Initialize a reader from raw CTFS container bytes.
   var tableRes = initVariableRecordTableReader(ctfsBytes, baseName, blockSize, maxEntries)
   if tableRes.isErr:
-    return err(tableRes.error)
+    return err(tableRes.unsafeError)
   ok(InterningTableReader(table: move tableRes.get()))
 
 proc initInterningTableReader*(image: ContainerImage, baseName: string,
@@ -309,14 +309,14 @@ proc initInterningTableReader*(image: ContainerImage, baseName: string,
   ## table's members in place.
   var tableRes = initVariableRecordTableReader(image, baseName, blockSize, maxEntries)
   if tableRes.isErr:
-    return err(tableRes.error)
+    return err(tableRes.unsafeError)
   ok(InterningTableReader(table: move tableRes.get()))
 
 proc readById*(r: InterningTableReader, id: uint64): Result[string, string] =
   ## Read the interned string by its ID.
   let dataRes = r.table.read(id)
   if dataRes.isErr:
-    return err(dataRes.error)
+    return err(dataRes.unsafeError)
   let data = dataRes.get()
   var s = newString(data.len)
   if data.len > 0:

@@ -775,16 +775,124 @@ proc writeMetaDat*(
 proc readU16LE(data: openArray[byte], offset: int): uint16 =
   uint16(data[offset]) or (uint16(data[offset + 1]) shl 8)
 
-proc readString(data: openArray[byte], pos: var int): Result[string, string] =
-  let lenVal = ? decodeVarint(data, pos)
-  let sLen = int(lenVal)
-  if pos + sLen > data.len:
-    return err("meta.dat: string extends past end of data")
-  var s = newString(sLen)
+template refuse(message: string) {.dirty.} =
+  ## `return err(message)`, for the walkers below, which answer `bool` and
+  ## name their refusal in `why`.
+  why = message
+  return false
+
+proc readStringInto(data: openArray[byte], pos: var int, dest: var string,
+    why: var string): bool =
+  ## A varint-length-prefixed string at `pos`, into `dest`.
+  let sLen = int(varintOrFail(data, pos, why))
+  if sLen < 0 or sLen > data.len - pos:
+    refuse("meta.dat: string extends past end of data")
+  dest = newString(sLen)
   for i in 0 ..< sLen:
-    s[i] = char(data[pos + i])
+    dest[i] = char(data[pos + i])
   pos += sLen
-  ok(s)
+  true
+
+proc readBody(data: openArray[byte], flags: uint16, pos: var int,
+    c: var MetaDatContents, why: var string): bool =
+  ## Every field after the fixed header, in order, into `c`: the strings, then
+  ## each flag-gated block the header declares. One walker answering `bool`
+  ## rather than a `Result` per field, which costs a reader that ships to a
+  ## browser several kilobytes of code for the same refusals.
+  template str(dest: var string) =
+    if not readStringInto(data, pos, dest, why): return false
+  template varint(): uint64 = varintOrFail(data, pos, why)
+
+  # Recording id (UUIDv7, canonical 36-char form).  M-REC-1, required
+  # in v3+: a malformed or missing id rejects the trace at parse time.
+  str(c.recordingId)
+  let idCheck = validateRecordingIdStr(c.recordingId)
+  if idCheck.isErr:
+    refuse(idCheck.unsafeError)
+  str(c.program)
+  let argsCount = varint()
+  for i in 0'u64 ..< argsCount:
+    var a: string
+    str(a)
+    c.args.add(move a)
+  str(c.workdir)
+  str(c.recorderId)
+
+  # MCR fields
+  if (flags and FlagHasMcrFields) != 0:
+    var m: McrMetaFields
+    let tickSourceVal = varint()
+    let totalThreadsVal = varint()
+    let atomicModeVal = varint()
+    if tickSourceVal > uint64(high(TickSource).ord):
+      refuse("meta.dat: invalid tick_source value " & $tickSourceVal)
+    if atomicModeVal > uint64(high(AtomicMode).ord):
+      refuse("meta.dat: invalid atomic_mode value " & $atomicModeVal)
+    m.tickSource = TickSource(tickSourceVal)
+    m.atomicMode = AtomicMode(atomicModeVal)
+    m.totalEvents = varint()
+    let totalCheckpointsVal = varint()
+    # The spec gives both counts as a varint with no narrower bound; the
+    # fields are 32 bits, so a larger count is refused rather than cut to
+    # its low half (the Rust reader's `decode_u32`, word for word).
+    for (field, v) in [("total_threads", totalThreadsVal),
+        ("total_checkpoints", totalCheckpointsVal)]:
+      if v > uint64(high(uint32)):
+        refuse("meta.dat: " & field & " value " & $v & " does not fit 32 bits")
+    m.totalThreads = uint32(totalThreadsVal)
+    m.totalCheckpoints = uint32(totalCheckpointsVal)
+    m.startTimeUnixUs = varint()
+    str(m.platform)
+    str(m.tickGranularity)
+    str(m.tickSourceStr)
+    str(m.atomicModeStr)
+    str(m.startTimeStr)
+    str(m.hookProfile)
+    let strategies = varint()
+    for i in 0'u64 ..< strategies:
+      var h: string
+      str(h)
+      m.hookStrategies.add(move h)
+    c.mcrFields = some(move m)
+
+  # Replay-launch fields (M-RLP-1, spec §6A.5).
+  if (flags and FlagHasReplayLaunchFields) != 0:
+    if pos + 1 > data.len:
+      refuse("meta.dat: replay_launch_fields aslr_disabled byte missing")
+    c.replayLaunchFields = some(ReplayLaunchFields(aslrDisabled: data[pos] != 0))
+    pos += 1
+
+  # Layout snapshot (M-RLP-2, spec §6B.7).
+  if (flags and FlagHasLayoutSnapshot) != 0:
+    if pos + 8 > data.len:
+      refuse("meta.dat: layout_snapshot hash bytes missing")
+    var l: LayoutSnapshotFields
+    for i in 0 ..< 8:
+      l.layoutHash = l.layoutHash or (uint64(data[pos + i]) shl (i * 8))
+    pos += 8
+    let fpLen = varint()
+    if fpLen > uint64(data.len - pos):
+      refuse("meta.dat: layout_snapshot fingerprint extends past end")
+    l.layoutFingerprint = newSeq[byte](int(fpLen))
+    for i in 0 ..< l.layoutFingerprint.len:
+      l.layoutFingerprint[i] = data[pos + i]
+    pos += int(fpLen)
+    c.layoutSnapshotFields = some(move l)
+
+  # Trace filter provenance (TF-M7, spec §7).
+  if (flags and FlagHasTraceFilterProvenance) != 0:
+    c.hasFilterProvenance = true
+    let count = varint()
+    for i in 0'u64 ..< count:
+      var e: FilterProvenance
+      str(e.path)
+      if pos + 32 > data.len:
+        refuse("meta.dat: trace_filter sha256 bytes extend past end")
+      for k in 0 ..< 32:
+        e.sha256[k] = data[pos + k]
+      pos += 32
+      c.filterProvenance.add(move e)
+  true
 
 proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
   ## Parse a version 6 `meta.dat`.
@@ -817,7 +925,6 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
   if unknownExt != 0:
     return err("meta.dat: flags_ext carries bits this reader does not " &
       "implement: 0x" & toHex(BiggestInt(unknownExt), 8))
-  let headerEnd = MetaDatHeaderSize
 
   # P6.5: strict back-compat rejection.  Any flag bit outside this
   # reader's ``KnownFlags`` set causes the open to fail cleanly rather
@@ -852,140 +959,24 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
       "line_count as the length of its per-line table. Re-record the trace " &
       "with a current recorder")
 
-  var pos = headerEnd
-
-  var contents = MetaDatContents(version: version)
-  contents.flagsExt = flagsExt
-  contents.hasSourceReload = (flagsExt and FlagExtHasSourceReload) != 0
-  contents.hasColumnAwareSteps = (flags and FlagHasColumnAwareSteps) != 0
-  contents.hasCorrelationIndex = (flags and FlagHasCorrelationIndex) != 0
-  contents.hasAlternateSourceViews =
-    (flags and FlagHasAlternateSourceViews) != 0
-  contents.supportsColumnBreakpoints =
-    (flags and FlagSupportsColumnBreakpoints) != 0
-  contents.supportsColumnMotions =
-    (flags and FlagSupportsColumnMotions) != 0
-  contents.hasCallStream = (flags and FlagHasCallStream) != 0
-  contents.hasStepStream = (flags and FlagHasStepStream) != 0
-  contents.hasValueStream = (flags and FlagHasValueStream) != 0
-  contents.hasIoEventStream = (flags and FlagHasIoEventStream) != 0
-  contents.hasInterningTables = (flags and FlagHasInterningTables) != 0
-  contents.hasSpanStream = (flags and FlagHasSpanStream) != 0
-  contents.hasLineCountTable = (flags and FlagHasLineCountTable) != 0
-
-  # Recording id (UUIDv7, canonical 36-char form).  M-REC-1, required
-  # in v3+: a malformed or missing id rejects the trace at parse time.
-  contents.recordingId = ? readString(data, pos)
-  ? validateRecordingIdStr(contents.recordingId)
-
-  # Program
-  contents.program = ? readString(data, pos)
-
-  # Args
-  let argsCount = ? decodeVarint(data, pos)
-  for i in 0'u64 ..< argsCount:
-    contents.args.add(? readString(data, pos))
-
-  # Workdir
-  contents.workdir = ? readString(data, pos)
-
-  # Recorder ID
-  contents.recorderId = ? readString(data, pos)
-
-  # MCR fields
-  if (flags and FlagHasMcrFields) != 0:
-    let tickSourceVal = ? decodeVarint(data, pos)
-    let totalThreadsVal = ? decodeVarint(data, pos)
-    let atomicModeVal = ? decodeVarint(data, pos)
-
-    if tickSourceVal > uint64(high(TickSource).ord):
-      return err("meta.dat: invalid tick_source value " & $tickSourceVal)
-    if atomicModeVal > uint64(high(AtomicMode).ord):
-      return err("meta.dat: invalid atomic_mode value " & $atomicModeVal)
-
-    let totalEventsVal = ? decodeVarint(data, pos)
-    let totalCheckpointsVal = ? decodeVarint(data, pos)
-    # The spec gives both counts as a varint with no narrower bound; the
-    # fields are 32 bits, so a larger count is refused rather than cut to
-    # its low half (the Rust reader's `decode_u32`, word for word).
-    for (field, v) in [("total_threads", totalThreadsVal),
-        ("total_checkpoints", totalCheckpointsVal)]:
-      if v > uint64(high(uint32)):
-        return err("meta.dat: " & field & " value " & $v &
-          " does not fit 32 bits")
-    let startTimeUnixUsVal = ? decodeVarint(data, pos)
-    let platformStr = ? readString(data, pos)
-    let tickGranularityStr = ? readString(data, pos)
-    let tickSourceStr = ? readString(data, pos)
-    let atomicModeStr = ? readString(data, pos)
-    let startTimeStr = ? readString(data, pos)
-    let hookProfileStr = ? readString(data, pos)
-    let hookStrategiesCount = ? decodeVarint(data, pos)
-    var hookStrategies: seq[string] = @[]
-    for i in 0'u64 ..< hookStrategiesCount:
-      hookStrategies.add(? readString(data, pos))
-
-    contents.mcrFields = some(McrMetaFields(
-      tickSource: TickSource(tickSourceVal),
-      totalThreads: uint32(totalThreadsVal),
-      atomicMode: AtomicMode(atomicModeVal),
-      totalEvents: totalEventsVal,
-      totalCheckpoints: uint32(totalCheckpointsVal),
-      startTimeUnixUs: startTimeUnixUsVal,
-      platform: platformStr,
-      tickGranularity: tickGranularityStr,
-      tickSourceStr: tickSourceStr,
-      atomicModeStr: atomicModeStr,
-      startTimeStr: startTimeStr,
-      hookProfile: hookProfileStr,
-      hookStrategies: hookStrategies,
-    ))
-
-  # Replay-launch fields (M-RLP-1, spec §6A.5).
-  if (flags and FlagHasReplayLaunchFields) != 0:
-    if pos + 1 > data.len:
-      return err("meta.dat: replay_launch_fields aslr_disabled byte missing")
-    let aslr = data[pos] != 0
-    pos += 1
-    contents.replayLaunchFields = some(ReplayLaunchFields(
-      aslrDisabled: aslr,
-    ))
-
-  # Layout snapshot (M-RLP-2, spec §6B.7).
-  if (flags and FlagHasLayoutSnapshot) != 0:
-    if pos + 8 > data.len:
-      return err("meta.dat: layout_snapshot hash bytes missing")
-    var h: uint64 = 0
-    for i in 0 ..< 8:
-      h = h or (uint64(data[pos + i]) shl (i * 8))
-    pos += 8
-    let fpLen = ? decodeVarint(data, pos)
-    if pos + int(fpLen) > data.len:
-      return err("meta.dat: layout_snapshot fingerprint extends past end")
-    var fp = newSeq[byte](int(fpLen))
-    for i in 0 ..< int(fpLen):
-      fp[i] = data[pos + i]
-    pos += int(fpLen)
-    contents.layoutSnapshotFields = some(LayoutSnapshotFields(
-      layoutHash: h,
-      layoutFingerprint: fp,
-    ))
-
-  # Trace filter provenance (TF-M7, spec §7).
-  if (flags and FlagHasTraceFilterProvenance) != 0:
-    contents.hasFilterProvenance = true
-    let countVal = ? decodeVarint(data, pos)
-    for i in 0'u64 ..< countVal:
-      let path = ? readString(data, pos)
-      if pos + 32 > data.len:
-        return err("meta.dat: trace_filter sha256 bytes extend past end")
-      var sha: array[32, byte]
-      for k in 0 ..< 32:
-        sha[k] = data[pos + k]
-      pos += 32
-      contents.filterProvenance.add(FilterProvenance(path: path, sha256: sha))
-
-  ok(contents)
+  result.ok(MetaDatContents(version: version, flagsExt: flagsExt,
+    hasSourceReload: (flagsExt and FlagExtHasSourceReload) != 0,
+    hasColumnAwareSteps: (flags and FlagHasColumnAwareSteps) != 0,
+    hasCorrelationIndex: (flags and FlagHasCorrelationIndex) != 0,
+    hasAlternateSourceViews: (flags and FlagHasAlternateSourceViews) != 0,
+    supportsColumnBreakpoints: (flags and FlagSupportsColumnBreakpoints) != 0,
+    supportsColumnMotions: (flags and FlagSupportsColumnMotions) != 0,
+    hasCallStream: (flags and FlagHasCallStream) != 0,
+    hasStepStream: (flags and FlagHasStepStream) != 0,
+    hasValueStream: (flags and FlagHasValueStream) != 0,
+    hasIoEventStream: (flags and FlagHasIoEventStream) != 0,
+    hasInterningTables: (flags and FlagHasInterningTables) != 0,
+    hasSpanStream: (flags and FlagHasSpanStream) != 0,
+    hasLineCountTable: (flags and FlagHasLineCountTable) != 0))
+  var pos = MetaDatHeaderSize
+  var why: string
+  if not readBody(data, flags, pos, result.unsafeGet(), why):
+    result = err(why)
 
 # ---------------------------------------------------------------------------
 # Buffer-based writer (for FFI / standalone use)
@@ -1052,5 +1043,5 @@ proc writeMetaDatToBuffer*(
     hasLineCountTable: hasLineCountTable,
     hasCorrelationIndex: hasCorrelationIndex,
     hasSourceReload: hasSourceReload))
-  doAssert res.isOk, "writeMetaDatToBuffer: " & (if res.isErr: res.error else: "")
+  doAssert res.isOk, "writeMetaDatToBuffer: " & (if res.isErr: res.unsafeError else: "")
   res.get()

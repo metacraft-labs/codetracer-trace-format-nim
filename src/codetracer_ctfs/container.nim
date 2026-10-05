@@ -203,7 +203,7 @@ proc addFile*(c: var Ctfs, name: string): Result[CtfsInternalFile, string] =
   let g = c.growRootDirectory()
   if g.isErr:
     return err("no free file entry slots, and the root directory could not " &
-               "grow: " & g.error)
+               "grow: " & g.unsafeError)
   let off = c.fileEntryOffset(firstNew)
   writeU64LE(c.data, off + 16, encodedName)
   if c.streaming:
@@ -636,6 +636,11 @@ proc truncatedContainerNote(wholeBlocks: uint64, blockSize: uint32,
     "-byte blocks in " & $len &
     " bytes, so it is truncated or its tail write was interrupted"
 
+proc blockRefusal(what: string, n: uint64, name, rest: string,
+    wholeBlocks: uint64, blockSize: uint32, len: int): string =
+  what & " " & $n & " of internal file " & name & rest &
+    truncatedContainerNote(wholeBlocks, blockSize, len)
+
 type
   MemberRun* = tuple[at: int, len: int]
     ## `len` bytes of a member, stored at `at` in the container image.
@@ -674,9 +679,11 @@ proc memberRuns*(data: openArray[byte], name: string,
   # floor, never `+ blockSize - 1`: rounding up would make the incomplete
   # final block addressable, which is the one arithmetic §5d forbids.
   let wholeBlocks = uint64(data.len div int(blockSize))
-  # Formatted only for a refusal; an ordinary read does not build it.
-  template truncatedNote: string =
-    truncatedContainerNote(wholeBlocks, blockSize, data.len)
+  # `<what> <n> of internal file <name><rest>` and the truncation note: one
+  # formatter for every block number found past the container's end, called
+  # only for a refusal.
+  template outOfBounds(what: string, n: uint64, rest: string): string =
+    blockRefusal(what, n, name, rest, wholeBlocks, blockSize, data.len)
 
   if mapBlock == 0'u64:
     if fileSize == 0:
@@ -692,8 +699,7 @@ proc memberRuns*(data: openArray[byte], name: string,
       return err("internal file " & name & " names data block 0 directly; " &
         "block 0 is the container's root directory and no member may name it")
     if b >= wholeBlocks:
-      return err("direct data block " & $b & " of internal file " & name &
-        " is out of bounds" & truncatedNote)
+      return err(outOfBounds("direct data block", b, " is out of bounds"))
     if fileSize > uint64(blockSize):
       return err("internal file " & name & " is stored in one direct block " &
         "but declares " & $fileSize & " bytes, more than one " & $blockSize &
@@ -704,8 +710,7 @@ proc memberRuns*(data: openArray[byte], name: string,
 
   # Path 1 of 3: the entry's mapping root.
   if mapBlock >= wholeBlocks:
-    return err("mapping root block " & $mapBlock & " of internal file " & name &
-      " is out of bounds" & truncatedNote)
+    return err(outOfBounds("mapping root block", mapBlock, " is out of bounds"))
   if fileSize == 0:
     return ok(newSeq[MemberRun](0))
 
@@ -741,9 +746,8 @@ proc memberRuns*(data: openArray[byte], name: string,
             " of internal file " & name)
         # Path 2a of 3: a mapping block reached through the chain.
         if chainPtr >= wholeBlocks:
-          return err("chain pointer at level " & $level & " of internal file " &
-            name & " names block " & $chainPtr & ", which is out of bounds" &
-            truncatedNote)
+          return err(outOfBounds("chain pointer at level", level,
+            " names block " & $chainPtr & ", which is out of bounds"))
         currentLevelBlock = chainPtr
 
     var navBlock = currentLevelBlock
@@ -764,9 +768,8 @@ proc memberRuns*(data: openArray[byte], name: string,
           " of internal file " & name)
       # Path 2b of 3: a mapping block reached by descending the hierarchy.
       if childBlock >= wholeBlocks:
-        return err("child block pointer at level " & $navLevel &
-          " of internal file " & name & " names block " & $childBlock &
-          ", which is out of bounds" & truncatedNote)
+        return err(outOfBounds("child block pointer at level", navLevel,
+          " names block " & $childBlock & ", which is out of bounds"))
       navBlock = childBlock
       navIdx = subIdx
       navLevel -= 1
@@ -787,8 +790,8 @@ proc memberRuns*(data: openArray[byte], name: string,
     # before it is multiplied by the block size, which on a damaged container
     # can overflow.
     if dataBlock >= wholeBlocks:
-      return err("data block " & $blockIdx & " of internal file " & name &
-        " is block " & $dataBlock & ", which is out of bounds" & truncatedNote)
+      return err(outOfBounds("data block", blockIdx,
+        " is block " & $dataBlock & ", which is out of bounds"))
 
     let blockOff = int(dataBlock) * int(blockSize)
     let toCopy = min(remaining, int(blockSize))

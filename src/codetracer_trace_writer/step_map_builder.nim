@@ -325,7 +325,7 @@ proc openStepMapIn*(container: openArray[byte]): Result[StepMapReader, string] =
     return openStepMapIn(image)
   var bytes = readInternalFile(container, StepMapFileName)
   if bytes.isErr:
-    return err(StepMapFileName & ": " & bytes.error)
+    return err(StepMapFileName & ": " & bytes.unsafeError)
   openStepMap(move bytes.get(), isCompactContainer(container))
 
 proc inflateChunk(r: StepMapReader, c: int,
@@ -377,6 +377,14 @@ proc fillRun(ids: var seq[int64], at: int, prev: var int64,
     dst[k] = v
   prev = v
 
+proc lineRefusal(path: uint64, line: uint32, what: string): string =
+  ## A refusal of line `(path, line)`'s record, for `what` is wrong with it.
+  "step-map.ns: line (" & $path & ", " & $line & ")" & what
+
+proc varintRefusal(c, pos: int): string =
+  "step-map.ns: chunk " & $c & ": a varint at byte " & $pos &
+    " is truncated or longer than ten bytes"
+
 proc scanChunk(r: StepMapReader, c: int, raw: openArray[byte],
     prevKey: var StepMapKey,
     havePrev: var bool, collect: bool,
@@ -390,8 +398,7 @@ proc scanChunk(r: StepMapReader, c: int, raw: openArray[byte],
   var pos = 0
   template next(v: var uint64) =
     if not readVarint(raw, pos, v):
-      return err("step-map.ns: chunk " & $c & ": a varint at byte " & $pos &
-        " is truncated or longer than ten bytes")
+      return err(varintRefusal(c, pos))
   var path = r.chunks[c].firstPath
   var line = 0'u32
   var first = true
@@ -426,7 +433,7 @@ proc scanChunk(r: StepMapReader, c: int, raw: openArray[byte],
       starts.add(pos)
     next(count)
     if count == 0:
-      return err("step-map.ns: line (" & $path & ", " & $line & ") has count 0")
+      return err(lineRefusal(path, line, " has count 0"))
     var ids: seq[int64]
     if take:
       ids = newSeqOfCap[int64](int(min(count, 1_000_000'u64)))
@@ -436,14 +443,14 @@ proc scanChunk(r: StepMapReader, c: int, raw: openArray[byte],
       next(gap)
       next(rep)
       if gap == 0 or rep == 0:
-        return err("step-map.ns: line (" & $path & ", " & $line &
-          ") has a run with gap " & $gap & " and repeat " & $rep)
+        return err(lineRefusal(path, line, " has a run with gap " & $gap &
+          " and repeat " & $rep))
       if rep > count - n:
-        return err("step-map.ns: line (" & $path & ", " & $line &
-          ")'s runs overshoot its count " & $count)
+        return err(lineRefusal(path, line, "'s runs overshoot its count " &
+          $count))
       if not runFits(prev, gap, rep):
-        return err("step-map.ns: line (" & $path & ", " & $line &
-          ") has a run whose step ids pass " & $high(int64))
+        return err(lineRefusal(path, line,
+          " has a run whose step ids pass " & $high(int64)))
       if take:
         # Grown a run at a time: `rep` was just checked against what is left
         # of `count`.
@@ -534,7 +541,7 @@ proc lookup*(r: var StepMapReader, pathId: uint64,
     if scanned.isErr:
       r.heldKeys.setLen(0)
       r.heldStarts.setLen(0)
-      return err(scanned.error)
+      return err(scanned.unsafeError)
     r.held = c
   var a = 0
   var b = r.heldKeys.len

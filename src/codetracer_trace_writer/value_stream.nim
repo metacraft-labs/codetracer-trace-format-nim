@@ -694,10 +694,10 @@ proc initValueStreamWriter*(ctfs: var Ctfs,
 
   let datRes = ctfs.addFile("values.dat")
   if datRes.isErr:
-    return err("failed to add values.dat: " & datRes.error)
+    return err("failed to add values.dat: " & datRes.unsafeError)
   let idxRes = ctfs.addFile("values.idx")
   if idxRes.isErr:
-    return err("failed to add values.idx: " & idxRes.error)
+    return err("failed to add values.idx: " & idxRes.unsafeError)
 
   var writer = ValueStreamWriter(
     dataFile: datRes.get(),
@@ -720,7 +720,7 @@ proc initValueStreamWriter*(ctfs: var Ctfs,
     hdr[i] = csLE[i]
   let hdrRes = ctfs.writeToFile(writer.indexFile, hdr)
   if hdrRes.isErr:
-    return err("failed to write values.idx header: " & hdrRes.error)
+    return err("failed to write values.idx header: " & hdrRes.unsafeError)
   ctfs.syncEntry(writer.indexFile)
 
   ok(writer)
@@ -749,7 +749,7 @@ proc writeChunk(ctfs: var Ctfs, w: var ValueStreamWriter,
   let datRes = ctfs.writeToFile(w.dataFile,
       compressed.toOpenArray(0, int(compressedSize) - 1))
   if datRes.isErr:
-    return err("failed to write value chunk: " & datRes.error)
+    return err("failed to write value chunk: " & datRes.unsafeError)
 
   var offBytes: array[8, byte]
   let offLE = toBytesLE(chunkStart)
@@ -757,7 +757,7 @@ proc writeChunk(ctfs: var Ctfs, w: var ValueStreamWriter,
     offBytes[i] = offLE[i]
   let offRes = ctfs.writeToFile(w.indexFile, offBytes)
   if offRes.isErr:
-    return err("failed to write values.idx offset: " & offRes.error)
+    return err("failed to write values.idx offset: " & offRes.unsafeError)
   ctfs.syncEntry(w.indexFile)
 
   w.dataOffset += uint64(compressedSize)
@@ -911,14 +911,14 @@ proc initValueStreamReader*(ctfsBytes: openArray[byte],
     let tableRes = initVariableRecordTableReader(ctfsBytes, "values",
         blockSize, maxEntries)
     if tableRes.isErr:
-      return err(tableRes.error)
+      return err(tableRes.unsafeError)
     return ok(ValueStreamReader(legacy: true, legacyTable: tableRes.get()))
   var datRes = readInternalFile(ctfsBytes, "values.dat", blockSize, maxEntries)
   if datRes.isErr:
-    return err("failed to read values.dat: " & datRes.error)
+    return err("failed to read values.dat: " & datRes.unsafeError)
   let idxRes = readInternalFile(ctfsBytes, "values.idx", blockSize, maxEntries)
   if idxRes.isErr:
-    return err("failed to read values.idx: " & idxRes.error)
+    return err("failed to read values.idx: " & idxRes.unsafeError)
   ok(ValueStreamReader(spec: ? openChunkedRecords(viewBytes(move datRes.get()),
     idxRes.get(), "values", "value", isCompactContainer(ctfsBytes))))
 
@@ -932,14 +932,14 @@ proc initValueStreamReader*(image: ContainerImage,
     let tableRes = initVariableRecordTableReader(image, "values",
         blockSize, maxEntries)
     if tableRes.isErr:
-      return err(tableRes.error)
+      return err(tableRes.unsafeError)
     return ok(ValueStreamReader(legacy: true, legacyTable: tableRes.get()))
   var datRes = viewMember(image, "values.dat", blockSize, maxEntries)
   if datRes.isErr:
-    return err("failed to read values.dat: " & datRes.error)
+    return err("failed to read values.dat: " & datRes.unsafeError)
   let idxRes = viewMember(image, "values.idx", blockSize, maxEntries)
   if idxRes.isErr:
-    return err("failed to read values.idx: " & idxRes.error)
+    return err("failed to read values.idx: " & idxRes.unsafeError)
   ok(ValueStreamReader(spec: ? openChunkedRecords(move datRes.get(),
     idxRes.get().copyOut(0, idxRes.get().len), "values", "value",
     isCompactContainer(image.bytes))))
@@ -1013,7 +1013,7 @@ proc readStepValues*(r: var ValueStreamReader,
   if r.legacy:
     let dataRes = r.legacyTable.read(stepIndex)
     if dataRes.isErr:
-      return err(dataRes.error)
+      return err(dataRes.unsafeError)
     return readLegacyRecord(dataRes.get())
 
   if stepIndex >= r.spec.count:
@@ -1095,7 +1095,7 @@ proc readStepEvents*(r: var ValueStreamReader,
   let res = decodeRecordEvents(r.spec.record(within), skipped)
   r.noteSkippedTags(skipped)
   if res.isErr:
-    return err("values.dat record " & $stepIndex & ": " & res.error)
+    return err("values.dat record " & $stepIndex & ": " & res.unsafeError)
   res
 
 proc lastSkippedTags*(r: ValueStreamReader): seq[uint8] =

@@ -245,7 +245,7 @@ proc collectFullProfileMembers*(full: openArray[byte]):
     let bytes = readMemberBytes(full, name, entrySize, entryMap, blockSize)
     if bytes.isErr:
       return err("reading member '" & name & "' out of the full container: " &
-        bytes.error)
+        bytes.unsafeError)
     members.add(CompactMember(name: name, encodedName: encoded,
                               payload: bytes.get()))
   ok(members)

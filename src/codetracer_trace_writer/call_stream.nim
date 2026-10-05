@@ -153,60 +153,64 @@ proc encodeCallRecord*(rec: CallRecord): seq[byte] {.raises: [].} =
 
   buf
 
+proc decodeCallFields(data: openArray[byte], rec: var CallRecord,
+    why: var string): bool =
+  ## Every field of a call record's wire format into `rec`. False, with `why`
+  ## set, where the record does not decode: one walker answering `bool`, so a
+  ## refusal costs one `Result` for the record rather than one per field.
+  var pos = 0
+  template varint(): uint64 = varintOrFail(data, pos, why)
+  template refuse(message: string) =
+    why = message
+    return false
+  template blob(dest: var seq[byte], what: string) =
+    let n = int(varint())
+    if n < 0 or pos + n > data.len:
+      refuse("truncated " & what & " data")
+    dest = fieldBytes(data, pos, n)
+    pos += n
+
+  rec.functionId = varint()
+  rec.parentCallKey = signedVarintOrFail(data, pos, why)
+  rec.entryStep = varint()
+  rec.exitStep = varint()
+  rec.depth = uint32(varint())
+
+  # The lists grow as they are read, sized at most by the bytes left: a count
+  # read from a damaged record must not size an allocation by itself.
+  let argsCount = varint()
+  rec.args = newSeqOfCap[CallArg](int(min(argsCount, uint64(data.len - pos))))
+  for i in 0'u64 ..< argsCount:
+    var arg = CallArg(varnameId: varint())
+    blob(arg.value, "arg")
+    rec.args.add(move arg)
+  blob(rec.returnValue, "return value")
+  blob(rec.exception, "exception")
+
+  let childrenCount = varint()
+  rec.children = newSeqOfCap[uint64](
+    int(min(childrenCount, uint64(data.len - pos))))
+  for i in 0'u64 ..< childrenCount:
+    rec.children.add(varint())
+
+  # `trace-events.md` §"Call Stream": a record's fields fill its
+  # `record_len` exactly. Bytes left over mean the record is not the one its
+  # frame claims, and the fields decoded above are not trustworthy either.
+  if pos != data.len:
+    refuse("call record's fields end at byte " & $pos & " of its " &
+      $data.len & "-byte frame")
+  true
+
 proc decodeCallRecord*(data: openArray[byte]): Result[CallRecord, string] {.raises: [].} =
   ## Decode a CallRecord from its wire format.
   ##
   ## Decoded into the result in place: a call record is 104 bytes, and a
   ## local copied into the result costs a zeroing and a copy of it per
   ## record, which a WebAssembly build makes two calls into the host.
-  var pos = 0
   result.ok(CallRecord())
-  template rec: untyped = result.unsafeGet()
-
-  rec.functionId = varintOrReturn(data, pos)
-  rec.parentCallKey = signedVarintOrReturn(data, pos)
-  rec.entryStep = varintOrReturn(data, pos)
-  rec.exitStep = varintOrReturn(data, pos)
-  rec.depth = uint32(varintOrReturn(data, pos))
-
-  # args
-  let argsCount = int(varintOrReturn(data, pos))
-  rec.args = newSeq[CallArg](argsCount)
-  for i in 0 ..< argsCount:
-    let varnameId = varintOrReturn(data, pos)
-    let argLen = int(varintOrReturn(data, pos))
-    if argLen < 0 or pos + argLen > data.len:
-      return err("truncated arg data")
-    rec.args[i] = CallArg(varnameId: varnameId,
-      value: fieldBytes(data, pos, argLen))
-    pos += argLen
-
-  # return value
-  let retLen = int(varintOrReturn(data, pos))
-  if retLen < 0 or pos + retLen > data.len:
-    return err("truncated return value data")
-  rec.returnValue = fieldBytes(data, pos, retLen)
-  pos += retLen
-
-  # exception
-  let excLen = int(varintOrReturn(data, pos))
-  if excLen < 0 or pos + excLen > data.len:
-    return err("truncated exception data")
-  rec.exception = fieldBytes(data, pos, excLen)
-  pos += excLen
-
-  # children
-  let childrenCount = int(varintOrReturn(data, pos))
-  rec.children = newSeq[uint64](childrenCount)
-  for i in 0 ..< childrenCount:
-    rec.children[i] = varintOrReturn(data, pos)
-
-  # `trace-events.md` §"Call Stream": a record's fields fill its
-  # `record_len` exactly. Bytes left over mean the record is not the one its
-  # frame claims, and the fields decoded above are not trustworthy either.
-  if pos != data.len:
-    return err("call record's fields end at byte " & $pos & " of its " &
-      $data.len & "-byte frame")
+  var why: string
+  if not decodeCallFields(data, result.unsafeGet(), why):
+    result = err(why)
 
 # ---------------------------------------------------------------------------
 # Zstd helpers
@@ -247,10 +251,10 @@ proc initCallStreamWriter*(ctfs: var Ctfs,
   let cs = max(chunkSize, 1)
   let datFileRes = ctfs.addFile("calls.dat")
   if datFileRes.isErr:
-    return err("failed to create calls.dat: " & datFileRes.error)
+    return err("failed to create calls.dat: " & datFileRes.unsafeError)
   let idxFileRes = ctfs.addFile("calls.idx")
   if idxFileRes.isErr:
-    return err("failed to create calls.idx: " & idxFileRes.error)
+    return err("failed to create calls.idx: " & idxFileRes.unsafeError)
 
   var w = CallStreamWriter(
     datFile: datFileRes.get(),
@@ -268,7 +272,7 @@ proc initCallStreamWriter*(ctfs: var Ctfs,
   writeU32LE(hdr, 0, uint32(cs))
   let hdrRes = ctfs.writeToFile(w.indexFile, hdr)
   if hdrRes.isErr:
-    return err("failed to write calls.idx header: " & hdrRes.error)
+    return err("failed to write calls.idx header: " & hdrRes.unsafeError)
   ctfs.syncEntry(w.indexFile)
 
   ok(w)
@@ -288,14 +292,14 @@ proc flushChunk(ctfs: var Ctfs, w: var CallStreamWriter): Result[void, string] {
   # 1. Chunk body.
   let writeRes = ctfs.writeToFile(w.datFile, compressed)
   if writeRes.isErr:
-    return err("calls.dat chunk write failed: " & writeRes.error)
+    return err("calls.dat chunk write failed: " & writeRes.unsafeError)
 
   # 2. Its offset, then the publish.
   var offBuf: array[8, byte]
   writeU64LE(offBuf, 0, chunkStart)
   let idxRes = ctfs.writeToFile(w.indexFile, offBuf)
   if idxRes.isErr:
-    return err("calls.idx offset write failed: " & idxRes.error)
+    return err("calls.idx offset write failed: " & idxRes.unsafeError)
   ctfs.syncEntry(w.indexFile)
 
   w.datOffset += uint64(compressed.len)
@@ -346,7 +350,7 @@ proc legacyCallStream(table: Result[VariableRecordTableReader, string]):
   ## VariableRecordTable (calls.dat + calls.off), read as such so old
   ## (flag-clear) bundles keep reading byte-for-byte unchanged.
   if table.isErr:
-    return err("failed to read legacy calls table: " & table.error)
+    return err("failed to read legacy calls table: " & table.unsafeError)
   ok(CallStreamReader(recordCount: table.get().count(), legacy: some(table.get())))
 
 proc openCallStream(dat: sink MemberView, idx: openArray[byte],
@@ -366,7 +370,7 @@ proc initCallStreamReader*(ctfsBytes: openArray[byte],
   ## the last chunk.
   var datRes = readInternalFile(ctfsBytes, "calls.dat", blockSize, maxEntries)
   if datRes.isErr:
-    return err("failed to read calls.dat: " & datRes.error)
+    return err("failed to read calls.dat: " & datRes.unsafeError)
   let idxRes = readInternalFile(ctfsBytes, "calls.idx", blockSize, maxEntries)
   if idxRes.isErr:
     return legacyCallStream(initVariableRecordTableReader(ctfsBytes, "calls",
@@ -380,7 +384,7 @@ proc initCallStreamReader*(image: ContainerImage,
   ## As above, over a container image it shares: `calls.dat` is read in place.
   var datRes = viewMember(image, "calls.dat", blockSize, maxEntries)
   if datRes.isErr:
-    return err("failed to read calls.dat: " & datRes.error)
+    return err("failed to read calls.dat: " & datRes.unsafeError)
   let idxRes = viewMember(image, "calls.idx", blockSize, maxEntries)
   if idxRes.isErr:
     return legacyCallStream(initVariableRecordTableReader(image, "calls",
@@ -396,7 +400,7 @@ proc readCall*(r: var CallStreamReader,
   if r.legacy.isSome:
     let dataRes = r.legacy.get().read(callKey)
     if dataRes.isErr:
-      return err(dataRes.error)
+      return err(dataRes.unsafeError)
     return decodeCallRecord(dataRes.get())
   if callKey >= r.recordCount:
     return err("call_key " & $callKey & " out of range (count " & $r.recordCount & ")")
@@ -407,6 +411,6 @@ proc readCall*(r: var CallStreamReader,
   # Decoded into the result, which is returned as it is.
   result = decodeCallRecord(r.spec.record(within))
   if result.isErr:
-    result = err("calls.dat record " & $callKey & ": " & result.error)
+    result = err("calls.dat record " & $callKey & ": " & result.unsafeError)
 
 proc count*(r: CallStreamReader): uint64 = r.recordCount
