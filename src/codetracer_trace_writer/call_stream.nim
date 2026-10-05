@@ -392,25 +392,37 @@ proc initCallStreamReader*(image: ContainerImage,
   openCallStream(move datRes.get(), idxRes.get().copyOut(0, idxRes.get().len),
     isCompactContainer(image.bytes))
 
+template readCallInto*(r: var CallStreamReader, callKey: uint64) =
+  ## `readCall`'s body, for a proc returning `Result[CallRecord, string]` that
+  ## reads a call record and returns it: the record is decoded into that
+  ## proc's `result`, so it is zeroed once for it rather than once per layer
+  ## it would pass through (on wasm32 each zeroing is a `memory.fill` call
+  ## into the host).
+  block readCallBody:
+    if r.legacy.isSome:
+      let dataRes = r.legacy.get().read(callKey)
+      result =
+        if dataRes.isErr: err(dataRes.unsafeError)
+        else: decodeCallRecord(dataRes.get())
+      break readCallBody
+    if callKey >= r.recordCount:
+      result = err("call_key " & $callKey & " out of range (count " &
+        $r.recordCount & ")")
+      break readCallBody
+    var within: int
+    var why: string
+    if not r.spec.locate(callKey, within, why):
+      result = err(why)
+      break readCallBody
+    result.ok(CallRecord())
+    if not decodeCallFields(r.spec.record(within), result.unsafeGet(), why):
+      result = err("calls.dat record " & $callKey & ": " & why)
+
 proc readCall*(r: var CallStreamReader,
     callKey: uint64): Result[CallRecord, string] =
   ## Read the call record at the given call_key, decompressing only its chunk.
   ## A one-chunk cache avoids re-decompressing clustered reads. Legacy bundles
   ## read directly from the VariableRecordTable.
-  if r.legacy.isSome:
-    let dataRes = r.legacy.get().read(callKey)
-    if dataRes.isErr:
-      return err(dataRes.unsafeError)
-    return decodeCallRecord(dataRes.get())
-  if callKey >= r.recordCount:
-    return err("call_key " & $callKey & " out of range (count " & $r.recordCount & ")")
-  var within: int
-  var why: string
-  if not r.spec.locate(callKey, within, why):
-    return err(why)
-  # Decoded into the result, which is returned as it is.
-  result = decodeCallRecord(r.spec.record(within))
-  if result.isErr:
-    result = err("calls.dat record " & $callKey & ": " & result.unsafeError)
+  r.readCallInto(callKey)
 
 proc count*(r: CallStreamReader): uint64 = r.recordCount

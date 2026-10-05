@@ -1577,7 +1577,7 @@ template ensureCallReader(r: var NewTraceReader) =
 
 proc call*(r: var NewTraceReader, callKey: uint64): Result[CallRecord, string] =
   r.ensureCallReader()
-  r.callReader.readCall(callKey)
+  r.callReader.readCallInto(callKey)
 
 proc callCount*(r: var NewTraceReader): Result[uint64, string] =
   r.ensureCallReader()
