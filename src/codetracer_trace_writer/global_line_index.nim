@@ -334,26 +334,23 @@ proc resolve*(gli: GlobalLineIndex, globalIdx: uint64): (int, uint64) =
   ## handle positions from a container — where the producer's packing is
   ## not known — must use `tryResolve` instead.
   let explicit = gli.bases.len - 1
-  let last = gli.fileCount - 1
-  var f: int
   if gli.runFiles > 0 and globalIdx >= gli.bases[explicit]:
+    # Inside the run, the file and its base come from one division.
+    let into = globalIdx - gli.bases[explicit]
     if gli.runSize == 0:
-      f = last
+      return (explicit + gli.runFiles - 1, into + 1)
+    let q = min(into div gli.runSize, uint64(gli.runFiles - 1))
+    return (explicit + int(q), into - q * gli.runSize + 1)
+  # The largest fileId below the run whose base is <= globalIdx.
+  var lo = 0
+  var hi = max(explicit - 1, 0)
+  while lo < hi:
+    let mid = (lo + hi + 1) div 2
+    if gli.bases[mid] <= globalIdx:
+      lo = mid
     else:
-      f = explicit + int(min((globalIdx - gli.bases[explicit]) div gli.runSize,
-        uint64(gli.runFiles - 1)))
-  else:
-    # The largest fileId below the run whose base is <= globalIdx.
-    var lo = 0
-    var hi = max(explicit - 1, 0)
-    while lo < hi:
-      let mid = (lo + hi + 1) div 2
-      if gli.bases[mid] <= globalIdx:
-        lo = mid
-      else:
-        hi = mid - 1
-    f = lo
-  (f, globalIdx - gli.fileBase(f) + 1)
+      hi = mid - 1
+  (lo, globalIdx - gli.fileBase(lo) + 1)
 
 proc refuseResolve(gli: GlobalLineIndex, globalIdx: uint64): string =
   ## Why `tryResolve` refuses `globalIdx`.
