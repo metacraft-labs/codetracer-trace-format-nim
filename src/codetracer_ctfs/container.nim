@@ -690,6 +690,10 @@ proc memberRuns*(data: openArray[byte], name: string,
   # only for a refusal.
   template outOfBounds(what: string, n: uint64, rest: string): string =
     blockRefusal(what, n, name, rest, wholeBlocks, blockSize, data.len)
+  # A mapping block of an image read as it is used is read before it is
+  # walked (`loader`); an image held whole has every block already.
+  template loaded(b: uint64): bool = loader == nil or loader(b)
+  template unloaded(b: uint64): string = "mapping block " & $b & " not readable"
 
   if mapBlock == 0'u64:
     if fileSize == 0:
@@ -746,8 +750,8 @@ proc memberRuns*(data: openArray[byte], name: string,
         let chainOff = int(currentLevelBlock) * int(blockSize) + int(usable) * 8
         if chainOff + 8 > data.len:
           return err("chain pointer out of bounds")
-        if loader != nil and not loader(currentLevelBlock):
-          return err("mapping block " & $currentLevelBlock & " not readable")
+        if not loaded(currentLevelBlock):
+          return err(unloaded(currentLevelBlock))
         let chainPtr = readU64LE(data, chainOff)
         if chainPtr == 0:
           return err("missing chain pointer at level " & $level &
@@ -770,8 +774,8 @@ proc memberRuns*(data: openArray[byte], name: string,
       let childOff = int(navBlock) * int(blockSize) + int(entryIdx) * 8
       if childOff + 8 > data.len:
         return err("child pointer out of bounds")
-      if loader != nil and not loader(navBlock):
-        return err("mapping block " & $navBlock & " not readable")
+      if not loaded(navBlock):
+        return err(unloaded(navBlock))
       let childBlock = readU64LE(data, childOff)
       if childBlock == 0:
         return err("missing child block at level " & $navLevel &
@@ -787,8 +791,8 @@ proc memberRuns*(data: openArray[byte], name: string,
     let ptrOff = int(navBlock) * int(blockSize) + int(navIdx) * 8
     if ptrOff + 8 > data.len:
       return err("data block pointer out of bounds")
-    if loader != nil and not loader(navBlock):
-      return err("mapping block " & $navBlock & " not readable")
+    if not loaded(navBlock):
+      return err(unloaded(navBlock))
     let dataBlock = readU64LE(data, ptrOff)
     if dataBlock == 0:
       return err("null data block at index " & $blockIdx & " of internal file " &

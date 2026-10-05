@@ -71,7 +71,9 @@ proc newContainerImage*(bytes: sink seq[byte]): ContainerImage =
 
 proc readsFromFile*(image: ContainerImage): bool {.inline.} =
   ## True for an image read from its file as it is used (`openFileImage`).
-  image.loaded.len > 0
+  ## Never, on a target with no files: none of the loading below is linked.
+  when fileImages: image.loaded.len > 0
+  else: false
 
 proc loadBlocks(image: ContainerImage, first, last: int): Result[void, string] =
   ## Read blocks `first .. last` of a file-backed image, those not read yet,
@@ -117,7 +119,7 @@ proc blocksRead*(image: ContainerImage): int =
     if b: inc result
 
 proc isLoaded(image: ContainerImage, at: int): bool {.inline.} =
-  image.loaded.len == 0 or image.loaded[at div image.blockSize]
+  not image.readsFromFile or image.loaded[at div image.blockSize]
 
 when fileImages:
   proc openFileImage*(path: string,
