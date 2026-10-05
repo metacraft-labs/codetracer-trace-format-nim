@@ -352,6 +352,31 @@ proc inflateChunk(r: StepMapReader, c: int,
       " bytes, not its declared " & $raw.len)
   ok()
 
+proc runFits(prev: int64, gap, rep: uint64): bool {.inline.} =
+  ## Whether a run of `rep` ids `gap` apart after `prev` ends at or below
+  ## `high(int64)`, the largest id a step id list holds: `gap * rep` is at
+  ## most what is left above `prev`, compared without forming the product.
+  ## `gap` and `rep` are at least 1, `prev` at least -1.
+  # `high(int64) - prev`, in unsigned arithmetic, which wraps to 2^63 for
+  # the -1 a list starts from.
+  let room = uint64(high(int64)) - cast[uint64](prev)
+  gap <= room div rep
+
+proc fillRun(ids: var seq[int64], at: int, prev: var int64,
+    gap, rep: uint64) {.inline.} =
+  ## Write a run's `rep` ids, `gap` apart after `prev`, to `ids[at ..]`, and
+  ## leave `prev` at the last. The caller has sized `ids` and checked the run
+  ## with `runFits`, so the ids are written without a check per id; the sum is
+  ## wrapping only because `gap` may be 2^63, which `int64` cannot hold, and
+  ## lands on an id `runFits` allowed.
+  let dst = cast[ptr UncheckedArray[int64]](addr ids[at])
+  let g = cast[int64](gap)
+  var v = prev
+  for k in 0 ..< int(rep):
+    v = v +% g
+    dst[k] = v
+  prev = v
+
 proc scanChunk(r: StepMapReader, c: int, raw: openArray[byte],
     prevKey: var StepMapKey,
     havePrev: var bool, collect: bool,
@@ -416,15 +441,17 @@ proc scanChunk(r: StepMapReader, c: int, raw: openArray[byte],
       if rep > count - n:
         return err("step-map.ns: line (" & $path & ", " & $line &
           ")'s runs overshoot its count " & $count)
+      if not runFits(prev, gap, rep):
+        return err("step-map.ns: line (" & $path & ", " & $line &
+          ") has a run whose step ids pass " & $high(int64))
       if take:
-        # Grown a run at a time and filled by index: `rep` was just checked
-        # against what is left of `count`.
-        var i = int(n)
+        # Grown a run at a time: `rep` was just checked against what is left
+        # of `count`.
         ids.setLen(int(n + rep))
-        for k in 0'u64 ..< rep:
-          prev += int64(gap)
-          ids[i] = prev
-          inc i
+        fillRun(ids, int(n), prev, gap, rep)
+      else:
+        # `runFits` bounds the product by 2^63, wrapping as `fillRun` does.
+        prev = prev +% cast[int64](gap * rep)
       n += rep
     if take:
       lines.add((path, line, move ids))
@@ -437,16 +464,15 @@ proc decodeIds(raw: openArray[byte], pos: int): seq[int64] =
   var count, gap, rep: uint64
   discard readVarint(raw, p, count)
   # The scan checked that the runs' repeats add up to `count` exactly.
+  # A run at a time: the scan checked each run's ids against `high(int64)`.
   result = newSeqUninit[int64](int(count))
   var prev = -1'i64
   var n = 0
   while n < int(count):
     discard readVarint(raw, p, gap)
     discard readVarint(raw, p, rep)
-    for k in 0 ..< int(rep):
-      prev += int64(gap)
-      result[n] = prev
-      inc n
+    fillRun(result, n, prev, gap, rep)
+    n += int(rep)
 
 proc loadAll*(r: StepMapReader): Result[seq[StepMapLine], string] =
   ## Every line's step ids, in key order. Refuses a map whose decoded counts

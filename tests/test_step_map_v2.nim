@@ -13,6 +13,7 @@ import results
 import codetracer_ctfs
 import codetracer_trace_writer/step_map_builder
 import codetracer_trace_writer/multi_stream_writer
+import codetracer_trace_writer/varint
 
 proc rdU32(d: openArray[byte], o: int): uint32 =
   for i in 0 ..< 4: result = result or (uint32(d[o + i]) shl (8 * i))
@@ -171,5 +172,67 @@ block the_writer_keys_exec_record_ids_and_line_0_as_1:
   doAssert r.lookup(0, 1).get() == @[0'i64, 2], $r.lookup(0, 1).get()
   doAssert r.lookup(0, 4).get() == @[3'i64]
   echo "PASS the_writer_keys_exec_record_ids_and_line_0_as_1"
+
+block step_ids_past_int64_are_refused:
+  # A step id list holds `int64`s, so a run whose ids pass `high(int64)` is
+  # refused by name, in a list read (`loadAll`, a lookup of that line) and in
+  # a record a lookup only steps over, rather than wrapping or stopping the
+  # process. The controls end exactly at `high(int64)`, and a run whose
+  # `gap * repeat` passes 2^64 is refused without the product overflowing.
+  proc mapOf(lines: openArray[(uint32, seq[(uint64, uint64)])]): seq[byte] =
+    ## A one-chunk map of path 0 with these lines and runs; the header counts
+    ## what the runs add up to.
+    var content: seq[byte]
+    var prevLine = 0'u32
+    var steps = 0'u64
+    for i, (line, runs) in lines:
+      encodeVarint(0, content)
+      encodeVarint(uint64(if i == 0: line else: line - prevLine), content)
+      prevLine = line
+      var count = 0'u64
+      for (_, rep) in runs: count += rep
+      steps += count
+      encodeVarint(count, content)
+      for (gap, rep) in runs:
+        encodeVarint(gap, content)
+        encodeVarint(rep, content)
+    var frame = newSeq[byte](int(ZSTD_compressBound(csize_t(content.len))))
+    let flen = ZSTD_compress(addr frame[0], csize_t(frame.len),
+      unsafeAddr content[0], csize_t(content.len), 3)
+    doAssert ZSTD_isError(flen) == 0
+    frame.setLen(int(flen))
+    proc put(m: var seq[byte], v: uint64, n: int) =
+      for i in 0 ..< n: m.add(byte((v shr (8 * i)) and 0xff))
+    result.put(0x53544D50'u64, 4); result.put(2, 2); result.put(1, 4)
+    result.put(1, 4); result.put(uint64(lines.len), 4); result.put(steps, 8)
+    result.put(0, 8); result.put(0, 8); result.put(uint64(lines[0][0]), 4)
+    result.add(frame)
+
+  const top = 1'u64 shl 63            # the gap from -1 to high(int64)
+  let atTop = mapOf([(3'u32, @[(top, 1'u64)])])
+  doAssert openStepMap(atTop).get().loadAll().get()[0].steps == @[high(int64)]
+  var r = openStepMap(atTop).get()
+  doAssert r.lookup(0, 3).get() == @[high(int64)]
+  let runToTop = mapOf([(3'u32, @[(1'u64, 5'u64), (top - 5, 1'u64)])])
+  doAssert openStepMap(runToTop).get().loadAll().get()[0].steps ==
+    @[0'i64, 1, 2, 3, 4, high(int64)]
+
+  for (what, m) in [
+      ("one past", mapOf([(3'u32, @[(top, 1'u64), (1'u64, 1'u64)])])),
+      ("a run past", mapOf([(3'u32, @[(1'u64 shl 61, 5'u64)])])),
+      ("a product past 2^64", mapOf([(3'u32, @[(1'u64 shl 62, 4'u64)])]))]:
+    let all = openStepMap(m).get().loadAll()
+    doAssert all.isErr and "pass" in all.error, what & ": " & $all
+    var lr = openStepMap(m).get()
+    let one = lr.lookup(0, 3)
+    doAssert one.isErr and "pass" in one.error, what & ": " & $one
+
+  # Line 3 passes; a lookup of line 4 steps over it and is refused.
+  let over = mapOf([(3'u32, @[(top, 1'u64), (1'u64, 1'u64)]),
+    (4'u32, @[(1'u64, 1'u64)])])
+  var lo = openStepMap(over).get()
+  let four = lo.lookup(0, 4)
+  doAssert four.isErr and "pass" in four.error, $four
+  echo "PASS step_ids_past_int64_are_refused"
 
 echo "ALL PASS test_step_map_v2"
