@@ -355,8 +355,22 @@ proc resolve*(gli: GlobalLineIndex, globalIdx: uint64): (int, uint64) =
     f = lo
   (f, globalIdx - gli.fileBase(f) + 1)
 
+proc refuseResolve(gli: GlobalLineIndex, globalIdx: uint64): string =
+  ## Why `tryResolve` refuses `globalIdx`.
+  if gli.fileCount == 0:
+    return "line-only global_position_index " & $globalIdx &
+      " cannot be resolved to (file, line): the trace registers no paths"
+  "line-only global_position_index " & $globalIdx &
+    " is outside this trace's address space of " & $gli.totalLines &
+    " (" & $gli.fileCount & " path(s)). A line-only container " &
+    "records no packing discriminator, and the writers disagree: " &
+    "codetracer_trace_format_nim packs prefixSum[path_id] + (line - 1), " &
+    "the Rust codetracer_trace_writer packs (path_id shl 32) or line " &
+    "(step_stream.rs pack_global_line_index). Resolving this index would " &
+    "require an assumption the container does not carry"
+
 proc tryResolve*(gli: GlobalLineIndex,
-    globalIdx: uint64): Result[(int, uint64), string] =
+    globalIdx: uint64): Result[(int, uint64), string] {.inline.} =
   ## Convert a line-only `global_position_index` back to `(file_id, line)`,
   ## refusing the indices this index cannot address.
   ##
@@ -382,16 +396,8 @@ proc tryResolve*(gli: GlobalLineIndex,
   ## writer, which refuses a step past a file's recorded line count
   ## (`multi_stream_writer.registerStep`) rather than emitting an address
   ## that lands in the next file.
-  if gli.fileCount == 0:
-    return err("line-only global_position_index " & $globalIdx &
-      " cannot be resolved to (file, line): the trace registers no paths")
-  if globalIdx >= gli.totalLines:
-    return err("line-only global_position_index " & $globalIdx &
-      " is outside this trace's address space of " & $gli.totalLines &
-      " (" & $gli.fileCount & " path(s)). A line-only container " &
-      "records no packing discriminator, and the writers disagree: " &
-      "codetracer_trace_format_nim packs prefixSum[path_id] + (line - 1), " &
-      "the Rust codetracer_trace_writer packs (path_id shl 32) or line " &
-      "(step_stream.rs pack_global_line_index). Resolving this index would " &
-      "require an assumption the container does not carry")
+  ## Inlined, and its refusal built out of line, because it is called once
+  ## per step a caller resolves.
+  if globalIdx >= gli.totalLines:  # also every index of an empty space
+    return err(refuseResolve(gli, globalIdx))
   ok(gli.resolve(globalIdx))

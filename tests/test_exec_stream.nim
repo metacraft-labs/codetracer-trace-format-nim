@@ -505,7 +505,8 @@ proc test_exec_stream_reads_in_any_order() {.raises: [].} =
   ## chunk partly decoded. Reads in order, backwards, in a pseudo-random walk
   ## that crosses chunks, and position reads interleaved with event reads,
   ## must agree with the whole-chunk decoders (`readChunkEvents`,
-  ## `resolveChunkPositions`) on every record, from fresh readers each time.
+  ## `resolveChunkPositions`) on every record, from fresh readers each time,
+  ## and with a cache that holds one chunk as with one that holds them all.
   proc enc(ev: StepEvent): seq[byte] =
     encodeStepEvent(ev, result)
   var ctfs = createCtfs()
@@ -542,18 +543,25 @@ proc test_exec_stream_reads_in_any_order() {.raises: [].} =
   for _ in 0 ..< 3000:
     x = (x * 1103 + 12345) mod 1000
     orders[^1].add(x)
-  for order in orders:
-    var r = initExecStreamReader(bytes).get()
+  # The default budget holds every chunk; a budget of one byte holds one, so
+  # every read of another chunk evicts the chunk the reader last read. The
+  # last walk reads events alone, with no position read between them.
+  const all = 8'u64 shl 20
+  for (order, budget, withPositions) in [(orders[0], all, true),
+      (orders[1], all, true), (orders[2], all, true), (orders[1], 1'u64, true),
+      (orders[2], 1'u64, true), (orders[2], 1'u64, false)]:
+    var r = initExecStreamReader(bytes, cacheBytes = budget).get()
     var k = 0
     for i in order:
-      if k mod 2 == 0:
+      if withPositions and k mod 2 == 0:
         doAssert r.eventPosition(uint64(i)).get() == allPositions[i],
           "position of record " & $i
       let ev = r.readEvent(uint64(i))
       doAssert ev.isOk, ev.error
       doAssert enc(ev.get()) == enc(allEvents[i]), "record " & $i
-      doAssert r.eventPosition(uint64(i)).get() == allPositions[i],
-        "position of record " & $i
+      if withPositions:
+        doAssert r.eventPosition(uint64(i)).get() == allPositions[i],
+          "position of record " & $i
       inc k
     doAssert r.readEvent(1000).isErr
   echo "PASS: test_exec_stream_reads_in_any_order"

@@ -400,10 +400,13 @@ proc readCall*(r: var CallStreamReader,
     return decodeCallRecord(dataRes.get())
   if callKey >= r.recordCount:
     return err("call_key " & $callKey & " out of range (count " & $r.recordCount & ")")
-  let within = ? r.spec.locate(callKey)
-  let rec = decodeCallRecord(r.spec.record(within))
-  if rec.isErr:
-    return err("calls.dat record " & $callKey & ": " & rec.error)
-  rec
+  var within: int
+  var why: string
+  if not r.spec.locate(callKey, within, why):
+    return err(why)
+  # Decoded into the result, which is returned as it is.
+  result = decodeCallRecord(r.spec.record(within))
+  if result.isErr:
+    result = err("calls.dat record " & $callKey & ": " & result.error)
 
 proc count*(r: CallStreamReader): uint64 = r.recordCount

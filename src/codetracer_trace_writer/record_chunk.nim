@@ -225,18 +225,38 @@ proc openChunkedRecords*(data: sink MemberView, idx: openArray[byte],
     r.count = uint64(last) * uint64(chunkSize) + uint64(? r.chunk.count(what))
   ok(r)
 
-proc locate*(r: var ChunkedRecords, index: uint64): Result[int, string] =
-  ## Hold the chunk with record `index`, which is below `count`, framed as far
-  ## as the record, and answer the record's index within the chunk.
-  let c = int(index div uint64(r.chunkSize))
-  let within = int(index mod uint64(r.chunkSize))
+proc reach(r: var ChunkedRecords, c, within: int, why: var string): bool =
+  ## `locate` past its fast path: load chunk `c` unless it is held, and frame
+  ## it as far as record `within`.
   if r.chunk.held != c:
-    ? r.loadChunk(c)
+    let loaded = r.loadChunk(c)
+    if loaded.isErr:
+      why = loaded.error
+      return false
   if within >= r.chunk.framed:
     let framing = r.chunk.frameTo(within)
     if framing != foHas:
-      return err(r.chunk.refusal(framing, within, r.what))
-  ok(within)
+      why = r.chunk.refusal(framing, within, r.what)
+      return false
+  true
+
+proc locate*(r: var ChunkedRecords, index: uint64, within: var int,
+    why: var string): bool {.inline.} =
+  ## Hold the chunk with record `index`, which is below `count`, framed as far
+  ## as the record, and set `within` to the record's index within the chunk.
+  ## False, with `why` set, where that chunk cannot be read as far. A reader
+  ## calls this once per record, so it builds no `Result`, and a record of
+  ## the chunk held, already framed, is found without a call.
+  let c = int(index div uint64(r.chunkSize))
+  within = int(index mod uint64(r.chunkSize))
+  (r.chunk.held == c and within < r.chunk.framed) or r.reach(c, within, why)
+
+proc locate*(r: var ChunkedRecords, index: uint64): Result[int, string] =
+  ## `locate`, as a `Result`: the record's index within its chunk.
+  var within: int
+  var why: string
+  if r.locate(index, within, why): ok(within)
+  else: err(why)
 
 template record*(r: ChunkedRecords, within: int): untyped =
   ## Record `within` of the held chunk, in place (see `locate`).

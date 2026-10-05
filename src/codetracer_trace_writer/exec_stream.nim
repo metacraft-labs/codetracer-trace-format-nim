@@ -154,6 +154,12 @@ type
                                ## the first encoded event begins: 4 in legacy
                                ## mode (past the u32 count header), 0 in SPEC
                                ## mode.
+    heldChunk: int
+      ## One more than the chunk the last read reached, 0 before any read;
+      ## `heldSlot` is its cache slot. Every slot is found through
+      ## `chunkSlot`, which sets both, and the cache evicts only inside it,
+      ## so the chunk named here is resident: a read in it skips the cache.
+    heldSlot: int
 
 proc initExecStreamWriter*(ctfs: var Ctfs,
     chunkSize: int = DefaultExecChunkSize): Result[ExecStreamWriter, string] =
@@ -534,28 +540,32 @@ proc chunkDecompressions*(r: ExecStreamReader): uint64 = r.chunkDecompressions
   ## probe; see the ``chunkDecompressions`` field).
 
 proc advanceCursor(ev: StepEvent, i: int, chunkIdx: int, cursor: var uint64,
-    anchored: var bool): Result[void, string] =
+    anchored: var bool, why: var string): bool =
   ## Move a chunk's cursor past record `i`, `ev` (`trace-events.md`
-  ## §"Encoding Rules", "Reading").
+  ## §"Encoding Rules", "Reading"). False, with `why` set, where the record
+  ## has no position to move to. Called once per record decoded, so it builds
+  ## no `Result`.
   case ev.kind
   of sekAbsoluteStep:
     cursor = ev.globalLineIndex
     anchored = true
   of sekDeltaStep, sekDeltaColumn:
     if not anchored:
-      return err("steps.dat chunk " & $chunkIdx & ": record " & $i & " is a " &
+      why = "steps.dat chunk " & $chunkIdx & ": record " & $i & " is a " &
         (if ev.kind == sekDeltaStep: "DeltaStep" else: "DeltaColumn") &
         " before the chunk's first AbsoluteStep, so it has no position to " &
-        "be relative to")
+        "be relative to"
+      return false
     let d = if ev.kind == sekDeltaStep: ev.lineDelta else: ev.columnDelta
     let p = int64(cursor) + d
     if p < 0:
-      return err("steps.dat chunk " & $chunkIdx & ": record " & $i &
-        " resolves to a negative position")
+      why = "steps.dat chunk " & $chunkIdx & ": record " & $i &
+        " resolves to a negative position"
+      return false
     cursor = uint64(p)
   else:
     discard
-  ok()
+  true
 
 proc commitChunk(r: var ExecStreamReader, slot: int,
     chunkIdx: int): Result[int, string]
@@ -563,9 +573,11 @@ proc commitChunk(r: var ExecStreamReader, slot: int,
 proc chunkSlot(r: var ExecStreamReader,
     chunkIdx: int): Result[int, string] =
   ## Return the cache slot holding chunk ``chunkIdx``, inflating it first if it
-  ## is not resident.
+  ## is not resident, and note it as the chunk held.
   let hit = r.cache.find(chunkIdx)
   if hit >= 0:
+    r.heldChunk = chunkIdx + 1
+    r.heldSlot = hit
     return ok(hit)
 
   if chunkIdx < 0 or chunkIdx >= r.offsets.len:
@@ -635,6 +647,8 @@ proc commitChunk(r: var ExecStreamReader, slot: int,
     m.complete = r.cache.data(slot).len == 0
 
   r.cache.commit(slot, chunkIdx)
+  r.heldChunk = chunkIdx + 1
+  r.heldSlot = slot
   ok(slot)
 
 proc decodeNext(r: var ExecStreamReader, slot: int,
@@ -657,12 +671,11 @@ proc decodeNext(r: var ExecStreamReader, slot: int,
     m.positions.setLenUninit(cap)
   m.starts[i] = int32(m.nextPos)
   if m.posRefusedAt == high(int):
-    let adv = advanceCursor(result.get(), i, chunkIdx, m.cursor, m.anchored)
-    if adv.isErr:
-      m.posRefusedAt = i
-      m.posRefusal = adv.error
-    else:
+    if advanceCursor(result.get(), i, chunkIdx, m.cursor, m.anchored,
+        m.posRefusal):
       m.positions[i] = m.cursor
+    else:
+      m.posRefusedAt = i
   m.nextPos = pos
   m.known = i + 1
   let atEnd =
@@ -699,13 +712,16 @@ proc readEvent*(r: var ExecStreamReader,
   let chunkIdx = int(eventIndex div uint64(r.chunkSize))
   let eventInChunk = int(eventIndex mod uint64(r.chunkSize))
 
-  let slot = ?r.chunkSlot(chunkIdx)
+  let slot =
+    if r.heldChunk == chunkIdx + 1: r.heldSlot
+    else: ? r.chunkSlot(chunkIdx)
   let mp = addr r.cache.meta(slot)
   template m: untyped = mp[]
   if eventInChunk < m.known:
     var pos = int(m.starts[eventInChunk])
     return decodeStepEvent(r.cache.data(slot), pos, r.allowSourceReload)
-  ? r.decodeThrough(slot, chunkIdx, eventInChunk - 1)
+  if eventInChunk > m.known:
+    ? r.decodeThrough(slot, chunkIdx, eventInChunk - 1)
   if m.complete:
     return err("event " & $eventIndex & " past the end of chunk " & $chunkIdx)
   r.decodeNext(slot, chunkIdx)
@@ -754,8 +770,10 @@ proc resolveChunkPositions*(events: openArray[StepEvent], chunkIdx: int,
   output.setLen(events.len)
   var cursor = 0'u64
   var anchored = false
+  var why: string
   for i in 0 ..< events.len:
-    ? advanceCursor(events[i], i, chunkIdx, cursor, anchored)
+    if not advanceCursor(events[i], i, chunkIdx, cursor, anchored, why):
+      return err(why)
     output[i] = cursor
   ok()
 

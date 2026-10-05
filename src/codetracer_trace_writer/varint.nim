@@ -138,6 +138,23 @@ template varintOrReturn*(data: openArray[byte], pos: var int): uint64 =
     return err(decodeVarint(data, pos).error)
   v
 
+template varintOrFail*(data: openArray[byte], pos: var int,
+    why: var string): uint64 =
+  ## `varintOrReturn` for a decoder that answers `bool` and names its refusal
+  ## in `why`: the same value, or `why` set to `decodeVarint`'s refusal and
+  ## `false` returned from the enclosing proc.
+  var v {.gensym.}: uint64
+  if not readVarint(data, pos, v):
+    why = decodeVarint(data, pos).error
+    return false
+  v
+
+template signedVarintOrFail*(data: openArray[byte], pos: var int,
+    why: var string): int64 =
+  ## `decodeSignedVarint`, as `varintOrFail`.
+  let z {.gensym.} = varintOrFail(data, pos, why)
+  if (z and 1) == 0: int64(z shr 1) else: not int64(z shr 1)
+
 template signedVarintOrReturn*(data: openArray[byte], pos: var int): int64 =
   ## `?decodeSignedVarint(data, pos)`, as `varintOrReturn`.
   let z {.gensym.} = varintOrReturn(data, pos)

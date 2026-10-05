@@ -418,22 +418,30 @@ type
     wtEvents   ## every event, as a `DecodedValueEvent`
     wtValues   ## only the tag-0 `StepValues` values, appended as they are read
 
+template refuse(message: string) {.dirty.} =
+  ## `return err(message)`, for a decoder that answers `bool` and names its
+  ## refusal in `why`.
+  why = message
+  return false
+
 proc decodeOneValueEvent(data: openArray[byte], pos: var int, tag: uint8,
     target: static WalkTarget,
     events: var seq[DecodedValueEvent], values: var seq[VariableValue],
-    skippedTags: var seq[uint8]): Result[void, string] =
+    skippedTags: var seq[uint8], why: var string): bool =
   ## Decode the fields of one tagged value-stream event, its tag already read.
+  ## False, with `why` set, where the event does not decode. Called once per
+  ## event of every record read, so it builds no `Result`.
   ## Every field is read and checked whatever `target` is; `target` decides
   ## only what is built: with `wtValues` an event that is not `StepValues` is
   ## stepped over without copying its payload, and a `StepValues` event's
   ## values go straight into `values`.
   case tag
   of TagStepValues:
-    let count = int(varintOrReturn(data, pos))
+    let count = int(varintOrFail(data, pos, why))
     # Every value takes at least two bytes, which bounds a count read from a
     # damaged record before anything is sized by it.
     if count < 0 or count > (data.len - pos) div 2:
-      return err("StepValues count " & $count & " exceeds the record")
+      refuse("StepValues count " & $count & " exceeds the record")
     when target == wtValues:
       var i = values.len
       values.setLen(i + count)
@@ -441,10 +449,10 @@ proc decodeOneValueEvent(data: openArray[byte], pos: var int, tag: uint8,
       var i = 0
       var vals = newSeq[VariableValue](count)
     for _ in 0 ..< count:
-      let vnId = varintOrReturn(data, pos)
-      let dLen = int(varintOrReturn(data, pos))
+      let vnId = varintOrFail(data, pos, why)
+      let dLen = int(varintOrFail(data, pos, why))
       if dLen < 0 or dLen > data.len - pos:
-        return err("truncated value data in StepValues record")
+        refuse("truncated value data in StepValues record")
       template d: untyped = data.toOpenArray(pos, pos + dLen - 1)
       let v = VariableValue(varnameId: vnId, typeId: decodeCborTopLevelTypeId(d),
         data: fieldBytes(data, pos, dLen))
@@ -457,8 +465,8 @@ proc decodeOneValueEvent(data: openArray[byte], pos: var int, tag: uint8,
     when target == wtEvents:
       events.add(DecodedValueEvent(kind: veStepValues, values: vals))
   of TagBindVariable, TagVariableCell:
-    let vid = varintOrReturn(data, pos)
-    let place = signedVarintOrReturn(data, pos)
+    let vid = varintOrFail(data, pos, why)
+    let place = signedVarintOrFail(data, pos, why)
     when target == wtEvents:
       if tag == TagBindVariable:
         events.add(DecodedValueEvent(kind: veBindVariable,
@@ -467,10 +475,10 @@ proc decodeOneValueEvent(data: openArray[byte], pos: var int, tag: uint8,
         events.add(DecodedValueEvent(kind: veVariableCell,
           variableId: vid, variablePlace: place))
   of TagCellValue, TagCompoundValue, TagAssignCell:
-    let place = signedVarintOrReturn(data, pos)
-    let vLen = varintOrReturn(data, pos)
+    let place = signedVarintOrFail(data, pos, why)
+    let vLen = varintOrFail(data, pos, why)
     if vLen > uint64(data.len - pos):
-      return err("truncated CBOR value in value-stream event tag " & $tag)
+      refuse("truncated CBOR value in value-stream event tag " & $tag)
     when target == wtEvents:
       let blob = fieldBytes(data, pos, int(vLen))
       case tag
@@ -485,37 +493,37 @@ proc decodeOneValueEvent(data: openArray[byte], pos: var int, tag: uint8,
           valueCbor: blob))
     pos += int(vLen)
   of TagAssignCompoundItem:
-    let place = signedVarintOrReturn(data, pos)
-    let index = varintOrReturn(data, pos)
-    let itemPlace = signedVarintOrReturn(data, pos)
+    let place = signedVarintOrFail(data, pos, why)
+    let index = varintOrFail(data, pos, why)
+    let itemPlace = signedVarintOrFail(data, pos, why)
     when target == wtEvents:
       events.add(DecodedValueEvent(kind: veAssignCompoundItem,
         compoundPlace: place, itemIndex: index, itemPlace: itemPlace))
   of TagDropVariable:
-    let id = varintOrReturn(data, pos)
+    let id = varintOrFail(data, pos, why)
     when target == wtEvents:
       events.add(DecodedValueEvent(kind: veDropVariable, droppedId: id))
   of TagDropVariables:
-    let count = int(varintOrReturn(data, pos))
+    let count = int(varintOrFail(data, pos, why))
     if count < 0 or count > data.len - pos:
-      return err("DropVariables count " & $count & " exceeds the record")
+      refuse("DropVariables count " & $count & " exceeds the record")
     when target == wtEvents:
       var ids = newSeq[uint64](count)
       for i in 0 ..< count:
-        ids[i] = varintOrReturn(data, pos)
+        ids[i] = varintOrFail(data, pos, why)
       events.add(DecodedValueEvent(kind: veDropVariables, droppedIds: ids))
     else:
       for i in 0 ..< count:
-        discard varintOrReturn(data, pos)
+        discard varintOrFail(data, pos, why)
   of TagAssignment:
-    let vnId = varintOrReturn(data, pos)
+    let vnId = varintOrFail(data, pos, why)
     if pos >= data.len:
-      return err("truncated pass_by in Assignment value-stream event")
+      refuse("truncated pass_by in Assignment value-stream event")
     let passBy = data[pos]
     inc pos
-    let fromLen = int(varintOrReturn(data, pos))
+    let fromLen = int(varintOrFail(data, pos, why))
     if fromLen < 0 or fromLen > data.len - pos:
-      return err("truncated RValue payload in Assignment value-stream event")
+      refuse("truncated RValue payload in Assignment value-stream event")
     when target == wtEvents:
       let blob = fieldBytes(data, pos, fromLen)
       events.add(DecodedValueEvent(kind: veAssignment,
@@ -526,26 +534,26 @@ proc decodeOneValueEvent(data: openArray[byte], pos: var int, tag: uint8,
     pos += fromLen
   else:
     when defined(oldReaderPreForwardCompat):
-      return err("unsupported value-stream event tag " & $tag &
+      refuse("unsupported value-stream event tag " & $tag &
         " in Nim value record (this reader predates the tag; rebuild ct-print " &
         "from codetracer-trace-format-nim)")
     else:
       if tag >= 10:
-        let payloadLen = int(varintOrReturn(data, pos))
+        let payloadLen = int(varintOrFail(data, pos, why))
         if payloadLen < 0 or payloadLen > data.len - pos:
-          return err("truncated payload in value-stream event tag " & $tag &
+          refuse("truncated payload in value-stream event tag " & $tag &
             " (expected " & $payloadLen & " bytes, only " & $(data.len - pos) & " remain)")
         pos += payloadLen
         skippedTags.add(tag)
       else:
-        return err("unsupported value-stream event tag " & $tag &
+        refuse("unsupported value-stream event tag " & $tag &
           " in Nim value record (this reader predates the tag; rebuild ct-print " &
           "from codetracer-trace-format-nim)")
-  ok()
+  true
 
 proc walkRecord(data: openArray[byte], target: static WalkTarget,
     events: var seq[DecodedValueEvent], values: var seq[VariableValue],
-    skippedTags: var seq[uint8]): Result[void, string] =
+    skippedTags: var seq[uint8], why: var string): bool =
   ## THE ONLY WALKER over one SPEC value record — "the concatenation of
   ## zero-or-more tagged value-stream events" — in wire order.
   ##
@@ -561,17 +569,26 @@ proc walkRecord(data: openArray[byte], target: static WalkTarget,
   ## Tags >= 10 are self-delimited by a varint length prefix following the tag,
   ## so they can be skipped without knowing their layout; their tags are
   ## recorded in ``skippedTags``.  Unknown tags < 10 are refused by name.
+  ##
+  ## False, with `why` set, where the record does not decode.
   var pos = 0
   while pos < data.len:
     let tag = data[pos]
     inc pos
     let tagStart = pos - 1
-    let r = decodeOneValueEvent(data, pos, tag, target, events, values,
-      skippedTags)
-    if r.isErr:
-      return err("value-stream event tag " & $tag & " at byte " & $tagStart &
-        ": " & r.error)
-  ok()
+    if not decodeOneValueEvent(data, pos, tag, target, events, values,
+        skippedTags, why):
+      refuse("value-stream event tag " & $tag & " at byte " & $tagStart &
+        ": " & why)
+  true
+
+proc walkRecord(data: openArray[byte], target: static WalkTarget,
+    events: var seq[DecodedValueEvent], values: var seq[VariableValue],
+    skippedTags: var seq[uint8]): Result[void, string] =
+  ## `walkRecord`, its refusal as a `Result`.
+  var why: string
+  if walkRecord(data, target, events, values, skippedTags, why): ok()
+  else: err(why)
 
 proc decodeRecordEvents*(data: openArray[byte],
     skippedTags: var seq[uint8]): Result[seq[DecodedValueEvent], string] =
@@ -999,11 +1016,23 @@ proc readStepValues*(r: var ValueStreamReader,
       return err(dataRes.error)
     return readLegacyRecord(dataRes.get())
 
-  let within = ?r.cacheRecordFor(stepIndex)
-  var skipped: seq[uint8] = @[]
-  let res = decodeRecord(r.spec.record(within), skipped)
+  if stepIndex >= r.spec.count:
+    return err("value step index " & $stepIndex & " out of range (count " &
+      $r.spec.count & ")")
+  # Read once per step by a walk, so no `Result` is built on the way to the
+  # one returned.
+  var within: int
+  var why: string
+  if not r.spec.locate(stepIndex, within, why):
+    return err(why)
+  var skipped: seq[uint8]
+  var values: seq[VariableValue]
+  var noEvents: seq[DecodedValueEvent]
+  let decoded = walkRecord(r.spec.record(within), wtValues, noEvents, values,
+    skipped, why)
   r.noteSkippedTags(skipped)
-  res
+  if decoded: ok(values)
+  else: err(why)
 
 proc readStepDropVariable*(r: var ValueStreamReader,
     stepIndex: uint64): Result[seq[uint64], string] =
