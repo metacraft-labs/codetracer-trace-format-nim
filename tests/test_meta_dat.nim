@@ -1051,6 +1051,38 @@ proc test_meta_dat_strict_unknown_flag_rejection() {.raises: [].} =
   echo "PASS: test_meta_dat_strict_unknown_flag_rejection"
 
 
+proc test_meta_dat_counts_past_32_bits_are_refused() {.raises: [].} =
+  ## `total_threads` and `total_checkpoints` are varints in the spec and
+  ## 32-bit fields here: a count past 32 bits is refused by name, not read as
+  ## its low half. Controls: 2^32 - 1 reads back as itself.
+  let meta = TraceMetadata(recordingId: TestRecordingId, program: "p")
+  let mcr = McrMetaFields(tickSource: tsMonotonic, totalThreads: 1,
+    atomicMode: amSeqCst, totalEvents: 1, totalCheckpoints: 1)
+  let plain = encodeMetaDat(meta, MetaDatFlagsInput()).get()
+  let base = encodeMetaDat(meta, MetaDatFlagsInput(mcrFields: some(mcr))).get()
+  # The MCR block follows `recorder_id`, where the plain encoding ends:
+  # tick_source, total_threads, atomic_mode, total_events, total_checkpoints,
+  # each one byte here.
+  let mcrStart = plain.len
+  proc withCount(at: int, v: uint64): seq[byte] =
+    result = base[0 ..< at]
+    encodeVarint(v, result)
+    result.add(base[at + 1 .. ^1])
+  for (field, at) in [("total_threads", mcrStart + 1),
+      ("total_checkpoints", mcrStart + 4)]:
+    doAssert base[at] == 1, field & " is the one-byte count it was written as"
+    let top = readMetaDat(withCount(at, uint64(high(uint32))))
+    doAssert top.isOk, field & ": " & $top
+    let m = top.get().mcrFields.get()
+    doAssert (if field == "total_threads": m.totalThreads
+              else: m.totalCheckpoints) == high(uint32), field
+    for v in [1'u64 shl 32, (1'u64 shl 32) + 5, high(uint64)]:
+      let r = readMetaDat(withCount(at, v))
+      doAssert r.isErr and r.error == "meta.dat: " & field & " value " & $v &
+        " does not fit 32 bits", field & " " & $v & ": " & $r
+  echo "PASS: test_meta_dat_counts_past_32_bits_are_refused"
+
+
 # Run all tests
 test_meta_dat_uuidv7_generation()
 test_meta_dat_uuidv7_ms_monotonic_sortable()
@@ -1063,6 +1095,7 @@ test_meta_dat_with_mcr_fields()
 test_meta_dat_empty_fields()
 test_meta_dat_roundtrip()
 test_meta_dat_roundtrip_with_mcr()
+test_meta_dat_counts_past_32_bits_are_refused()
 test_meta_dat_roundtrip_with_filter_provenance()
 test_meta_dat_roundtrip_empty_filter_provenance()
 test_meta_dat_no_filter_provenance_omits_flag()

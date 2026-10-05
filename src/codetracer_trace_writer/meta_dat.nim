@@ -905,6 +905,14 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
 
     let totalEventsVal = ? decodeVarint(data, pos)
     let totalCheckpointsVal = ? decodeVarint(data, pos)
+    # The spec gives both counts as a varint with no narrower bound; the
+    # fields are 32 bits, so a larger count is refused rather than cut to
+    # its low half (the Rust reader's `decode_u32`, word for word).
+    for (field, v) in [("total_threads", totalThreadsVal),
+        ("total_checkpoints", totalCheckpointsVal)]:
+      if v > uint64(high(uint32)):
+        return err("meta.dat: " & field & " value " & $v &
+          " does not fit 32 bits")
     let startTimeUnixUsVal = ? decodeVarint(data, pos)
     let platformStr = ? readString(data, pos)
     let tickGranularityStr = ? readString(data, pos)
