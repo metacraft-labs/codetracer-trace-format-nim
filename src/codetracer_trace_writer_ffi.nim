@@ -4006,6 +4006,96 @@ proc trace_writer_record_empty_filter_provenance(
     return 1.cint
   0.cint
 
+template metaBlockWriter(handle: TraceWriterHandle, what: string) =
+  ## The checks every flag-gated `meta.dat` block setter makes first, each
+  ## returning 1 with the reason in `trace_writer_last_error`.
+  if handle.isNil:
+    setError("NULL handle")
+    return 1.cint
+  if not handle.useMultiStream:
+    setError(what & " only supported in CTFS multi-stream mode")
+    return 1.cint
+  if not handle.msWriterReady:
+    setError("writer not ready (call begin_events first)")
+    return 1.cint
+
+proc trace_writer_set_mcr_fields(
+    handle: TraceWriterHandle,
+    tick_source: cint, total_threads: uint32, atomic_mode: cint,
+    total_events: uint64, total_checkpoints: uint32,
+    start_time_unix_us: uint64,
+    platform, tick_granularity, tick_source_str, atomic_mode_str,
+      start_time_str, hook_profile: cstring,
+    hook_strategies: ptr UncheckedArray[cstring],
+    hook_strategies_count: csize_t,
+): cint {.exportc, cdecl, dynlib, ffiGuard.} =
+  ## Write the MCR fields block (`meta.dat` flag bit 0, `internal-files.md`
+  ## §"Extended Fields") with these values. `tick_source` and `atomic_mode`
+  ## are the `TickSource` / `AtomicMode` ordinals, and one outside its
+  ## enumeration is refused; a NULL string is written empty. Refused once
+  ## `meta.dat` is written, at the first record. Returns 0 on success.
+  metaBlockWriter(handle, "MCR fields")
+  if tick_source < 0 or tick_source > cint(high(TickSource)):
+    setError("tick_source " & $tick_source & " is not a TickSource ordinal")
+    return 1.cint
+  if atomic_mode < 0 or atomic_mode > cint(high(AtomicMode)):
+    setError("atomic_mode " & $atomic_mode & " is not an AtomicMode ordinal")
+    return 1.cint
+  if hook_strategies.isNil and hook_strategies_count > 0:
+    setError("hook_strategies is NULL with a count of " &
+      $hook_strategies_count)
+    return 1.cint
+  var strategies = newSeq[string](int(hook_strategies_count))
+  for i in 0 ..< strategies.len:
+    strategies[i] = $hook_strategies[i]
+  let r = handle.msWriter.setMcrFields(McrMetaFields(
+    tickSource: TickSource(tick_source), totalThreads: total_threads,
+    atomicMode: AtomicMode(atomic_mode), totalEvents: total_events,
+    totalCheckpoints: total_checkpoints, startTimeUnixUs: start_time_unix_us,
+    platform: $platform, tickGranularity: $tick_granularity,
+    tickSourceStr: $tick_source_str, atomicModeStr: $atomic_mode_str,
+    startTimeStr: $start_time_str, hookProfile: $hook_profile,
+    hookStrategies: strategies))
+  if r.isErr:
+    setError(r.error)
+    return 1.cint
+  0.cint
+
+proc trace_writer_set_replay_launch_fields(
+    handle: TraceWriterHandle, aslr_disabled: cint,
+): cint {.exportc, cdecl, dynlib, ffiGuard.} =
+  ## Write the replay-launch fields block (`meta.dat` flag bit 1):
+  ## `aslr_disabled` is false for 0, true otherwise. Refused once `meta.dat`
+  ## is written. Returns 0 on success.
+  metaBlockWriter(handle, "replay-launch fields")
+  let r = handle.msWriter.setReplayLaunchFields(
+    ReplayLaunchFields(aslrDisabled: aslr_disabled != 0))
+  if r.isErr:
+    setError(r.error)
+    return 1.cint
+  0.cint
+
+proc trace_writer_set_layout_snapshot(
+    handle: TraceWriterHandle, layout_hash: uint64,
+    fingerprint: ptr uint8, fingerprint_len: csize_t,
+): cint {.exportc, cdecl, dynlib, ffiGuard.} =
+  ## Write the layout snapshot block (`meta.dat` flag bit 2): the layout's
+  ## hash and its `fingerprint_len` fingerprint bytes. Refused once `meta.dat`
+  ## is written. Returns 0 on success.
+  metaBlockWriter(handle, "layout snapshot")
+  if fingerprint.isNil and fingerprint_len > 0:
+    setError("fingerprint is NULL with a length of " & $fingerprint_len)
+    return 1.cint
+  var fp = newSeq[byte](int(fingerprint_len))
+  if fp.len > 0:
+    copyMem(addr fp[0], fingerprint, fp.len)
+  let r = handle.msWriter.setLayoutSnapshot(
+    LayoutSnapshotFields(layoutHash: layout_hash, layoutFingerprint: fp))
+  if r.isErr:
+    setError(r.error)
+    return 1.cint
+  0.cint
+
 proc ct_write_meta_dat(
     handle: TraceWriterHandle,
     recorder_id: ptr uint8,

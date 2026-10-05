@@ -223,6 +223,27 @@ int      trace_writer_set_compact_threshold(trace_writer_t handle,
 int trace_writer_set_recording_id(trace_writer_t handle,
                                   const char* recording_id);
 
+/*
+ * The flag-gated meta.dat blocks (internal-files.md "Extended Fields"), each
+ * written when it is set and set before the first record, as filter
+ * provenance is.  tick_source / atomic_mode are TickSource / AtomicMode
+ * ordinals (an ordinal outside its enumeration is refused); a NULL string is
+ * written empty.  Returns 0 on success, non-zero on refusal
+ * (see trace_writer_last_error).
+ */
+int trace_writer_set_mcr_fields(trace_writer_t handle,
+    int tick_source, uint32_t total_threads, int atomic_mode,
+    uint64_t total_events, uint32_t total_checkpoints,
+    uint64_t start_time_unix_us,
+    const char* platform, const char* tick_granularity,
+    const char* tick_source_str, const char* atomic_mode_str,
+    const char* start_time_str, const char* hook_profile,
+    const char* const* hook_strategies, size_t hook_strategies_count);
+int trace_writer_set_replay_launch_fields(trace_writer_t handle,
+                                          int aslr_disabled);
+int trace_writer_set_layout_snapshot(trace_writer_t handle,
+    uint64_t layout_hash, const uint8_t* fingerprint, size_t fingerprint_len);
+
 void trace_writer_start(trace_writer_t handle, const char* path, int64_t line);
 /*
  * meta.dat is written once, at the trace's first record (trace_writer_start

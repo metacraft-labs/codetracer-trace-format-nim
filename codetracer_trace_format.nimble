@@ -78,6 +78,8 @@ task test, "Run all tests":
   # frames that do not pledge a decompressed size.
   exec "nim c -r -p:src tests/test_rust_written_events_log.nim"
   exec "nim c -r tests/test_meta_dat.nim"
+  # The writer writes the MCR, replay-launch and layout blocks it is given.
+  exec "nim c -r tests/test_writer_meta_blocks.nim"
   exec "nim c -r tests/test_namespace_descriptor.nim"
   exec "nim c -d:release -r tests/test_sub_block_pool.nim"
   exec "nim c -d:release -r tests/test_btree.nim"

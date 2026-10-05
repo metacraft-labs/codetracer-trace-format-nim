@@ -187,6 +187,7 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_correlation_marker_api.nim", binary: "build/test-bin/test_correlation_marker_api"),
   TestSpec(source: "tests/test_close_publishes_entry_sizes.nim", binary: "build/test-bin/test_close_publishes_entry_sizes"),
   TestSpec(source: "tests/test_meta_dat.nim", binary: "build/test-bin/test_meta_dat"),
+  TestSpec(source: "tests/test_writer_meta_blocks.nim", binary: "build/test-bin/test_writer_meta_blocks"),
   TestSpec(source: "tests/test_namespace_descriptor.nim", binary: "build/test-bin/test_namespace_descriptor"),
   TestSpec(source: "tests/test_sub_block_pool.nim", binary: "build/test-bin/test_sub_block_pool"),
   TestSpec(source: "tests/test_btree.nim", binary: "build/test-bin/test_btree"),

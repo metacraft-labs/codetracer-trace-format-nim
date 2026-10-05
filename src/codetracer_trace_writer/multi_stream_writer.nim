@@ -344,6 +344,14 @@ type
       ## (spec § 7 distinguishes "no provenance recorded" from
       ## "provenance recorded but empty").
 
+    # The other flag-gated `meta.dat` blocks (`internal-files.md`
+    # §"Extended Fields"): MCR fields (bit 0), replay-launch fields (bit 1)
+    # and a layout snapshot (bit 2). Each is written when it is set, and is
+    # set before the first record, as the provenance chain is.
+    mcrFields*: Option[McrMetaFields]
+    replayLaunchFields*: Option[ReplayLaunchFields]
+    layoutSnapshotFields*: Option[LayoutSnapshotFields]
+
     # P6.3 / P6.4 — column-aware step mode.  When set:
     #  * `writeColumnStep` is permitted (emits tag 0x07, sekDeltaColumn);
     #  * `meta.dat` flags include `FlagHasColumnAwareSteps` (bit 4) so
@@ -636,6 +644,9 @@ proc commitMeta(w: var MultiStreamTraceWriter): Result[void, string] =
   var metaFile = metaFileRes.get()
   let metaRes = w.container.writeMetaDat(
     metaFile, w.metadata,
+    mcrFields = w.mcrFields,
+    replayLaunchFields = w.replayLaunchFields,
+    layoutSnapshotFields = w.layoutSnapshotFields,
     filterProvenance = w.filterProvenance,
     emitFilterProvenance = w.recordEmptyFilterProvenance,
     columnAwareSteps = w.columnAwareSteps,
@@ -1014,6 +1025,30 @@ proc addFilterProvenance*(w: var MultiStreamTraceWriter,
   ## Append one trace-filter chain entry. Refused once ``meta.dat`` is written.
   ? w.refuseAfterCommit("addFilterProvenance")
   w.filterProvenance.add(entry)
+  ok()
+
+proc setMcrFields*(w: var MultiStreamTraceWriter,
+    fields: McrMetaFields): Result[void, string] =
+  ## Write the MCR fields block (`meta.dat` flag bit 0). Refused once
+  ## ``meta.dat`` is written.
+  ? w.refuseAfterCommit("setMcrFields")
+  w.mcrFields = some(fields)
+  ok()
+
+proc setReplayLaunchFields*(w: var MultiStreamTraceWriter,
+    fields: ReplayLaunchFields): Result[void, string] =
+  ## Write the replay-launch fields block (`meta.dat` flag bit 1). Refused
+  ## once ``meta.dat`` is written.
+  ? w.refuseAfterCommit("setReplayLaunchFields")
+  w.replayLaunchFields = some(fields)
+  ok()
+
+proc setLayoutSnapshot*(w: var MultiStreamTraceWriter,
+    fields: LayoutSnapshotFields): Result[void, string] =
+  ## Write the layout snapshot block (`meta.dat` flag bit 2). Refused once
+  ## ``meta.dat`` is written.
+  ? w.refuseAfterCommit("setLayoutSnapshot")
+  w.layoutSnapshotFields = some(fields)
   ok()
 
 proc recordEmptyFilterProvenanceBlock*(w: var MultiStreamTraceWriter):
