@@ -1,5 +1,7 @@
 import std/[json, options, tables, unittest]
 import codetracer_ctfs/[managed_sender, managed_sender_ci, trace_storage_config]
+import codetracer_trace_types
+import codetracer_trace_writer/[meta_dat, uuid_v7]
 
 type
   TestBackend = ref object of ManagedSenderBackend
@@ -147,15 +149,63 @@ suite "managed shared sender":
     let slices = payload["recordingManifest"]["mcrSlices"]
     check slices.kind == JArray
     check slices.len == 1
-    check slices[0]["key"].getStr() == "traces/tenant-a/session/slice_0000.ct"
-    check slices[0]["index"].getInt() == 0
-    check slices[0]["order"].getInt() == 0
-    check slices[0]["sizeBytes"].getInt() == 4096
-    check slices[0]["sha256"].getStr() == "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-    check slices[0]["retentionStatus"].getStr() == "retained"
-    check slices[0]["uploadState"].getStr() == "uploaded"
-    check slices[0]["sourceKind"].getStr() == "split_ctfs"
-    check slices[0]["timeRange"]["geidStart"].getInt() == 10
-    check slices[0]["timeRange"]["geidEnd"].getInt() == 20
+    # codetracer-ci's McrSliceManifest: it refuses an entry without
+    # sliceIndex, sliceKey, uploadCompletionState and retentionStatus, and
+    # resolves dive-in links only through `complete` + `available` slices.
+    check slices[0]["sliceIndex"].getInt() == 0
+    check slices[0]["sliceKey"].getStr() == "traces/tenant-a/session/slice_0000.ct"
+    check slices[0]["uploadCompletionState"].getStr() == "complete"
+    check slices[0]["retentionStatus"].getStr() == "available"
+    check slices[0]["contentLength"].getInt() == 4096
+    check slices[0]["contentHash"].getStr() == "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    check slices[0]["geidStart"].getInt() == 10
+    check slices[0]["geidEnd"].getInt() == 20
     check payload["recordingManifest"]["timeRange"]["geidStart"].getInt() == 10
     check payload["recordingManifest"]["timeRange"]["geidEnd"].getInt() == 20
+    # The manifest's recordingId above ("recording") is not a recorder id the
+    # writer would produce; the sender forwards whatever the recorder put
+    # there and codetracer-ci validates it (400 invalid_recording_id).
+    check payload["recordingManifest"]["recordingId"].getStr() == "recording"
+
+  test "codetracer_ci_finalize_payload_declares_the_meta_dat_recording_id_nim":
+    # HS-M2 U3b: the recording id codetracer-ci resolves a dive-in link by is
+    # the one in the recording's meta.dat. Mint it as the writer does, write
+    # a real v6 meta.dat, read the id back through the reader, and hand the
+    # sender the manifest the recorder builds from it.
+    let minted = newUuidV7()
+    check minted.isOk
+    let metaBytes = writeMetaDatToBuffer(TraceMetadata(
+      recordingId: $minted.get(), workdir: "/srv", program: "inventory",
+      args: @["inventory"]))
+    let meta = readMetaDat(metaBytes)
+    check meta.isOk
+    let metaRecordingId = meta.get().recordingId
+    check metaRecordingId.len == 36
+
+    let backend = newCodetracerCiSenderBackend(CodetracerCiSenderConfig(
+      baseUrl: "http://127.0.0.1:8080", tenantId: "tenant-a", bearerToken: "ct_ci_token",
+      platform: "native", serviceName: "inventory", instanceId: "ct-mcr"))
+    proc requestFor(recordingId: string): ManagedFinalizeRequest =
+      var manifest = TraceStorageManifest(
+        schema: traceStorageSchema,
+        recordingId: recordingId,
+        service: ServiceIdentity(serviceName: "inventory", environment: "test", instanceId: "ct-mcr", tenantId: "tenant-a"),
+        lifecycle: lsUploaded,
+        retry: RetryState(attempt: 0, nextRetryAt: none(string), lastError: none(string)),
+        finalize: FinalizeState(finalized: false, finalizedAt: none(string), idempotencyKey: "u3b"),
+        retention: dsRetained,
+        replication: ReplicationState(targetReplicas: 1, completedReplicas: 1))
+      manifest.source.kind = tskSplitCtfs
+      manifest.source.segments = @[CtfsSegment(index: 0, geidStart: 0, geidEnd: 9,
+        file: PlacedObject(objectId: "traces/t/s/slices/slice_0000.ct", uri: "local://s/slice_0000.ct",
+          sizeBytes: 1, sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          placement: Placement(pool: "p", serverId: "s"), upload: usUploaded, dataState: dsRetained))]
+      ManagedFinalizeRequest(totalSlices: 1, totalEvents: 10, manifest: manifest, idempotencyKey: "u3b")
+
+    let declared = backend.finalizePayloadJson(requestFor(metaRecordingId))
+    check declared["recordingManifest"].hasKey("recordingId")
+    check declared["recordingManifest"]["recordingId"].getStr() == metaRecordingId
+    # Negative control: a recorder that named no recording declares none,
+    # rather than an empty string codetracer-ci would refuse.
+    let undeclared = backend.finalizePayloadJson(requestFor(""))
+    check not undeclared["recordingManifest"].hasKey("recordingId")

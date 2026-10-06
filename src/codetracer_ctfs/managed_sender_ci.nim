@@ -132,34 +132,35 @@ method uploadManifest*(backend: CodetracerCiSenderBackend,
     item: ManagedUploadObject): tuple[ok: bool, receipt: ManagedUploadReceipt, err: ManagedSenderError] =
   backend.uploadObject(item, "application/vnd.codetracer.recording-manifest+json")
 
-proc dataStateName(value: DataState): string =
-  case value
-  of dsRetained: "retained"
-  of dsExpired: "expired"
-  of dsDeleted: "deleted"
+# The finalize body is codetracer-ci's `FinalizeUploadSessionApiRequest`; its
+# `recordingManifest` is codetracer-ci's `RecordingManifest`, and each
+# `mcrSlices` entry its `McrSliceManifest` (codetracer-ci
+# apps/Monolith/Monolith.TraceStorage/RecordingManifest.cs; documented in
+# codetracer-ci rewrite-docs/04-apis-events/http-api.md, "POST
+# /api/v1/traces/{sessionId}/finalize"). codetracer-ci refuses a slice entry
+# without `sliceIndex`, `sliceKey`, `uploadCompletionState` and
+# `retentionStatus`, and answers only slices that are `complete` and
+# `available` when it resolves a dive-in link.
 
-proc traceSourceKindName(value: TraceSourceKind): string =
+proc ciRetentionStatus(value: DataState): string =
+  ## codetracer-ci's `RetentionStatuses`: a slice it may still serve is
+  ## `available`; one whose bytes are gone is `expired`.
   case value
-  of tskSingleCtfs: "single_ctfs"
-  of tskSplitCtfs: "split_ctfs"
-  of tskShardedSplitCtfs: "sharded_split_ctfs"
-  of tskMaterializedArtifact: "materialized_artifact"
+  of dsRetained: "available"
+  of dsExpired, dsDeleted: "expired"
 
-proc segmentSliceJson(segment: CtfsSegment, sourceKind: TraceSourceKind): JsonNode =
+proc ciUploadCompletionState(value: UploadState): string =
+  ## codetracer-ci's `UploadCompletionStates` for one slice.
+  if value == usUploaded: "complete" else: "uploading"
+
+proc segmentSliceJson(segment: CtfsSegment): JsonNode =
   %*{
-    "key": segment.file.objectId,
-    "objectKey": segment.file.objectId,
-    "index": segment.index,
-    "order": segment.index,
-    "sizeBytes": segment.file.sizeBytes,
-    "sha256": segment.file.sha256,
-    "retentionStatus": segment.file.dataState.dataStateName,
-    "uploadState": segment.file.upload.uploadStateName,
-    "sourceKind": sourceKind.traceSourceKindName,
-    "timeRange": {
-      "geidStart": segment.geidStart,
-      "geidEnd": segment.geidEnd,
-    },
+    "sliceIndex": segment.index,
+    "sliceKey": segment.file.objectId,
+    "uploadCompletionState": segment.file.upload.ciUploadCompletionState,
+    "retentionStatus": segment.file.dataState.ciRetentionStatus,
+    "contentLength": segment.file.sizeBytes,
+    "contentHash": "sha256:" & segment.file.sha256,
     "geidStart": segment.geidStart,
     "geidEnd": segment.geidEnd,
     "storagePoolId": segment.file.placement.pool,
@@ -202,7 +203,7 @@ proc mcrSlicesJson(manifest: TraceStorageManifest): JsonNode =
   if manifest.source.kind != tskSplitCtfs:
     return
   for segment in manifest.source.segments:
-    result.add(segment.segmentSliceJson(manifest.source.kind))
+    result.add(segment.segmentSliceJson())
 
 proc shardedMcrSegmentsJson(manifest: TraceStorageManifest): JsonNode =
   result = newJArray()
@@ -242,7 +243,7 @@ proc mcrManifestJson(backend: CodetracerCiSenderBackend, request: ManagedFinaliz
   let mcrSlices = request.manifest.mcrSlicesJson()
   let shardedMcrSegments = request.manifest.shardedMcrSegmentsJson()
   let timeRange = request.manifest.mcrTimeRangeJson()
-  %*{
+  result = %*{
     "kind": "mcr_slices",
     "uploadCompletionState": "complete",
     "serviceIdentity": {"serviceName": backend.config.serviceName},
@@ -259,6 +260,14 @@ proc mcrManifestJson(backend: CodetracerCiSenderBackend, request: ManagedFinaliz
     "finalizedAt": finalizedAt,
     "manifestS3Key": manifestKey,
   }
+  # The recording's own id (the UUIDv7 in its `meta.dat`, which the recorder
+  # put into the manifest): codetracer-ci resolves a dive-in link's
+  # `recording_id` by it (codetracer-specs
+  # spec/Observability-Platform/docs/attribute-url-contract-v0.md, "Dive-In
+  # URL"). Left out when the recorder named none; codetracer-ci then knows the
+  # upload by its own id only.
+  if request.manifest.recordingId.len > 0:
+    result["recordingId"] = %request.manifest.recordingId
 
 proc finalizePayloadJson*(backend: CodetracerCiSenderBackend,
     request: ManagedFinalizeRequest): JsonNode =
