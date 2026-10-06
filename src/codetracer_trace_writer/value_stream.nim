@@ -1110,4 +1110,3 @@ proc skippedTags*(r: ValueStreamReader): seq[uint8] =
 
 proc skippedTagCounts*(r: ValueStreamReader): seq[(uint8, int)] =
   r.skippedTagCounts
-

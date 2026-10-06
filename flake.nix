@@ -2,6 +2,10 @@
   description = "CTFS (CodeTracer File System) container format — Nim implementation";
 
   inputs = {
+    standard-hooks-src = {
+      url = "github:metacraft-labs/devops-modules/c8ef41d446e211892fe9775182b43d5d517554ac";
+      flake = false;
+    };
     # Same toolchain source as the sibling Rust `codetracer-trace-format`
     # repo, so the Nim/Rust pair that make up the trace-format layer are
     # built with one pinned compiler set rather than two.
@@ -92,7 +96,7 @@
             cp ${inputs.nim-packages-index}/packages.json $out/packages_official.json
           '';
 
-          preCommit = inputs.pre-commit-hooks.lib.${system}.run {
+          legacyPreCommit = inputs.pre-commit-hooks.lib.${system}.run {
             src = ./.;
             hooks = {
               lint = {
@@ -104,6 +108,73 @@
               };
             };
           };
+          standardHooks = import (inputs.standard-hooks-src + "/git-hooks/standard-hooks.nix") {
+            inherit pkgs;
+            lib = pkgs.lib;
+            src = inputs.standard-hooks-src;
+          };
+          preCommit = inputs.pre-commit-hooks.lib.${system}.run {
+            src = ./.;
+            default_stages = [
+              "pre-commit"
+              "pre-push"
+            ];
+            hooks = standardHooks // {
+              lint = {
+                enable = true;
+                name = "Lint";
+                entry = "just lint";
+                language = "system";
+                pass_filenames = false;
+                stages = [ "pre-commit" ];
+              };
+            };
+          };
+          nativeHookFactory =
+            configuration:
+            pkgs.runCommand "trace-nim-native-hook-factory"
+              {
+                nativeBuildInputs = [
+                  pkgs.git
+                  pkgs.bash
+                  configuration.config.package
+                ];
+              }
+              ''
+                export PRE_COMMIT_HOME="$TMPDIR/trace-nim-native-hook-cache"
+                export GIT_CONFIG_GLOBAL="$TMPDIR/trace-nim-native-factory-gitconfig"
+                export GIT_CONFIG_NOSYSTEM=1
+                : > "$GIT_CONFIG_GLOBAL"
+                mkdir -p "$PRE_COMMIT_HOME" fixture
+                cd fixture
+                git init --template= >/dev/null
+                if git config --get core.hooksPath; then
+                  echo 'Unexpected native factory hooksPath authority' >&2
+                  exit 1
+                fi
+                test "$(git rev-parse --path-format=absolute --git-path hooks)" = "$PWD/.git/hooks"
+                ln -s ${configuration.config.configFile} ${configuration.config.configPath}
+                mkdir -p "$out"
+                for hook in pre-commit pre-push; do
+                  ${configuration.config.package}/bin/pre-commit install -c ${configuration.config.configPath} -t "$hook"
+                  install -m 0755 ".git/hooks/$hook" "$out/$hook"
+                done
+              '';
+          expectedNativeHook = nativeHookFactory preCommit;
+          expectedLegacyNativeHook = nativeHookFactory legacyPreCommit;
+          hookOwnershipGuard = ./nix/hook-ownership-guard.py;
+          hookTransaction = ./nix/hook-transaction.py;
+          actualNativeInstaller = pkgs.writeShellScript "trace-nim-native-hook-installer" preCommit.shellHook;
+          guardedHookInstall = ''
+            ${pkgs.python3}/bin/python3 ${hookTransaction} "$ct_tfn_root" ${hookOwnershipGuard} ${expectedNativeHook} ${pkgs.git}/share/git-core/templates ${expectedLegacyNativeHook} ${preCommit.config.configFile} ${legacyPreCommit.config.configFile} ${actualNativeInstaller} ${pkgs.git}/bin/git ${pkgs.bash}/bin/bash >&2
+            _trace_hook_status=$?
+            if [ "$_trace_hook_status" -ne 0 ]; then
+              unset _trace_hook_status
+              exit 1
+            fi
+            unset _trace_hook_status
+          '';
+
         in
         {
           checks.pre-commit-check = preCommit;
@@ -142,6 +213,8 @@
               pkgs.just
               pkgs.nixfmt-rfc-style
               pkgs.prek
+              pkgs.pre-commit
+              pkgs.python3
               pkgs.git
             ]
             ++ preCommit.enabledPackages;
@@ -167,15 +240,9 @@
               ct_tfn_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
               if [ -n "$ct_tfn_root" ] \
                 && [ -f "$ct_tfn_root/codetracer_trace_format.nimble" ] \
-                && [ -f "$ct_tfn_root/src/codetracer_trace_writer_ffi.nim" ]; then
-                ( cd "$ct_tfn_root" && ${preCommit.shellHook} )
-                # git-hooks.nix's installer leaves core.hooksPath as the RELATIVE
-                # `.git/hooks`, in the config every worktree shares. A linked worktree
-                # cannot resolve it (there `.git` is a file), so git silently runs no
-                # hooks there. Point it at the common hooks directory instead.
-                if [ "$(git -C "$ct_tfn_root" config --local --get core.hooksPath 2>/dev/null)" = .git/hooks ]; then
-                  git -C "$ct_tfn_root" config --local core.hooksPath "$(git -C "$ct_tfn_root" rev-parse --path-format=absolute --git-common-dir)/hooks"
-                fi
+                && [ -f "$ct_tfn_root/src/codetracer_trace_writer_ffi.nim" ] \
+                && [ "$(${pkgs.coreutils}/bin/sha256sum "$ct_tfn_root/flake.nix" | ${pkgs.coreutils}/bin/cut -d' ' -f1)" = "${builtins.hashFile "sha256" ./flake.nix}" ]; then
+                ( cd "$ct_tfn_root" && ${guardedHookInstall} ) || exit 1
               else
                 ct_tfn_root=""
               fi

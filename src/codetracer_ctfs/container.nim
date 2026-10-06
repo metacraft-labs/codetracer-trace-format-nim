@@ -22,7 +22,9 @@ proc createCtfs*(
   ## Compression is NOT in the header — it is a property of each member's format.
   var c: Ctfs
   c.blockSize = blockSize
-  c.maxRootEntries = maxRootEntries
+  doAssert maxRootEntries != 0 or uint64(blockSize) >= uint64(rootEntryStart(maxShards)),
+    "CTFS auto-fill root prefix does not fit block 0"
+  c.maxRootEntries = effectiveRootEntryCount(blockSize, maxRootEntries, maxShards)
   c.encryption = encryption
   c.maxShards = maxShards
   # `ctfs-container.md` §1: the root region is `root_blocks` contiguous blocks
@@ -482,9 +484,13 @@ type
 proc findFileEntry*(data: openArray[byte], name: string,
     maxEntries: uint32 = DefaultMaxRootEntries): CtfsEntryLookup =
   ## Find `name` in the root directory of the container image `data`.
+  let layout = rootDirectoryLayout(data)
+  if layout.error.len > 0:
+    return CtfsEntryLookup(found: false)
+  let entryStart = layout.entryStart
   let encoded = base40Encode(name)
-  for i in 0 ..< int(maxEntries):
-    let off = HeaderSize + ExtHeaderSize + i * FileEntrySize
+  for i in 0 ..< int(min(maxEntries, layout.entryCount)):
+    let off = entryStart + i * FileEntrySize
     if off + FileEntrySize > data.len:
       break
     if readU64LE(data, off + 16) == encoded:

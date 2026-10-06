@@ -139,12 +139,23 @@ proc usableEntries*(c: Ctfs): uint64 =
   ## Usable entries per mapping block (last entry reserved for chain pointer).
   c.entriesPerBlock() - 1
 
+proc rootEntryStart*(maxShards: uint8): int =
+  ## Version-5 full-profile header plus seven six-byte free-list roots per shard.
+  HeaderSize + ExtHeaderSize + 7 * int(maxShards) * 6
+
+proc effectiveRootEntryCount*(blockSize, declared: uint32, maxShards: uint8): uint32 =
+  ## A zero header count auto-fills the remainder of block 0 after the roots.
+  if declared != 0: return declared
+  let prefix = uint64(rootEntryStart(maxShards))
+  if uint64(blockSize) < prefix: return 0
+  uint32((uint64(blockSize) - prefix) div uint64(FileEntrySize))
+
 proc fileEntryOffset*(c: Ctfs, index: int): int =
   ## Byte offset of a file entry from the start of the container.  The entry
   ## array starts in block 0 and, when it is larger than block 0, continues
   ## into the blocks after it (`rootBlockCount`), so this is a plain byte
   ## offset and may lie past the end of block 0.
-  HeaderSize + ExtHeaderSize + index * FileEntrySize
+  rootEntryStart(c.maxShards) + index * FileEntrySize
 
 proc rootBlockCount*(blockSize: uint32, maxRootEntries: uint32,
                      maxShards: uint8): uint64 =
@@ -161,8 +172,7 @@ proc rootBlockCount*(blockSize: uint32, maxRootEntries: uint32,
   ## 0 for a zero block size, which no reader accepts.
   if blockSize == 0'u32:
     return 0
-  let rootBytes = uint64(HeaderSize + ExtHeaderSize) +
-    7'u64 * uint64(maxShards) * 6'u64 +
+  let rootBytes = uint64(rootEntryStart(maxShards)) +
     uint64(maxRootEntries) * uint64(FileEntrySize)
   max(1'u64, (rootBytes + uint64(blockSize) - 1) div uint64(blockSize))
 
@@ -215,3 +225,21 @@ proc ctfsVersionError*(data: openArray[byte]): string =
       "reader reads version " & $CtfsVersion & " only (older containers are " &
       "re-recorded; ctfs-container.md §2, \"Older versions are refused\")"
   ""
+
+proc rootDirectoryLayout*(data: openArray[byte]): tuple[entryStart: int, entryCount: uint32, error: string] =
+  ## Validate the version-5 header-derived directory before any entry traversal.
+  if data.len < HeaderSize + ExtHeaderSize:
+    return (0, 0'u32, "CTFS container too short for root layout")
+  for i in 0 ..< CtfsMagic.len:
+    if data[i] != CtfsMagic[i]: return (0, 0'u32, "invalid CTFS magic")
+  let versionErr = ctfsVersionError(data)
+  if versionErr.len > 0: return (0, 0'u32, versionErr)
+  let blockSize = readU32LE(data, 8)
+  let declared = readU32LE(data, 12)
+  let prefix = rootEntryStart(data[7])
+  if blockSize == 0 or (declared == 0 and uint64(blockSize) < uint64(prefix)):
+    return (0, 0'u32, "unusable CTFS auto-fill root layout")
+  let count = effectiveRootEntryCount(blockSize, declared, data[7])
+  if uint64(prefix) + uint64(count) * uint64(FileEntrySize) > uint64(data.len):
+    return (0, 0'u32, "truncated CTFS reserved root directory")
+  (prefix, count, "")

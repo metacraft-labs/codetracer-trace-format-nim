@@ -847,4 +847,3 @@ proc buildFullDocument*(reader: var NewTraceReader,
 
   root["events"] = eventsArr
   return root
-

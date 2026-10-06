@@ -30,4 +30,3 @@ proc ffiCompilerFlags*(app, target: string): seq[string] =
   else:
     # So the archive can be linked into shared objects (a PyO3 `.so`).
     result.add "--passC:-fPIC"
-

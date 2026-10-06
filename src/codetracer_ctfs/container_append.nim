@@ -106,8 +106,9 @@ proc openClosedCtfs*(path: string): Result[Ctfs, string] =
       "internal file can be added"))
 
   let blockSize = readU32LE(data, 8)
+  let entryStart = rootEntryStart(readMaxShards(data))
   if blockSize == 0'u32 or blockSize mod 8 != 0 or
-     int(blockSize) < HeaderSize + ExtHeaderSize + FileEntrySize:
+     int(blockSize) < entryStart + FileEntrySize:
     return err(appendError(path, "declares an unusable block size of " & $blockSize))
   if data.len mod int(blockSize) != 0:
     return err(appendError(path,
@@ -148,9 +149,8 @@ proc openClosedCtfs*(path: string): Result[Ctfs, string] =
     # table recommends exactly the 0 that half of this tree cannot read. That
     # makes the split a latent interop hazard rather than a style difference,
     # which is why it is written down here instead of quietly relied upon.
-    maxRootEntries = uint32(
-      (int(blockSize) - HeaderSize - ExtHeaderSize) div FileEntrySize)
-  if HeaderSize + ExtHeaderSize + int(maxRootEntries) * FileEntrySize > int(blockSize):
+    maxRootEntries = effectiveRootEntryCount(blockSize, maxRootEntries, readMaxShards(data))
+  if uint64(entryStart) + uint64(maxRootEntries) * uint64(FileEntrySize) > uint64(blockSize):
     return err(appendError(path,
       "declares " & $maxRootEntries & " root entries, which do not fit in its " &
       $blockSize & "-byte block 0; an entry array that spills past block 0 " &

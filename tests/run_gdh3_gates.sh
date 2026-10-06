@@ -88,7 +88,7 @@ header_ok=1
 # is the control).
 if ! grep -qE '^void trace_writer_register_step\(' "$HEADER"; then
   echo "HEADER-FAIL: the positive control did not match, so the scan is not" \
-       "reading the header and every check below would pass vacuously" >&2
+        "reading the header and every check below would pass vacuously" >&2
   header_ok=0
 fi
 # Anchored to `^<return type> <name>(` — syntax only. A prose mention of
@@ -147,7 +147,7 @@ if ! build_c "$WORK/gdh3" "$WORK/lib-plain.a"; then
   fail_script "tests/test_gdh3_fork_path_ids.c does not compile against the header"
 fi
 if ! nim c "${NIMFLAGS[@]}" --nimcache:"$WORK/nc-verify" \
-     -o:"$WORK/gdh3_verify" tests/gdh3_verify.nim >"$WORK/verify.build.log" 2>&1; then
+      -o:"$WORK/gdh3_verify" tests/gdh3_verify.nim >"$WORK/verify.build.log" 2>&1; then
   tail -30 "$WORK/verify.build.log" >&2
   fail_script "tests/gdh3_verify.nim does not compile"
 fi
@@ -268,9 +268,9 @@ else
     failures=$((failures + 1))
   elif [[ "$rc" != "0" ]] || ! verify_bundle mirror-ctrl single >/dev/null 2>&1; then
     echo "ARM-FAIL: the mirror arm went red on the SINGLE-version control." \
-         "It must pass there — a mirror and the writer agree with one" \
-         "version, and an arm that fails everywhere has not been shown to" \
-         "discriminate" >&2
+          "It must pass there — a mirror and the writer agree with one" \
+          "version, and an arm that fails everywhere has not been shown to" \
+          "discriminate" >&2
     failures=$((failures + 1))
   else
     echo "   control (one version): PASSES under the mirror, as it must"
@@ -283,12 +283,12 @@ else
       vrc=$?
       if [[ $vrc -eq 0 ]]; then
         echo "ARM-FAIL: the mirror arm PASSED the two-version gate; the" \
-             "mutation did not turn it red" >&2
+              "mutation did not turn it red" >&2
         failures=$((failures + 1))
       elif ! grep -q "GDH3-FAIL\[gdh3_fork_uses_the_writers_own_path_id\]" \
-             "$WORK/mirror-two.verify"; then
+              "$WORK/mirror-two.verify"; then
         echo "ARM-FAIL: the mirror arm exited $vrc but not with" \
-             "GDH3-FAIL[gdh3_fork_uses_the_writers_own_path_id]:" >&2
+              "GDH3-FAIL[gdh3_fork_uses_the_writers_own_path_id]:" >&2
         cat "$WORK/mirror-two.verify" >&2
         failures=$((failures + 1))
       else
@@ -312,7 +312,7 @@ echo
 #   that failed everywhere would not have been shown to discriminate.
 echo "-- arm gdh3FalsifySilentSkipReload (C: -DGDH3_FALSIFY_SILENT_SKIP_RELOAD)"
 if ! build_c "$WORK/gdh3-skip" "$WORK/lib-plain.a" \
-       -DGDH3_FALSIFY_SILENT_SKIP_RELOAD; then
+        -DGDH3_FALSIFY_SILENT_SKIP_RELOAD; then
   tail -20 "$WORK/gdh3-skip.build.log" >&2
   echo "ARM-FAIL: the silent-skip arm did not COMPILE" >&2
   failures=$((failures + 1))
@@ -323,8 +323,8 @@ else
     failures=$((failures + 1))
   elif [[ "$rc" != "0" ]] || ! verify_bundle skip-ctrl single >/dev/null 2>&1; then
     echo "ARM-FAIL: the silent-skip arm went red on the SINGLE-version" \
-         "control. It must pass there — with no reload the sentinel branch" \
-         "is never reached" >&2
+          "control. It must pass there — with no reload the sentinel branch" \
+          "is never reached" >&2
     failures=$((failures + 1))
   else
     echo "   control (one version): PASSES under the silent skip, as it must"
@@ -334,20 +334,20 @@ else
       failures=$((failures + 1))
     elif [[ "$rc" != "0" ]]; then
       echo "ARM-FAIL: the silent-skip arm's PRODUCER failed (rc $rc). The" \
-           "whole point of this arm is that the producer notices nothing;" \
-           "a producer-side failure means the arm is testing the wrong thing" >&2
+            "whole point of this arm is that the producer notices nothing;" \
+            "a producer-side failure means the arm is testing the wrong thing" >&2
       failures=$((failures + 1))
     else
       verify_bundle skip-two two >"$WORK/skip-two.verify" 2>&1
       vrc=$?
       if [[ $vrc -eq 0 ]]; then
         echo "ARM-FAIL: the silent-skip arm PASSED the two-version gate; a" \
-             "reload whose source was never bundled was reported as fine" >&2
+              "reload whose source was never bundled was reported as fine" >&2
         failures=$((failures + 1))
       elif ! grep -q "GDH3-FAIL\[gdh3_fork_uses_the_writers_own_path_id\]" \
-             "$WORK/skip-two.verify"; then
+              "$WORK/skip-two.verify"; then
         echo "ARM-FAIL: the silent-skip arm exited $vrc but not with" \
-             "GDH3-FAIL[gdh3_fork_uses_the_writers_own_path_id]:" >&2
+              "GDH3-FAIL[gdh3_fork_uses_the_writers_own_path_id]:" >&2
         cat "$WORK/skip-two.verify" >&2
         failures=$((failures + 1))
       else
@@ -386,9 +386,9 @@ else
       echo "ARM-FAIL: the discard-result arm PASSED the refusal gate" >&2
       failures=$((failures + 1))
     elif ! grep -q "GDH3-FAIL\[gdh3_refused_registration_reaches_the_c_caller\]" \
-           "$WORK/discard.out"; then
+            "$WORK/discard.out"; then
       echo "ARM-FAIL: the discard-result arm exited $drc but not with" \
-           "GDH3-FAIL[gdh3_refused_registration_reaches_the_c_caller]:" >&2
+            "GDH3-FAIL[gdh3_refused_registration_reaches_the_c_caller]:" >&2
       cat "$WORK/discard.out" >&2
       failures=$((failures + 1))
     else

@@ -542,6 +542,16 @@ proc openNewTraceFromBytes*(data: seq[byte],
   ## Layout A the open fails with a named ``paths.dat[N]: …`` error
   ## instead of returning misdecoded positions.
 
+  # A malformed or unsupported container is not an absent optional member.
+  # Keep the low-level safe lookup contract; admit the header before any
+  # metadata/table-presence branch can interpret not-found as optional absence.
+  let versionErr = ctfsVersionError(data)
+  if versionErr.len > 0:
+    return err(versionErr)
+  let rootLayout = rootDirectoryLayout(data)
+  if rootLayout.error.len > 0:
+    return err(rootLayout.error)
+
   var reader: NewTraceReader
   reader.data = data
   reader.blockSize = blockSize

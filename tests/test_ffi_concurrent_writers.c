@@ -101,7 +101,7 @@ int main(void) {
     }
   }
   printf("PASS: %d concurrent writers produced identical %zu-byte containers; errors stayed per thread\n",
-         THREADS, jobs[0].len);
+          THREADS, jobs[0].len);
   for (int i = 0; i < THREADS; i++) free(jobs[i].bytes);
   return 0;
 }

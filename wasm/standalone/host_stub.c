@@ -37,8 +37,8 @@ static size_t heap_ptr; /* next never-used address; 0 means "not started yet" */
 static size_t heap_end; /* one past the last addressable byte we own */
 
 /* The header is 16 bytes so the payload stays 16-byte aligned. It records the
-   block's class, which is all `free` and `realloc` need: the capacity is
-   `1 << cls`, and `realloc` never copies more than that out of a block. */
+    block's class, which is all `free` and `realloc` need: the capacity is
+    `1 << cls`, and `realloc` never copies more than that out of a block. */
 typedef struct {
   size_t cls;
   size_t pad[3];
@@ -65,7 +65,7 @@ static void *carve(size_t cls) {
   size_t total = sizeof(hdr_t) + ((size_t)1 << cls);
   if (total > heap_end - heap_ptr) {
     /* The module is linked with -Wl,--no-entry and no libc, so nothing else
-       grows linear memory. Grow generously to keep the call count down. */
+        grows linear memory. Grow generously to keep the call count down. */
     size_t need = total - (heap_end - heap_ptr);
     size_t pages = (need + WASM_PAGE - 1u) / WASM_PAGE;
     if (pages < 16u) pages = 16u;
@@ -103,7 +103,7 @@ void free(void *p) {
 
 void *calloc(size_t n, size_t m) {
   /* A product that wraps would allocate a short block the caller believes is
-     long. */
+      long. */
   if (m != 0 && n > (size_t)-1 / m) return 0;
   size_t total = n * m;
   unsigned char *p = (unsigned char *)malloc(total);

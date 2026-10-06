@@ -732,4 +732,3 @@ test_value_stream_drop_variable_events()
 test_value_stream_unknown_tag_is_refused_by_name()
 test_value_stream_forward_compat_tag_skipped()
 test_value_stream_forward_compat_truncated_payload_refused()
-

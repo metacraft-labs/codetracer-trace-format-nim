@@ -262,8 +262,8 @@ int trace_writer_enable_line_count_table(trace_writer_t handle);
  * Returns 0 on success, non-zero on failure (see trace_writer_last_error).
  */
 int trace_writer_register_path_with_line_count(trace_writer_t handle,
-                                               const char* path,
-                                               uint64_t line_count);
+                                                const char* path,
+                                                uint64_t line_count);
 
 /*
  * The failure return of the two uint64_t-returning path entry points below.
@@ -351,7 +351,7 @@ uint64_t trace_writer_register_path(trace_writer_t handle, const char* path);
  * buffer is cleared on entry.
  */
 uint64_t trace_writer_register_variable_name(trace_writer_t handle,
-                                             const char* name);
+                                              const char* name);
 
 /* --------------------------------------------------------------------------
  * Source-reload markers (GDH-M6 — design §6.3)
@@ -495,18 +495,18 @@ void trace_writer_register_variable_raw(trace_writer_t handle,
  * registration indistinguishable from a successful one.
  */
 void trace_writer_register_return_int_by_type_id(trace_writer_t handle,
-                                                 int64_t value,
-                                                 size_t type_id);
+                                                  int64_t value,
+                                                  size_t type_id);
 
 void trace_writer_register_variable_int_by_type_id(trace_writer_t handle,
-                                                   const char* name,
-                                                   int64_t value,
-                                                   size_t type_id);
+                                                    const char* name,
+                                                    int64_t value,
+                                                    size_t type_id);
 
 void trace_writer_register_variable_raw_by_type_id(trace_writer_t handle,
-                                                   const char* name,
-                                                   const char* value_repr,
-                                                   size_t type_id);
+                                                    const char* name,
+                                                    const char* value_repr,
+                                                    size_t type_id);
 
 void trace_writer_register_variable_cbor(trace_writer_t handle,
     const char* name,

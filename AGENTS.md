@@ -62,16 +62,16 @@ point `CODETRACER_TRACE_FORMAT_DIR` at it.
 
 ## Commands
 
-| Command                     | What it does                                                         |
-| --------------------------- | -------------------------------------------------------------------- |
+| Command                     | What it does                                                          |
+| --------------------------- | --------------------------------------------------------------------- |
 | `just build`                | `ct-print` + `ct-space` + `libcodetracer_trace_writer.a`              |
 | `just build-static-lib`     | Only the C-FFI static library the Rust crate links                    |
-| `just test`                 | `nimble test` (the full declared corpus) **+** the C-FFI smoke test    |
+| `just test`                 | `nimble test` (the full declared corpus) **+** the C-FFI smoke test   |
 | `just test-nim`             | Only `nimble test`                                                    |
 | `just test-ffi`             | `nimble testFfi` — compiles `tests/test_ffi.c` against the static lib |
-| `just lint`                 | `nim check` over the library entry points + `nixfmt --check`           |
+| `just lint`                 | `nim check` over the library entry points + `nixfmt --check`          |
 | `just format` (alias `fmt`) | `nixfmt flake.nix`                                                    |
-| `just bench`                | `nimble bench` — machine-dependent, deliberately not part of `test`    |
+| `just bench`                | `nimble bench` — machine-dependent, deliberately not part of `test`   |
 | `just nix-build`            | `nix build .#default`                                                 |
 
 `repro.nim` expresses the same graph natively for `reprobuild` (per-test
@@ -91,7 +91,7 @@ choice the sibling Nim repos `io-mon`, `nim-stackable-hooks` and
   container that has **already been closed** (`CTFS-Binary-Format.md` §5d).
   Distinct from `container.nim`'s `addFile`/`writeToFile`, which run mid-write.
   It reopens the sealed image, recovers `NextFreeBlock` from the file length,
-  and then drives the *same* `addFile`/`writeToFile`/`insertDataBlock` — it
+  and then drives the _same_ `addFile`/`writeToFile`/`insertDataBlock` — it
   owns no mapping arithmetic of its own, deliberately. Exposed to C as
   `ct_container_append_files` / `ct_container_create`. This is what let the
   wasm recorder delete its second CTFS writer; before it existed, that writer
@@ -151,13 +151,13 @@ choice the sibling Nim repos `io-mon`, `nim-stackable-hooks` and
 - `tests/test_path_filter.nim` uses `std/re`, which dlopens libpcre — the dev
   shell puts it on `LD_LIBRARY_PATH`.
 - **The corpus is green.** Running every command of the nimble `test` task
-  independently on x86_64-linux gives **51 pass / 0 fail**, and `just test`
+  independently on `x86_64-linux` gives **51 pass / 0 fail**, and `just test`
   exits 0. It was 48/3 until M34b; the three red gates were hard-coded
-  *performance* thresholds embedded in correctness tests. Two were closed by
+  _performance_ thresholds embedded in correctness tests. Two were closed by
   real optimisation and still assert in `test`:
   - `test_new_trace_reader.nim` `medianUs < 100.0` — was 263-267 µs, now
     **1.4 µs**. `ExecStreamReader.readEvent` re-decoded every preceding record
-    in the chunk to reach record *k* (O(chunkSize) per random seek, and it
+    in the chunk to reach record _k_ (O(chunkSize) per random seek, and it
     re-counted the whole chunk on every inflation), and its one-slot chunk
     cache thrashed on a 3-chunk stream. It now keeps a per-chunk record-start
     table (built by the count pass it already made) and an LRU chunk cache.
@@ -172,7 +172,7 @@ choice the sibling Nim repos `io-mon`, `nim-stackable-hooks` and
 
   The third could not be met on this host and its assertion moved to `bench`
   (see above) — but the underlying defect was fixed too:
-  `ChunkedCompressedTableReader` had a *single* last-chunk slot, so a random
+  `ChunkedCompressedTableReader` had a _single_ last-chunk slot, so a random
   read pattern re-inflated a 64 KiB frame on ~99.6% of lookups. With the LRU
   cache the same benchmark went from **151-161 µs** to a median of **54.6 µs**
   per lookup (12 samples, 42.5-77.1 µs) and a repeated read of a resident
@@ -184,6 +184,7 @@ choice the sibling Nim repos `io-mon`, `nim-stackable-hooks` and
   before a line of reader code runs. Re-sampled with the host at load 23 of
   32 cores: 37.7 / 48.5 / 53.5 / 56.0 / 72.6 µs — still 3 of 5 over the gate.
   See `Value-Origin-Tracking.milestones.org` § M34b.
+
 - **`ram_cache`'s marginal timing gate is closed (M34c).**
   `tests/test_ram_cache.nim`'s `bench_ram_cache_hit_latency` used to assert
   `perReadNs < 1000` against `LruCache.get`, which returns `Option[V]` and so
@@ -191,7 +192,7 @@ choice the sibling Nim repos `io-mon`, `nim-stackable-hooks` and
   that is one allocate + 4 KiB memcpy + free per read, ~95% of the ~830 ns it
   reported. `LruCache` now has **`tryGet`**, which returns a borrowed `ptr V`
   (`nil` on a miss), promotes to MRU and keeps the same counters; `get`
-  survives as the *owning* accessor and is implemented over it, so no caller
+  survives as the _owning_ accessor and is implemented over it, so no caller
   broke. `cached_trace_reader.readBlock` uses `tryGet`.
   **The 1000 ns threshold is unchanged** and now clears by ~10x: 12
   consecutive samples at load 126 gave 64-93 ns. The same runs measured the
@@ -214,7 +215,7 @@ choice the sibling Nim repos `io-mon`, `nim-stackable-hooks` and
   immediately and hand back an owned value;
   `test_borrow_never_escapes_the_cache` asserts that from the outside — the
   returned value is not an alias (mutating it does not reach the cache), it is
-  a copy and not a *move* (the entry is still readable afterwards), and it
+  a copy and not a _move_ (the entry is still readable afterwards), and it
   outlives both the eviction of its entry and a `clear`. If you add a caller,
   the rule is the one on the proc: read through the pointer, or copy out of
   it, before the next `put`/`clear`; a `put` may evict the very entry you are

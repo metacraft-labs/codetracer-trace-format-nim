@@ -28,7 +28,7 @@ int main(void) {
      * process lock) is not safe to call from several host threads. */
     ASSERT(strcmp(trace_writer_build_config(),
                   "app:staticlib;threads:off;mm:arc;release:on;processLock:on") == 0,
-           "the shipped archive must report the build_ffi.nims configuration");
+            "the shipped archive must report the build_ffi.nims configuration");
     printf("[OK] trace_writer_build_config: %s\n", trace_writer_build_config());
 
     /* Create a trace writer */
@@ -323,55 +323,55 @@ int main(void) {
          * SAME span_id (last-record-wins), and an external-bound span. */
         {
             const char* keys[] = { "http.method", "http.url",
-                                   "http.status_code", "http.duration_ms" };
+                                    "http.status_code", "http.duration_ms" };
             const char* vals[] = { "GET", "/api/users/42", "200", "12" };
 
             /* open record: no end fields, status unknown */
             ASSERT(trace_writer_register_span(w,
-                       1, 0, SPAN_FLAG_OPEN, SPAN_STATUS_UNKNOWN,
-                       1700000000000000000ULL, 0,
-                       0, 7, 100, 0,
-                       NULL, NULL, "web-request", "GET /api/users/42",
-                       SPAN_STRUCTURAL_CONTIGUOUS |
-                           SPAN_STRUCTURAL_SHARES_TIMELINE,
-                       keys, vals, 2) == 0,
-                   "register_span (open)");
+                        1, 0, SPAN_FLAG_OPEN, SPAN_STATUS_UNKNOWN,
+                        1700000000000000000ULL, 0,
+                        0, 7, 100, 0,
+                        NULL, NULL, "web-request", "GET /api/users/42",
+                        SPAN_STRUCTURAL_CONTIGUOUS |
+                            SPAN_STRUCTURAL_SHARES_TIMELINE,
+                        keys, vals, 2) == 0,
+                    "register_span (open)");
 
             /* a live recorder can publish it before closing */
             ASSERT(trace_writer_flush_spans(w) == 0, "flush_spans");
 
             /* completion record for the same span_id */
             ASSERT(trace_writer_register_span(w,
-                       1, 0, 0, SPAN_STATUS_OK,
-                       1700000000000000000ULL, 1700000000012000000ULL,
-                       0, 7, 100, 350,
-                       NULL, NULL, "web-request", "GET /api/users/42",
-                       SPAN_STRUCTURAL_CONTIGUOUS |
-                           SPAN_STRUCTURAL_SHARES_TIMELINE,
-                       keys, vals, 4) == 0,
-                   "register_span (completion)");
+                        1, 0, 0, SPAN_STATUS_OK,
+                        1700000000000000000ULL, 1700000000012000000ULL,
+                        0, 7, 100, 350,
+                        NULL, NULL, "web-request", "GET /api/users/42",
+                        SPAN_STRUCTURAL_CONTIGUOUS |
+                            SPAN_STRUCTURAL_SHARES_TIMELINE,
+                        keys, vals, 4) == 0,
+                    "register_span (completion)");
 
             /* external-bound span: execution lives in another container */
             ASSERT(trace_writer_register_span(w,
-                       2, 0, SPAN_FLAG_EXTERNAL, SPAN_STATUS_ERROR,
-                       1700000000000000000ULL, 1700000000500000000ULL,
-                       0, 0, 0, 0,
-                       "01949fcc-7d92-7e9c-cccc-dddddddddddd",
-                       "requests/req-0002.ct",
-                       "web-request", "POST /api/orders",
-                       SPAN_STRUCTURAL_SHARES_TIMELINE,
-                       keys, vals, 4) == 0,
-                   "register_span (external)");
+                        2, 0, SPAN_FLAG_EXTERNAL, SPAN_STATUS_ERROR,
+                        1700000000000000000ULL, 1700000000500000000ULL,
+                        0, 0, 0, 0,
+                        "01949fcc-7d92-7e9c-cccc-dddddddddddd",
+                        "requests/req-0002.ct",
+                        "web-request", "POST /api/orders",
+                        SPAN_STRUCTURAL_SHARES_TIMELINE,
+                        keys, vals, 4) == 0,
+                    "register_span (external)");
 
             /* an open record carrying end fields must be REJECTED, not
              * silently normalised — the fail-closed contract at the ABI. */
             ASSERT(trace_writer_register_span(w,
-                       3, 0, SPAN_FLAG_OPEN, SPAN_STATUS_UNKNOWN,
-                       1700000000000000000ULL, 1700000000000000001ULL,
-                       0, 0, 0, 99,
-                       NULL, NULL, "web-request", "bad",
-                       0, NULL, NULL, 0) != 0,
-                   "register_span must reject an open record with end fields");
+                        3, 0, SPAN_FLAG_OPEN, SPAN_STATUS_UNKNOWN,
+                        1700000000000000000ULL, 1700000000000000001ULL,
+                        0, 0, 0, 99,
+                        NULL, NULL, "web-request", "bad",
+                        0, NULL, NULL, 0) != 0,
+                    "register_span must reject an open record with end fields");
 
             printf("[OK] ms: spans (open + completion + external + reject)\n");
         }
@@ -475,12 +475,12 @@ int main(void) {
                 body_a[i] = (unsigned char)((i * 7 + i / 4096) % 251);
             }
             ASSERT(ct_container_append_files(path, names, contents, lengths, 3) == 0,
-                   "ct_container_append_files");
+                    "ct_container_append_files");
             ASSERT(stat(path, &st) == 0, "stat the appended container");
             ASSERT(st.st_size % 4096 == 0,
-                   "an appended container must stay a whole number of blocks");
+                    "an appended container must stay a whole number of blocks");
             ASSERT((size_t)st.st_size > sizeof(body_a),
-                   "the container should have grown by at least the payload");
+                    "the container should have grown by at least the payload");
             printf("[OK] container: append (%ld bytes)\n", (long)st.st_size);
 
             /* Append-only: a name that already exists must be refused, and
@@ -490,10 +490,10 @@ int main(void) {
                 const unsigned char* dup_contents[1] = { body_b };
                 size_t dup_lengths[1] = { sizeof(body_b) };
                 ASSERT(ct_container_append_files(path, dup_names, dup_contents,
-                                                 dup_lengths, 1) != 0,
-                       "appending an existing name must fail");
+                                                  dup_lengths, 1) != 0,
+                        "appending an existing name must fail");
                 ASSERT(trace_writer_last_error()[0] != '\0',
-                       "a refused append must set an error message");
+                        "a refused append must set an error message");
                 printf("[OK] container: append refuses an existing name\n");
             }
 
@@ -504,15 +504,15 @@ int main(void) {
                 const unsigned char* bad_contents[1] = { body_b };
                 size_t bad_lengths[1] = { sizeof(body_b) };
                 ASSERT(ct_container_append_files(path, bad_names, bad_contents,
-                                                 bad_lengths, 1) != 0,
-                       "appending an unencodable name must fail");
+                                                  bad_lengths, 1) != 0,
+                        "appending an unencodable name must fail");
                 printf("[OK] container: append refuses an unencodable name\n");
             }
 
             /* A container that is not a container. */
             ASSERT(ct_container_append_files("/tmp/ct_container_append_test.missing",
-                                             names, contents, lengths, 1) != 0,
-                   "appending to a nonexistent container must fail");
+                                              names, contents, lengths, 1) != 0,
+                    "appending to a nonexistent container must fail");
             printf("[OK] container: append refuses a nonexistent container\n");
         }
         remove(path);
