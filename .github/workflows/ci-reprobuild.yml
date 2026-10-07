@@ -160,6 +160,11 @@ jobs:
         # Materialises the `test` collection.
         run: dev-exec repro test ${{ runner.os != 'Windows' && '--tool-provisioning=nix' || '' }}
 
+      - name: Inspect the original Windows compiler header boundary on failure
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: dev-exec pwsh -NoProfile -File ./ci/inspect-gcc-header-boundary.ps1 -NimInclude C:/dev-deps/nim/lib -ProjectInclude (Join-Path $env:GITHUB_WORKSPACE "include") -ProjectHeader codetracer_crossing_state.h
+
       - name: just build (cross-check)
         # Re-runs the legacy `just build` path inside the same env so
         # we catch silent divergences between `repro build` outputs
