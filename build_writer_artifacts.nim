@@ -22,13 +22,23 @@ proc ctPrintPath*(projectRoot: string): string =
   projectRoot / (when defined(windows): "ct-print.exe" else: "ct-print")
 
 proc buildSharedLib*(projectRoot: string;
-                     compilerSdkRefs: seq[string] = @[]): BuildActionDef =
+                     compilerSdkRefs: seq[string] = @[];
+                     nativeIncludeDir = ""; nativeLibDir = ""): BuildActionDef =
   doAssert projectRoot.len > 0 and not projectRoot.isAbsolute
   const target = (when defined(windows): "msvc" else: "posix")
   let output = sharedLibraryPath(projectRoot)
+  var nativeFlags: seq[string] = @[]
+  var nativeInputs: seq[string] = @[]
+  when not defined(windows):
+    if nativeIncludeDir.len > 0 or nativeLibDir.len > 0:
+      doAssert nativeIncludeDir.isAbsolute and nativeLibDir.isAbsolute
+      nativeFlags = @["--passC:-I" & nativeIncludeDir,
+        "--passL:-L" & nativeLibDir, "--passL:-Wl,-rpath," & nativeLibDir]
+      nativeInputs = @[nativeIncludeDir / "zstd.h", nativeLibDir]
   let call = publicCliCall("nim", "nim", "c", "nim.nim.c", @[
     cliArgSeq("canonicalFlags", ffiCompilerFlags("lib", target),
               cpkPositional, 0),
+    cliArgSeq("nativeDependencyFlags", nativeFlags, cpkPositional, 0),
     cliArg("parallelBuild", 2, alias = "--parallelBuild:", format = cafConcat),
     cliArg("paths", projectRoot / "src", alias = "--path:", format = cafConcat),
     cliArg("nimcache", projectRoot / ".repro/build/shared-writer/nimcache",
@@ -42,7 +52,7 @@ proc buildSharedLib*(projectRoot: string;
     extraInputs = @[projectRoot / "src", projectRoot / "include",
       projectRoot / "build_ffi_flags.nim", projectRoot / "build_ffi.nims",
       projectRoot / "build_writer_artifacts.nim", projectRoot / "nim.cfg",
-      projectRoot / "config.nims", projectRoot / "codetracer_trace_format.nimble"],
+      projectRoot / "config.nims", projectRoot / "codetracer_trace_format.nimble"] & nativeInputs,
     extraOutputs = @[output], dependencyPolicy = automaticMonitorPolicy())
   appendRegisteredActionToolIdentityRefs(result.id, compilerSdkRefs)
   when defined(windows):
@@ -53,13 +63,23 @@ proc buildSharedLib*(projectRoot: string;
     appendRegisteredActionToolIdentityRefs(result.id, ["gcc"])
 
 proc buildCtPrint*(projectRoot: string;
-                   compilerSdkRefs: seq[string] = @[]): BuildActionDef =
+                   compilerSdkRefs: seq[string] = @[];
+                     nativeIncludeDir = ""; nativeLibDir = ""): BuildActionDef =
   doAssert projectRoot.len > 0 and not projectRoot.isAbsolute
   let output = ctPrintPath(projectRoot)
+  var nativeFlags: seq[string] = @[]
+  var nativeInputs: seq[string] = @[]
+  when not defined(windows):
+    if nativeIncludeDir.len > 0 or nativeLibDir.len > 0:
+      doAssert nativeIncludeDir.isAbsolute and nativeLibDir.isAbsolute
+      nativeFlags = @["--passC:-I" & nativeIncludeDir,
+        "--passL:-L" & nativeLibDir, "--passL:-Wl,-rpath," & nativeLibDir]
+      nativeInputs = @[nativeIncludeDir / "zstd.h", nativeLibDir]
   let call = publicCliCall("nim", "nim", "c", "nim.nim.c", @[
     cliArg("mm", "arc", alias = "--mm:", format = cafConcat),
     cliArgSeq("defines", @["release"], alias = "-d:",
               format = cafConcat, repeated = true),
+    cliArgSeq("nativeDependencyFlags", nativeFlags, cpkPositional, 0),
     cliArg("parallelBuild", 2, alias = "--parallelBuild:", format = cafConcat),
     cliArg("paths", projectRoot / "src", alias = "--path:", format = cafConcat),
     cliArg("nimcache", projectRoot / ".repro/build/ct-print/nimcache",
@@ -71,7 +91,7 @@ proc buildCtPrint*(projectRoot: string;
   result = recordToolInvocation("codetracer-trace-format-nim.ct-print.nim-c", call,
     extraInputs = @[projectRoot / "src", projectRoot / "codetracer_trace_format.nimble",
       projectRoot / "nim.cfg", projectRoot / "config.nims",
-      projectRoot / "build_writer_artifacts.nim"],
+      projectRoot / "build_writer_artifacts.nim"] & nativeInputs,
     extraOutputs = @[output], dependencyPolicy = automaticMonitorPolicy())
   appendRegisteredActionToolIdentityRefs(result.id, compilerSdkRefs)
   when defined(macosx):

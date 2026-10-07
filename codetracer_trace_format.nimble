@@ -1,3 +1,5 @@
+import std/strutils
+
 # Package
 version       = "0.1.0"
 author        = "Metacraft Labs"
@@ -440,15 +442,37 @@ task testFfiThreads, "C hosts: close after the recording thread exited; concurre
     for t in ["worker_thread_exit", "concurrent_writers"]:
       for v in ["ship", "tls", "nolock"]:
         exec "gcc -O1 -o " & dir & "/" & t & "-" & v & " tests/test_ffi_" & t & ".c " & dir & "/lib-" & v & ".a -lzstd -lm -lpthread -I include" & extra
-    exec dir & "/worker_thread_exit-ship"
-    exec dir & "/concurrent_writers-ship"
-    let (_, tlsCode) = gorgeEx(dir & "/worker_thread_exit-tls")
+    exec "gcc -O1 -o " & dir & "/host_guard tests/ffi_host_guard.c"
+    proc guardedHost(name: string): int =
+      let (reserved, reserveCode) = gorgeEx(dir & "/host_guard --reserve " & dir)
+      let receipt = reserved.strip()
+      let prefix = dir & "/guardian-result-"
+      if reserveCode != 0 or not receipt.startsWith(prefix) or
+          receipt.len != prefix.len + 6:
+        raise newException(AssertionDefect, "FFI guardian receipt acquisition failed")
+      for ch in receipt[prefix.len ..< receipt.len]:
+        if ch notin {'a'..'z', 'A'..'Z', '0'..'9'}:
+          raise newException(AssertionDefect, "FFI guardian receipt name refused")
+      let (output, code) = gorgeEx(dir & "/host_guard " & dir & "/" & name & " " & receipt)
+      echo output
+      let terminalProof = "FFI-GUARD-RESULT-v1\nnatural\n" & $code & "\n"
+      if code == 125 or code == 126 or not fileExists(receipt) or
+          readFile(receipt) != terminalProof:
+        raise newException(AssertionDefect,
+          "FFI host guardian refused or timed out: " & name & " (exit " & $code & ")")
+      code
+    for name in ["worker_thread_exit-ship", "concurrent_writers-ship"]:
+      let code = guardedHost(name)
+      if code != 0:
+        raise newException(AssertionDefect,
+          "shipped FFI host failed: " & name & " (exit " & $code & ")")
+    let tlsCode = guardedHost("worker_thread_exit-tls")
     if tlsCode == 0:
       raise newException(AssertionDefect, "the worker-thread host PASSED against a --threads:on " &
         "archive: the test no longer reaches the cross-thread free it guards")
     var lockCaught = false
     for attempt in 0 ..< 5:
-      let (_, code) = gorgeEx(dir & "/concurrent_writers-nolock")
+      let code = guardedHost("concurrent_writers-nolock")
       if code != 0:
         lockCaught = true
         break

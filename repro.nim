@@ -311,12 +311,20 @@ package codetracer_trace_format_nim:
     # -p:src -o:ct-print src/codetracer_ct_print.nim``). The output is the
     # repo-root ``ct-print`` so downstream recorder tests find it at the
     # fixed sibling path ``../codetracer-trace-format-nim/ct-print``.
-    let ctPrintBuild = buildCtPrint(".")
+    let zstdIncludeDir = (when defined(windows): "" else: getEnv("CT_ZSTD_INCLUDE_DIR"))
+    let zstdLibDir = (when defined(windows): "" else: getEnv("CT_ZSTD_LIB_DIR"))
+    when not defined(windows):
+      doAssert zstdIncludeDir.isAbsolute and zstdLibDir.isAbsolute,
+        "owning typed builds require declared Zstd include/library paths"
+    let zstdInputs = (when defined(windows): newSeq[string]()
+                     else: @[zstdIncludeDir / "zstd.h", zstdLibDir])
+    let ctPrintBuild = buildCtPrint(".", nativeIncludeDir = zstdIncludeDir,
+      nativeLibDir = zstdLibDir)
 
     discard collect("default", @[ctPrintBuild])
 
     # Opt-in owning producer; no shipping/default or test corpus expansion.
-    discard collect("sharedLib", @[buildSharedLib(".")])
+    discard collect("sharedLib", @[buildSharedLib(".", nativeIncludeDir = zstdIncludeDir, nativeLibDir = zstdLibDir)])
 
     # ---- Test corpus (the `test` / `test-builds` collections) --------
     #
@@ -344,7 +352,12 @@ package codetracer_trace_format_nim:
       # ``LD_LIBRARY_PATH`` needed (the nix ``ld`` wrapper bakes the rpath
       # in). ``-L<pcreLibDir>`` comes from ``CT_PCRE_LIB_DIR``; without it
       # a bare ``-lpcre`` relies on the C toolchain's default search path.
+      var extraPassC: seq[string] = @[]
       var extraPassL: seq[string] = @[]
+      when not defined(windows):
+        extraPassC.add("-I" & zstdIncludeDir)
+        extraPassL.add("-L" & zstdLibDir)
+        extraPassL.add("-Wl,-rpath," & zstdLibDir)
       if spec.pcre:
         if pcreLibDir.len > 0:
           extraPassL.add("-L" & pcreLibDir)
@@ -363,9 +376,14 @@ package codetracer_trace_format_nim:
         binary = spec.binary,
         defines = buildDefines,
         paths = @["src"],
+        extraPassC = extraPassC,
         extraPassL = extraPassL,
-        extraInputs = @["src", "codetracer_trace_format.nimble", "nim.cfg"],
+        extraInputs = @["src", "codetracer_trace_format.nimble", "nim.cfg"] & zstdInputs,
         actionId = "codetracer-trace-format-nim.test_build." & stem)
+      when defined(macosx):
+        appendRegisteredActionToolIdentityRefs(edge.action.id, ["clang"])
+      elif not defined(windows):
+        appendRegisteredActionToolIdentityRefs(edge.action.id, ["gcc"])
       testBuildActions.add(edge.action)
 
       let executeEdge =

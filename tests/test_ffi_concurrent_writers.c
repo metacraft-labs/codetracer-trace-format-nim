@@ -40,11 +40,12 @@ static pthread_barrier_t start_line;
 static void *record(void *arg) {
   job_t *job = (job_t *)arg;
   trace_writer_t w = trace_writer_new("concurrent", FFI_TRACE_FORMAT_BINARY);
-  if (w == NULL) { job->failed = 1; return NULL; }
+  if (w == NULL) job->failed = 1;
   /* Same recording id everywhere, so the containers can be compared. */
-  if (trace_writer_set_recording_id(w, "0190f0a0-0000-7000-8000-000000000001") != 0 ||
-      trace_writer_begin_in_memory(w) != 0) { job->failed = 1; return NULL; }
+  if (!job->failed && (trace_writer_set_recording_id(w, "0190f0a0-0000-7000-8000-000000000001") != 0 ||
+      trace_writer_begin_in_memory(w) != 0)) job->failed = 1;
   pthread_barrier_wait(&start_line);
+  if (!job->failed) {
   trace_writer_start(w, "/src/main.c", 1);
   char path[32], name[32];
   for (int i = 0; i < STEPS; i++) {
@@ -56,9 +57,14 @@ static void *record(void *arg) {
   if (job->idx == 0) {
     /* Thread 0 alone makes a call fail; the others must not see it. */
     trace_writer_clear_last_error();
-    if (trace_writer_close(NULL) == 0) { job->failed = 1; return NULL; }
+    if (trace_writer_close(NULL) == 0) job->failed = 1;
+  }
   }
   pthread_barrier_wait(&start_line);
+  if (job->failed) {
+    if (w != NULL) trace_writer_free(w);
+    return NULL;
+  }
   snprintf(job->err_seen, sizeof job->err_seen, "%s", trace_writer_last_error());
   if (trace_writer_close(w) != 0) { job->failed = 1; return NULL; }
   job->len = trace_writer_container_len(w);

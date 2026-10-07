@@ -240,6 +240,8 @@
             ++ preCommit.enabledPackages;
 
             PKG_CONFIG_PATH = "${pkgs.zstd.dev}/lib/pkgconfig";
+            CT_ZSTD_INCLUDE_DIR = "${pkgs.zstd.dev}/include";
+            CT_ZSTD_LIB_DIR = "${pkgs.zstd.out}/lib";
 
             # Consumed by `repro.nim`'s `test_path_filter` edge, which links
             # pcre directly instead of relying on a run-time library search.
