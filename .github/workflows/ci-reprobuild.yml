@@ -119,7 +119,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          ./ci/acquire-windows-nim-sources.ps1 -Destination "$env:RUNNER_TEMP/trace-nim-sources" -Manifest ./ci/windows-complete-source-manifest.json -Lock ./flake.lock -Receipt "$env:RUNNER_TEMP/trace-nim-source-receipt.json"
+          ./ci/acquire-windows-nim-sources.ps1 -Destination "$env:RUNNER_TEMP/trace-nim-sources" -Manifest (Join-Path $env:GITHUB_WORKSPACE "ci/windows-complete-source-manifest.json") -Lock (Join-Path $env:GITHUB_WORKSPACE "flake.lock") -Receipt "$env:RUNNER_TEMP/trace-nim-source-receipt.json"
 
       - name: Setup dev env (reprobuild flavor)
         # setup-dev-env clones the siblings listed in .github/sibling-repos

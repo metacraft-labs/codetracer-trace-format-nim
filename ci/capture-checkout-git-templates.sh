@@ -73,11 +73,11 @@ record_inventory() {
 }
 record_inventory "$hooks" > "$receipt/initialized-before.tsv"
 record_inventory "$receipt/probe/.git/hooks" > "$receipt/actual-template-initialized.tsv"
-cmp "$receipt/initialized-before.tsv" "$receipt/actual-template-initialized.tsv"
+test "$(sha256sum < "$receipt/initialized-before.tsv")" = "$(sha256sum < "$receipt/actual-template-initialized.tsv")"
 record_inventory "$templates/hooks" > "$receipt/immutable-template-source.tsv"
 # Revalidate actual whole inventory after probe, before treating capture stable.
 record_inventory "$hooks" > "$receipt/initialized-after.tsv"
-cmp "$receipt/initialized-before.tsv" "$receipt/initialized-after.tsv"
+test "$(sha256sum < "$receipt/initialized-before.tsv")" = "$(sha256sum < "$receipt/initialized-after.tsv")"
 test "$source_before" = "$(record_source | sha256sum)"
 test "$index_before" = "$(sha256sum "$common/index")"
 test "$config_before" = "$(sha256sum "$common/config")"
