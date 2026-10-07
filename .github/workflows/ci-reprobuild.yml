@@ -77,6 +77,12 @@ jobs:
         with:
           gh-token: ${{ steps.ci_token.outputs.token }}
 
+      - name: Bind committed constructor before owning shell entry
+        if: runner.os != 'Windows'
+        env:
+          GH_TOKEN: ${{ steps.ci_token.outputs.token }}
+        run: bash .github/scripts/bind-unix-constructor.sh
+
       - name: Expose the declared non-SIP shell
         if: runner.os != 'Windows'
         run: |
@@ -176,3 +182,12 @@ jobs:
           include-hidden-files: true
           retention-days: 7
           if-no-files-found: warn
+
+      - name: Retain constructor and narrow guard refusal evidence
+        if: always() && runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: constructor-binding-${{ matrix.os }}-${{ matrix.arch }}
+          path: .repro/constructor-binding/
+          include-hidden-files: true
+          if-no-files-found: error

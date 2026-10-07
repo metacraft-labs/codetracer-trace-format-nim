@@ -16,6 +16,8 @@ EXPECTED_NATIVE = Path(sys.argv[2]).resolve(strict=True)
 EXPECTED_LEGACY_NATIVE = Path(sys.argv[6]).resolve(strict=True)
 EXPECTED_CONFIG = Path(sys.argv[7]).resolve(strict=True)
 EXPECTED_LEGACY_CONFIG = Path(sys.argv[8]).resolve(strict=True)
+EXPECTED_PRIOR_STANDARD_NATIVE = Path(sys.argv[9]).resolve(strict=True)
+EXPECTED_PRIOR_STANDARD_CONFIG = Path(sys.argv[10]).resolve(strict=True)
 MODE = sys.argv[3]
 import tempfile
 
@@ -136,6 +138,7 @@ def census():
             raise RuntimeError('Effective Git hook path differs from qualified common hooks')
     native = {name: hashlib.sha256((EXPECTED_NATIVE / name).read_bytes()).hexdigest() for name in ('pre-commit','pre-push')}
     legacy_native = {name: hashlib.sha256((EXPECTED_LEGACY_NATIVE / name).read_bytes()).hexdigest() for name in ('pre-commit','pre-push')}
+    prior_standard_native = {name: hashlib.sha256((EXPECTED_PRIOR_STANDARD_NATIVE / name).read_bytes()).hexdigest() for name in ('pre-commit','pre-push')}
     refuse_workspace_target(ROOT)
     generated_config = ROOT / '.pre-commit-config.yaml'
     config_identity = None
@@ -146,6 +149,7 @@ def census():
         permitted = {EXPECTED_CONFIG}
         if MODE in ('prepare','before','tool','snapshot','rollback'):
             permitted.add(EXPECTED_LEGACY_CONFIG)
+            permitted.add(EXPECTED_PRIOR_STANDARD_CONFIG)
         if config_target not in permitted:
             raise RuntimeError('Unknown generated hook configuration target')
         config_identity = {'target':str(config_target),'sha256':hashlib.sha256(config_target.read_bytes()).hexdigest(),'lexicalTarget':os.readlink(generated_config)}
@@ -172,6 +176,13 @@ def census():
                 for hook in legacy_native:
                     if path.name in (hook, hook + '.repro-local'):
                         known.add(legacy_native[hook])
+                        known.add(prior_standard_native[hook])
+            # Installation replaces native main slots before managed reconciliation
+            # consumes the previous exact native local slots. Final after is new-only.
+            if MODE == 'native':
+                for hook in prior_standard_native:
+                    if path.name == hook + '.repro-local':
+                        known.add(prior_standard_native[hook])
             for hook in native:
                 if path.name == hook + '.legacy':
                     known.add(MANAGED[hook])

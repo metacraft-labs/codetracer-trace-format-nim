@@ -113,8 +113,26 @@
             lib = pkgs.lib;
             src = inputs.standard-hooks-src;
           };
+          priorStandardPreCommit = inputs.pre-commit-hooks.lib.${system}.run {
+            src = ./.;
+            default_stages = [
+              "pre-commit"
+              "pre-push"
+            ];
+            hooks = standardHooks // {
+              lint = {
+                enable = true;
+                name = "Lint";
+                entry = "just lint";
+                language = "system";
+                pass_filenames = false;
+                stages = [ "pre-commit" ];
+              };
+            };
+          };
           preCommit = inputs.pre-commit-hooks.lib.${system}.run {
             src = ./.;
+            package = pkgs.prek;
             default_stages = [
               "pre-commit"
               "pre-push"
@@ -142,10 +160,11 @@
               }
               ''
                 export PRE_COMMIT_HOME="$TMPDIR/trace-nim-native-hook-cache"
+                export XDG_CACHE_HOME="$TMPDIR/trace-nim-native-factory-cache"
                 export GIT_CONFIG_GLOBAL="$TMPDIR/trace-nim-native-factory-gitconfig"
                 export GIT_CONFIG_NOSYSTEM=1
                 : > "$GIT_CONFIG_GLOBAL"
-                mkdir -p "$PRE_COMMIT_HOME" fixture
+                mkdir -p "$PRE_COMMIT_HOME" "$XDG_CACHE_HOME" fixture
                 cd fixture
                 git init --template= >/dev/null
                 if git config --get core.hooksPath; then
@@ -156,17 +175,18 @@
                 ln -s ${configuration.config.configFile} ${configuration.config.configPath}
                 mkdir -p "$out"
                 for hook in pre-commit pre-push; do
-                  ${configuration.config.package}/bin/pre-commit install -c ${configuration.config.configPath} -t "$hook"
+                  ${pkgs.lib.getExe configuration.config.package} install -c ${configuration.config.configPath} -t "$hook"
                   install -m 0755 ".git/hooks/$hook" "$out/$hook"
                 done
               '';
           expectedNativeHook = nativeHookFactory preCommit;
           expectedLegacyNativeHook = nativeHookFactory legacyPreCommit;
+          expectedPriorStandardNativeHook = nativeHookFactory priorStandardPreCommit;
           hookOwnershipGuard = ./nix/hook-ownership-guard.py;
           hookTransaction = ./nix/hook-transaction.py;
           actualNativeInstaller = pkgs.writeShellScript "trace-nim-native-hook-installer" preCommit.shellHook;
           guardedHookInstall = ''
-            ${pkgs.python3}/bin/python3 ${hookTransaction} "$ct_tfn_root" ${hookOwnershipGuard} ${expectedNativeHook} ${pkgs.git}/share/git-core/templates ${expectedLegacyNativeHook} ${preCommit.config.configFile} ${legacyPreCommit.config.configFile} ${actualNativeInstaller} ${pkgs.git}/bin/git ${pkgs.bash}/bin/bash >&2
+            ${pkgs.python3}/bin/python3 ${hookTransaction} "$ct_tfn_root" ${hookOwnershipGuard} ${expectedNativeHook} ${pkgs.git}/share/git-core/templates ${expectedLegacyNativeHook} ${preCommit.config.configFile} ${legacyPreCommit.config.configFile} ${actualNativeInstaller} ${pkgs.git}/bin/git ${pkgs.bash}/bin/bash ${expectedPriorStandardNativeHook} ${priorStandardPreCommit.config.configFile} >&2
             _trace_hook_status=$?
             if [ "$_trace_hook_status" -ne 0 ]; then
               unset _trace_hook_status

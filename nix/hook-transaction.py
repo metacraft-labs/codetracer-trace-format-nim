@@ -6,7 +6,8 @@ import base64, hashlib, json, os, pathlib, stat, subprocess, sys, tempfile, time
 root=pathlib.Path(sys.argv[1]); guard=sys.argv[2]; native=sys.argv[3]; templates=sys.argv[4]
 legacy=sys.argv[5]; config=sys.argv[6]; legacy_config=sys.argv[7]; installer=sys.argv[8]
 git_exe=sys.argv[9]; bash_exe=sys.argv[10]
-args=[str(root),native,'snapshot','reserved',templates,legacy,config,legacy_config]
+prior_native=sys.argv[11]; prior_config=sys.argv[12]
+args=[str(root),native,'snapshot','reserved',templates,legacy,config,legacy_config,prior_native,prior_config]
 ctx=pathlib.Path(tempfile.mkdtemp(prefix='trace-nim-hook-transaction-'))
 active=None; last_sid=None; stages=[]
 def group_exists(pgid):
@@ -47,7 +48,26 @@ def run(label,argv,child_env=None):
     finally: drain()
   item['exit']=code
   item['direct_child_reaped_and_process_group_absent']=True
-  if code: raise RuntimeError(label+' failed; retained receipt '+str(ctx))
+  if code:
+    if label in ('snapshot','prepare','tool','native-check','after','rollback-census'):
+      diagnostic=(ctx/(label+'.stderr')).read_bytes()
+      sys.stderr.buffer.write(diagnostic)
+      sys.stderr.buffer.flush()
+      requested=os.environ.get('TRACE_NIM_GUARD_DIAGNOSTIC_ROOT')
+      if requested:
+        expected=root/'.repro/constructor-binding/guard-stderr'
+        if os.environ.get('GITHUB_WORKSPACE')!=str(root) or pathlib.Path(requested)!=expected:
+          raise RuntimeError('Guard diagnostic output differs from the owning CI proof root; original guard failed')
+        for ancestor in [expected,*expected.parents]:
+          info=ancestor.lstat()
+          if not stat.S_ISDIR(info.st_mode):
+            raise RuntimeError('Guard diagnostic output has non-directory/symlink ancestry; original guard failed')
+        observed=subprocess.check_output([git_exe,'-C',str(root),'rev-parse','--show-toplevel']).decode().strip()
+        if observed!=str(root):
+          raise RuntimeError('Guard diagnostic output is outside the owning Git root; original guard failed')
+        with (expected/(label+'-'+str(os.getpid())+'.stderr')).open('xb') as failure_file:
+          failure_file.write(diagnostic)
+    raise RuntimeError(label+' failed; retained receipt '+str(ctx))
   return (ctx/(label+'.stdout')).read_bytes()
 
 def plain_file(p):
@@ -81,10 +101,25 @@ snapshot={'initial':initial,'hooks':original,'gitconfig':original_config,'genera
 transaction=False; success=False; error=None
 try:
   transaction=True
-  receipt=run('prepare',[sys.executable,guard,*[str(root),native,'prepare','reserved',templates,legacy,config,legacy_config]])
+  receipt=run('prepare',[sys.executable,guard,*[str(root),native,'prepare','reserved',templates,legacy,config,legacy_config,prior_native,prior_config]])
   (ctx/'prepared.json').write_bytes(receipt)
-  tool=run('tool',[sys.executable,guard,*[str(root),native,'tool','reserved',templates,legacy,config,legacy_config]]).decode().strip()
+  tool=run('tool',[sys.executable,guard,*[str(root),native,'tool','reserved',templates,legacy,config,legacy_config,prior_native,prior_config]]).decode().strip()
   needed=not(config_link.is_symlink() and os.readlink(config_link)==config)
+  # Replace only exact prior standard native local slots under this snapshot.
+  # Preflight the complete current state before the first retirement write.
+  if original_link == prior_config:
+    retire=[]
+    for hook in ('pre-commit','pre-push'):
+      local=hooks/(hook+'.repro-local')
+      if local.exists():
+        expected=plain_file(pathlib.Path(prior_native)/hook)
+        expected['mode']=0o755  # measured installer mode; Nix freezes factory output to 0555
+        if plain_file(local)!=expected: raise RuntimeError('Unknown prior native local slot')
+        retire.append(local)
+    if {p.name:plain_file(p) for p in hooks.iterdir()}!=original: raise RuntimeError('Hook inventory changed before prior retirement')
+    if plain_file(gitconfig)!=original_config or git('ls-files','--stage','-z')!=index: raise RuntimeError('Git state changed before prior retirement')
+    if not config_link.is_symlink() or os.readlink(config_link)!=original_link: raise RuntimeError('Generated config changed before prior retirement')
+    for local in retire: local.unlink()
   native_global=ctx/'native-installer-empty-global'
   native_global.write_bytes(b'');native_global.chmod(0o600)
   native_env=dict(os.environ)
@@ -98,12 +133,12 @@ try:
   native_env['GIT_CONFIG_NOSYSTEM']='1'
   run('native-install',[bash_exe,installer],native_env)
   if native_global.read_bytes()!=b'': raise RuntimeError('Native installer mutated private empty global')
-  if needed: run('native-check',[sys.executable,guard,*[str(root),native,'native','reserved',templates,legacy,config,legacy_config]])
+  if needed: run('native-check',[sys.executable,guard,*[str(root),native,'native','reserved',templates,legacy,config,legacy_config,prior_native,prior_config]])
   run('managed-reconcile',[tool,'hooks','ensure','--vcs',str(root)])
   # Preserve original linked-worktree repair inside exact transaction authority.
   if git('config','--local','--get','core.hooksPath').decode().strip()=='.git/hooks':
     run('relative-to-common-hookspath',[git_exe,'-C',str(root),'config','--local','core.hooksPath',str(hooks)])
-  run('after',[sys.executable,guard,*[str(root),native,'after',str(ctx/'prepared.json'),templates,legacy,config,legacy_config]])
+  run('after',[sys.executable,guard,*[str(root),native,'after',str(ctx/'prepared.json'),templates,legacy,config,legacy_config,prior_native,prior_config]])
   if git('ls-files','--stage','-z')!=index: raise RuntimeError('Semantic index changed')
   success=True
 except BaseException as exc:
@@ -119,7 +154,7 @@ finally:
   if transaction and not success and drain_error is None:
     try:
       # Guard admits only genuine bound bodies; it never restores unknown writes.
-      run('rollback-census',[sys.executable,guard,*[str(root),native,'rollback','reserved',templates,legacy,config,legacy_config]])
+      run('rollback-census',[sys.executable,guard,*[str(root),native,'rollback','reserved',templates,legacy,config,legacy_config,prior_native,prior_config]])
       if git('ls-files','--stage','-z')!=index: raise RuntimeError('Unknown semantic index mutation; no restoration')
       current=plain_file(gitconfig)
       if current['mode']!=original_config['mode'] or base64.b64decode(current['bytes']) not in allowed_configs:
