@@ -23,10 +23,16 @@ proc ctPrintPath*(projectRoot: string): string =
 
 proc buildSharedLib*(projectRoot: string;
                      compilerSdkRefs: seq[string] = @[];
-                     nativeIncludeDir = ""; nativeLibDir = ""): BuildActionDef =
+                     nativeIncludeDir = ""; nativeLibDir = "";
+                     nimDependencyDirs: seq[string] = @[]): BuildActionDef =
   doAssert projectRoot.len > 0 and not projectRoot.isAbsolute
   const target = (when defined(windows): "msvc" else: "posix")
   let output = sharedLibraryPath(projectRoot)
+  var dependencyFlags: seq[string] = @[]
+  for dependencyDir in nimDependencyDirs:
+    doAssert dependencyDir.isAbsolute and dirExists(dependencyDir),
+      "declared Nim source dependency must be an existing absolute directory"
+    dependencyFlags.add("--path:" & dependencyDir)
   var nativeFlags: seq[string] = @[]
   var nativeInputs: seq[string] = @[]
   when not defined(windows):
@@ -38,6 +44,7 @@ proc buildSharedLib*(projectRoot: string;
   let call = publicCliCall("nim", "nim", "c", "nim.nim.c", @[
     cliArgSeq("canonicalFlags", ffiCompilerFlags("lib", target),
               cpkPositional, 0),
+    cliArgSeq("nimSourceDependencyFlags", dependencyFlags, cpkPositional, 0),
     cliArgSeq("nativeDependencyFlags", nativeFlags, cpkPositional, 0),
     cliArg("parallelBuild", 2, alias = "--parallelBuild:", format = cafConcat),
     cliArg("paths", projectRoot / "src", alias = "--path:", format = cafConcat),
@@ -52,7 +59,7 @@ proc buildSharedLib*(projectRoot: string;
     extraInputs = @[projectRoot / "src", projectRoot / "include",
       projectRoot / "build_ffi_flags.nim", projectRoot / "build_ffi.nims",
       projectRoot / "build_writer_artifacts.nim", projectRoot / "nim.cfg",
-      projectRoot / "config.nims", projectRoot / "codetracer_trace_format.nimble"] & nativeInputs,
+      projectRoot / "config.nims", projectRoot / "codetracer_trace_format.nimble"] & nativeInputs & nimDependencyDirs,
     extraOutputs = @[output], dependencyPolicy = automaticMonitorPolicy())
   appendRegisteredActionToolIdentityRefs(result.id, compilerSdkRefs)
   when defined(windows):
@@ -64,9 +71,15 @@ proc buildSharedLib*(projectRoot: string;
 
 proc buildCtPrint*(projectRoot: string;
                    compilerSdkRefs: seq[string] = @[];
-                     nativeIncludeDir = ""; nativeLibDir = ""): BuildActionDef =
+                     nativeIncludeDir = ""; nativeLibDir = "";
+                     nimDependencyDirs: seq[string] = @[]): BuildActionDef =
   doAssert projectRoot.len > 0 and not projectRoot.isAbsolute
   let output = ctPrintPath(projectRoot)
+  var dependencyFlags: seq[string] = @[]
+  for dependencyDir in nimDependencyDirs:
+    doAssert dependencyDir.isAbsolute and dirExists(dependencyDir),
+      "declared Nim source dependency must be an existing absolute directory"
+    dependencyFlags.add("--path:" & dependencyDir)
   var nativeFlags: seq[string] = @[]
   var nativeInputs: seq[string] = @[]
   when not defined(windows):
@@ -79,6 +92,7 @@ proc buildCtPrint*(projectRoot: string;
     cliArg("mm", "arc", alias = "--mm:", format = cafConcat),
     cliArgSeq("defines", @["release"], alias = "-d:",
               format = cafConcat, repeated = true),
+    cliArgSeq("nimSourceDependencyFlags", dependencyFlags, cpkPositional, 0),
     cliArgSeq("nativeDependencyFlags", nativeFlags, cpkPositional, 0),
     cliArg("parallelBuild", 2, alias = "--parallelBuild:", format = cafConcat),
     cliArg("paths", projectRoot / "src", alias = "--path:", format = cafConcat),
@@ -91,7 +105,7 @@ proc buildCtPrint*(projectRoot: string;
   result = recordToolInvocation("codetracer-trace-format-nim.ct-print.nim-c", call,
     extraInputs = @[projectRoot / "src", projectRoot / "codetracer_trace_format.nimble",
       projectRoot / "nim.cfg", projectRoot / "config.nims",
-      projectRoot / "build_writer_artifacts.nim"] & nativeInputs,
+      projectRoot / "build_writer_artifacts.nim"] & nativeInputs & nimDependencyDirs,
     extraOutputs = @[output], dependencyPolicy = automaticMonitorPolicy())
   appendRegisteredActionToolIdentityRefs(result.id, compilerSdkRefs)
   when defined(macosx):

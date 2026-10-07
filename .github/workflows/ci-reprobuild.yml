@@ -115,6 +115,12 @@ jobs:
               "$CT_ZSTD_INCLUDE_DIR" "$CT_ZSTD_LIB_DIR" >> "$GITHUB_ENV"
           '
 
+      - name: Acquire complete locked Nim source dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./ci/acquire-windows-nim-sources.ps1 -Destination "$env:RUNNER_TEMP/trace-nim-sources" -Manifest ./ci/windows-complete-source-manifest.json -Lock ./flake.lock -Receipt "$env:RUNNER_TEMP/trace-nim-source-receipt.json"
+
       - name: Setup dev env (reprobuild flavor)
         # setup-dev-env clones the siblings listed in .github/sibling-repos
         # (codetracer-trace-format, codetracer-trace-format-nim) at the

@@ -1,0 +1,733 @@
+{
+  "nim-stew": {
+    "locked": {
+      "lastModified": 1785236459,
+      "narHash": "sha256-OoKTs5Y5ps0oL43benYf3W6j/KerFZ6xAxaf9mGcaOw=",
+      "owner": "status-im",
+      "repo": "nim-stew",
+      "rev": "1a5d0b99209f50ff055d9b5216849ba0365f8cf5",
+      "type": "github"
+    },
+    "members": {
+      "config.nims": {
+        "kind": "file",
+        "body": "23c85246a472f931d073766469406e70e20a93d22805b7c8e2e15ac3776a9942",
+        "mode": 292
+      },
+      "stew.nimble": {
+        "kind": "file",
+        "body": "09126bde69a5c046d9b1291801f13fdd5be5b26065f6c1efa430cb407f697da3",
+        "mode": 292
+      },
+      "README.md": {
+        "kind": "file",
+        "body": "3127122470705124f71d195d99e8fda93624ec1840d40cc18817c16e0c36663e",
+        "mode": 292
+      },
+      "LICENSE-MIT": {
+        "kind": "file",
+        "body": "575aa5d3809bdc35ae7ff6d068675e9cb3b494f9eb3f017aa71aa38576c56749",
+        "mode": 292
+      },
+      ".gitignore": {
+        "kind": "file",
+        "body": "71449655f6537313cb44f9ab51eac4b9271e6c27d0209df499cb8cf87dcae344",
+        "mode": 292
+      },
+      "LICENSE-APACHEv2": {
+        "kind": "file",
+        "body": "ab0af3ce8ab22189cb875b657461ff185b0c8b0738d2baa830b7a3e5de1cdaac",
+        "mode": 292
+      },
+      "tests/test_base32.nim": {
+        "kind": "file",
+        "body": "88f5c971fa4266ee17cdb7db02b672478c933f4c4977e4763891fecc93ffc027",
+        "mode": 292
+      },
+      "tests/test_objects.nim": {
+        "kind": "file",
+        "body": "c4c4bb807f64b6907bebcdb3f4f8680f650699f9bd74579b1250c4190724075a",
+        "mode": 292
+      },
+      "tests/test_enums.nim": {
+        "kind": "file",
+        "body": "6e75c279146a256c57248fc0e7024c643d17b031579486598cf30a70b92e7673",
+        "mode": 292
+      },
+      "tests/test_bitseqs.nim": {
+        "kind": "file",
+        "body": "e2c0e34b47a2f4f81261dc087db35c73dc266e7f00a4c9634852a0eb97355be0",
+        "mode": 292
+      },
+      "tests/test_importops.nim": {
+        "kind": "file",
+        "body": "ca2c99ce22cd71f66b08f8da946c6822a9fb2c41f90e3ab6765af840ebbb27e8",
+        "mode": 292
+      },
+      "tests/test_base64.nim": {
+        "kind": "file",
+        "body": "37fb9b7e9ab6e85a5cdef0ed9b1e00a37cfb23c14dbfec13cdf323cac15e9ce5",
+        "mode": 292
+      },
+      "tests/test_macros.nim": {
+        "kind": "file",
+        "body": "b012fad779ea7efcd9d046c4c4446561c91d336ecdffe06696cb9611722b33d2",
+        "mode": 292
+      },
+      "tests/test_base58.nim": {
+        "kind": "file",
+        "body": "25314121d3cc798ecfea18db3bc2523a9c294bd1097376962a2f1e7a790b6d2b",
+        "mode": 292
+      },
+      "tests/test_endians2.nim": {
+        "kind": "file",
+        "body": "9fbec4e11870d8e1e13516dc4e2342c8b3f3d8bb57f35e80e1a0c0d30181de9a",
+        "mode": 292
+      },
+      "tests/test_staticfor.nim": {
+        "kind": "file",
+        "body": "d42cb18cd3e1d512f221216da60ea45ed4067633fe8d4b346db03967279d4514",
+        "mode": 292
+      },
+      "tests/test_helper.nim": {
+        "kind": "file",
+        "body": "481b4f28c5f90c1aa72228b6d00f35530b6c0f89565405a508a43a9c80a064b5",
+        "mode": 292
+      },
+      "tests/test_leb128.nim": {
+        "kind": "file",
+        "body": "fd68bacf28e5c442284bf2e2e7e829a412cf6e5968a77f9fd415eebdd74ba785",
+        "mode": 292
+      },
+      "tests/test_keyed_queue.nim": {
+        "kind": "file",
+        "body": "46581266ffe76418d6da5c317f81e3fc93ac517c02704965a5b4eca36a7a2c2e",
+        "mode": 292
+      },
+      "tests/all_tests.nim": {
+        "kind": "file",
+        "body": "d69f2b6e29b52e1b92210ad69a0ed0522c8d5202904abaa8da6adbacf33e405f",
+        "mode": 292
+      },
+      "tests/test_lentutils.nim": {
+        "kind": "file",
+        "body": "65c8f484fe5d2a409f632d0aace31c3bc8b7a6f6781a38b01c6b919bc7c55f21",
+        "mode": 292
+      },
+      "tests/test_base10.nim": {
+        "kind": "file",
+        "body": "20ae7f81ee1ac790d6696d5cf3676240890f882df8749dabbac17528f08dfc74",
+        "mode": 292
+      },
+      "tests/test_ctops.nim": {
+        "kind": "file",
+        "body": "e353a851f95a12dcaf9bd8c37214a97a5d6f7a9752265722fd5b23ff06e75406",
+        "mode": 292
+      },
+      "tests/test_arrayops.nim": {
+        "kind": "file",
+        "body": "ec7426f49d011f69a50af68c1f5af510d9d69a5baceb43b19549ee1b2cadf86e",
+        "mode": 292
+      },
+      "tests/test_ptrops.nim": {
+        "kind": "file",
+        "body": "94ec6a63514612df622cdef928d071346d5579e9ead8b20b3ff864ed5f2bce78",
+        "mode": 292
+      },
+      "tests/test_byteutils.nim": {
+        "kind": "file",
+        "body": "c1c743d6569769ee86268fcff005afb1f48f35b0bf8777ccc13bc1b7cf2efb40",
+        "mode": 292
+      },
+      "tests/test_io2.nim": {
+        "kind": "file",
+        "body": "7c34cace6b1160df06f17dfda7e6098ac2ef9744d13697fc48149f867461ff1f",
+        "mode": 292
+      },
+      "tests/test_assign2.nim": {
+        "kind": "file",
+        "body": "34e27a3559014ab6bbaca9d2fe368e492675cf17f709c0ede2e44747a8d3fbca",
+        "mode": 292
+      },
+      "tests/test_bitops2.nim": {
+        "kind": "file",
+        "body": "d247ca9682485e950da5e30fccaa65b978790d2b1c3a7d7ff3b63fe42f2696b4",
+        "mode": 292
+      },
+      "tests/test_arraybuf.nim": {
+        "kind": "file",
+        "body": "1df42a5fe3aee68b5889601b2b0fa6ce042867adbff0b86f96cd7b5115972d57",
+        "mode": 292
+      },
+      "tests/test_winacl.nim": {
+        "kind": "file",
+        "body": "c1d29fe38ff1533abf0d7d9a4ba4b9f97917bb6d1fe0c0fec09455d4ae78eaf6",
+        "mode": 292
+      },
+      "tests/test_sets.nim": {
+        "kind": "file",
+        "body": "2308f1ea1ccb612ca157c3341670062ef6e4fb50aad8f355f2b5f9a1bc1db6a9",
+        "mode": 292
+      },
+      "tests/test_strformat.nim": {
+        "kind": "file",
+        "body": "2f30e5909ea75c29cc6c971a60422bf57b39087c21330119650a178013005b6b",
+        "mode": 292
+      },
+      "tests/test_templateutils.nim": {
+        "kind": "file",
+        "body": "a90790f6f79867333a637bca4c6988a02716b98bec1063d334a09c25be0b51a4",
+        "mode": 292
+      },
+      "tests/nim.cfg": {
+        "kind": "file",
+        "body": "e7d15b5834db7246e593d2e6bafbd7d406e2e424e5f32b145dd31fba6a7d122f",
+        "mode": 292
+      },
+      "tests/test_base36.nim": {
+        "kind": "file",
+        "body": "ebed0736a046d4ce0e218a7d57da9157a0c81df54ccf21e5df29de8b74326806",
+        "mode": 292
+      },
+      "tests/test_sequtils2.nim": {
+        "kind": "file",
+        "body": "d47788add4aae150ab777a6c3a79aec6dc79e054776f255504f71a5bbfd373f1",
+        "mode": 292
+      },
+      "tests/test_sorted_set.nim": {
+        "kind": "file",
+        "body": "fa69a85bc6bc25c372535d1677aae5016f1f5a25a55a8e4dba77703d08f527b9",
+        "mode": 292
+      },
+      "tests/test_interval_set.nim": {
+        "kind": "file",
+        "body": "6e120ed216b8870c9d647a65577f385b4c90691c2c16f9299a2a65f562d0f8bb",
+        "mode": 292
+      },
+      "tests/test_faux_closures.nim": {
+        "kind": "file",
+        "body": "d4e86a9393fa93a9e4a4d400d881de4b052b0b7aacf2d4dfc6d7bed65c2b5472",
+        "mode": 292
+      },
+      "stew/ptrops.nim": {
+        "kind": "file",
+        "body": "195cfaba7c1e25e970a63f559fc8af808dad034a8aa8263b41030ceb1a559d31",
+        "mode": 292
+      },
+      "stew/staticfor.nim": {
+        "kind": "file",
+        "body": "d8230fe7dbc11279a349408aadcac25c0b832312a4f0275dfb5c430b6229546e",
+        "mode": 292
+      },
+      "stew/rlimits.nim": {
+        "kind": "file",
+        "body": "0cf367a60a3edcd9d717384e183ab3ee898e57b54cd8a604e012b599612e05e1",
+        "mode": 292
+      },
+      "stew/interval_set.nim": {
+        "kind": "file",
+        "body": "520b7916c2cb81def47263e39da942208ea4d8a376428f017b725cd115a3d43f",
+        "mode": 292
+      },
+      "stew/lentutils.nim": {
+        "kind": "file",
+        "body": "66af1a00fb7b5ca8726bbfd86d0243d985cce3b21995c775626fd7005ff01050",
+        "mode": 292
+      },
+      "stew/arraybuf.nim": {
+        "kind": "file",
+        "body": "ee20f75c9df025e03f4674eeef9a2b3633900c627a0528e17922640e8fc6e280",
+        "mode": 292
+      },
+      "stew/base36.nim": {
+        "kind": "file",
+        "body": "b8a42a6ac6d1057fca0be079aac5750463729fdad771823f1be53b8723a5e0a8",
+        "mode": 292
+      },
+      "stew/bitseqs.nim": {
+        "kind": "file",
+        "body": "1aaff54376d592356db707b4e032ba78ef652fa4574a460afc870d6911f9825c",
+        "mode": 292
+      },
+      "stew/objects.nim": {
+        "kind": "file",
+        "body": "92be9634a5bd5b34ada258dbe209bf0bdc34a7c860b4ef80da53ae41dc882359",
+        "mode": 292
+      },
+      "stew/arrayops.nim": {
+        "kind": "file",
+        "body": "92f09b952c639d4a3eb574c3a33555a00d0a20ba22e1a7078883ac8a9706ffe3",
+        "mode": 292
+      },
+      "stew/sorted_set.nim": {
+        "kind": "file",
+        "body": "281b6e4db79c027e213aa0128471fd34cfb159f55990069e438fbb292604e4ce",
+        "mode": 292
+      },
+      "stew/ctops.nim": {
+        "kind": "file",
+        "body": "7ecdb8480b12b35a2e96a1d2a1fbd5ce40cf1b5124cba1f7473e91070d5591dd",
+        "mode": 292
+      },
+      "stew/io2.nim": {
+        "kind": "file",
+        "body": "6fcfe3d1c5af6f522b566d0648014214fb3a7553d7f2d7dbc01b674ab5d72491",
+        "mode": 292
+      },
+      "stew/importops.nim": {
+        "kind": "file",
+        "body": "17f48767d8f1ea680b17174f926818afea4a40d752d1da1847dfc827364d6b4b",
+        "mode": 292
+      },
+      "stew/base64.nim": {
+        "kind": "file",
+        "body": "4cb9383d3795b7fe6cb15172b1292e1547eebd2ffc0655d87e9c7fa6aa254e30",
+        "mode": 292
+      },
+      "stew/faux_closures.nim": {
+        "kind": "file",
+        "body": "b1dc6847bee4f142da018e6ac4839ef55e579ff62ec1b5ab267631a797686c06",
+        "mode": 292
+      },
+      "stew/strings.nim": {
+        "kind": "file",
+        "body": "492d22f0fc3dc08c85e9ffd48cb56d5488e87e78df76a8172f93d39b8a0f4ac3",
+        "mode": 292
+      },
+      "stew/bitops2.nim": {
+        "kind": "file",
+        "body": "2be4ad9840c0484513c582f471ec95854d765b93b856c2307a9c385c8942879b",
+        "mode": 292
+      },
+      "stew/base58.nim": {
+        "kind": "file",
+        "body": "e6f8cf453f7de47dba11672e321a3ef1226a3cde1e2ce3083c41738aa9dcd156",
+        "mode": 292
+      },
+      "stew/base32.nim": {
+        "kind": "file",
+        "body": "11dc54af6aee49b6fe353d6371cd0b4f873a251270c4140e9364b8bd1389d440",
+        "mode": 292
+      },
+      "stew/templateutils.nim": {
+        "kind": "file",
+        "body": "444a7aed9801ed6ed06c2404a8cb01c65254c63435d27e8830e02ac0b111f97f",
+        "mode": 292
+      },
+      "stew/sequtils2.nim": {
+        "kind": "file",
+        "body": "5991158af24e48ff8670a26b52495bc87e0ab2448c32a272acf722e59a82ad85",
+        "mode": 292
+      },
+      "stew/closures.nim": {
+        "kind": "file",
+        "body": "4c8770201b44572946c31f410968c3f3ebef61f891fba828c21a76f76e5e2874",
+        "mode": 292
+      },
+      "stew/endians2.nim": {
+        "kind": "file",
+        "body": "fbe820dc9ae3539f297744e43268c42b78858988c17db850489d5f8c46e3f75a",
+        "mode": 292
+      },
+      "stew/README.md": {
+        "kind": "file",
+        "body": "82182ab233759677bec5327b423a63aa55d2de7524fd06d42625e5e7dfee853e",
+        "mode": 292
+      },
+      "stew/leb128.nim": {
+        "kind": "file",
+        "body": "8f1aea36d2210b76af268b10baa053b4796d21b7ac4e1bdc871b1f1515c57ed9",
+        "mode": 292
+      },
+      "stew/base10.nim": {
+        "kind": "file",
+        "body": "9ec0efaf39229410909833a0393c8a98ba29342d016ff02af18e28e5466aae7f",
+        "mode": 292
+      },
+      "stew/assign2.nim": {
+        "kind": "file",
+        "body": "0dc1ac4d1d97e0b6b16c80cff9b653762dc0adf15bee087d3524da76ba3b47ec",
+        "mode": 292
+      },
+      "stew/keyed_queue.nim": {
+        "kind": "file",
+        "body": "a4ddcb147b7d0338e63e1743ba3befe355ab4b03c82fa930cfd27f39dcef7c46",
+        "mode": 292
+      },
+      "stew/enums.nim": {
+        "kind": "file",
+        "body": "b6fe675ea738f1748b9f4c0487064aa9789356965a2021bb5e7f3bc23ded36ae",
+        "mode": 292
+      },
+      "stew/evalonce.nim": {
+        "kind": "file",
+        "body": "783aa10ca22026f5442ae232e24d1feabcd06d561250d0d6da8a54ff13dc6fee",
+        "mode": 292
+      },
+      "stew/byteutils.nim": {
+        "kind": "file",
+        "body": "406c435d6f3ecb7f8dd954b0f7f74e3555ee91ebef3fb9db7ec8b55096aa6602",
+        "mode": 292
+      },
+      ".github/workflows/ci.yml": {
+        "kind": "file",
+        "body": "93681d23ea94a3362d6c77226e42a1fa2cb0ff296f65cb4eb9cd8390270a4c85",
+        "mode": 292
+      },
+      "stew/ranges/stackarrays.nim": {
+        "kind": "file",
+        "body": "33ee6b827b6fe0be0521383be9a8696c8f5e3dcec739ad1cdd0bdb2b8bebbc8e",
+        "mode": 292
+      },
+      "stew/sorted_set/rbtree_rotate.nim": {
+        "kind": "file",
+        "body": "5cadd635ab19417ea231eb0a99e0beedc37a4b04f813b4c2a824e3f2b237d342",
+        "mode": 292
+      },
+      "stew/sorted_set/rbtree_verify.nim": {
+        "kind": "file",
+        "body": "8e7ff3041de4ce8121cc5f3f6735a2a1475e07720db9fd563a4f449584b000c8",
+        "mode": 292
+      },
+      "stew/sorted_set/rbtree_delete.nim": {
+        "kind": "file",
+        "body": "6b9f9d65dde99a03cb1a9f7af0702c08497b88fa24a8cd307546da4f752e34dc",
+        "mode": 292
+      },
+      "stew/sorted_set/rbtree_desc.nim": {
+        "kind": "file",
+        "body": "9c2e2b9cc87e591f8aa994a6746e046874ba1b96a93118a8ac7f34cfba4c8022",
+        "mode": 292
+      },
+      "stew/sorted_set/rbtree_find.nim": {
+        "kind": "file",
+        "body": "7afae9434a24c203bb1d32d3461941e44f5090f2e3e17276668d59c884736bff",
+        "mode": 292
+      },
+      "stew/sorted_set/rbtree_reset.nim": {
+        "kind": "file",
+        "body": "d5c91e0142cc5923463f8646d32d39a250f536a70571e3575ab25fe3039a511b",
+        "mode": 292
+      },
+      "stew/sorted_set/rbtree_flush.nim": {
+        "kind": "file",
+        "body": "0714f017d8718a3a3970f1524a6735476b8b79918144676938ad645e4e11ebe5",
+        "mode": 292
+      },
+      "stew/sorted_set/rbtree_insert.nim": {
+        "kind": "file",
+        "body": "cbe5592321081239ad77c60d1f031211f0395bc231584823f7377cd9e3621667",
+        "mode": 292
+      },
+      "stew/sorted_set/rbtree_walk.nim": {
+        "kind": "file",
+        "body": "27b19106b9c0d9d776fc59e8e56284f4b9db0ef14b083b22027582650f996975",
+        "mode": 292
+      },
+      "stew/windows/acl.nim": {
+        "kind": "file",
+        "body": "ba33047e03d311910b1e2d6ca86325129fce277b374ba646858fbbbc36882282",
+        "mode": 292
+      },
+      "stew/keyed_queue/kq_debug.nim": {
+        "kind": "file",
+        "body": "73567550d946decc710421f56c476677fcfb0099179196f0b199c641e929f3af",
+        "mode": 292
+      },
+      "stew/shims/tables.nim": {
+        "kind": "file",
+        "body": "37026f34e641c8cb0f6cd95c00cfd1f82a951f5f010adf790a53b6ee63c402ff",
+        "mode": 292
+      },
+      "stew/shims/strformat.nim": {
+        "kind": "file",
+        "body": "3355fa8849c7623ee70e781c373697900bdf8a1fbb43fd453be7507954f5eb1b",
+        "mode": 292
+      },
+      "stew/shims/sequninit.nim": {
+        "kind": "file",
+        "body": "729efddb07520513db99a7a2289514e0a6ef09fbd26733d9623fcbcf2a324b6b",
+        "mode": 292
+      },
+      "stew/shims/hashes.nim": {
+        "kind": "file",
+        "body": "145790e4b82ed1321b032790a6f50cbd2ea43ee30bed6c5c2a2300c5f5b41156",
+        "mode": 292
+      },
+      "stew/shims/sets.nim": {
+        "kind": "file",
+        "body": "db137c4ddd46ea98530594bf08d93cf395a57ff991800a9851806ade4f72c0c8",
+        "mode": 292
+      },
+      "stew/shims/sequtils.nim": {
+        "kind": "file",
+        "body": "c6150faabbbe810080e687f0a7737e247ccd2c3a6704cf5999169bba413c61f6",
+        "mode": 292
+      },
+      "stew/shims/macros.nim": {
+        "kind": "file",
+        "body": "d2207be677046886173326b47e7aa6689b20b52db72c1e2dc0bbb6532e654ee6",
+        "mode": 292
+      },
+      "tests/ranges/tstackarrays.nim": {
+        "kind": "file",
+        "body": "230ce768e4d20bcddbba7bf0836bcdd5ef25e57cd31f7468d3e54ba5bd9e7e9f",
+        "mode": 292
+      },
+      "tests/ranges/all.nim": {
+        "kind": "file",
+        "body": "45693bcebd37b76c02a5d09f566ba2ccb6f98a0c00a06007e0e58ddc34cde3d3",
+        "mode": 292
+      }
+    }
+  },
+  "nim-results": {
+    "locked": {
+      "lastModified": 1781622808,
+      "narHash": "sha256-chvmxuQw7gxRxXelxxBCXHQGk1LXmg63+VysnJhlxmE=",
+      "owner": "arnetheduck",
+      "repo": "nim-results",
+      "rev": "b319652e98a198fa881ca70a76754c2dd6f09804",
+      "type": "github"
+    },
+    "members": {
+      "README.md": {
+        "kind": "file",
+        "body": "b8620243cfb588cb8101a11d3711fda879a60406a4f849913b870efd628b5726",
+        "mode": 292
+      },
+      ".gitignore": {
+        "kind": "file",
+        "body": "bf4b8bbad44ccc948c67149700c074f333b2a0842ea65fe8dd75ed0dd0c537d6",
+        "mode": 292
+      },
+      "results.nim": {
+        "kind": "file",
+        "body": "e815286fa2c8878828661af3a50d5653405578c5d045cd71f11b18980880326b",
+        "mode": 292
+      },
+      "LICENSE-APACHEv2": {
+        "kind": "file",
+        "body": "2e106d852f87d7184452d2f4d9f6c45b270641a4680d0bda2107a556c1b3b296",
+        "mode": 292
+      },
+      "LICENSE-MIT": {
+        "kind": "file",
+        "body": "d9a8be1afd486712f24a92b2ff24a563a9de4856a1e4e8227717aa4f0bdb2921",
+        "mode": 292
+      },
+      ".git-blame-ignore-revs": {
+        "kind": "file",
+        "body": "16cff44b849feee4fdb27b5d442d2487e387a03b34d58d326b275055bdc8b6e2",
+        "mode": 292
+      },
+      "results.nimble": {
+        "kind": "file",
+        "body": "c4eae88f94fb5d6c418c4761ae57a4ace9f9f497555e18e8a4719664774b066d",
+        "mode": 292
+      },
+      "tests/test_results.nim": {
+        "kind": "file",
+        "body": "7beb3c14beed7a5e02d7881103de3e76436aee45e68c82ba98656e4fac736e30",
+        "mode": 292
+      },
+      "tests/test_results2.nim": {
+        "kind": "file",
+        "body": "b2ef28f2be4a83d9dcb9f983f2360008f363274286e91569b7ee34dca06e4907",
+        "mode": 292
+      },
+      "benchmarks/benchmark.nim": {
+        "kind": "file",
+        "body": "1fb777108a1b44de858d774b028642dc9bac4bfa9cf8f3069544598a4e5e9c5a",
+        "mode": 292
+      },
+      ".github/workflows/ci.yml": {
+        "kind": "file",
+        "body": "2a37a39c96ca0aaf9b8e204d064e20e57ca621431b135f6e61263d0c7bac7468",
+        "mode": 292
+      }
+    }
+  },
+  "nim-unittest2": {
+    "locked": {
+      "lastModified": 1778153804,
+      "narHash": "sha256-utr4sB1zjSYoo5gb5cfIOf1bcyKOcAG6aO4iHyRGb28=",
+      "owner": "status-im",
+      "repo": "nim-unittest2",
+      "rev": "92e1c13dcfb6d7e4ea6fb624fe9cc31e3dc76813",
+      "type": "github"
+    },
+    "members": {
+      "nim.cfg": {
+        "kind": "file",
+        "body": "8dd429c65f31d8da0b63cd0b33d9f0cc2b81f05196bbfd6c5652ff35d9a0a8cb",
+        "mode": 292
+      },
+      "config.nims": {
+        "kind": "file",
+        "body": "a504e9fc19bce52c837f46ec87ab98d839e9315fa64974a1080a3862d76087b2",
+        "mode": 292
+      },
+      "nimdoc.out.css": {
+        "kind": "file",
+        "body": "c9069a480d6b9d8608cea38430260151a24143c500d5328689f57d154209c93e",
+        "mode": 292
+      },
+      ".gitignore": {
+        "kind": "file",
+        "body": "5b094eda0f49f152f58ef3c1e44eda113724d2c4d78831dbd94bbbb38c239703",
+        "mode": 292
+      },
+      "nimble.lock": {
+        "kind": "file",
+        "body": "25a50b2020bdcb685b46c29fa1dfc9849ec9db5dc2380c59bfdc3af9ce837874",
+        "mode": 292
+      },
+      "README.md": {
+        "kind": "file",
+        "body": "e245ec2eb96d0f1a627dec214b0df1f4436ffb6f716f0d1d9ff989ed55ba1e53",
+        "mode": 292
+      },
+      "LICENSE.txt": {
+        "kind": "file",
+        "body": "4bb4c4aac9dfc5378a59187d3c5c81159dceb04c90796cd084bca6c918b5d3fa",
+        "mode": 292
+      },
+      "unittest2.nim": {
+        "kind": "file",
+        "body": "ed98c13cc5b267ae93bc59dc7016c99669af80084ceecbbfd214b221b54ac734",
+        "mode": 292
+      },
+      "unittest2.nimble": {
+        "kind": "file",
+        "body": "df40c1b2fbe9900a7f74dddeb98bf8ad787fc34c432c273737f2ce7a3281ffb1",
+        "mode": 292
+      },
+      "book/book.toml": {
+        "kind": "file",
+        "body": "547f97ea6775ef71c4d28e8ce355998fa1c66979a62313f30ddabe43c967d526",
+        "mode": 292
+      },
+      "book/open-in.css": {
+        "kind": "file",
+        "body": "2c65c1389ec50ce231d24836b1fba28865d0949264c140f5bfb46d96631adc7d",
+        "mode": 292
+      },
+      "book/mdbook-admonish.css": {
+        "kind": "file",
+        "body": "36443d3ef67a1132762b26e561dbe31acd05b81bf03d78ee38ab1f09afd55ca1",
+        "mode": 292
+      },
+      "tests/sampletests.nim": {
+        "kind": "file",
+        "body": "65c74dad041977089ea8cab3bc9c023bf9d884cda0a876faae079aeef40c7b64",
+        "mode": 292
+      },
+      "tests/tunittest.nim": {
+        "kind": "file",
+        "body": "3832947c4928cabdef526e631106b59eac7a7a6d803dee2b498111f5b67945bc",
+        "mode": 292
+      },
+      "tests/nim.cfg": {
+        "kind": "file",
+        "body": "28e0b6368929ac832f9be9f97a87b84ef6c67f5f2ad9adbb5d843afc14b11ca0",
+        "mode": 292
+      },
+      "examples/nim.cfg": {
+        "kind": "file",
+        "body": "28e0b6368929ac832f9be9f97a87b84ef6c67f5f2ad9adbb5d843afc14b11ca0",
+        "mode": 292
+      },
+      "examples/quickstart.nim": {
+        "kind": "file",
+        "body": "84be1199d2b851c46ff548bc596204d857bb2c3bb15e2c6eba502bfb67baf97a",
+        "mode": 292
+      },
+      "examples/dependency_injection.nim": {
+        "kind": "file",
+        "body": "f3e059af2028075ef8c701de9b04995a0c427c6894f4000dea65a185057c8b65",
+        "mode": 292
+      },
+      "examples/checkpoints.nim": {
+        "kind": "file",
+        "body": "b23a898db2e1880d39827253dad1ffc701d2cf1464bc5afe4cdb07fdc71e1d4b",
+        "mode": 292
+      },
+      "examples/suite_fixture.nim": {
+        "kind": "file",
+        "body": "9315f6a8b718891eeef786e3042f8da45698212d342cc24da0d30f5c7794464d",
+        "mode": 292
+      },
+      "examples/collect_and_run.nim": {
+        "kind": "file",
+        "body": "0d2847dbc497a28d80e73d232f1b5c5f72b9b4cdf36c2666b51ea10e3277e0bb",
+        "mode": 292
+      },
+      "examples/data_driven.nim": {
+        "kind": "file",
+        "body": "4510ce49ab770cfc70597e8171dcd6be7ce21ec1f5487271f5de4f066512b2a3",
+        "mode": 292
+      },
+      "examples/execution_order.nim": {
+        "kind": "file",
+        "body": "b878db20dd4b224091607118a445d24a8f0fb799e45025213dee319a2e2e163a",
+        "mode": 292
+      },
+      "examples/compile_time.nim": {
+        "kind": "file",
+        "body": "a5fa20b7cdb0d246c3438e2635d54f252ab945e7648d0930bd80831aec13e0ab",
+        "mode": 292
+      },
+      ".github/workflows/ci.yml": {
+        "kind": "file",
+        "body": "7b007f94093bd12e96eebf16bb562c576486ca0c14b8ba57f36f7b2b845e7267",
+        "mode": 292
+      },
+      ".github/workflows/doc.yml": {
+        "kind": "file",
+        "body": "588f85d630ac89d78caeb1855374767b559cc8ba74e54c5a8ac40b0d32eebbdb",
+        "mode": 292
+      },
+      "book/src/quickstart.md": {
+        "kind": "file",
+        "body": "843c23bdd9b2ad9d1225058615079145ba117304ea1af65579271237d4340f4b",
+        "mode": 292
+      },
+      "book/src/compilation-flags.md": {
+        "kind": "file",
+        "body": "b1b999070c5e16f376aa568566164baedbe1be953b2c6f30c533c66c6091176f",
+        "mode": 292
+      },
+      "book/src/examples.md": {
+        "kind": "file",
+        "body": "01a6e4136d68a52a1be27e0b940009d1b91e0f971ce02e61b9583ebc481efaaf",
+        "mode": 292
+      },
+      "book/src/command-line.md": {
+        "kind": "file",
+        "body": "744eba2ae2097be80ada994d663e412df6aac5ccbde879a982a5a07da02945b9",
+        "mode": 292
+      },
+      "book/src/running-tests.md": {
+        "kind": "file",
+        "body": "5174d8e061eb54fa8f0a1466bfc044e50baf8631224a67c431a654ef6bb1d71a",
+        "mode": 292
+      },
+      "book/src/porting-from-unittest.md": {
+        "kind": "file",
+        "body": "853a1a994e569e01ec86c59fdffd389d48d4da059b37c152e3d71a986a39af4a",
+        "mode": 292
+      },
+      "book/src/SUMMARY.md": {
+        "kind": "file",
+        "body": "396a34eeb2bb6b5bd35b5a7ca8454de9fd80a3df0ef62be4ed8ee77f0ad18ffb",
+        "mode": 292
+      },
+      "book/src/operation-modes.md": {
+        "kind": "file",
+        "body": "6a4f36213072131009a28265116b5bef542d9011f5505cff1196c194983a00f8",
+        "mode": 292
+      }
+    }
+  }
+}

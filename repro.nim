@@ -318,13 +318,20 @@ package codetracer_trace_format_nim:
         "owning typed builds require declared Zstd include/library paths"
     let zstdInputs = (when defined(windows): newSeq[string]()
                      else: @[zstdIncludeDir / "zstd.h", zstdLibDir])
+    var nimDependencyDirs: seq[string] = @[]
+    when defined(windows):
+      for key in ["CT_NIM_STEW_SRC", "CT_NIM_RESULTS_SRC", "CT_NIM_UNITTEST2_SRC"]:
+        let dependencyDir = getEnv(key)
+        doAssert dependencyDir.isAbsolute and dirExists(dependencyDir),
+          "owning Windows builds require complete declared Nim source dependency: " & key
+        nimDependencyDirs.add(dependencyDir)
     let ctPrintBuild = buildCtPrint(".", nativeIncludeDir = zstdIncludeDir,
-      nativeLibDir = zstdLibDir)
+      nativeLibDir = zstdLibDir, nimDependencyDirs = nimDependencyDirs)
 
     discard collect("default", @[ctPrintBuild])
 
     # Opt-in owning producer; no shipping/default or test corpus expansion.
-    discard collect("sharedLib", @[buildSharedLib(".", nativeIncludeDir = zstdIncludeDir, nativeLibDir = zstdLibDir)])
+    discard collect("sharedLib", @[buildSharedLib(".", nativeIncludeDir = zstdIncludeDir, nativeLibDir = zstdLibDir, nimDependencyDirs = nimDependencyDirs)])
 
     # ---- Test corpus (the `test` / `test-builds` collections) --------
     #
@@ -375,10 +382,10 @@ package codetracer_trace_format_nim:
         source = spec.source,
         binary = spec.binary,
         defines = buildDefines,
-        paths = @["src"],
+        paths = @["src"] & nimDependencyDirs,
         extraPassC = extraPassC,
         extraPassL = extraPassL,
-        extraInputs = @["src", "codetracer_trace_format.nimble", "nim.cfg"] & zstdInputs,
+        extraInputs = @["src", "codetracer_trace_format.nimble", "nim.cfg"] & zstdInputs & nimDependencyDirs,
         actionId = "codetracer-trace-format-nim.test_build." & stem)
       when defined(macosx):
         appendRegisteredActionToolIdentityRefs(edge.action.id, ["clang"])
