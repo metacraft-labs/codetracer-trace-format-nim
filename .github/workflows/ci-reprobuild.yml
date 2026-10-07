@@ -97,6 +97,22 @@ jobs:
               /nix/store/*/bin/bash) dirname "$shell_path" >> "$GITHUB_PATH" ;;
               *) echo "Expected declared Nix bash, got $shell_path" >&2; exit 1 ;;
             esac
+            # Provider graph construction needs these declared inputs before
+            # repro exec can introspect/activate this same owning shell.
+            case "${CT_ZSTD_INCLUDE_DIR:?missing owning Zstd include}" in
+              /nix/store/*/include) ;;
+              *) echo "Invalid declared Zstd include prefix" >&2; exit 1 ;;
+            esac
+            case "${CT_ZSTD_LIB_DIR:?missing owning Zstd library}" in
+              /nix/store/*/lib) ;;
+              *) echo "Invalid declared Zstd library prefix" >&2; exit 1 ;;
+            esac
+            [[ "$CT_ZSTD_INCLUDE_DIR" =~ ^/nix/store/[a-z0-9]{32}-[^[:space:]]+/include$ ]]
+            [[ "$CT_ZSTD_LIB_DIR" =~ ^/nix/store/[a-z0-9]{32}-[^[:space:]]+/lib$ ]]
+            test -f "$CT_ZSTD_INCLUDE_DIR/zstd.h"
+            test -d "$CT_ZSTD_LIB_DIR"
+            printf "CT_ZSTD_INCLUDE_DIR=%s\nCT_ZSTD_LIB_DIR=%s\n" \
+              "$CT_ZSTD_INCLUDE_DIR" "$CT_ZSTD_LIB_DIR" >> "$GITHUB_ENV"
           '
 
       - name: Setup dev env (reprobuild flavor)
