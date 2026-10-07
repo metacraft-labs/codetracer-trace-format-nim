@@ -12,9 +12,16 @@ test -z "${GIT_DIR-}${GIT_WORK_TREE-}${GIT_COMMON_DIR-}${GIT_TEMPLATE_DIR-}${GIT
 git_exe=$(command -v git)
 git_real=$(realpath "$git_exe")
 test -f "$git_real" && test -x "$git_real"
-case "$git_real" in /nix/store/*/bin/git) ;; *) echo 'unqualified checkout Git prefix' >&2; exit 1 ;; esac
-git_root=${git_real%/bin/git}
+case "$git_real" in
+  /nix/store/*/bin/git) git_root=${git_real%/bin/git} ;;
+  /usr/bin/git)
+    # Actual hosted checkout principal; diagnostic only, never hook admission.
+    test "$(git --exec-path)" = /usr/lib/git-core
+    git_root=/usr ;;
+  *) echo 'unqualified checkout Git prefix' >&2; exit 1 ;;
+esac
 templates="$git_root/share/git-core/templates"
+git_body_before=$(sha256sum "$git_real")
 test -d "$templates/hooks" && test ! -L "$templates" && test ! -L "$templates/hooks"
 # An inherited template selector is outside this source-qualified authority.
 if git config --get init.templateDir >/dev/null; then
@@ -57,7 +64,6 @@ test -z "$(git --no-optional-locks status --porcelain=v1 --untracked-files=no)"
 source_before=$(record_source | sha256sum)
 index_before=$(sha256sum "$common/index")
 config_before=$(sha256sum "$common/config")
-git init --template="$templates" "$receipt/probe" > "$receipt/probe.stdout" 2> "$receipt/probe.stderr"
 record_inventory() {
   local root=$1 member name mode body
   local members=("$root"/*)
@@ -71,10 +77,16 @@ record_inventory() {
     printf '%s\t%s\t%s\n' "$name" "$mode" "$body"
   done | LC_ALL=C sort
 }
+record_inventory "$templates/hooks" > "$receipt/template-source-before.tsv"
+git init --template="$templates" "$receipt/probe" > "$receipt/probe.stdout" 2> "$receipt/probe.stderr"
 record_inventory "$hooks" > "$receipt/initialized-before.tsv"
 record_inventory "$receipt/probe/.git/hooks" > "$receipt/actual-template-initialized.tsv"
 test "$(sha256sum < "$receipt/initialized-before.tsv")" = "$(sha256sum < "$receipt/actual-template-initialized.tsv")"
-record_inventory "$templates/hooks" > "$receipt/immutable-template-source.tsv"
+record_inventory "$templates/hooks" > "$receipt/actual-template-source.tsv"
+# Hosted source is mutable: require the entire template body/mode inventory
+# and executable image unchanged across the read-only probe.
+test "$(sha256sum < "$receipt/template-source-before.tsv")" = "$(sha256sum < "$receipt/actual-template-source.tsv")"
+test "$git_body_before" = "$(sha256sum "$git_real")"
 # Revalidate actual whole inventory after probe, before treating capture stable.
 record_inventory "$hooks" > "$receipt/initialized-after.tsv"
 test "$(sha256sum < "$receipt/initialized-before.tsv")" = "$(sha256sum < "$receipt/initialized-after.tsv")"
