@@ -37,6 +37,7 @@ proc test_a_killed_recording_reads_up_to_its_last_sealed_chunk() =
     doAssert r.get().meta.program == "durable" and
       r.get().meta.workdir == "/work", "meta.dat is not complete on disk"
 
+  let helper = w.registerFunctionAt("/src/a.nim", 3, "helper").get()
   let f = w.registerFunction("main").get()
   discard f
   let vn = w.registerVarname("x").get()
@@ -56,6 +57,9 @@ proc test_a_killed_recording_reads_up_to_its_last_sealed_chunk() =
       "a path registered before the seal is not readable"
     doAssert rd.varnameCount() == 1 and rd.varname(vn).get() == "x",
       "a variable name registered before the seal is not readable"
+    doAssert rd.functionCount() == 1 and rd.function(helper).get() == "helper",
+      "a function declared in a registered file before the seal is not " &
+      "readable (" & $rd.functionCount() & " function records)"
     for i in 0'u64 ..< 2 * ChunkSize:
       doAssert rd.stepAbsoluteGlobalLineIndex(i).get() == i,
         "step " & $i & " reads back at the wrong position"
@@ -64,6 +68,7 @@ proc test_a_killed_recording_reads_up_to_its_last_sealed_chunk() =
   doAssert w.closeCtfs().isOk
   var rd = openNewTrace(path).get()
   doAssert rd.stepCount().get() == 2 * ChunkSize + 3
+  doAssert rd.functionCount() == 2, "after close both functions are there"
   removeFile(path)
   echo "PASS: test_a_killed_recording_reads_up_to_its_last_sealed_chunk"
 
