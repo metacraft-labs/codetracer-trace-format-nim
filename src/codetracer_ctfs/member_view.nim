@@ -84,6 +84,32 @@ proc readsFromFile*(image: ContainerImage): bool {.inline.} =
   when fileImages: image.loaded.len > 0
   else: false
 
+when fileImages:
+  when defined(posix):
+    import std/posix
+
+  proc readAt(image: ContainerImage, at, n: int): int =
+    ## Read image bytes `[at, at + n)` from the file into the image; how many
+    ## were read, short where the file ends first, -1 where it cannot be read.
+    ## One `pread` on a POSIX system, which moves no file position.
+    when defined(posix):
+      let fd = getFileHandle(image.file)
+      while result < n:
+        let got = pread(fd, addr image.bytes[at + result], n - result,
+          Off(at + result))
+        if got < 0:
+          if errno == EINTR: continue
+          return -1
+        if got == 0:
+          break
+        result += got
+    else:
+      try:
+        image.file.setFilePos(at)
+        result = image.file.readBuffer(addr image.bytes[at], n)
+      except IOError, OSError:
+        result = -1
+
 proc loadBlocks(image: ContainerImage, first, last: int): Result[void, string] =
   ## Read blocks `first .. last` of a file-backed image, those not read yet,
   ## each run of them with one read.
@@ -98,13 +124,7 @@ proc loadBlocks(image: ContainerImage, first, last: int): Result[void, string] =
         inc e
       let at = b * image.blockSize
       let n = min((e + 1) * image.blockSize, image.bytes.len) - at
-      var got = 0
-      try:
-        image.file.setFilePos(at)
-        got = image.file.readBuffer(addr image.bytes[at], n)
-      except IOError, OSError:
-        got = -1
-      if got != n:
+      if image.readAt(at, n) != n:
         return err("container file " & image.path & ": blocks " & $b &
           " to " & $e & " could not be read; the file is shorter than when " &
           "it was opened, or unreadable")
