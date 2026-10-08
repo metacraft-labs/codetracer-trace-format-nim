@@ -153,11 +153,21 @@ proc encodeCallRecord*(rec: CallRecord): seq[byte] {.raises: [].} =
 
   buf
 
-proc decodeCallFields(data: openArray[byte], rec: var CallRecord,
-    why: var string): bool =
-  ## Every field of a call record's wire format into `rec`. False, with `why`
-  ## set, where the record does not decode: one walker answering `bool`, so a
-  ## refusal costs one `Result` for the record rather than one per field.
+type
+  CallHead = object
+    ## A call record's fixed-size fields, decoded before the record is built.
+    functionId: uint64
+    parentCallKey: int64
+    entryStep: uint64
+    exitStep: uint64
+    depth: uint32
+
+proc decodeCallFields(data: openArray[byte], head: var CallHead,
+    args: var seq[CallArg], returnValue, exception: var seq[byte],
+    children: var seq[uint64], why: var string): bool =
+  ## Every field of a call record's wire format. False, with `why` set, where
+  ## the record does not decode: one walker answering `bool`, so a refusal
+  ## costs one `Result` for the record rather than one per field.
   var pos = 0
   template varint(): uint64 = varintOrFail(data, pos, why)
   template refuse(message: string) =
@@ -170,28 +180,28 @@ proc decodeCallFields(data: openArray[byte], rec: var CallRecord,
     dest = fieldBytes(data, pos, n)
     pos += n
 
-  rec.functionId = varint()
-  rec.parentCallKey = signedVarintOrFail(data, pos, why)
-  rec.entryStep = varint()
-  rec.exitStep = varint()
-  rec.depth = uint32(varint())
+  head.functionId = varint()
+  head.parentCallKey = signedVarintOrFail(data, pos, why)
+  head.entryStep = varint()
+  head.exitStep = varint()
+  head.depth = uint32(varint())
 
   # The lists grow as they are read, sized at most by the bytes left: a count
   # read from a damaged record must not size an allocation by itself.
   let argsCount = varint()
-  rec.args = newSeqOfCap[CallArg](int(min(argsCount, uint64(data.len - pos))))
+  args = newSeqOfCap[CallArg](int(min(argsCount, uint64(data.len - pos))))
   for i in 0'u64 ..< argsCount:
     var arg = CallArg(varnameId: varint())
     blob(arg.value, "arg")
-    rec.args.add(move arg)
-  blob(rec.returnValue, "return value")
-  blob(rec.exception, "exception")
+    args.add(move arg)
+  blob(returnValue, "return value")
+  blob(exception, "exception")
 
   let childrenCount = varint()
-  rec.children = newSeqOfCap[uint64](
+  children = newSeqOfCap[uint64](
     int(min(childrenCount, uint64(data.len - pos))))
   for i in 0'u64 ..< childrenCount:
-    rec.children.add(varint())
+    children.add(varint())
 
   # `trace-events.md` §"Call Stream": a record's fields fill its
   # `record_len` exactly. Bytes left over mean the record is not the one its
@@ -201,16 +211,29 @@ proc decodeCallFields(data: openArray[byte], rec: var CallRecord,
       $data.len & "-byte frame")
   true
 
+template decodeCallInto(data: openArray[byte], refusalPrefix: string) =
+  ## Decode a call record into the enclosing proc's
+  ## `Result[CallRecord, string]`, or its refusal, prefixed. The record is
+  ## built once, from its decoded fields, in the result: a call record is 104
+  ## bytes (72 on wasm32), and building it any other way zeroes it first,
+  ## which a WebAssembly build makes a call into the host.
+  var head: CallHead
+  var args: seq[CallArg]
+  var returnValue, exception: seq[byte]
+  var children: seq[uint64]
+  var why: string
+  if decodeCallFields(data, head, args, returnValue, exception, children, why):
+    result.ok(CallRecord(functionId: head.functionId,
+      parentCallKey: head.parentCallKey, entryStep: head.entryStep,
+      exitStep: head.exitStep, depth: head.depth, args: move args,
+      returnValue: move returnValue, exception: move exception,
+      children: move children))
+  else:
+    result = err(refusalPrefix & why)
+
 proc decodeCallRecord*(data: openArray[byte]): Result[CallRecord, string] {.raises: [].} =
   ## Decode a CallRecord from its wire format.
-  ##
-  ## Decoded into the result in place: a call record is 104 bytes, and a
-  ## local copied into the result costs a zeroing and a copy of it per
-  ## record, which a WebAssembly build makes two calls into the host.
-  result.ok(CallRecord())
-  var why: string
-  if not decodeCallFields(data, result.unsafeGet(), why):
-    result = err(why)
+  decodeCallInto(data, "")
 
 # ---------------------------------------------------------------------------
 # Zstd helpers
@@ -394,10 +417,8 @@ proc initCallStreamReader*(image: ContainerImage,
 
 template readCallInto*(r: var CallStreamReader, callKey: uint64) =
   ## `readCall`'s body, for a proc returning `Result[CallRecord, string]` that
-  ## reads a call record and returns it: the record is decoded into that
-  ## proc's `result`, so it is zeroed once for it rather than once per layer
-  ## it would pass through (on wasm32 each zeroing is a `memory.fill` call
-  ## into the host).
+  ## reads a call record and returns it: the record is built in that proc's
+  ## `result` rather than in each layer it would pass through.
   block readCallBody:
     if r.legacy.isSome:
       let dataRes = r.legacy.get().read(callKey)
@@ -410,13 +431,11 @@ template readCallInto*(r: var CallStreamReader, callKey: uint64) =
         $r.recordCount & ")")
       break readCallBody
     var within: int
-    var why: string
-    if not r.spec.locate(callKey, within, why):
-      result = err(why)
+    var whyNot: string
+    if not r.spec.locate(callKey, within, whyNot):
+      result = err(whyNot)
       break readCallBody
-    result.ok(CallRecord())
-    if not decodeCallFields(r.spec.record(within), result.unsafeGet(), why):
-      result = err("calls.dat record " & $callKey & ": " & why)
+    decodeCallInto(r.spec.record(within), "calls.dat record " & $callKey & ": ")
 
 proc readCall*(r: var CallStreamReader,
     callKey: uint64): Result[CallRecord, string] =
