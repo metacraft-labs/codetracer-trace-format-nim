@@ -1061,6 +1061,9 @@ proc trace_writer_start(
   # Buffer this as the first pending step
   handle.pendingStepPathId = pathId
   handle.pendingStepLine = uint64(line)
+  # A column belongs to the step it was registered on; one left by a step
+  # whose flush was refused does not move to this one.
+  handle.pendingColumnDelta = 0
   handle.hasPendingStep = true
   handle.started = true
   return
@@ -1250,6 +1253,9 @@ proc trace_writer_register_step(
   # Buffer this as the new pending step
   handle.pendingStepPathId = pathId
   handle.pendingStepLine = uint64(line)
+  # A column belongs to the step it was registered on; one left by a step
+  # whose flush was refused does not move to this one.
+  handle.pendingColumnDelta = 0
   handle.hasPendingStep = true
   return
 
@@ -2279,6 +2285,9 @@ proc ct_assignment_with_column(
     setError("ct_assignment_with_column: multi-stream Step does not yet carry column; falling back to no-column")
   handle.pendingStepPathId = pathId
   handle.pendingStepLine = uint64(line)
+  # A column belongs to the step it was registered on; one left by a step
+  # whose flush was refused does not move to this one.
+  handle.pendingColumnDelta = 0
   handle.hasPendingStep = true
   return
 
