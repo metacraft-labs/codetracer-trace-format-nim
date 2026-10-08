@@ -51,11 +51,20 @@ const
     ## two spellings of one state presents: neither writer was wrong against the
     ## text as it stood, so the text was pinned and both now write `0`.
   DefaultBlockSize*: uint32 = 4096
+
   DefaultMaxRootEntries*: uint32 = 31
   HeaderSize* = 8
   ExtHeaderSize* = 8
   FileEntrySize* = 24  # 8 (size) + 8 (mapBlock) + 8 (name)
   MaxChainLevels* = 5  ## Maximum depth of multi-level mapping
+
+
+proc blockSizeRefusal*(blockSize: uint32): string =
+  ## Empty for a block size a full container may declare — 1024, 2048 or 4096
+  ## (`ctfs-container.md` §1) — and otherwise the refusal, naming the value.
+  if blockSize in [1024'u32, 2048'u32, 4096'u32]: ""
+  else: "block size " & $blockSize & " is not one a CTFS container may " &
+    "declare (1024, 2048 or 4096)"
 
 type
   CtfsCompressionMethod* = enum

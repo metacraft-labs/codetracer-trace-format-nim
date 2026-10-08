@@ -111,9 +111,9 @@ proc openClosedCtfs*(path: string): Result[Ctfs, string] =
       "internal file can be added"))
 
   let blockSize = readU32LE(data, 8)
-  if blockSize == 0'u32 or blockSize mod 8 != 0 or
-     int(blockSize) < HeaderSize + ExtHeaderSize + FileEntrySize:
-    return err(appendError(path, "declares an unusable block size of " & $blockSize))
+  let refusal = blockSizeRefusal(blockSize)
+  if refusal.len > 0:
+    return err(appendError(path, refusal))
   if data.len mod int(blockSize) != 0:
     return err(appendError(path,
       "is " & $data.len & " bytes, not a whole number of " & $blockSize &

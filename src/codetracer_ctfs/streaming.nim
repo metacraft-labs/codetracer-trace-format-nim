@@ -19,6 +19,9 @@ proc createCtfsStreaming*(path: string, blockSize: uint32 = DefaultBlockSize,
   ## file entries: block 0, plus the blocks the entry array overflows into)
   ## is written so concurrent readers can see the container structure as
   ## soon as it is created.
+  let refusal = blockSizeRefusal(blockSize)
+  if refusal.len > 0:
+    return err(refusal)
   var c = createCtfs(blockSize, maxRootEntries, encryption, maxShards)
   try:
     c.streamFile = open(path, fmReadWrite)

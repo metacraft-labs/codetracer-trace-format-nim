@@ -1165,6 +1165,16 @@ type
                 ## at profile 0)
     cbCompact   ## the compact directory (version 6, profile 1)
 
+proc fullBlockSizeCheck(data: openArray[byte]): Result[void, string] =
+  ## A full container's block size is 1024, 2048 or 4096 (`ctfs-container.md`
+  ## §1); one declaring any other is refused, naming the value.
+  if data.len < 12:
+    return err("container is " & $data.len & " bytes, short of its header")
+  let refusal = blockSizeRefusal(readU32LE(data, 8))
+  if refusal.len > 0:
+    return err(refusal)
+  ok()
+
 proc containerBody(data: openArray[byte]): Result[ContainerBody, string] =
   ## Which body `data` carries, refusing every version this library does not
   ## read and, at version 6, every header value §1c has a reader refuse.
@@ -1177,6 +1187,7 @@ proc containerBody(data: openArray[byte]): Result[ContainerBody, string] =
   if versionErr.len > 0:
     return err(versionErr)
   if data[5] != CtfsVersionV6:
+    ?fullBlockSizeCheck(data)
     return ok(cbFull)
   let profile = ?readCtfsProfile(data)
   ?checkV6Reserved(data)
@@ -1186,7 +1197,10 @@ proc containerBody(data: openArray[byte]): Result[ContainerBody, string] =
       $scheme & ": its body is read after it is reconstructed as header || " &
       "decompress(rest) (ctfs-container.md §1a), and these bytes are the " &
       "stored body")
-  ok(if profile == cpCompact: cbCompact else: cbFull)
+  if profile == cpCompact:
+    return ok(cbCompact)
+  ?fullBlockSizeCheck(data)
+  ok(cbFull)
 
 proc checkReadableContainer*(data: openArray[byte]): Result[void, string] =
   ## Refuse, naming the value, a container whose members this library cannot

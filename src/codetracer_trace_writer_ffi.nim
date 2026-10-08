@@ -3509,6 +3509,11 @@ proc readMemberOfPath(path: cstring, member: string, what: string,
   var bytes = newSeq[byte](raw.len)
   for i in 0 ..< raw.len:
     bytes[i] = byte(raw[i])
+  # A file that is not a readable container is a failure, never a container
+  # that lacks the member.
+  let readable = checkReadableContainer(bytes)
+  if readable.isErr:
+    return err(what & ": " & readable.error)
   if not hasInternalFile(bytes, member):
     return ok(newSeq[byte]())
   found = true
@@ -4177,8 +4182,9 @@ proc ct_container_create(
     setError("ct_container_create: path is NULL")
     return 1.cint
   let bs = if block_size == 0'u32: DefaultBlockSize else: block_size
-  if bs mod 8 != 0'u32 or int(bs) < HeaderSize + ExtHeaderSize + FileEntrySize:
-    setError("ct_container_create: unusable block size " & $bs)
+  let refusal = blockSizeRefusal(bs)
+  if refusal.len > 0:
+    setError("ct_container_create: " & refusal)
     return 1.cint
   var c = createCtfs(blockSize = bs)
   let res = writeCtfsToFile(c, $path)
