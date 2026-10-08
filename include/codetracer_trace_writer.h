@@ -913,6 +913,51 @@ uint8_t* ct_spans_json(const char* path, int settled, size_t* out_len);
 uint8_t* ct_span_types_json(const char* path, size_t* out_len);
 
 /* --------------------------------------------------------------------------
+ * Line hits and the correlation index
+ *
+ * trace_writer_enable_linehits makes the writer record `linehits.tc`: from
+ * the call on, every step records its position and exec-record index, and the
+ * index is written at close. Call after trace_writer_begin_events and before
+ * the first step it should cover. Returns 0 on success, 1 on failure.
+ *
+ * The read functions take a container path and return a JSON document in
+ * *out_buf / *out_len, freed with ct_free_buffer. Each returns 0 with the
+ * document; 1 when the container has no such member, with nothing allocated
+ * (for the correlation index that means "not indexed", which is not an empty
+ * index); and -1 on failure, with trace_writer_last_error set. A malformed
+ * member is a failure, never an empty answer.
+ *
+ * An entry object is {"key":K,"kind":k,"flags":f,"identity":"<48 hex>",
+ * "wall_time_unix_ns":W,"monotonic_time_ns":M,"geid":G,"thread_id":T}, where
+ * key is the B-tree key of its bucket and identity the entry's 24 identity
+ * bytes in lowercase hex.
+ * -------------------------------------------------------------------------- */
+
+int trace_writer_enable_linehits(trace_writer_t handle);
+
+/* [{"position":P,"steps":[s,...]},...] in position order. */
+int ct_linehits_json(const char* path, uint8_t** out_buf, size_t* out_len);
+
+/* Every entry, in key order and bucket order. */
+int ct_correlation_index_json(const char* path, uint8_t** out_buf,
+    size_t* out_len);
+
+/* The confirmed kind-0 entries for (trace_id[16], span_id[8]), wire bytes. */
+int ct_correlation_lookup_span(const char* path,
+    const uint8_t* trace_id, size_t trace_id_len,
+    const uint8_t* span_id, size_t span_id_len,
+    uint8_t** out_buf, size_t* out_len);
+
+/* The confirmed kind-1 entries for (marker_id, key_value). */
+int ct_correlation_lookup_boundary(const char* path, uint64_t marker_id,
+    const uint8_t* key_value, size_t key_value_len,
+    uint8_t** out_buf, size_t* out_len);
+
+/* The marker labels in id order, each as lowercase hex of its bytes. */
+int ct_marker_labels_json(const char* path, uint8_t** out_buf,
+    size_t* out_len);
+
+/* --------------------------------------------------------------------------
  * Thread lifecycle events
  *
  * Recorders that observe multi-threaded program execution emit ThreadStart /

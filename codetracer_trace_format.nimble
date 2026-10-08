@@ -315,6 +315,7 @@ task test, "Run all tests":
   # and the flow view rendered program output one source line too high.
   # Same FFI-`include` compile requirements as the two tests above.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_io_event_pending_step_attribution.nim"
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_linehits_and_correlation_index.nim"
   # The C ABI's view of the paths.dat layout question: meta.dat bit 4 decides,
   # `ct_reader_column_aware_paths_suspected` reports a record set that also
   # decodes as Layout A, and `ct_reader_open_assume_column_aware_paths` is the

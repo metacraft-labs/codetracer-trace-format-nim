@@ -413,6 +413,23 @@ proc lookupBoundary*(idx: var CorrmarkIndex, markerId: uint64, keyValue: string)
       hits.add(m)
   ok(hits)
 
+proc allEntriesWithKeys*(idx: var CorrmarkIndex):
+    Result[seq[(uint64, CorrelationMarker)], string] =
+  ## Every entry with the B-tree key of its bucket, in ascending key order and
+  ## bucket order. For inspection, like `allEntries`.
+  let keysRes = idx.tree.keys()
+  if keysRes.isErr:
+    return err("corrmark.ns: " & keysRes.error)
+  var entries: seq[(uint64, CorrelationMarker)] = @[]
+  for key in keysRes.get():
+    let descRes = idx.tree.lookup(key)
+    if descRes.isErr:
+      return err("corrmark.ns: " & descRes.error)
+    let (off, count) = ?idx.bucketAt(descRes.get())
+    for i in 0 ..< count:
+      entries.add((key, decodeEntry(idx.image, off + 4 + i * CorrmarkEntrySize)))
+  ok(entries)
+
 proc allEntries*(idx: var CorrmarkIndex): Result[seq[CorrelationMarker], string] =
   ## Every entry in the index, in ascending key order.
   ##
@@ -428,17 +445,10 @@ proc allEntries*(idx: var CorrmarkIndex): Result[seq[CorrelationMarker], string]
   ## `ct print` mode could show it. Without a view like this, a recorder that
   ## declared coverage and a recorder that silently dropped the call produce
   ## output that is identical.
-  let keysRes = idx.tree.keys()
-  if keysRes.isErr:
-    return err("corrmark.ns: " & keysRes.error)
+  let withKeys = ?idx.allEntriesWithKeys()
   var entries: seq[CorrelationMarker] = @[]
-  for key in keysRes.get():
-    let descRes = idx.tree.lookup(key)
-    if descRes.isErr:
-      continue
-    let (off, count) = ?idx.bucketAt(descRes.get())
-    for i in 0 ..< count:
-      entries.add(decodeEntry(idx.image, off + 4 + i * CorrmarkEntrySize))
+  for (_, m) in withKeys:
+    entries.add(m)
   ok(entries)
 
 proc traceIdHexOf*(m: CorrelationMarker): string =

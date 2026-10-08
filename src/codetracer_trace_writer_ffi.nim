@@ -53,6 +53,9 @@ import codetracer_trace_writer/cbor
 import codetracer_trace_writer/call_stream
 import codetracer_trace_writer/io_event_stream
 import codetracer_trace_writer/span_stream
+import codetracer_trace_writer/corrmark_builder
+import codetracer_trace_writer/linehits_reader
+import codetracer_ctfs/xxh64
 import codetracer_trace_writer/step_encoding
 import codetracer_trace_writer/streaming_value_encoder
 import codetracer_trace_writer/new_trace_reader
@@ -3896,6 +3899,287 @@ proc ct_span_types_json(path: cstring,
     return nil
   copyMem(buf, unsafeAddr doc[0], doc.len)
   buf
+
+# ---------------------------------------------------------------------------
+# Line hits and the correlation index — writer opt-in and read side
+# ---------------------------------------------------------------------------
+
+proc trace_writer_enable_linehits(
+    handle: TraceWriterHandle,
+): cint {.exportc, cdecl, dynlib, ffiGuard.} =
+  ## Record a `linehits.tc` line-hit index from this point on: every step
+  ## records its position and exec-record index, and the index is written at
+  ## close. Call after `trace_writer_begin_events` and before the first step
+  ## the index should cover. Returns 0 on success, 1 on failure.
+  if handle.isNil:
+    setError("trace_writer_enable_linehits: NULL handle")
+    return 1.cint
+  if not handle.useMultiStream or not handle.msWriterReady:
+    setError("trace_writer_enable_linehits: writer not ready " &
+      "(call trace_writer_begin_events first)")
+    return 1.cint
+  handle.msWriter.enableLinehits()
+  0.cint
+
+proc hexOf(bytes: openArray[byte]): string =
+  const digits = "0123456789abcdef"
+  result = newStringOfCap(bytes.len * 2)
+  for b in bytes:
+    result.add(digits[int(b shr 4)])
+    result.add(digits[int(b and 0x0F)])
+
+proc markerEntryJson(key: uint64, m: CorrelationMarker): string =
+  var identity: seq[byte] = @[]
+  for b in m.traceId: identity.add(b)
+  for b in m.spanId: identity.add(b)
+  "{\"key\":" & $key & ",\"kind\":" & $m.kind & ",\"flags\":" & $m.flags &
+    ",\"identity\":\"" & hexOf(identity) & "\",\"wall_time_unix_ns\":" &
+    $m.wallTimeUnixNs & ",\"monotonic_time_ns\":" & $m.monotonicTimeNs &
+    ",\"geid\":" & $m.geid & ",\"thread_id\":" & $m.threadId & "}"
+
+proc readMemberOfPath(path: cstring, member: string, what: string,
+    found: var bool): Result[seq[byte], string] =
+  ## The bytes of `member` in the container at `path`; `found` is false when
+  ## the container has no such member, which is not an error.
+  found = false
+  if path.isNil:
+    return err(what & ": NULL path")
+  let p = $path
+  var raw: string
+  try:
+    raw = readFile(p)
+  except IOError, OSError:
+    return err(what & ": cannot read " & p)
+  var bytes = newSeq[byte](raw.len)
+  for i in 0 ..< raw.len:
+    bytes[i] = byte(raw[i])
+  if not hasInternalFile(bytes, member):
+    return ok(newSeq[byte]())
+  found = true
+  let data = readInternalFile(bytes, member)
+  if data.isErr:
+    return err(what & ": " & data.error)
+  ok(data.get())
+
+proc returnDocument(doc: string, what: string, outBuf: ptr ptr uint8,
+    outLen: ptr csize_t): cint =
+  let buf = cast[ptr uint8](alloc(max(doc.len, 1)))
+  if buf.isNil:
+    setError(what & ": out of memory")
+    return -1.cint
+  if doc.len > 0:
+    copyMem(buf, unsafeAddr doc[0], doc.len)
+  outBuf[] = buf
+  outLen[] = csize_t(doc.len)
+  0.cint
+
+template readSideEntry(what: string, outBuf: ptr ptr uint8,
+    outLen: ptr csize_t) =
+  if outBuf.isNil or outLen.isNil:
+    setError(what & ": NULL out_buf or out_len")
+    return -1.cint
+  outBuf[] = nil
+  outLen[] = 0
+
+proc ct_linehits_json(path: cstring, out_buf: ptr ptr uint8,
+    out_len: ptr csize_t): cint {.exportc, cdecl, dynlib, ffiGuard.} =
+  ## Every position of the container's `linehits.tc` with its step ids, in
+  ## key order, as `[{"position":P,"steps":[...]},...]`. Returns 0 with the
+  ## document, 1 when the container has no line-hit index (nothing is
+  ## allocated), -1 on failure (see `trace_writer_last_error`). Free the
+  ## document with `ct_free_buffer`.
+  readSideEntry("ct_linehits_json", out_buf, out_len)
+  var found = false
+  let image = readMemberOfPath(path, LinehitsFileName, "ct_linehits_json",
+    found)
+  if image.isErr:
+    setError(image.error)
+    return -1.cint
+  if not found:
+    return 1.cint
+  let reader = openLinehitsImage(image.get())
+  if reader.isErr:
+    setError("ct_linehits_json: " & reader.error)
+    return -1.cint
+  let positions = reader.get().positions()
+  if positions.isErr:
+    setError("ct_linehits_json: " & positions.error)
+    return -1.cint
+  var doc = "["
+  for i, p in positions.get():
+    let steps = reader.get().hits(p)
+    if steps.isErr:
+      setError("ct_linehits_json: " & steps.error)
+      return -1.cint
+    if i > 0: doc.add(",")
+    doc.add("{\"position\":" & $p & ",\"steps\":[")
+    for j, st in steps.get():
+      if j > 0: doc.add(",")
+      doc.add($st)
+    doc.add("]}")
+  doc.add("]")
+  returnDocument(doc, "ct_linehits_json", out_buf, out_len)
+
+proc openCorrelationIndexOfPath(path: cstring, what: string,
+    found: var bool): Result[CorrmarkIndex, string] =
+  let image = ?readMemberOfPath(path, CorrmarkNamespaceName, what, found)
+  if not found:
+    return ok(CorrmarkIndex())
+  let idx = openCorrmarkIndex(image)
+  if idx.isErr:
+    return err(what & ": " & idx.error)
+  idx
+
+proc decodeVariableRecords(dat, off: openArray[byte]):
+    Result[seq[seq[byte]], string] =
+  ## The records of a variable-size record table: `off` holds `u64` end
+  ## offsets after a leading 0, non-decreasing and ending at `dat`'s length.
+  if off.len mod 8 != 0 or off.len < 8:
+    return err("the offset table is " & $off.len & " bytes")
+  template at(i: int): uint64 =
+    var v = 0'u64
+    for k in 0 ..< 8: v = v or (uint64(off[(i) * 8 + k]) shl (8 * k))
+    v
+  if at(0) != 0:
+    return err("the offset table does not start at 0")
+  var records: seq[seq[byte]] = @[]
+  for i in 1 ..< off.len div 8:
+    let a = at(i - 1)
+    let b = at(i)
+    if b < a or b > uint64(dat.len):
+      return err("offset " & $i & " is out of order or past the data")
+    records.add(@(dat.toOpenArray(int(a), int(b) - 1)))
+  if at(off.len div 8 - 1) != uint64(dat.len):
+    return err("the offsets do not end at the data's length")
+  ok(records)
+
+proc ct_correlation_index_json(path: cstring, out_buf: ptr ptr uint8,
+    out_len: ptr csize_t): cint {.exportc, cdecl, dynlib, ffiGuard.} =
+  ## Every entry of the container's `corrmark.ns`, in key order and bucket
+  ## order, as an array of entry objects (`key`, `kind`, `flags`, `identity`
+  ## as 48 lowercase hex digits, `wall_time_unix_ns`, `monotonic_time_ns`,
+  ## `geid`, `thread_id`). Returns 0 with the document, 1 when the container
+  ## carries no correlation index — "not indexed", which is not an empty
+  ## index — and -1 on failure.
+  readSideEntry("ct_correlation_index_json", out_buf, out_len)
+  var found = false
+  var idx = openCorrelationIndexOfPath(path, "ct_correlation_index_json",
+    found)
+  if idx.isErr:
+    setError(idx.error)
+    return -1.cint
+  if not found:
+    return 1.cint
+  let entries = idx.get().allEntriesWithKeys()
+  if entries.isErr:
+    setError("ct_correlation_index_json: " & entries.error)
+    return -1.cint
+  var doc = "["
+  for i, (key, m) in entries.get():
+    if i > 0: doc.add(",")
+    doc.add(markerEntryJson(key, m))
+  doc.add("]")
+  returnDocument(doc, "ct_correlation_index_json", out_buf, out_len)
+
+proc ct_correlation_lookup_span(path: cstring,
+    trace_id: ptr UncheckedArray[byte], trace_id_len: csize_t,
+    span_id: ptr UncheckedArray[byte], span_id_len: csize_t,
+    out_buf: ptr ptr uint8, out_len: ptr csize_t): cint
+    {.exportc, cdecl, dynlib, ffiGuard.} =
+  ## The confirmed kind-0 entries for a distributed-trace span (16 and 8 wire
+  ## bytes), as entry objects; `[]` when the index does not cover it. Returns
+  ## 0, 1 when the container carries no correlation index, -1 on failure.
+  readSideEntry("ct_correlation_lookup_span", out_buf, out_len)
+  if trace_id.isNil or span_id.isNil or trace_id_len != 16 or
+      span_id_len != 8:
+    setError("ct_correlation_lookup_span: trace_id must be 16 bytes and " &
+      "span_id 8")
+    return -1.cint
+  var found = false
+  var idx = openCorrelationIndexOfPath(path, "ct_correlation_lookup_span",
+    found)
+  if idx.isErr:
+    setError(idx.error)
+    return -1.cint
+  if not found:
+    return 1.cint
+  var t: array[16, byte]
+  var sp: array[8, byte]
+  for i in 0 ..< 16: t[i] = trace_id[i]
+  for i in 0 ..< 8: sp[i] = span_id[i]
+  let hits = idx.get().lookup(t, sp)
+  if hits.isErr:
+    setError("ct_correlation_lookup_span: " & hits.error)
+    return -1.cint
+  let key = correlationKey(t, sp)
+  var doc = "["
+  for i, m in hits.get():
+    if i > 0: doc.add(",")
+    doc.add(markerEntryJson(key, m))
+  doc.add("]")
+  returnDocument(doc, "ct_correlation_lookup_span", out_buf, out_len)
+
+proc ct_correlation_lookup_boundary(path: cstring, marker_id: uint64,
+    key_value: ptr UncheckedArray[byte], key_value_len: csize_t,
+    out_buf: ptr ptr uint8, out_len: ptr csize_t): cint
+    {.exportc, cdecl, dynlib, ffiGuard.} =
+  ## The confirmed kind-1 entries for a boundary crossing (interned marker id
+  ## and key value), as entry objects; `[]` when the index holds none.
+  ## Returns 0, 1 when the container carries no correlation index, -1 on
+  ## failure.
+  readSideEntry("ct_correlation_lookup_boundary", out_buf, out_len)
+  var found = false
+  var idx = openCorrelationIndexOfPath(path, "ct_correlation_lookup_boundary",
+    found)
+  if idx.isErr:
+    setError(idx.error)
+    return -1.cint
+  if not found:
+    return 1.cint
+  let keyValue = ptrLenToString(key_value, key_value_len)
+  let hits = idx.get().lookupBoundary(marker_id, keyValue)
+  if hits.isErr:
+    setError("ct_correlation_lookup_boundary: " & hits.error)
+    return -1.cint
+  let key = boundaryIndexKey(marker_id, keyValue)
+  var doc = "["
+  for i, m in hits.get():
+    if i > 0: doc.add(",")
+    doc.add(markerEntryJson(key, m))
+  doc.add("]")
+  returnDocument(doc, "ct_correlation_lookup_boundary", out_buf, out_len)
+
+proc ct_marker_labels_json(path: cstring, out_buf: ptr ptr uint8,
+    out_len: ptr csize_t): cint {.exportc, cdecl, dynlib, ffiGuard.} =
+  ## The container's correlation-marker labels in id order, each as lowercase
+  ## hex of its bytes: `["6170692d63616c6c",...]`. Returns 0, 1 when the
+  ## container has no `markers.dat`, -1 on failure.
+  readSideEntry("ct_marker_labels_json", out_buf, out_len)
+  var found = false
+  let dat = readMemberOfPath(path, "markers.dat", "ct_marker_labels_json",
+    found)
+  if dat.isErr:
+    setError(dat.error)
+    return -1.cint
+  if not found:
+    return 1.cint
+  var offFound = false
+  let off = readMemberOfPath(path, "markers.off", "ct_marker_labels_json",
+    offFound)
+  if off.isErr:
+    setError(off.error)
+    return -1.cint
+  let labels = decodeVariableRecords(dat.get(), off.get())
+  if not offFound or labels.isErr:
+    setError("ct_marker_labels_json: " &
+      (if offFound: labels.error else: "markers.dat has no markers.off"))
+    return -1.cint
+  var doc = "["
+  for i, rec in labels.get():
+    if i > 0: doc.add(",")
+    doc.add("\"" & hexOf(rec) & "\"")
+  doc.add("]")
+  returnDocument(doc, "ct_marker_labels_json", out_buf, out_len)
 
 # ---------------------------------------------------------------------------
 # Close
