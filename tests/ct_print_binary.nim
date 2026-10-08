@@ -15,10 +15,11 @@ import std/[os, osproc, strutils, times]
 const
   repoRoot* = currentSourcePath().parentDir.parentDir
   ctPrintSrc* = repoRoot / "src" / "codetracer_ct_print.nim"
-  ctPrintBin* = "/tmp/ctprint_build/ct-print"
-    ## A fixed path outside the repository, so the binary survives between
-    ## runs and between branches. The staleness check below is what keeps that
-    ## cache honest.
+  ctPrintBin* = repoRoot / ".nimcache" / "test-ct-print" / "ct-print"
+    ## Inside this checkout's ignored `.nimcache`, so the binary survives
+    ## between runs but is never shared with another checkout: the staleness
+    ## check below compares modification times, and a binary another worktree
+    ## built after this one's sources changed would pass it.
 
 proc newestSourceTime(): Time =
   ## The modification time of the most recently changed file under `src/`.

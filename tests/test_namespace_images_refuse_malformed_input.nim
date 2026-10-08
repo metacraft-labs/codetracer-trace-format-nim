@@ -70,6 +70,9 @@ proc test_header_refusals() =
   bad[Flags] = 0b10
   refuses(bad, "leaf type", "leaf type A where B is expected")
   bad = good
+  bad.putU64(28, 2)
+  refuses(bad, "names no root", "a higher commit id in the slot with no root")
+  bad = good
   bad.putU64(PageCountOff, 99)
   refuses(bad, "page_count", "page_count past the image")
   echo "PASS: test_header_refusals"

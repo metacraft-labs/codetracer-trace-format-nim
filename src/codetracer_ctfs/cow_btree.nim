@@ -898,8 +898,9 @@ proc loadCowBTree*(image: openArray[byte],
   ## the `NSB1` magic, declares the expected leaf type and no unknown flag
   ## bits, and its `page_count` pages fit in it (bytes past them are a
   ## payload region that descriptors address). The committed root is the slot
-  ## with the higher commit id (0 for both: empty), and the tree under it must
-  ## pass `validateCommittedTree`.
+  ## with the higher commit id (0 for both: empty); a committed slot naming
+  ## root 0 is refused, and the tree under the root must pass
+  ## `validateCommittedTree`.
   if image.len < PageSize:
     return err("namespace B-tree image is " & $image.len &
       " bytes, shorter than its header page")
@@ -939,6 +940,9 @@ proc loadCowBTree*(image: openArray[byte],
     pendingFree: @[],
     readers: @[],
   )
+  if t.committedSlot() >= 0 and t.committedRoot() == 0:
+    return err("namespace B-tree: commit id " & $t.committedCommitId() &
+      " names no root")
   # The NamespaceHeader carries the roots and the allocation cursors but not
   # the live-key total, so the validating walk counts it.
   t.count = ?t.validateCommittedTree(t.committedRoot(), pageCount)
