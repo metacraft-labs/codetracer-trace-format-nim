@@ -74,16 +74,26 @@ type
     ##
     ## Step records are variable-length varints, so the only way to reach
     ## record *k* is to decode records 0..k-1. Each record is decoded once on
-    ## the way, which notes where it starts and the cursor position after it,
-    ## so a walk over the chunk decodes every record once and a read near the
-    ## chunk's start decodes no further than it.
+    ## the way, which notes where every `StartStride`-th one starts, so a walk
+    ## over the chunk decodes every record once, a read near the chunk's start
+    ## decodes no further than it, and a read of a record already passed
+    ## decodes fewer than `StartStride` records before it. The cursor position
+    ## after each record is resolved when one is asked for (`eventPosition`,
+    ## `chunkPositions`), as far as it is asked: a walk that reads records
+    ## alone keeps no position per record.
     starts: seq[int32]
-      ## Byte offset of record `k` inside the decompressed chunk, `k < known`.
+      ## Byte offset inside the decompressed chunk of record
+      ## `k * StartStride`, for those below `known`.
     positions: seq[uint64]
       ## The cursor position after record `k` (`trace-events.md` §"Encoding
-      ## Rules", "Reading"), `k < known` and `k < posRefusedAt`.
+      ## Rules", "Reading"), `k < resolved`.
     known: int
       ## How many records have been decoded.
+    resolved: int
+      ## How many records' positions are in `positions`: the records before
+      ## the first refused one, as far as positions have been asked for.
+    resolvePos: int
+      ## Where record `resolved` starts.
     nextPos: int
       ## Where record `known` starts.
     complete: bool
@@ -635,6 +645,7 @@ proc commitChunk(r: var ExecStreamReader, slot: int,
   ## Make the chunk just put in ``slot`` resident, nothing of it decoded yet.
   template m: untyped = r.cache.meta(slot)
   m.nextPos = r.payloadStart
+  m.resolvePos = r.payloadStart
   m.posRefusedAt = high(int)
   if r.legacy:
     # Legacy chunk: the first 4 bytes are a u32 LE event count, records follow.
@@ -653,11 +664,13 @@ proc commitChunk(r: var ExecStreamReader, slot: int,
   r.heldSlot = slot
   ok(slot)
 
+const StartStride = 16
+  ## Every how many records a chunk notes where one starts.
+
 proc decodeNext(r: var ExecStreamReader, slot: int,
     chunkIdx: int): Result[StepEvent, string] {.inline.} =
   ## Decode the next record of the chunk in ``slot`` — record ``known`` — and
-  ## note where it starts and the cursor position after it. The chunk must not
-  ## be ``complete``.
+  ## note where it starts. The chunk must not be ``complete``.
   let mp = addr r.cache.meta(slot)
   template m: untyped = mp[]
   let i = m.known
@@ -667,17 +680,8 @@ proc decodeNext(r: var ExecStreamReader, slot: int,
   if result.isErr:
     return err("failed to decode event " & $i & " of chunk " & $chunkIdx &
       ": " & result.unsafeError)
-  if i >= m.starts.len:
-    let cap = max(256, 2 * m.starts.len)
-    m.starts.setLenUninit(cap)
-    m.positions.setLenUninit(cap)
-  m.starts[i] = int32(m.nextPos)
-  if m.posRefusedAt == high(int):
-    if advanceCursor(result.get(), i, chunkIdx, m.cursor, m.anchored,
-        m.posRefusal):
-      m.positions[i] = m.cursor
-    else:
-      m.posRefusedAt = i
+  if i mod StartStride == 0:
+    m.starts.add(int32(m.nextPos))
   m.nextPos = pos
   m.known = i + 1
   let atEnd =
@@ -693,6 +697,32 @@ proc decodeThrough(r: var ExecStreamReader, slot: int, chunkIdx: int,
   ## ends first.
   while r.cache.meta(slot).known <= i and not r.cache.meta(slot).complete:
     discard ? r.decodeNext(slot, chunkIdx)
+  ok()
+
+proc resolveThrough(r: var ExecStreamReader, slot: int, chunkIdx: int,
+    i: int): Result[void, string] =
+  ## Resolve the positions of the chunk in ``slot`` through record ``i``, or
+  ## to the first refused one: each record is decoded again from where it was
+  ## noted to start, and the cursor moved past it (`advanceCursor`). Record
+  ## ``i`` must have been decoded.
+  let mp = addr r.cache.meta(slot)
+  template m: untyped = mp[]
+  if m.positions.len <= i:
+    m.positions.setLenUninit(max(i + 1, min(2 * m.positions.len, m.known)))
+  while m.resolved <= i and m.posRefusedAt == high(int):
+    let k = m.resolved
+    var pos = m.resolvePos
+    let ev = decodeStepEvent(r.cache.data(slot), pos, r.allowSourceReload)
+    if ev.isErr:
+      return err("failed to decode event " & $k & " of chunk " & $chunkIdx &
+        ": " & ev.unsafeError)
+    if advanceCursor(ev.get(), k, chunkIdx, m.cursor, m.anchored,
+        m.posRefusal):
+      m.positions[k] = m.cursor
+      m.resolved = k + 1
+      m.resolvePos = pos
+    else:
+      m.posRefusedAt = k
   ok()
 
 proc chunkRecordCount(r: var ExecStreamReader, slot: int,
@@ -720,7 +750,10 @@ proc readEvent*(r: var ExecStreamReader,
   let mp = addr r.cache.meta(slot)
   template m: untyped = mp[]
   if eventInChunk < m.known:
-    var pos = int(m.starts[eventInChunk])
+    # From the nearest noted start, stepping over the records between.
+    var pos = int(m.starts[eventInChunk div StartStride])
+    for _ in 0 ..< eventInChunk mod StartStride:
+      discard decodeStepEvent(r.cache.data(slot), pos, r.allowSourceReload)
     return decodeStepEvent(r.cache.data(slot), pos, r.allowSourceReload)
   if eventInChunk > m.known:
     ? r.decodeThrough(slot, chunkIdx, eventInChunk - 1)
@@ -751,8 +784,8 @@ proc readChunkEvents*(r: var ExecStreamReader,
     return ok(firstEventIdx)
   output = newSeqOfCap[StepEvent](eventCount)
 
+  var pos = r.payloadStart
   for i in 0 ..< eventCount:
-    var pos = int(r.cache.meta(slot).starts[i])
     let evRes = decodeStepEvent(r.cache.data(slot), pos, r.allowSourceReload)
     if evRes.isErr:
       return err("failed to decode event " & $i & " while streaming chunk " &
@@ -794,6 +827,7 @@ proc eventPosition*(r: var ExecStreamReader,
     ? r.decodeThrough(slot, chunkIdx, i)
     if i >= m.known:
       return err("step " & $eventIndex & " is past the end of its exec chunk")
+  ? r.resolveThrough(slot, chunkIdx, i)
   if i >= m.posRefusedAt:
     return err(m.posRefusal)
   ok(m.positions[i])
@@ -807,6 +841,8 @@ proc chunkPositions*(r: var ExecStreamReader, chunkIdx: int,
     return err("chunk index out of range: " & $chunkIdx)
   let slot = ?r.chunkSlot(chunkIdx)
   let count = ? r.chunkRecordCount(slot, chunkIdx)
+  if count > 0:
+    ? r.resolveThrough(slot, chunkIdx, count - 1)
   template m: untyped = r.cache.meta(slot)
   if m.posRefusedAt < count:
     output.setLen(0)
