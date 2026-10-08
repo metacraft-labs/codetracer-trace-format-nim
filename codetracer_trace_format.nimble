@@ -349,6 +349,7 @@ task test, "Run all tests":
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_refused_column_stays_with_its_step.nim"
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_block_size_is_one_of_three.nim"
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_meta_text_is_utf8.nim"
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_assignment_refuses_unknown_kinds.nim"
   # Every class of C ABI entry point reports its failure to the caller, and
   # the guard that does it is on every exported proc. Then the two mutation
   # builds, each removing one half of the guard: the test must FAIL under both,

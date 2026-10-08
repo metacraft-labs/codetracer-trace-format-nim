@@ -2241,6 +2241,14 @@ proc ct_assignment(
   ## step.
   if handle.isNil:
     return
+  # Both arrive as integers; one outside its enumeration is refused before it
+  # is used as one.
+  if ord(rvalue_kind) notin ord(low(FfiRValueKind)) .. ord(high(FfiRValueKind)):
+    setError("ct_assignment: " & $ord(rvalue_kind) & " is not an RValue kind")
+    return
+  if ord(pass_by) notin ord(low(FfiPassBy)) .. ord(high(FfiPassBy)):
+    setError("ct_assignment: " & $ord(pass_by) & " is not a PassBy mode")
+    return
   let name = toNimStr(target_name)
   let rvalue = buildRvalue(rvalue_kind, simple_variable_id, compound_ids,
                            compound_len, field_name, index, call_key)
