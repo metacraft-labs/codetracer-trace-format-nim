@@ -3641,10 +3641,12 @@ proc trace_writer_begin_crossing(
     setError("trace_writer_begin_crossing: writer not ready " &
       "(call trace_writer_begin_events first)")
     return 0'u64
-  # Flush the buffered caller step so `w.stepCount` reflects it before we
-  # snapshot `start_step` — mirrors `trace_writer_register_call`.
-  if handle.msWriter.stepCount > 0'u64:
-    discard flushPendingStep(handle)
+  # The buffered step is the caller's, always written before the crossing
+  # opens, so `start_step` is the first step inside it — as
+  # `trace_writer_register_call` does for a call's first step, including the
+  # recording's first step. A refused flush is reported by `flushPendingStep`
+  # and latched by the entry-point guard.
+  discard flushPendingStep(handle)
   let spanId = handle.msWriter.beginCrossing(toNimStr(span_type))
   if spanId == 0'u64:
     setError("trace_writer_begin_crossing: writer is closed or the open " &
