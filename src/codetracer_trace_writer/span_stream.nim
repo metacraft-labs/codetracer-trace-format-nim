@@ -25,7 +25,11 @@ when defined(nimPreviewSlimSystem):
 ## | `spans.idx`   | Companion index    | header + `[offset u64][cumulative u64]`...  |
 ## | `spantype.ns` | Namespace          | interned `span_type` id -> span ids         |
 ##
-## All three are gated by `meta.dat` bit 13 `FlagHasSpanStream`.
+## A container carries a span stream when it carries `spans.dat`. The writer
+## creates the members at the first span; `meta.dat`, written before that,
+## never has bit 13 `FlagHasSpanStream` set by it, and a reader answers
+## presence from the root directory, never from the bit
+## (`internal-files.md` §"Stream-presence flags are a hint, not a gate").
 ##
 ## # Data layout (`spans.dat`) — CTFS §9c chunked compressed table
 ##
@@ -92,10 +96,8 @@ when defined(nimPreviewSlimSystem):
 ##
 ## `index_version` is new: the original RS-M1 layout
 ## (`[chunk_size u32][offset u64]...`, no counts, 4-byte header) carried no
-## version field at all.  It is nevertheless not a compatibility problem — the
-## whole span stream is gated on `meta.dat` bit 13 `FlagHasSpanStream`, bit 13
-## is REJECTING for readers that do not know it, and no container in existence
-## carries it — so there is no migration path to write and none is offered.
+## version field at all.  No container carrying that layout was ever
+## published, so there is no migration path to write and none is offered.
 ## Version 1 names that never-shipped layout; version 2 is what this module
 ## reads and writes, and anything else is rejected.  A stale v1 index also
 ## fails structurally: its 4-byte header would put `offset_0`'s low half where
@@ -1207,7 +1209,6 @@ proc pageSpans*(r: SpanStreamReader, fromSpanId: uint64,
 
 proc hasSpanStreamFiles*(ctfsBytes: openArray[byte],
     maxEntries: uint32 = DefaultMaxRootEntries): bool =
-  ## Whether the container carries `spans.dat`.  Callers should gate on the
-  ## `meta.dat` bit 13 `FlagHasSpanStream` instead; this is for diagnostics
-  ## and for tests that assert a span-free container gained no new files.
+  ## Whether the container carries `spans.dat`: the structural answer to
+  ## whether it has a span stream, which `meta.dat` bit 13 is only a hint of.
   hasInternalFile(ctfsBytes, SpansDataFileName, maxEntries)

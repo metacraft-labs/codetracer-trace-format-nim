@@ -330,8 +330,9 @@ proc decodeStepEvent*(data: openArray[byte], pos: var int,
   ## (``TagSourceReload``) is accepted only when ``meta.dat`` carries
   ## ``FlagExtHasSourceReload``.  The default is FALSE so that every
   ## caller that has not been taught to consult the flag refuses the tag
-  ## rather than decoding it — the strict-rejection contract bit 13's
-  ## documentation states (``meta_dat.nim``), applied one layer down.
+  ## rather than decoding it — the strict rejection ``readMetaDat`` applies
+  ## to an unknown flag bit (``KnownFlags`` in ``meta_dat.nim``), applied one
+  ## layer down.
   ##
   ## The alternative — SKIPPING an unknown tag — is what this signature
   ## exists to make impossible.  A skip cannot know the record's length,

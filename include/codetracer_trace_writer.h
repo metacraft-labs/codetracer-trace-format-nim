@@ -645,11 +645,11 @@ void trace_writer_register_special_event(trace_writer_t handle,
  * a session_manifest.jsonl / codetracer_spans.jsonl sidecar.  Spec:
  * codetracer-specs/Trace-Files/CTFS-Request-Span-Streams.md.
  *
- * Only the binary (multi-stream) backend supports spans.  Registering at
- * least one span sets meta.dat flag bit 13 (0x2000, FlagHasSpanStream) on the
- * finished container; a recording that registers none is byte-for-byte
- * unchanged.  NOTE that bit 13 is REJECTED by readers that predate it, so a
- * recorder should only emit spans once its consumers understand the bit.
+ * Only the binary (multi-stream) backend supports spans.  The first span
+ * creates spans.dat and spans.idx; a recording that registers none has
+ * neither.  meta.dat flag bit 13 (FlagHasSpanStream) stays clear: meta.dat is
+ * written at the first record, and a reader finds the stream by the presence
+ * of spans.dat.
  *
  * To publish an in-flight request, call once with SPAN_FLAG_OPEN set and
  * end_wall_ns / end_step zero, then call again on completion with the SAME

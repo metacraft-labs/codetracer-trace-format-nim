@@ -174,14 +174,10 @@ type
       ## True once at least one span has been registered, which is also when
       ## `spans.dat` / `spans.idx` were added to the container.
       ##
-      ## The span stream is the ONLY stream this writer does not always emit.
-      ## `meta.dat` bit 13 is a REJECTING flag for readers that predate it
-      ## (`KnownFlags`), so stamping it unconditionally would make every
-      ## container this writer produces unreadable by older readers, for a
-      ## feature almost no recording uses.  Gating on actual span registration
-      ## keeps a span-free container byte-for-byte identical to what this
-      ## writer produced before RS-M1 — same files, flag word unchanged — which
-      ## is the same back-compat contract `source_views.dat` (bit 5) follows.
+      ## The span stream is created lazily, so a span-free container carries
+      ## none of its members. `meta.dat` bit 13 stays clear either way: it is
+      ## written at the first record, before any span, and a reader finds the
+      ## stream by the presence of `spans.dat`.
     interning: TraceInterningTables
       ## The writer's OWN interning tables.  Used only when
       ## ``sharedInterning`` is nil (the classic owned/standalone path, and an
@@ -2822,8 +2818,7 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
 
   # RS-M1: flush the last partial spans.dat chunk and emit the spantype.ns
   # span-type index.  Skipped entirely when no span was ever registered, so a
-  # span-free container gains no new files and keeps bit 13 clear.  Must run
-  # before meta.dat so the has_span_stream flag below is accurate.
+  # span-free container gains no span members.
   if w.hasSpans:
     let spanFlushRes = span_stream.flush(w.container, w.spanWriter)
     if spanFlushRes.isErr:

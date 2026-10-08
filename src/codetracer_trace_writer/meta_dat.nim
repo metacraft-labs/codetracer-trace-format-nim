@@ -263,18 +263,13 @@ const
     ## `codetracer_spans.jsonl` sidecars.  See
     ## ``codetracer-specs/Trace-Files/CTFS-Request-Span-Streams.md``.
     ##
-    ## **This bit is NOT additive at the reader.**  Unlike the flag-bit notes
-    ## on bits 8-12 above, which describe their streams as "a reader that does
-    ## not know the bit simply ignores the files", ``KnownFlags`` +
-    ## ``readMetaDat`` REJECT any container carrying a bit outside the known
-    ## mask.  A reader built before this constant existed therefore refuses a
-    ## span-bearing container outright rather than ignoring `spans.dat`.  The
-    ## rollout consequence: reader support (this constant, in ``KnownFlags``)
-    ## must ship everywhere before any writer sets the bit.  Accordingly no
-    ## existing writer call site sets it — `hasSpanStream` defaults to false
-    ## on both `writeMetaDat` and `writeMetaDatToBuffer`, so a recorder must
-    ## opt in explicitly and containers without spans are byte-identical to
-    ## what the writer produced before this bit existed.
+    ## A stream-presence HINT, never a read gate (`internal-files.md`
+    ## §"Stream-presence flags are a hint, not a gate"): a reader finds the
+    ## span stream by the presence of `spans.dat`.  The split-stream writer
+    ## never sets it — `meta.dat` is written at the first record, before any
+    ## span — so `hasSpanStream` defaults to false on both `writeMetaDat` and
+    ## `writeMetaDatToBuffer`.  A reader that predates this constant refuses a
+    ## container whose flag word carries it (``KnownFlags`` + ``readMetaDat``).
     ##
     ## Bit 14 is ``FlagHasLineCountTable`` and bit 15 is
     ## ``FlagHasCorrelationIndex``, so the ``u16`` is now fully allocated and
@@ -309,11 +304,10 @@ const
     ## its per-line table, so setting both would declare the same field
     ## twice under two layouts.  ``writeMetaDat`` refuses the combination.
     ##
-    ## **This bit is NOT additive at the reader**, for the same reason
-    ## bit 13 is not: ``KnownFlags`` + ``readMetaDat`` reject any
-    ## container carrying a bit outside the known mask, so a reader built
-    ## before this constant existed refuses a count-bearing container
-    ## outright.  The rollout consequence is the one recorded on bit 13 —
+    ## **This bit is NOT additive at the reader**: ``KnownFlags`` +
+    ## ``readMetaDat`` reject any container carrying a bit outside the
+    ## known mask, so a reader built before this constant existed refuses
+    ## a count-bearing container outright.  The rollout consequence:
     ## reader support (this constant, in ``KnownFlags``) must ship
     ## everywhere BEFORE any writer sets the bit.  Accordingly no
     ## recorder sets it by default: ``enableLineCountTable`` is an
@@ -351,8 +345,7 @@ const
     ## ``KnownFlags`` + ``readMetaDat`` refuse a container carrying any bit
     ## outside the known mask, so a reader without this constant rejects every
     ## marker-bearing recording outright instead of ignoring an index it has
-    ## no use for.  Reader support therefore ships before the writer sets it —
-    ## the same rollout rule bit 13 records.
+    ## no use for.  Reader support therefore ships before the writer sets it.
     ##
     ## Must match ``codetracer_trace_writer::meta_dat::FLAG_HAS_CORRELATION_INDEX``
     ## (Rust) and the db-backend ``FLAG_HAS_CORRELATION_INDEX`` bit 15.
@@ -514,14 +507,10 @@ type
       ## entry, not this bit, is what a consumer must consult to tell "never
       ## indexed" from "indexed and covering nothing" (contract §9).
     hasSpanStream*: bool
-      ## RS-M1: True iff FlagHasSpanStream was set on the meta.dat header.
-      ## When set, the trace carries `spans.dat` + `spans.idx` (interval
-      ## records for every `span_type` — web requests, processes, tests) plus
-      ## the `spantype.ns` span-type index, and readers may enumerate spans
-      ## without the retired JSONL sidecars.  Clear means the container has no
-      ## span streams and a span reader must report zero spans (it must not go
-      ## looking for the files).  NOTE: unlike bits 8-12, this bit is not
-      ## additive for readers that predate it — see `FlagHasSpanStream`.
+      ## RS-M1: True iff FlagHasSpanStream was set on the meta.dat header —
+      ## a hint that the trace carries `spans.dat`, never a read gate: a span
+      ## reader looks for `spans.dat` whatever this says, since the writer
+      ## leaves the bit clear (see `FlagHasSpanStream`).
     hasLineCountTable*: bool
       ## True iff FlagHasLineCountTable was set on the meta.dat header.
       ## When set, every `paths.dat` record carries the file's line count
