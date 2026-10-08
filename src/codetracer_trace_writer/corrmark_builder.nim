@@ -333,6 +333,27 @@ type
     tree: CowBTree
     image: seq[byte]
 
+proc bucketAt(idx: CorrmarkIndex, desc: openArray[byte]):
+    Result[(int, int), string] =
+  ## The byte offset and entry count of the bucket `desc` addresses. The
+  ## descriptor must lie inside the image and span exactly the bucket: its
+  ## `u32` count and that many 60-byte entries.
+  if desc.len != 16:
+    return err("corrmark.ns: descriptor is " & $desc.len & " bytes, not 16")
+  let off = readU64LE(desc, 0)
+  let size = readU64LE(desc, 8)
+  let imageLen = uint64(idx.image.len)
+  if off > imageLen or size > imageLen - off:
+    return err("corrmark.ns: descriptor out of range")
+  if size < 4:
+    return err("corrmark.ns: bucket of " & $size &
+      " bytes is shorter than its count")
+  let count = uint64(readU32LE(idx.image, int(off)))
+  if 4'u64 + count * uint64(CorrmarkEntrySize) != size:
+    return err("corrmark.ns: bucket of " & $count & " entries does not " &
+      "span its " & $size & "-byte descriptor")
+  ok((int(off), int(count)))
+
 proc openCorrmarkIndex*(image: openArray[byte]): Result[CorrmarkIndex, string] =
   ## Parse a `corrmark.ns` image once, ready for repeated lookups.
   var idx = CorrmarkIndex(image: @image)
@@ -354,13 +375,7 @@ proc lookup*(idx: var CorrmarkIndex,
   let descRes = idx.tree.lookup(key)
   if descRes.isErr:
     return ok(newSeq[CorrelationMarker]())  # no such key — a legitimate miss
-  let desc = descRes.get()
-  if desc.len < 16:
-    return err("corrmark.ns: short descriptor")
-  let off = int(readU64LE(desc, 0))
-  let size = int(readU64LE(desc, 8))
-  if size < 4 or off + size > idx.image.len:
-    return err("corrmark.ns: descriptor out of range")
+  let (off, count) = ?idx.bucketAt(descRes.get())
 
   var probe: CorrelationMarker
   let tn = min(traceIdBe.len, 16)
@@ -368,9 +383,6 @@ proc lookup*(idx: var CorrmarkIndex,
   let sn = min(spanIdBe.len, 8)
   for i in 0 ..< sn: probe.spanId[i] = spanIdBe[i]
 
-  let count = int(readU32LE(idx.image, off))
-  if 4 + count * CorrmarkEntrySize > size:
-    return err("corrmark.ns: bucket overruns its descriptor")
   var hits: seq[CorrelationMarker] = @[]
   for i in 0 ..< count:
     let m = decodeEntry(idx.image, off + 4 + i * CorrmarkEntrySize)
@@ -391,16 +403,7 @@ proc lookupBoundary*(idx: var CorrmarkIndex, markerId: uint64, keyValue: string)
   let descRes = idx.tree.lookup(key)
   if descRes.isErr:
     return ok(newSeq[CorrelationMarker]())
-  let desc = descRes.get()
-  if desc.len < 16:
-    return err("corrmark.ns: short descriptor")
-  let off = int(readU64LE(desc, 0))
-  let size = int(readU64LE(desc, 8))
-  if size < 4 or off + size > idx.image.len:
-    return err("corrmark.ns: descriptor out of range")
-  let count = int(readU32LE(idx.image, off))
-  if 4 + count * CorrmarkEntrySize > size:
-    return err("corrmark.ns: bucket overruns its descriptor")
+  let (off, count) = ?idx.bucketAt(descRes.get())
   var hits: seq[CorrelationMarker] = @[]
   for i in 0 ..< count:
     let m = decodeEntry(idx.image, off + 4 + i * CorrmarkEntrySize)
@@ -433,16 +436,7 @@ proc allEntries*(idx: var CorrmarkIndex): Result[seq[CorrelationMarker], string]
     let descRes = idx.tree.lookup(key)
     if descRes.isErr:
       continue
-    let desc = descRes.get()
-    if desc.len < 16:
-      return err("corrmark.ns: short descriptor")
-    let off = int(readU64LE(desc, 0))
-    let size = int(readU64LE(desc, 8))
-    if size < 4 or off + size > idx.image.len:
-      return err("corrmark.ns: descriptor out of range")
-    let count = int(readU32LE(idx.image, off))
-    if 4 + count * CorrmarkEntrySize > size:
-      return err("corrmark.ns: bucket overruns its descriptor")
+    let (off, count) = ?idx.bucketAt(descRes.get())
     for i in 0 ..< count:
       entries.add(decodeEntry(idx.image, off + 4 + i * CorrmarkEntrySize))
   ok(entries)

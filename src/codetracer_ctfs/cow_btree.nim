@@ -41,6 +41,7 @@
 ## traverses the immutable page graph. The byte layout is therefore part of the
 ## wire format and is documented inline below.
 
+import std/[sets, strutils]
 import results
 export results
 
@@ -810,18 +811,98 @@ proc serialize*(t: CowBTree): seq[byte] =
   ## NamespaceHeader, pages 1.. are B-tree node / free pages. Returns a copy.
   t.pages
 
+proc validateCommittedTree(t: CowBTree, root: uint64,
+                           pageLimit: uint64): Result[uint64, string] =
+  ## Check the tree reachable from `root` before anything reads it, and return
+  ## its key count.
+  ##
+  ## Every page a node references is in `[1, pageLimit)`; every node is a leaf
+  ## or an internal node with at least one key and no more than fit in a page;
+  ## the reserved node-header bytes are zero; keys ascend strictly within a
+  ## node and stay inside the range their parent's separators give the
+  ## subtree (`separator[i-1] <= key < separator[i]`); no page is reached
+  ## twice; and every leaf is at the same depth. A tree that passes cannot
+  ## send a lookup outside the image or into a loop, and answers every lookup
+  ## the way its key order says.
+  if root == 0:
+    return ok(0'u64)
+  type Frame = tuple[page: uint64, depth: int, lo: uint64, hasLo: bool,
+                     hi: uint64, hasHi: bool]
+  var visited = initHashSet[uint64]()
+  var stack: seq[Frame] = @[(page: root, depth: 0, lo: 0'u64, hasLo: false,
+                             hi: 0'u64, hasHi: false)]
+  var leafDepth = -1
+  var keyCount = 0'u64
+  while stack.len > 0:
+    let f = stack.pop()
+    if f.page == 0 or f.page >= pageLimit:
+      return err("namespace B-tree: page " & $f.page &
+        " is outside the tree's " & $pageLimit & " pages")
+    if f.page in visited:
+      return err("namespace B-tree: page " & $f.page & " is reached twice")
+    visited.incl(f.page)
+    let base = pageBase(f.page)
+    let kind = t.pages[base]
+    if t.pages[base + 1] != 0 or t.pages[base + 4] != 0 or
+        t.pages[base + 5] != 0 or t.pages[base + 6] != 0 or
+        t.pages[base + 7] != 0:
+      return err("namespace B-tree: page " & $f.page &
+        " has non-zero reserved header bytes")
+    let count = t.nodeCount(f.page)
+    if count == 0:
+      return err("namespace B-tree: page " & $f.page & " holds no keys")
+    let isLeaf = kind == KindLeaf
+    if not isLeaf and kind != KindInternal:
+      return err("namespace B-tree: page " & $f.page & " has node kind " &
+        $kind)
+    let needed =
+      if isLeaf: NodeHeaderBytes + count * (8 + t.descriptorSize)
+      else: NodeHeaderBytes + count * 8 + (count + 1) * 8
+    if needed > PageSize:
+      return err("namespace B-tree: page " & $f.page & " claims " & $count &
+        " keys, more than a page holds")
+    var prev = 0'u64
+    for i in 0 ..< count:
+      let k = t.nodeKey(f.page, i)
+      if i > 0 and k <= prev:
+        return err("namespace B-tree: keys of page " & $f.page &
+          " do not ascend")
+      if (f.hasLo and k < f.lo) or (f.hasHi and k >= f.hi):
+        return err("namespace B-tree: key " & $k & " of page " & $f.page &
+          " is outside the range its parent gives it")
+      prev = k
+    if isLeaf:
+      if leafDepth < 0:
+        leafDepth = f.depth
+      elif leafDepth != f.depth:
+        return err("namespace B-tree: leaves at depths " & $leafDepth &
+          " and " & $f.depth)
+      keyCount += uint64(count)
+    else:
+      for i in countdown(count, 0):
+        let child = t.nodeChild(f.page, count, i)
+        let lo = if i == 0: f.lo else: t.nodeKey(f.page, i - 1)
+        let hasLo = if i == 0: f.hasLo else: true
+        let hi = if i == count: f.hi else: t.nodeKey(f.page, i)
+        let hasHi = if i == count: f.hasHi else: true
+        stack.add((page: child, depth: f.depth + 1, lo: lo, hasLo: hasLo,
+                   hi: hi, hasHi: hasHi))
+  ok(keyCount)
+
 proc loadCowBTree*(image: openArray[byte],
                    leafType: CowLeafType): Result[CowBTree, string] =
   ## Reconstruct a CoW B-tree from an on-disk page image (page 0 =
-  ## NamespaceHeader). Validates the magic and that the image is page-aligned.
-  ## The reconstructed tree is read-ready: `committedRoot` selects the highest
-  ## valid commit id slot and `lookup` traverses the published tree.
+  ## NamespaceHeader), refusing an image a lookup could not trust.
   ##
-  ## This is the Nim-side analogue of the Rust reader: it proves a CoW-written
-  ## image round-trips, and it is what the crash-safety test uses to read a torn
-  ## image. Writers can resume from a loaded tree as well.
-  if image.len < HeaderTotal:
-    return err("image too short for namespace header")
+  ## The image is at least one page and a whole number of pages, starts with
+  ## the `NSB1` magic, declares the expected leaf type and no unknown flag
+  ## bits, and its `page_count` pages fit in it (bytes past them are a
+  ## payload region that descriptors address). The committed root is the slot
+  ## with the higher commit id (0 for both: empty), and the tree under it must
+  ## pass `validateCommittedTree`.
+  if image.len < PageSize:
+    return err("namespace B-tree image is " & $image.len &
+      " bytes, shorter than its header page")
   if image[0] != HdrMagic0 or image[1] != HdrMagic1 or
      image[2] != HdrMagic2 or image[3] != HdrMagic3:
     return err("invalid namespace B-tree magic")
@@ -831,13 +912,22 @@ proc loadCowBTree*(image: openArray[byte],
     of cltTypeA: 8
     of cltTypeB: 16
   let flags = image[OffFlags]
+  if (flags and not 0b11'u8) != 0:
+    return err("namespace B-tree: unknown flag bits 0x" & toHex(flags))
+  if (flags and 1'u8) != uint8(leafType):
+    return err("namespace B-tree: leaf type " & $(flags and 1'u8) &
+      " where " & $uint8(leafType) & " is expected")
+  let pageCount = rU64(image, OffPageCount)
+  if pageCount == 0 or pageCount > uint64(image.len div PageSize):
+    return err("namespace B-tree: page_count " & $pageCount &
+      " does not fit the " & $(image.len div PageSize) & "-page image")
   var t = CowBTree(
     descriptorSize: descSize,
     leafType: leafType,
     skipSubBlocks: (flags and 0b10) != 0,
     order: orderFor(descSize),
     pages: @image,
-    pageCount: rU64(image, OffPageCount),
+    pageCount: pageCount,
     nextFreePage: rU64(image, OffNextFree),
     freeListHead: rU64(image, OffFreeHead),
     root0: rU64(image, OffRoot0),
@@ -845,21 +935,13 @@ proc loadCowBTree*(image: openArray[byte],
     commit0: rU64(image, OffCommit0),
     commit1: rU64(image, OffCommit1),
     lastCommit: max(rU64(image, OffCommit0), rU64(image, OffCommit1)),
-    count: 0,  # recomputed below; the live-key total is not on the wire
+    count: 0,
     pendingFree: @[],
     readers: @[],
   )
   # The NamespaceHeader carries the roots and the allocation cursors but not
-  # the live-key total, so it is recounted here by walking the committed tree.
-  # It has to happen at load: `count` is read through a non-`var` accessor, so
-  # there is no later point at which a lazy recount could run, and leaving the
-  # field at its zero value makes `count()` report an EMPTY namespace for a
-  # loaded image whose `keys()` returns every key — a wrong answer that reads
-  # as a plausible one. O(live keys), against an open that already copies the
-  # whole page image.
-  var loadedKeys: seq[uint64]
-  t.collectKeysFrom(t.committedRoot(), loadedKeys)
-  t.count = uint64(loadedKeys.len)
+  # the live-key total, so the validating walk counts it.
+  t.count = ?t.validateCommittedTree(t.committedRoot(), pageCount)
   ok(t)
 
 # ---------------------------------------------------------------------------
