@@ -56,10 +56,19 @@ type
     starts: seq[int]       ## the member offset at which each run begins
     len: int
 
+when fileImages:
+  proc closeRead(f: File) {.raises: [].} =
+    ## Close a file this image only read. Nothing written is at stake, so a
+    ## failing close (which `-d:nimPreviewCheckedClose` raises) is not one.
+    try:
+      close(f)
+    except IOError:
+      discard
+
 proc `=destroy`(x: ContainerImageObj) =
   when fileImages:
     if x.file != nil:
-      close(x.file)
+      closeRead(x.file)
     `=destroy`(x.path)
   `=destroy`(x.bytes)
   `=destroy`(x.loaded)
@@ -156,7 +165,7 @@ when fileImages:
           return err("failed to read file: " & path)
       except IOError, OSError:
         return err("failed to read file: " & path)
-      close(image.file)
+      closeRead(image.file)
       image.file = nil
       return ok(image)
     # The root directory: the entry array after the header, as many entries as

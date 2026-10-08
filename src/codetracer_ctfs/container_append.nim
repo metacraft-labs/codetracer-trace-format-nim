@@ -219,6 +219,15 @@ when defined(ctfsAppendFaultInjection):
     ##
     ## See `tests/test_container_append_ordering.nim`.
 
+proc closeAfterFailure(f: File) {.raises: [].} =
+  ## Close `f` on the way out of a failed append. The failure already
+  ## reported is the one the caller needs; a close that fails as well (which
+  ## `-d:nimPreviewCheckedClose` raises) adds nothing to it.
+  try:
+    close(f)
+  except IOError:
+    discard
+
 proc writeAppendedBlocks(c: Ctfs, path: string, firstNewBlock: uint64,
                          oldRootBlocks: uint64): Result[void, string] =
   ## Write the appended tail, then the root region.  Never touches anything
@@ -239,7 +248,7 @@ proc writeAppendedBlocks(c: Ctfs, path: string, firstNewBlock: uint64,
       let n = c.data.len - tailStart
       f.setFilePos(int64(tailStart))
       if f.writeBuffer(unsafeAddr c.data[tailStart], n) != n:
-        close(f)
+        closeAfterFailure(f)
         return err(appendError(path, "short write appending " & $n & " bytes"))
       syncToDisk(f)
 
@@ -251,7 +260,7 @@ proc writeAppendedBlocks(c: Ctfs, path: string, firstNewBlock: uint64,
     # writes around it rather than moving it along with either.
     when defined(ctfsAppendFaultInjection):
       if ctfsAppendStopAtMidpoint:
-        close(f)
+        closeAfterFailure(f)
         return err(appendError(path,
           "fault injection: abandoned between the tail write and block 0"))
 
@@ -261,7 +270,7 @@ proc writeAppendedBlocks(c: Ctfs, path: string, firstNewBlock: uint64,
       let n = tailStart - midStart
       f.setFilePos(int64(midStart))
       if f.writeBuffer(unsafeAddr c.data[midStart], n) != n:
-        close(f)
+        closeAfterFailure(f)
         return err(appendError(path, "short write rewriting moved mapping blocks"))
       syncToDisk(f)
 
@@ -269,13 +278,16 @@ proc writeAppendedBlocks(c: Ctfs, path: string, firstNewBlock: uint64,
     let rootBytes = int(rootBlocks) * bs
     f.setFilePos(0)
     if f.writeBuffer(unsafeAddr c.data[0], rootBytes) != rootBytes:
-      close(f)
+      closeAfterFailure(f)
       return err(appendError(path, "short write rewriting the root region"))
     syncToDisk(f)
   except IOError, OSError:
-    close(f)
+    closeAfterFailure(f)
     return err(appendError(path, "I/O error while appending"))
-  close(f)
+  try:
+    close(f)
+  except IOError:
+    return err(appendError(path, "closing the container after the append"))
   ok()
 
 proc appendInternalFiles*(path: string, names: openArray[string],
