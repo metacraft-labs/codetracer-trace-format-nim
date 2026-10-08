@@ -444,24 +444,23 @@ proc decodeOneValueEvent(data: openArray[byte], pos: var int, tag: uint8,
     # damaged record before anything is sized by it.
     if count < 0 or count > (data.len - pos) div 2:
       refuse("StepValues count " & $count & " exceeds the record")
+    # The values are added to a list reserved for them rather than stored
+    # into one lengthened first: a lengthening zeroes the slots, and on
+    # wasm32 a zeroing of a size not known at compile time is a call into the
+    # host.
     when target == wtValues:
-      var i = values.len
-      values.setLen(i + count)
+      template vals: untyped = values
+      if values.len == 0:
+        values = newSeqOfCap[VariableValue](count)
     else:
-      var i = 0
-      var vals = newSeq[VariableValue](count)
+      var vals = newSeqOfCap[VariableValue](count)
     for _ in 0 ..< count:
       let vnId = varintOrFail(data, pos, why)
       let dLen = int(varintOrFail(data, pos, why))
       if dLen < 0 or dLen > data.len - pos:
         refuse("truncated value data in StepValues record")
-      let v = VariableValue(varnameId: vnId,
-        data: fieldBytes(data, pos, dLen))
-      when target == wtValues:
-        values[i] = v
-      else:
-        vals[i] = v
-      inc i
+      vals.add(VariableValue(varnameId: vnId,
+        data: fieldBytes(data, pos, dLen)))
       pos += dLen
     when target == wtEvents:
       events.add(DecodedValueEvent(kind: veStepValues, values: vals))
