@@ -130,6 +130,7 @@ when defined(nimPreviewSlimSystem):
 
 import std/options
 import std/strutils
+import std/unicode
 import results
 import ../codetracer_trace_types
 import ../codetracer_ctfs/types
@@ -582,6 +583,19 @@ type
     hasCorrelationIndex*: bool
     hasSourceReload*: bool
 
+proc metaTextRefusal*(s: string, what: string): string =
+  ## Empty when `s` is UTF-8, as every string meta.dat carries is
+  ## (`internal-files.md` §"Metadata (meta.dat)"); otherwise the refusal,
+  ## naming the field.
+  if validateUtf8(s) < 0: ""
+  else: "meta.dat: " & what & " is not UTF-8"
+
+template refuseNonUtf8(s: string, what: string) =
+  block:
+    let refusal = metaTextRefusal(s, what)
+    if refusal.len > 0:
+      return err(refusal)
+
 proc encodeMetaDat*(meta: TraceMetadata,
     input: MetaDatFlagsInput): Result[seq[byte], string] =
   ## Serialize a version 6 `meta.dat`.
@@ -594,6 +608,23 @@ proc encodeMetaDat*(meta: TraceMetadata,
 
   # Recording id must be present and syntactically valid (M-REC-1).
   ? validateRecordingIdStr(meta.recordingId)
+  refuseNonUtf8(meta.program, "program")
+  for arg in meta.args:
+    refuseNonUtf8(arg, "an argument")
+  refuseNonUtf8(meta.workdir, "workdir")
+  refuseNonUtf8(input.recorderId, "recorder_id")
+  if input.mcrFields.isSome:
+    let m = input.mcrFields.get()
+    for (s, what) in [(m.platform, "platform"),
+        (m.tickGranularity, "tick_granularity"),
+        (m.tickSourceStr, "tick_source_str"),
+        (m.atomicModeStr, "atomic_mode_str"),
+        (m.startTimeStr, "start_time_str"), (m.hookProfile, "hook_profile")]:
+      refuseNonUtf8(s, what)
+    for st in m.hookStrategies:
+      refuseNonUtf8(st, "a hook strategy")
+  for entry in input.filterProvenance:
+    refuseNonUtf8(entry.path, "a filter-provenance path")
 
   var buf: seq[byte]
   ? buf.writeRawBytes(MetaDatMagic)

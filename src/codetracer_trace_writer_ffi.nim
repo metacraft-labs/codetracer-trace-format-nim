@@ -586,6 +586,10 @@ proc trace_writer_new(
       "use FFI_TRACE_FORMAT_BINARY")
     return nil
   let prog = toNimStr(program)
+  let progRefusal = metaTextRefusal(prog, "program")
+  if progRefusal.len > 0:
+    setError("trace_writer_new: " & progRefusal)
+    return nil
 
   let state = cast[TraceWriterHandle](alloc0(sizeof(TraceWriterState)))
   state[] = TraceWriterState(
@@ -1092,6 +1096,10 @@ proc trace_writer_set_workdir(
   if handle.isNil:
     return
   let wd = toNimStr(workdir)
+  let wdRefusal = metaTextRefusal(wd, "workdir")
+  if wdRefusal.len > 0:
+    setError("trace_writer_set_workdir: " & wdRefusal)
+    return
   if handle.msWriterReady:
     let r = handle.msWriter.setWorkdir(wd)
     if r.isErr:
@@ -1178,6 +1186,11 @@ proc trace_writer_set_args(
       if not aPtr.isNil and aLen > 0.csize_t:
         argSeq[i] = newString(int(aLen))
         copyMem(addr argSeq[i][0], aPtr, int(aLen))
+  for a in argSeq:
+    let refusal = metaTextRefusal(a, "an argument")
+    if refusal.len > 0:
+      setError("trace_writer_set_args: " & refusal)
+      return
   # Propagate to the multi-stream writer's metadata if already created; it
   # refuses once meta.dat is written (at the first record).
   if handle.msWriterReady:
@@ -3922,6 +3935,10 @@ proc trace_writer_add_filter_provenance(
   if not path.isNil and path_len > 0.csize_t:
     pStr = newString(int(path_len))
     copyMem(addr pStr[0], path, int(path_len))
+  let pathRefusal = metaTextRefusal(pStr, "a filter-provenance path")
+  if pathRefusal.len > 0:
+    setError(pathRefusal)
+    return 1.cint
   var entry: FilterProvenance
   entry.path = pStr
   if not sha256_bytes.isNil:
@@ -3995,6 +4012,18 @@ proc trace_writer_set_mcr_fields(
   var strategies = newSeq[string](int(hook_strategies_count))
   for i in 0 ..< strategies.len:
     strategies[i] = $hook_strategies[i]
+  for (s, what) in [($platform, "platform"), ($tick_granularity, "tick_granularity"),
+      ($tick_source_str, "tick_source_str"), ($atomic_mode_str, "atomic_mode_str"),
+      ($start_time_str, "start_time_str"), ($hook_profile, "hook_profile")]:
+    let refusal = metaTextRefusal(s, what)
+    if refusal.len > 0:
+      setError(refusal)
+      return 1.cint
+  for st in strategies:
+    let refusal = metaTextRefusal(st, "a hook strategy")
+    if refusal.len > 0:
+      setError(refusal)
+      return 1.cint
   let r = handle.msWriter.setMcrFields(McrMetaFields(
     tickSource: TickSource(tick_source), totalThreads: total_threads,
     atomicMode: AtomicMode(atomic_mode), totalEvents: total_events,
