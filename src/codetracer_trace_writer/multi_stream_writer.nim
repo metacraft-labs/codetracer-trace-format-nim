@@ -212,31 +212,25 @@ type
     pathLineCounts: seq[uint64]
     pendingFuncs: seq[tuple[path: string, line: uint64, name: string,
         pathId: Option[uint64]]]
-      ## `funcs.dat` records, held until `close`.
+      ## Every function registered, by id. Records `0 ..< funcsWritten` are in
+      ## `funcs.dat`; the rest wait for their declaration path.
       ##
-      ## THE TABLE IS DEFERRED BECAUSE ITS RECORD NEEDS AN ADDRESS THAT DOES NOT
-      ## EXIST YET. `internal-files.md:46` gives the record as
-      ## `global_line_index: varint, name_len: varint, name`, and that address is
-      ## the declaration site's position in the trace's global space — which is
-      ## only computable once the path is interned and, for a line-count or
-      ## column-aware trace, once its size is known. At `registerFunction` time
-      ## neither is guaranteed.
+      ## A record is written as soon as it and every function before it can
+      ## be: at registration when its path is registered, else when the path
+      ## is, else at `close`, which registers it.
       ##
-      ## The alternative was to intern the path here, and it is DISQUALIFIED by
-      ## measurement rather than taste: `registerPath` would intern it with an
-      ## EMPTY per-line length table, and this table is write-once, so the real
-      ## lengths arriving later could not correct it. That silently corrupts
-      ## column-aware addressing for the file.
-      ##
-      ## Deferring costs bounded writer memory and nothing else. Interning
-      ## tables are NOT streamed: `trace-events.md:109` lists them as
-      ## "Loaded at startup", `internal-files.md:49` as "loaded at reader startup
-      ## (typically 1-5 MB total)". A reader reads them whole before anything
-      ## else, so holding them until close does not weaken the streaming property
-      ## that `steps.dat`, `values.dat`, `calls.dat` and `events.dat` rely on.
-      ## At 64 bytes of path, 32 of name and 8 of line, 10,000 functions is about
-      ## 1 MB and 100,000 about 10 MB — the same order as the table the reader
-      ## loads regardless.
+      ## A record waits because its address — the declaration site's position
+      ## in the trace's line space (`internal-files.md`, `funcs.dat`) — needs
+      ## its file's place in that space, known only once the path is interned
+      ## and, for a line-count or column-aware trace, sized. Interning the path
+      ## at `registerFunction` instead is disqualified: it would intern it with
+      ## an EMPTY per-line length table, and that table is write-once, so the
+      ## real lengths arriving later could not correct it.
+    funcsWritten: int
+      ## How many of `pendingFuncs` are in `funcs.dat`.
+    funcLineBases: seq[uint64]
+      ## `funcLineBases[i]` is file `i`'s base in the line space a function's
+      ## declaration address is in; extended as declarations reach new files.
     funcIds: Table[string, uint64]
       ## Name -> id for the deferred table, keeping the id space name-keyed as
       ## the C ABI's `trace_writer_ensure_function_id` requires.
@@ -1065,6 +1059,9 @@ proc linehits*(w: var MultiStreamTraceWriter): var LinehitsBuilder =
 # Path registration
 # ---------------------------------------------------------------------------
 
+proc writeReadyFuncs(w: var MultiStreamTraceWriter,
+    atClose = false): Result[void, string]
+
 proc registerPath*(w: var MultiStreamTraceWriter,
     path: string,
     lineLengths: openArray[uint32] = [],
@@ -1143,6 +1140,7 @@ proc registerPath*(w: var MultiStreamTraceWriter,
     # ``positionSpaceCounts`` reads that as the pre-table convention.
     w.pathLineCounts.add(if w.lineCountTable: lineCount else: 0'u64)
     w.extendGli()
+    ?w.writeReadyFuncs()
   ok(id)
 
 # ---------------------------------------------------------------------------
@@ -1316,6 +1314,7 @@ proc registerPathVersion*(w: var MultiStreamTraceWriter,
       w.extendGli()
 
   w.currentPathVersions[gdh1VersionKey(path)] = id
+  ?w.writeReadyFuncs()
   ok(id)
 
 proc currentPathId*(w: MultiStreamTraceWriter,
@@ -1418,13 +1417,61 @@ proc registerSourceView*(w: var MultiStreamTraceWriter,
 # Function / Type / Varname registration (interning)
 # ---------------------------------------------------------------------------
 
+proc funcLineBase(w: var MultiStreamTraceWriter, pathId: uint64): uint64 =
+  ## File `pathId`'s base in the line space of declaration addresses: every
+  ## earlier file sized by its recorded line count, or `DefaultLinesPerFile`
+  ## where it records none. Every file below `pathId` is registered, and a
+  ## file's size never changes once it is.
+  if w.funcLineBases.len == 0:
+    w.funcLineBases.add(0'u64)
+  while uint64(w.funcLineBases.len) <= pathId:
+    let i = w.funcLineBases.len - 1
+    let count =
+      if w.lineCountTable and i < w.pathLineCounts.len and w.pathLineCounts[i] > 0:
+        w.pathLineCounts[i]
+      else:
+        DefaultLinesPerFile
+    w.funcLineBases.add(w.funcLineBases[^1] + count)
+  w.funcLineBases[int(pathId)]
+
+proc writeReadyFuncs(w: var MultiStreamTraceWriter,
+    atClose = false): Result[void, string] =
+  ## Append the `funcs.dat` records that can be written now, in id order,
+  ## stopping at the first whose declaration path is not registered.
+  ## `atClose` writes a function with no declaration path at file 0.
+  while w.funcsWritten < w.pendingFuncs.len:
+    let i = w.funcsWritten
+    var pathId: uint64
+    if w.pendingFuncs[i].pathId.isSome:
+      pathId = w.pendingFuncs[i].pathId.get()
+    elif w.pendingFuncs[i].path.len > 0:
+      let current = w.pathIdIfRegistered(w.pendingFuncs[i].path)
+      if current.isNone:
+        break
+      pathId = current.get()
+    elif atClose:
+      pathId = 0'u64
+    else:
+      break
+    # A LINE ADDRESS, NOT THE COLUMN-AWARE POSITION ADDRESS: the column
+    # extension re-interprets the address carried by STEP records and says
+    # nothing about `funcs.dat` (`internal-files.md`), and a declaration site
+    # is a line, not a cursor position.
+    let line = max(w.pendingFuncs[i].line, 1'u64)
+    let gli = w.funcLineBase(pathId) + (line - 1)
+    let rec = encodeFuncRecord(gli, w.pendingFuncs[i].name)
+    discard ?w.container.appendRecord(w.interningPtr[].funcs, rec)
+    w.funcsWritten += 1
+  ok()
+
 proc registerFunctionAt*(w: var MultiStreamTraceWriter,
     path: string, line: uint64, name: string): Result[uint64, string] =
   ## Register a function at its declaration site and return its interned ID.
   ##
-  ## The record is BUFFERED, not written: see `pendingFuncs` for why the address
-  ## it needs cannot be computed here. The id is allocated immediately, so a
-  ## caller can reference the function straight away.
+  ## The record is written now when its declaration path and every earlier
+  ## function's are registered, and otherwise waits (see `pendingFuncs`). The
+  ## id is allocated immediately, so a caller can reference the function
+  ## straight away.
   let key = qualifiedPayload(w.qualifier, name)
   let existing = w.funcIds.getOrDefault(key, high(uint64))
   if existing != high(uint64):
@@ -1436,6 +1483,7 @@ proc registerFunctionAt*(w: var MultiStreamTraceWriter,
   let pathId = if path.len > 0: w.pathIdIfRegistered(path) else: none(uint64)
   w.pendingFuncs.add((path: path, line: line, name: key, pathId: pathId))
   w.funcIds[key] = id
+  ?w.writeReadyFuncs()
   ok(id)
 
 proc registerFunction*(w: var MultiStreamTraceWriter,
@@ -2684,70 +2732,22 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   # it at its first record.
   ? w.commitMeta()
 
-  # FLUSH THE DEFERRED `funcs.dat` FIRST, while the container is still open and
-  # every path this trace will ever register is already interned. That is the
-  # whole point of deferring: the record's `global_line_index` is computable now
-  # and was not computable when the function was registered.
-  #
-  # A declaration path that was never interned is a real possibility — a
-  # function in a file no step ever visited — and it is interned HERE rather
-  # than refused. Doing it now is safe in the way doing it early was not: no
-  # further step can arrive to contradict an empty per-line length table,
-  # because the writer is closing.
-  #
-  # THE LINE SPACE IS BUILT HERE AND IS NOT `w.gli`. In a column-aware trace
-  # `w.gli` is the BYTE-OFFSET position space the step stream addresses through,
-  # and using it gave a function in the second file address 8 where the Rust
-  # writer gave 100000. A per-file line count of `DefaultLinesPerFile` where the
-  # trace records no real one is the same convention the Rust writer's
-  # `LinePositionSpace` uses, and both constants are 100,000.
-  # EVERY DECLARATION PATH IS REGISTERED BEFORE THE SPACE IS SIZED. A function
-  # whose file no step visited brings a path nothing else interned; sizing the
-  # space from the paths interned so far and interning afterwards addressed that
-  # file past the end of the space (an IndexDefect inside `close()`). And it is
-  # registered through `registerPath`, the route every other path takes, so the
-  # record has the table's layout and the path reaches `meta.dat`'s list. Under
-  # the line-count table such a path has no recorded size and is refused there,
-  # by name: laying it out at an assumed size is what the table exists to stop.
-  var funcPathIds = newSeq[uint64](w.pendingFuncs.len)
-  # Indexed rather than `pairs`, which copies each element's two strings.
-  for i in 0 ..< w.pendingFuncs.len:
-    template pf: untyped = w.pendingFuncs[i]
-    if pf.pathId.isSome:
-      funcPathIds[i] = pf.pathId.get()
-    elif pf.path.len > 0:
-      let idRes = w.registerPath(pf.path)
+  # The function records still waiting for their declaration path, first,
+  # while the container is open. A declaration path that was never interned —
+  # a function in a file no step visited — is interned here rather than
+  # refused: no later step can arrive to contradict its table, because the
+  # writer is closing. Under the line-count table such a path has no recorded
+  # size and `registerPath` refuses it, by name.
+  while w.funcsWritten < w.pendingFuncs.len:
+    let i = w.funcsWritten
+    if w.pendingFuncs[i].pathId.isNone and w.pendingFuncs[i].path.len > 0 and
+        w.pathIdIfRegistered(w.pendingFuncs[i].path).isNone:
+      let idRes = w.registerPath(w.pendingFuncs[i].path)
       if idRes.isErr:
-        return err("close: function " & pf.name & " is declared at " &
-          pf.path & ", which could not be registered: " & idRes.error)
-      funcPathIds[i] = idRes.get()
-
-  var lineCounts: seq[uint64] = @[]
-  let pathCount = w.interningPtr[].paths.count()
-  for i in 0 ..< int(pathCount):
-    if w.lineCountTable and i < w.pathLineCounts.len and w.pathLineCounts[i] > 0:
-      lineCounts.add(w.pathLineCounts[i])
-    else:
-      lineCounts.add(DefaultLinesPerFile)
-  var lineSpace = buildGlobalLineIndex(lineCounts)
-
-  for i in 0 ..< w.pendingFuncs.len:
-    template pf: untyped = w.pendingFuncs[i]
-    let pathId = funcPathIds[i]
-    # A LINE ADDRESS, NOT THE COLUMN-AWARE POSITION ADDRESS, and the difference
-    # is not academic: `toGlobalLineIndex` returns a byte offset in a
-    # column-aware trace, so using it here gave a function in the second file
-    # address 8 where the Rust writer gave 100000, for the same function in the
-    # same trace.
-    #
-    # `internal-files.md` settles it: the column extension re-interprets the
-    # address carried by STEP records and says nothing about `funcs.dat`, and a
-    # declaration site is a line rather than a cursor position — there is no
-    # column at which a function is declared.
-    let gli = lineSpace.globalIndex(int(pathId), max(pf.line, 1))
-    let rec = encodeFuncRecord(gli, pf.name)
-    discard ?w.container.appendRecord(w.interningPtr[].funcs, rec)
-  w.pendingFuncs.setLen(0)
+        return err("close: function " & w.pendingFuncs[i].name &
+          " is declared at " & w.pendingFuncs[i].path &
+          ", which could not be registered: " & idRes.error)
+    ?w.writeReadyFuncs(atClose = true)
 
   # Finalize linehits if enabled
   if w.linehitsBuilder.isSome:
