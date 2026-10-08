@@ -201,6 +201,10 @@ type
       ## producing bare payloads.
     metadata*: TraceMetadata
     paths*: seq[string]
+    newestPathId: Table[string, uint64]
+      ## `paths[i]`'s newest index, by name: what `pathIdIfRegistered` answers
+      ## in O(1) rather than by scanning `paths`, which it is asked once per
+      ## function registration.
     pathLineLengths: seq[seq[uint32]]
       ## P6 follow-up — per-path line-length tables, used in column-aware
       ## mode to compute byte-offset-based ``global_position_index`` values
@@ -734,6 +738,7 @@ proc initMultiStreamWriter*(path: string, program: string,
   w.metadata = TraceMetadata(
     recordingId: resolvedId, program: program, args: @[], workdir: "")
   w.paths = @[]
+  w.newestPathId = initTable[string, uint64]()
   w.gliDirty = true
   w.filePath = path
   # M26b — emit the prepopulated `step-map.ns` breakpoint index by default on
@@ -822,6 +827,7 @@ proc initMultiStreamWriterAttached*(ctfs: ptr Ctfs, program: string,
   w.metadata = TraceMetadata(
     recordingId: resolvedId, program: program, args: @[], workdir: "")
   w.paths = @[]
+  w.newestPathId = initTable[string, uint64]()
   w.gliDirty = true
   w.filePath = ""
   # Same M26b default as the owned path — line-only writers emit step-map.ns.
@@ -1128,6 +1134,7 @@ proc registerPath*(w: var MultiStreamTraceWriter,
   # Track paths list for meta.dat (only add if new)
   if id == uint64(w.paths.len):
     w.paths.add(path)
+    w.newestPathId[path] = id
     # Mirror the per-file line-lengths so ``toGlobalLineIndex`` can
     # compute byte-offset positions in column-aware mode.  A line-only
     # writer stores an empty seq: its slots are sized by line count.
@@ -1300,6 +1307,7 @@ proc registerPathVersion*(w: var MultiStreamTraceWriter,
       w.pathLineCounts.insert(recordedCount, 0)
     else:
       w.paths.add(registerName)
+      w.newestPathId[registerName] = uint64(w.paths.len - 1)
       w.pathLineLengths.add(@[])
       when gdh1Arm(gdh1FalsifyNoMirror):
         # FALSIFIER (GDH-G1, arm 2, literal form): append the record but
@@ -1349,13 +1357,18 @@ proc pathIdIfRegistered*(w: MultiStreamTraceWriter,
   let current = w.currentPathId(path)
   if current.isSome:
     return current
-  # Reverse scan so that, if a version was ever appended without going
-  # through `currentPathVersions`, the NEWEST record still wins — the
-  # same rule `registerStep` follows.
-  for i in countdown(w.paths.len - 1, 0):
-    if w.paths[i] == path:
-      return some(uint64(i))
-  none(uint64)
+  # The NEWEST record of the name wins, even for a version appended
+  # without going through `currentPathVersions` — the same rule
+  # `registerStep` follows.
+  when gdh1Arm(gdh1FalsifyPrepend):
+    # The falsifier inserts at index 0 and so moves every recorded index.
+    for i in countdown(w.paths.len - 1, 0):
+      if w.paths[i] == path:
+        return some(uint64(i))
+    none(uint64)
+  else:
+    let id = w.newestPathId.getOrDefault(path, high(uint64))
+    if id == high(uint64): none(uint64) else: some(id)
 
 proc pathIdForStep*(w: var MultiStreamTraceWriter,
     path: string): Result[uint64, string] =
