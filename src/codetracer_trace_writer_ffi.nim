@@ -3461,7 +3461,7 @@ proc trace_writer_enable_linehits(
   if handle.isNil:
     setError("trace_writer_enable_linehits: NULL handle")
     return 1.cint
-  if not handle.useMultiStream or not handle.msWriterReady:
+  if not handle.msWriterReady:
     setError("trace_writer_enable_linehits: writer not ready " &
       "(call trace_writer_begin_events first)")
     return 1.cint
