@@ -9,14 +9,13 @@ when defined(nimPreviewSlimSystem):
 ## ``events.idx`` (byte-compatible with the Rust ``IoEventStreamReader``).  Each
 ## record is ``u8 kind (EventLogKind ordinal), varint step_id, len+metadata,
 ## len+content`` — byte-identical to the Rust ``IoEventRecord::encode``.  These
-## tests exercise multi-chunk streams, the per-chunk independent decode, the
-## metadata round-trip, and the legacy ``.off`` VRT back-compat path.
+## tests exercise multi-chunk streams, the per-chunk independent decode,
+## and metadata round-trip.
 
 import std/times
 import std/strutils
 import results
 import codetracer_ctfs/container
-import codetracer_ctfs/variable_record_table
 import codetracer_trace_writer/io_event_stream
 import codetracer_trace_writer/varint
 
@@ -166,58 +165,6 @@ proc test_io_event_kind_roundtrip() {.raises: [].} =
 
   echo "PASS: test_io_event_kind_roundtrip"
 
-# ---------------------------------------------------------------------------
-# test_io_event_stream_legacy_back_compat — old .off VRT bundles still read
-# ---------------------------------------------------------------------------
-
-proc encodeLegacyIOEvent(ev: IOEvent): seq[byte] =
-  ## Encode one event in the PRE-M24a-3 legacy framing:
-  ## ``u8 kind (IOEventKind ordinal), varint stepId, varint data_len, data``.
-  ## Used to synthesize an old-format ``events.dat``/``events.off`` VRT so we
-  ## can prove the reader's legacy path still works.  Note: legacy framing had
-  ## no metadata field and the kind byte was the IOEventKind ordinal.
-  var rec: seq[byte] = @[]
-  rec.add(case ev.kind
-    of elkWrite: 0'u8
-    of elkWriteOther: 1'u8
-    of elkReadFile: 2'u8
-    else: 3'u8)
-  encodeVarint(ev.stepId, rec)
-  encodeVarint(uint64(ev.data.len), rec)
-  rec.add(ev.data)
-  rec
-
-proc test_io_event_stream_legacy_back_compat() {.raises: [].} =
-  var ctfs = createCtfs()
-  let tableRes = initVariableRecordTableWriter(ctfs, "events")
-  doAssert tableRes.isOk
-  var table = tableRes.get()
-
-  var rng = initRng(555)
-  var events: seq[IOEvent] = @[]
-  for i in 0 ..< 50:
-    # Legacy events carry no metadata, and one of the legacy API's four kinds.
-    let ev = IOEvent(
-      kind: [elkWrite, elkWriteOther, elkReadFile, elkError][rng.next() mod 4],
-      stepId: rng.next() mod 100000,
-      metadata: @[],
-      data: makeData(rng, int(rng.next() mod 30) + 1))
-    events.add(ev)
-    let appendRes = ctfs.append(table, encodeLegacyIOEvent(ev))
-    doAssert appendRes.isOk, "append legacy record failed: " & appendRes.error
-
-  let rawBytes = ctfs.toBytes()
-  let readerRes = initIOEventStreamReader(rawBytes, legacy = true)
-  doAssert readerRes.isOk, "legacy reader init failed: " & readerRes.error
-  var reader = readerRes.get()
-  doAssert reader.count == 50, "legacy count mismatch: got " & $reader.count
-
-  for i in 0 ..< 50:
-    let got = readEvent(reader, uint64(i))
-    doAssert got.isOk, "legacy readEvent failed at " & $i & ": " & got.error
-    assertEqualEvent(got.get(), events[i], "legacy event " & $i)
-
-  echo "PASS: test_io_event_stream_legacy_back_compat"
 
 # ---------------------------------------------------------------------------
 # bench_io_event_page_load
@@ -265,5 +212,4 @@ proc bench_io_event_page_load() {.raises: [].} =
 test_io_event_stream_write_read()
 test_io_event_stream_page_load()
 test_io_event_kind_roundtrip()
-test_io_event_stream_legacy_back_compat()
 bench_io_event_page_load()

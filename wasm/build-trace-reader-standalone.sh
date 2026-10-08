@@ -55,18 +55,10 @@
 #     assumed, with ORDER-SENSITIVE metadata;
 #   * the line-hit index (`linehits.tc`) — a CoW namespace B-tree read back
 #     through `linehits_reader.nim`, with hit lists compared element-wise;
-#   * the LEGACY Nim-v4 framing. This one cannot be produced by the writer in
-#     `src/` at all: `close()` stamps has_step_stream / has_value_stream /
-#     has_io_event_stream unconditionally, and those three bits are what
-#     `new_trace_reader` selects its decoders from. `legacy.ct` is therefore
-#     laid out by hand. Without it the legacy decoders in exec_stream,
-#     value_stream and io_event_stream are never executed on this target.
-#
-# `misframed.ct` closes the last gap: legacy bytes with SPEC-framing flags. A
-# split container has no `events.log`, which two shipping readers use as their
-# format discriminator, so this is exactly where a wrong-but-plausible answer
-# would hide. The adjudication records what the reader does rather than
-# asserting what it should — and asserts that wasm and the host agree about it.
+#   * the refusal of a container in the retired record-table layout
+#     (`values.off`, `events.off`): `legacy.ct`, laid out by hand since no
+#     writer produces it, and `misframed.ct`, the same container with meta.dat
+#     claiming the spec layout. Both are refused by name, here and on the host.
 #
 # ---------------------------------------------------------------------------
 # WHAT A HOST HAS TO SUPPLY
@@ -85,9 +77,9 @@
 # CSPRNG or a `Date.now()`; those belong to `trace_writer_host_stub.c` and the
 # recording identity it mints, and are reached only by a module that writes.
 #
-# That set did not grow when the span stream, the CoW-namespace line-hit index
-# and the legacy decoders were added to what the module executes: they cost
-# size, not capabilities.
+# That set did not grow when the span stream and the CoW-namespace line-hit
+# index were added to what the module executes: they cost size, not
+# capabilities.
 #
 set -euo pipefail
 
@@ -181,15 +173,10 @@ build_module trace_reader_only_standalone $READ_EXPORTS
 #   corpus.ct    — the SPEC framing, carrying every surface this repo's writer
 #                  can emit: steps, values, calls, interning tables, source
 #                  views, IO events, spans and the line-hit index.
-#   legacy.ct    — the pre-M24a Nim-v4 framing. The writer in `src/` CANNOT
-#                  emit it (close() stamps has_step_stream / has_value_stream /
-#                  has_io_event_stream unconditionally), so it is laid out by
-#                  hand; without it the three legacy decoders in
-#                  exec_stream / value_stream / io_event_stream are never
-#                  executed on this target at all.
-#   misframed.ct — legacy bytes, SPEC-framing flags. Not a container anything
-#                  produces; the isolated form of "what happens when the
-#                  discriminator and the bytes disagree".
+#   legacy.ct    — a container in the retired record-table layout, laid out
+#                  by hand; the reader refuses it, naming `values.off`.
+#   misframed.ct — the same container, meta.dat claiming the spec layout;
+#                  refused just the same.
 echo "==> corpus.ct / legacy.ct / misframed.ct (host build)"
 NATIVE="$OUT/trace_reader_native"
 nim c -d:release --hints:off -p:"$REPO/src" \

@@ -103,20 +103,13 @@ proc buildCorpus*(): Result[seq[byte], string] =
   ok(w.toBytes())
 
 # ---------------------------------------------------------------------------
-# The legacy Nim-v4 framing
+# A container in the retired record-table layout
 # ---------------------------------------------------------------------------
 #
-# The writer in `src/` cannot emit this: `close()` stamps `has_step_stream`,
-# `has_value_stream` and `has_io_event_stream` unconditionally, so every
-# container it produces is SPEC-framed.  The legacy shape still exists in the
-# wild — it is what pre-M24a Nim-v4 bundles are, and `new_trace_reader` selects
-# its decoders from those three flags — so the only way to EXECUTE those
-# decoders is to lay the container out by hand, which is what follows.
-#
-# The framings are transcribed from the readers they have to satisfy
-# (`exec_stream.nim`, `value_stream.nim`, `io_event_stream.nim`), and the
-# per-stream shapes match the ones `tests/test_*_stream.nim` already build for
-# the host-side back-compat tests.
+# Values and I/O events as uncompressed variable-size record tables
+# (`values.off`, `events.off`) beside a step stream with a per-chunk count
+# header and a `total_events` trailer. No writer produces it; it is laid out
+# by hand so that the reader's refusal of it is exercised on this target.
 
 proc buildLegacyExecStream(ctfs: var Ctfs, events: seq[StepEvent],
     chunkSize: int): Result[uint64, string] =
@@ -261,7 +254,7 @@ proc buildLegacyCorpusFlagged(claimSpecFraming: bool):
   if ioTableRes.isErr: return err("events table: " & ioTableRes.error)
   var ioTable = ioTableRes.get()
   for i in 0 ..< LegacyIoCount:
-    let ev = IOEvent(kind: legacyIoKind(i), stepId: legacyIoStep(i),
+    let ev = IOEvent(kind: [elkWrite, elkWriteOther, elkReadFile, elkError][i mod 4], stepId: legacyIoStep(i),
                      metadata: @[], data: legacyIoData(i))
     let a = ctfs.append(ioTable, encodeLegacyIoRecord(ev, legacyIoOrdinal(i)))
     if a.isErr: return err("append legacy io event: " & a.error)

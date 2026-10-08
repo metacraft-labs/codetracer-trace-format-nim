@@ -575,6 +575,20 @@ const RetiredMembers* = ["events.log", "events.fmt"]
   ## stream and its encoding marker. A container's events live in its split
   ## streams.
 
+const LegacyLayoutMembers* = ["values.off", "events.off", "calls.off"]
+  ## Offset tables of a stream layout that is not part of the trace format:
+  ## values, I/O events and calls stored as uncompressed variable-size record
+  ## tables. Every stream is a chunked table with a companion `.idx`.
+
+proc refuseLegacyLayout*(containerBytes: openArray[byte],
+    maxEntries: uint32): Result[void, string] =
+  ## `err` naming the first member of that layout the container carries.
+  for name in LegacyLayoutMembers:
+    if hasInternalFile(containerBytes, name, maxEntries):
+      return err("this container carries `" & name & "`, a stream layout " &
+        "that is not part of the trace format; it is refused")
+  ok()
+
 proc refuseRetiredMembers*(containerBytes: openArray[byte],
     maxEntries: uint32): Result[void, string] =
   ## `err` naming the first retired member the container carries. A reader
@@ -647,6 +661,7 @@ proc openNewTraceFromImage(image: ContainerImage, blockSize: uint32,
   reader.maxEntries = maxEntries
   reader.assumedColumnAwarePaths = assumeColumnAwarePaths
   ? refuseRetiredMembers(reader.image.bytes, maxEntries)
+  ? refuseLegacyLayout(reader.image.bytes, maxEntries)
 
   # Read meta.dat.  A container that HAS one and cannot parse it is refused,
   # rather than opened with a zeroed `meta`.  Every flag this reader consults
@@ -807,11 +822,7 @@ when ctHasFilesystem:
     ## member that shrank, a published chunk that moved -- is refused, naming
     ## the member; the handle is then to be closed. A container this handle
     ## holds whole rather than reading from its file is opened again.
-    let incremental = r.image.readsFromFile and
-      (not r.execLoaded or r.meta.hasStepStream) and
-      (not r.valueLoaded or r.meta.hasValueStream) and
-      (not r.ioEventLoaded or r.meta.hasIoEventStream)
-    if not incremental:
+    if not r.image.readsFromFile:
       var reopened = openNewTrace(path,
         assumeColumnAwarePaths = r.assumedColumnAwarePaths)
       if reopened.isErr:
@@ -1335,15 +1346,7 @@ proc decodeGlobalPositionIndex*(r: var NewTraceReader,
 
 proc loadExecReader(r: var NewTraceReader): Result[void, string] =
   if not r.execLoaded:
-    # M24a-1: select the steps.dat/steps.idx framing by the meta.dat
-    # ``has_step_stream`` flag.  Bundles written by the current Nim writer
-    # (and by the Rust writer) set the flag and use the SPEC-canonical layout
-    # (header-less chunks, no total_events trailer) that the Rust
-    # ``StepStreamReader`` reads byte-for-byte.  Pre-M24a-1 Nim-v4 bundles
-    # never set the flag and use the legacy framing (per-chunk u32 count +
-    # total_events trailer); ``legacy = not hasStepStream`` keeps them readable.
     var res = initExecStreamReader(r.image, int(r.blockSize), int(r.maxEntries),
-      legacy = not r.meta.hasStepStream,
       # GDH-M2: tag 0x08 is decodable only where the container declares
       # it.  A container that carries the tag with the flag clear is
       # refused BY NAME here rather than decoded — see
@@ -1571,14 +1574,7 @@ proc stepAbsoluteGlobalLineIndices*(r: var NewTraceReader,
 
 proc loadValueReader(r: var NewTraceReader): Result[void, string] =
   if not r.valueLoaded:
-    # M24a-2: select the values.dat/values.idx framing by the meta.dat
-    # ``has_value_stream`` flag.  Bundles written by the current Nim writer
-    # (and by the Rust writer) set the flag and use the SPEC-canonical chunked
-    # layout that the Rust ``ValueStreamReader`` reads byte-for-byte.  Pre-M24a-2
-    # Nim-v4 bundles never set the flag and use the legacy ``.off`` VRT framing;
-    # ``legacy = not hasValueStream`` keeps them readable.
-    var res = initValueStreamReader(r.image, r.blockSize, r.maxEntries,
-      legacy = not r.meta.hasValueStream)
+    var res = initValueStreamReader(r.image, r.blockSize, r.maxEntries)
     if res.isErr: return err(res.unsafeError)
     r.valueReader = move res.get()
     r.valueLoaded = true
@@ -1767,14 +1763,7 @@ proc callRange*(r: var NewTraceReader, start, count: uint64,
 
 proc loadIOEventReader(r: var NewTraceReader): Result[void, string] =
   if not r.ioEventLoaded:
-    # M24a-3: select the events.dat/events.idx framing by the meta.dat
-    # ``has_io_event_stream`` flag.  Bundles written by the current Nim writer
-    # (and by the Rust writer) set the flag and use the SPEC-canonical chunked
-    # layout that the Rust ``IoEventStreamReader`` reads byte-for-byte.
-    # Pre-M24a-3 Nim-v4 bundles never set the flag and use the legacy ``.off``
-    # VRT framing; ``legacy = not hasIoEventStream`` keeps them readable.
-    var res = initIOEventStreamReader(r.image, r.blockSize, r.maxEntries,
-      legacy = not r.meta.hasIoEventStream)
+    var res = initIOEventStreamReader(r.image, r.blockSize, r.maxEntries)
     if res.isErr: return err(res.unsafeError)
     r.ioEventReader = move res.get()
     r.ioEventLoaded = true

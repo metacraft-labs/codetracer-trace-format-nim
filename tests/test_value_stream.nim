@@ -17,7 +17,6 @@ when defined(nimPreviewSlimSystem):
 import std/strutils
 import results
 import codetracer_ctfs/container
-import codetracer_ctfs/variable_record_table
 import codetracer_trace_writer/value_stream
 import codetracer_trace_writer/varint
 import codetracer_trace_writer/cbor
@@ -196,85 +195,6 @@ proc test_value_stream_many_variables() {.raises: [].} =
   assertEqualVals(got.get(), vals, "single step")
 
   echo "PASS: test_value_stream_many_variables"
-
-# ---------------------------------------------------------------------------
-# test_value_stream_legacy_back_compat — old .off VRT bundles still read
-# ---------------------------------------------------------------------------
-
-proc encodeLegacyRecord(values: openArray[VariableValue]): seq[byte] =
-  ## Encode one step's values in the PRE-M24a-2 legacy framing:
-  ## ``varint count, count × (varint varnameId, varint typeId, varint dataLen,
-  ## data)``.  Used to synthesize an old-format ``values.dat``/``values.off``
-  ## VariableRecordTable so we can prove the reader's legacy path still works.
-  var rec: seq[byte] = @[]
-  encodeVarint(uint64(values.len), rec)
-  for v in values:
-    encodeVarint(v.varnameId, rec)
-    encodeVarint(v.typeId, rec)
-    encodeVarint(uint64(v.data.len), rec)
-    rec.add(v.data)
-  rec
-
-proc test_value_stream_legacy_back_compat() {.raises: [].} =
-  # Hand-build a legacy .off VariableRecordTable named "values" with the old
-  # per-record framing (a separate verbatim typeId field), then read it via
-  # the legacy reader path — this is exactly what the FFI reader selects when
-  # the has_value_stream flag is clear (pre-M24a-2 Nim-v4 bundle).
-  var ctfs = createCtfs()
-  let tableRes = initVariableRecordTableWriter(ctfs, "values")
-  doAssert tableRes.isOk
-  var table = tableRes.get()
-
-  var rng = initRng(555)
-  var steps: seq[seq[VariableValue]] = @[]
-  for i in 0 ..< 50:
-    let vals =
-      if i mod 7 == 0: newSeq[VariableValue]()  # value-less step
-      else: makeValues(rng, int(rng.next() mod 3) + 1)
-    steps.add(vals)
-    let appendRes = ctfs.append(table, encodeLegacyRecord(vals))
-    doAssert appendRes.isOk, "append legacy record failed: " & appendRes.error
-
-  let rawBytes = ctfs.toBytes()
-  let readerRes = initValueStreamReader(rawBytes, legacy = true)
-  doAssert readerRes.isOk, "legacy reader init failed: " & readerRes.error
-  var reader = readerRes.get()
-  doAssert reader.count == 50,
-    "legacy count mismatch: got " & $reader.count
-
-  for i in 0 ..< 50:
-    let got = readStepValues(reader, uint64(i))
-    doAssert got.isOk, "legacy readStepValues failed at " & $i & ": " & got.error
-    assertEqualVals(got.get(), steps[i], "legacy step " & $i)
-
-  echo "PASS: test_value_stream_legacy_back_compat"
-
-proc test_value_stream_legacy_type_id_is_the_values() {.raises: [].} =
-  ## The legacy framing stores a type id beside each value. A
-  ## ``VariableValue``'s type id is its CBOR's, in that layout as in the SPEC
-  ## one, so a framing id that disagrees with the value's is not reported.
-  var ctfs = createCtfs()
-  let tableRes = initVariableRecordTableWriter(ctfs, "values")
-  doAssert tableRes.isOk
-  var table = tableRes.get()
-  let data = encInt(1, 3)
-  var rec: seq[byte] = @[]
-  encodeVarint(1'u64, rec)   # count
-  encodeVarint(9'u64, rec)   # varname id
-  encodeVarint(7'u64, rec)   # the framing's type id, not the value's
-  encodeVarint(uint64(data.len), rec)
-  rec.add(data)
-  doAssert ctfs.append(table, rec).isOk
-  let rawBytes = ctfs.toBytes()
-  var reader = initValueStreamReader(rawBytes, legacy = true).get()
-  let got = readStepValues(reader, 0)
-  doAssert got.isOk, got.error
-  doAssert got.get().len == 1 and got.get()[0].varnameId == 9
-  doAssert got.get()[0].data == data
-  doAssert got.get()[0].typeId == 3,
-    "legacy type id: got " & $got.get()[0].typeId & ", the value's is 3"
-
-  echo "PASS: test_value_stream_legacy_type_id_is_the_values"
 
 # ---------------------------------------------------------------------------
 # test_value_stream_assignment_events — tag-9 Assignment rides in the same
@@ -803,8 +723,6 @@ proc test_value_stream_values_walk_agrees_with_events_walk() {.raises: [].} =
 test_value_stream_write_read()
 test_value_stream_empty_record()
 test_value_stream_many_variables()
-test_value_stream_legacy_back_compat()
-test_value_stream_legacy_type_id_is_the_values()
 test_value_stream_assignment_events()
 test_value_stream_drop_variables_events()
 test_value_stream_drop_variable_events()

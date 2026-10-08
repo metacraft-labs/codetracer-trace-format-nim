@@ -52,14 +52,13 @@ proc ctVerifyInput(): int32 {.exportc: "ct_verify_input", cdecl.} =
 
 proc ctVerifyLegacyInput(): int32 {.exportc: "ct_verify_legacy_input",
     cdecl.} =
-  ## The same, for a LEGACY-framed v4 container: no `events.log`, and a
-  ## meta.dat that leaves the three stream bits clear so the reader picks the
-  ## pre-M24a decoders.
+  ## A container in the retired record-table layout: 0 when the reader
+  ## refuses it, naming the member.
   verifyLegacyCorpus(input)
 
 proc ctProbeMisframed(): int32 {.exportc: "ct_probe_misframed", cdecl.} =
-  ## Read legacy-framed bytes whose meta.dat claims the SPEC framing, and
-  ## report what came back as a bit set. See `probeMisframedLegacy`.
+  ## Read the retired-layout container whose meta.dat claims the spec layout;
+  ## 0 when it is refused. See `probeMisframedLegacy`.
   probeMisframedLegacy(input)
 
 # ---------------------------------------------------------------------------

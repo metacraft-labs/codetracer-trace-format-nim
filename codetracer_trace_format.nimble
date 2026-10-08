@@ -260,6 +260,9 @@ task test, "Run all tests":
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src -p:tests tests/test_retired_streams_are_refused.nim"
   # A refresh follows a container being written incrementally (`ctfs-container.md` §6).
   exec "nim c -r -p:src tests/test_follow_is_incremental.nim"
+  # Every container is read in the spec stream layout whatever its presence
+  # bits say; one in the retired record-table layout is refused by name.
+  exec "nim c -r -p:src tests/test_spec_layout_always.nim"
   # ct-print reports a step position it cannot resolve instead of emitting
   # the plausible wrong (path, line) the unchecked inverse produces.
   exec "nim c -r -d:release -p:src tests/test_ct_print_unresolvable_position.nim"

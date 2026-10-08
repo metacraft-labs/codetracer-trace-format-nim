@@ -50,25 +50,10 @@
 ## that kind. Values 14-255 are unassigned and refused on both sides, by value.
 ## ``metadata`` is carried verbatim; ``data`` is the record's ``content``.
 ##
-## # Backward compatibility (legacy Nim-v4 bundles)
-##
-## Bundles written by the pre-M24a-3 Nim writer used a ``VariableRecordTable``
-## (``events.dat`` + ``events.off`` — an uncompressed variable-size record table
-## with a u64 offset table), and a different per-record format
-## (``u8 kind, varint stepId, varint data_len, data`` — NO metadata, and ``kind``
-## was the 4-value ``IOEventKind`` ordinal, NOT the ``EventLogKind`` ordinal).
-## Those bundles never set the ``meta.dat`` ``has_io_event_stream`` flag (bit
-## 11), so the FFI reader distinguishes the two layouts by that flag: flag set ⇒
-## SPEC chunked layout, flag clear ⇒ legacy ``.off`` VRT layout.
-## ``initIOEventStreamReader`` accepts an explicit ``legacy`` parameter for this;
-## standalone callers that only ever read freshly-written bundles get the SPEC
-## layout by default.
-
 import results
 import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
 import ../codetracer_ctfs/streaming
-import ../codetracer_ctfs/variable_record_table
 import ../codetracer_ctfs/zstd_bindings
 import ./varint
 import ./record_chunk
@@ -105,8 +90,6 @@ type
 
   IOEventStreamReader* = object
     spec: ChunkedRecords       ## events.dat + events.idx (SPEC mode)
-    legacy: bool               ## true ⇒ legacy .off VRT layout; false ⇒ SPEC
-    legacyTable: VariableRecordTableReader  ## only valid when legacy == true
 
 proc eventLogKindName*(k: EventLogKind): string =
   ## The kind's name as `trace-events.md` §"EventLogKind (u8 enum)" spells it.
@@ -192,36 +175,6 @@ proc decodeIOEvent*(data: openArray[byte]): Result[IOEvent, string] {.raises: []
     stepId: stepId,
     metadata: meta,
     data: evData))
-
-# ---------------------------------------------------------------------------
-# Legacy per-record decode (pre-M24a-3 .off VRT framing)
-# ---------------------------------------------------------------------------
-
-proc decodeLegacyIOEvent(data: openArray[byte]): Result[IOEvent, string] {.raises: [].} =
-  ## Decode a legacy ``.off`` VRT IO event record (pre-M24a-3 framing):
-  ## ``u8 kind, varint stepId, varint data_len, data`` — the ``kind`` byte was
-  ## the 4-value ``IOEventKind`` ordinal (NOT an ``EventLogKind`` ordinal) and
-  ## there was no metadata field.
-  if data.len < 1:
-    return err("legacy IO event data too short")
-  var pos = 0
-  let kindByte = data[pos]
-  pos += 1
-  # The legacy 4-value API ordinal: stdout, stderr, file op, error.
-  let kind = case kindByte
-    of 0: elkWrite
-    of 1: elkWriteOther
-    of 2: elkReadFile
-    of 3: elkError
-    else: return err("invalid legacy IO event kind: " & $kindByte)
-  let stepId = ?decodeVarint(data, pos)
-  let dataLen = int(?decodeVarint(data, pos))
-  if pos + dataLen > data.len:
-    return err("truncated legacy IO event data")
-  var evData = newSeq[byte](dataLen)
-  for i in 0 ..< dataLen:
-    evData[i] = data[pos + i]
-  ok(IOEvent(kind: kind, stepId: stepId, metadata: @[], data: evData))
 
 # ---------------------------------------------------------------------------
 # Writer (SPEC chunked layout)
@@ -333,27 +286,12 @@ proc count*(w: IOEventStreamWriter): uint64 = w.totalRecords
 
 proc initIOEventStreamReader*(ctfsBytes: openArray[byte],
     blockSize: uint32 = DefaultBlockSize,
-    maxEntries: uint32 = DefaultMaxRootEntries,
-    legacy: bool = false): Result[IOEventStreamReader, string] =
+    maxEntries: uint32 = DefaultMaxRootEntries): Result[IOEventStreamReader, string] =
   ## Initialize a reader from raw CTFS container bytes.
   ##
-  ## ``legacy`` selects the on-disk framing (see module docs):
-  ##   * ``false`` (default) — SPEC chunked layout (``events.dat`` chunked Zstd +
-  ##     ``events.idx`` = ``[chunk_size: u32][offset: u64]...``).  Byte-compatible
-  ##     with the Rust ``IoEventStreamReader``.
-  ##   * ``true`` — legacy Nim-v4 ``.off`` VariableRecordTable layout
-  ##     (``events.dat`` + ``events.off``, per-record
-  ##     ``u8 kind, varint stepId, varint data_len, data``).
-  ##
-  ## The FFI reader passes ``legacy = not meta.hasIoEventStream``: pre-M24a-3
-  ## bundles never set the ``has_io_event_stream`` flag, so a clear flag selects
-  ## the legacy reader and a set flag the SPEC reader.
-  if legacy:
-    let tableRes = initVariableRecordTableReader(ctfsBytes, "events",
-        blockSize, maxEntries)
-    if tableRes.isErr:
-      return err(tableRes.unsafeError)
-    return ok(IOEventStreamReader(legacy: true, legacyTable: tableRes.get()))
+  ## ``events.dat`` is chunked Zstd and ``events.idx`` is
+  ## ``[chunk_size: u32][offset: u64]...``, byte-compatible with the Rust
+  ## ``IoEventStreamReader``.
   var datRes = readInternalFile(ctfsBytes, "events.dat", blockSize, maxEntries)
   if datRes.isErr:
     return err("failed to read events.dat: " & datRes.unsafeError)
@@ -366,16 +304,9 @@ proc initIOEventStreamReader*(ctfsBytes: openArray[byte],
 
 proc initIOEventStreamReader*(image: ContainerImage,
     blockSize: uint32 = DefaultBlockSize,
-    maxEntries: uint32 = DefaultMaxRootEntries,
-    legacy: bool = false): Result[IOEventStreamReader, string] =
+    maxEntries: uint32 = DefaultMaxRootEntries): Result[IOEventStreamReader, string] =
   ## As above, over a container image it shares: `events.dat` is read in
   ## place.
-  if legacy:
-    let tableRes = initVariableRecordTableReader(image, "events",
-        blockSize, maxEntries)
-    if tableRes.isErr:
-      return err(tableRes.unsafeError)
-    return ok(IOEventStreamReader(legacy: true, legacyTable: tableRes.get()))
   var datRes = viewMember(image, "events.dat", blockSize, maxEntries)
   if datRes.isErr:
     return err("failed to read events.dat: " & datRes.unsafeError)
@@ -390,10 +321,7 @@ proc refresh*(r: var IOEventStreamReader, image: ContainerImage,
     blockSize: uint32 = DefaultBlockSize,
     maxEntries: uint32 = DefaultMaxRootEntries): Result[void, string] =
   ## Extend the reader by the chunks the container in `image` has published
-  ## since it was opened or last refreshed (`ctfs-container.md` §6). A legacy
-  ## `.off` layout is never written live and is not followed.
-  if r.legacy:
-    return err("events.dat: a legacy event table is not followed")
+  ## since it was opened or last refreshed (`ctfs-container.md` §6).
   let dat = viewMember(image, "events.dat", blockSize, maxEntries)
   if dat.isErr:
     return err("failed to read events.dat: " & dat.unsafeError)
@@ -402,21 +330,11 @@ proc refresh*(r: var IOEventStreamReader, image: ContainerImage,
     return err("failed to read events.idx: " & idx.unsafeError)
   r.spec.refresh(dat.unsafeGet(), ? idx.unsafeGet().contents(), "events")
 
-proc count*(r: IOEventStreamReader): uint64 =
-  if r.legacy:
-    r.legacyTable.count()
-  else:
-    r.spec.count
+proc count*(r: IOEventStreamReader): uint64 = r.spec.count
 
 proc readEvent*(r: var IOEventStreamReader,
     index: uint64): Result[IOEvent, string] =
   ## Read the IO event record at the given index, decompressing only its chunk.
-  if r.legacy:
-    let dataRes = r.legacyTable.read(index)
-    if dataRes.isErr:
-      return err(dataRes.unsafeError)
-    return decodeLegacyIOEvent(dataRes.get())
-
   if index >= r.spec.count:
     return err("io event index " & $index & " out of range (count " &
       $r.spec.count & ")")

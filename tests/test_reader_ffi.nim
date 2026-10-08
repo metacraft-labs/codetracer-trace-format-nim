@@ -105,11 +105,7 @@ proc writeTestTrace(path: string) =
   doAssert metaFileRes.isOk
   var metaFile = metaFileRes.get()
   let meta = TraceMetadata(recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb", program: "test_ffi_prog", args: @["--test"], workdir: "/tmp/ffi")
-  # ``hasValueStream`` is what routes the reader to the SPEC ``values.dat`` /
-  # ``values.idx`` layout this fixture writes; a clear flag selects the legacy
-  # ``values.off`` VariableRecordTable, which nothing here produces. The
-  # fixture declared a container it had not written, and every value lookup
-  # was refused for a file that was never going to exist.
+  # The stream-presence bits state the streams this fixture writes.
   let metaWr = ctfs.writeMetaDat(metaFile, meta,
     recorderId = "ffi-test", hasStepStream = true, hasValueStream = true,
     hasCallStream = true, hasIoEventStream = true, hasInterningTables = true)

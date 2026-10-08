@@ -40,10 +40,8 @@
 ## offset[chunk+1])` (or to end for the last chunk), and index `N mod chunkSize`
 ## within it — O(1), no whole-stream decompression.
 ##
-## This storage replaces the pre-M20 `calls.dat` + `calls.off`
-## VariableRecordTable layout (which the Rust seekable reader could not index),
-## so a Nim-written split bundle is now SEEKABLE by the db-backend's
-## `CallStreamReader` exactly like a Rust-writer one. The PUBLIC reader/writer
+## A Nim-written container is seekable by the Rust `CallStreamReader` exactly
+## like a Rust-written one. The PUBLIC reader/writer
 ## API (`initCallStreamWriter`, `writeCall`, `finalizeCallStream`,
 ## `initCallStreamReader`, `readCall`, `count`) is unchanged so callers
 ## (`multi_stream_writer`, `new_trace_reader`) need only the close-time
@@ -54,7 +52,6 @@ import results
 import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
 import ../codetracer_ctfs/streaming
-import ../codetracer_ctfs/variable_record_table
 import ../codetracer_ctfs/zstd_bindings
 import ./varint
 import ./record_chunk
@@ -103,19 +100,10 @@ type
     finalized: bool
 
   CallStreamReader* = object
-    ## Reads the dedicated call stream. Supports BOTH on-disk layouts so a
-    ## reader works on any bundle, old or new:
-    ##   * NEW (M20): chunked-Zstd `calls.dat` + companion `calls.idx`
-    ##     (Rust-`CallStreamReader`-compatible, seekable). Selected when
-    ##     `calls.idx` is present.
-    ##   * LEGACY (pre-M20): `calls.dat` + `calls.off` VariableRecordTable.
-    ##     Selected when `calls.idx` is absent. This keeps bundles recorded by
-    ##     the pre-M20 Nim writer (flag clear) reading byte-for-byte unchanged.
-    spec: ChunkedRecords           ## calls.dat + calls.idx (new format)
+    ## Reads the dedicated call stream: chunked-Zstd `calls.dat` and its
+    ## companion `calls.idx`.
+    spec: ChunkedRecords
     recordCount: uint64
-    legacy: Option[VariableRecordTableReader]
-      ## Present iff the bundle uses the legacy `calls.dat` + `calls.off`
-      ## VariableRecordTable layout (no `calls.idx`).
 
 # ---------------------------------------------------------------------------
 # Record encode/decode (unchanged wire format)
@@ -367,15 +355,6 @@ proc count*(w: CallStreamWriter): uint64 = w.recordCount
 # Reader
 # ---------------------------------------------------------------------------
 
-proc legacyCallStream(table: Result[VariableRecordTableReader, string]):
-    Result[CallStreamReader, string] =
-  ## A pre-M20 legacy bundle has no calls.idx: its calls.dat is a
-  ## VariableRecordTable (calls.dat + calls.off), read as such so old
-  ## (flag-clear) bundles keep reading byte-for-byte unchanged.
-  if table.isErr:
-    return err("failed to read legacy calls table: " & table.unsafeError)
-  ok(CallStreamReader(recordCount: table.get().count(), legacy: some(table.get())))
-
 proc openCallStream(dat: sink MemberView, idx: openArray[byte],
     stored: bool): Result[CallStreamReader, string] =
   # A reader of a container still being written can meet a partial index
@@ -396,8 +375,7 @@ proc initCallStreamReader*(ctfsBytes: openArray[byte],
     return err("failed to read calls.dat: " & datRes.unsafeError)
   let idxRes = readInternalFile(ctfsBytes, "calls.idx", blockSize, maxEntries)
   if idxRes.isErr:
-    return legacyCallStream(initVariableRecordTableReader(ctfsBytes, "calls",
-      blockSize, maxEntries))
+    return err("failed to read calls.idx: " & idxRes.unsafeError)
   openCallStream(viewBytes(move datRes.get()), idxRes.get(),
     isCompactContainer(ctfsBytes))
 
@@ -410,8 +388,7 @@ proc initCallStreamReader*(image: ContainerImage,
     return err("failed to read calls.dat: " & datRes.unsafeError)
   let idxRes = viewMember(image, "calls.idx", blockSize, maxEntries)
   if idxRes.isErr:
-    return legacyCallStream(initVariableRecordTableReader(image, "calls",
-      blockSize, maxEntries))
+    return err("failed to read calls.idx: " & idxRes.unsafeError)
   openCallStream(move datRes.get(), ? idxRes.get().contents(),
     isCompactContainer(image.bytes))
 
@@ -419,10 +396,7 @@ proc refresh*(r: var CallStreamReader, image: ContainerImage,
     blockSize: uint32 = DefaultBlockSize,
     maxEntries: uint32 = DefaultMaxRootEntries): Result[void, string] =
   ## Extend the reader by the chunks the container in `image` has published
-  ## since it was opened or last refreshed (`ctfs-container.md` §6). A legacy
-  ## `.off` layout is never written live and is not followed.
-  if r.legacy.isSome:
-    return err("calls.dat: a legacy call table is not followed")
+  ## since it was opened or last refreshed (`ctfs-container.md` §6).
   let dat = viewMember(image, "calls.dat", blockSize, maxEntries)
   if dat.isErr:
     return err("failed to read calls.dat: " & dat.unsafeError)
@@ -438,12 +412,6 @@ template readCallInto*(r: var CallStreamReader, callKey: uint64) =
   ## reads a call record and returns it: the record is built in that proc's
   ## `result` rather than in each layer it would pass through.
   block readCallBody:
-    if r.legacy.isSome:
-      let dataRes = r.legacy.get().read(callKey)
-      result =
-        if dataRes.isErr: err(dataRes.unsafeError)
-        else: decodeCallRecord(dataRes.get())
-      break readCallBody
     if callKey >= r.recordCount:
       result = err("call_key " & $callKey & " out of range (count " &
         $r.recordCount & ")")
@@ -458,8 +426,7 @@ template readCallInto*(r: var CallStreamReader, callKey: uint64) =
 proc readCall*(r: var CallStreamReader,
     callKey: uint64): Result[CallRecord, string] =
   ## Read the call record at the given call_key, decompressing only its chunk.
-  ## A one-chunk cache avoids re-decompressing clustered reads. Legacy bundles
-  ## read directly from the VariableRecordTable.
+  ## A one-chunk cache avoids re-decompressing clustered reads.
   r.readCallInto(callKey)
 
 proc count*(r: CallStreamReader): uint64 = r.recordCount

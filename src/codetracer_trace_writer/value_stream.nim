@@ -62,24 +62,10 @@
 ## ``typeId`` accessor reads the CBOR value's top-level ``type_id`` when it is
 ## asked for, and the reader does not derive it while it decodes.
 ##
-## # Backward compatibility (legacy Nim-v4 bundles)
-##
-## Bundles written by the pre-M24a-2 Nim writer used a ``VariableRecordTable``
-## (``values.dat`` + ``values.off`` — an uncompressed variable-size record table
-## with a u64 offset table), and a different per-record format (``varint count``,
-## then ``varint varnameId, varint typeId, varint dataLen, data`` per value).
-## Those bundles never set the ``meta.dat`` ``has_value_stream`` flag (bit 10),
-## so the FFI reader distinguishes the two layouts by that flag: flag set ⇒ SPEC
-## chunked layout, flag clear ⇒ legacy ``.off`` VRT layout.
-## ``initValueStreamReader`` accepts an explicit ``legacy`` parameter for this;
-## standalone callers that only ever read freshly-written bundles get the SPEC
-## layout by default.
-
 import results
 import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
 import ../codetracer_ctfs/streaming
-import ../codetracer_ctfs/variable_record_table
 import ../codetracer_ctfs/zstd_bindings
 import ../codetracer_trace_types
 import ./cbor
@@ -201,8 +187,6 @@ type
 
   ValueStreamReader* = object
     spec: ChunkedRecords       ## values.dat + values.idx (SPEC mode)
-    legacy: bool               ## true ⇒ legacy .off VRT layout; false ⇒ SPEC
-    legacyTable: VariableRecordTableReader  ## only valid when legacy == true
     lastSkippedTags*: seq[uint8]  ## tags >= 10 skipped in the most recent readStepValues / readStepAssignments
     skippedTags*: seq[uint8]      ## distinct tags >= 10 skipped across all reads
     skippedTagCounts*: seq[(uint8, int)] ## cumulative count per tag
@@ -892,27 +876,12 @@ proc totalRecords*(w: ValueStreamWriter): uint64 = w.totalRecords
 
 proc initValueStreamReader*(ctfsBytes: openArray[byte],
     blockSize: uint32 = DefaultBlockSize,
-    maxEntries: uint32 = DefaultMaxRootEntries,
-    legacy: bool = false): Result[ValueStreamReader, string] =
+    maxEntries: uint32 = DefaultMaxRootEntries): Result[ValueStreamReader, string] =
   ## Initialize a reader from raw CTFS container bytes.
   ##
-  ## ``legacy`` selects the on-disk framing (see module docs):
-  ##   * ``false`` (default) — SPEC chunked layout (``values.dat`` chunked Zstd +
-  ##     ``values.idx`` = ``[chunk_size: u32][offset: u64]...``).  Byte-compatible
-  ##     with the Rust ``ValueStreamReader``.
-  ##   * ``true`` — legacy Nim-v4 ``.off`` VariableRecordTable layout
-  ##     (``values.dat`` + ``values.off``, per-record ``varint count`` +
-  ##     ``varnameId/typeId/dataLen/data``).
-  ##
-  ## The FFI reader passes ``legacy = not meta.hasValueStream``: pre-M24a-2
-  ## bundles never set the ``has_value_stream`` flag, so a clear flag selects the
-  ## legacy reader and a set flag the SPEC reader.
-  if legacy:
-    let tableRes = initVariableRecordTableReader(ctfsBytes, "values",
-        blockSize, maxEntries)
-    if tableRes.isErr:
-      return err(tableRes.unsafeError)
-    return ok(ValueStreamReader(legacy: true, legacyTable: tableRes.get()))
+  ## ``values.dat`` is chunked Zstd and ``values.idx`` is
+  ## ``[chunk_size: u32][offset: u64]...``, byte-compatible with the Rust
+  ## ``ValueStreamReader``.
   var datRes = readInternalFile(ctfsBytes, "values.dat", blockSize, maxEntries)
   if datRes.isErr:
     return err("failed to read values.dat: " & datRes.unsafeError)
@@ -924,16 +893,9 @@ proc initValueStreamReader*(ctfsBytes: openArray[byte],
 
 proc initValueStreamReader*(image: ContainerImage,
     blockSize: uint32 = DefaultBlockSize,
-    maxEntries: uint32 = DefaultMaxRootEntries,
-    legacy: bool = false): Result[ValueStreamReader, string] =
+    maxEntries: uint32 = DefaultMaxRootEntries): Result[ValueStreamReader, string] =
   ## As above, over a container image it shares: `values.dat` is read in
   ## place.
-  if legacy:
-    let tableRes = initVariableRecordTableReader(image, "values",
-        blockSize, maxEntries)
-    if tableRes.isErr:
-      return err(tableRes.unsafeError)
-    return ok(ValueStreamReader(legacy: true, legacyTable: tableRes.get()))
   var datRes = viewMember(image, "values.dat", blockSize, maxEntries)
   if datRes.isErr:
     return err("failed to read values.dat: " & datRes.unsafeError)
@@ -948,10 +910,7 @@ proc refresh*(r: var ValueStreamReader, image: ContainerImage,
     blockSize: uint32 = DefaultBlockSize,
     maxEntries: uint32 = DefaultMaxRootEntries): Result[void, string] =
   ## Extend the reader by the chunks the container in `image` has published
-  ## since it was opened or last refreshed (`ctfs-container.md` §6). A legacy
-  ## `.off` layout is never written live and is not followed.
-  if r.legacy:
-    return err("values.dat: a legacy value table is not followed")
+  ## since it was opened or last refreshed (`ctfs-container.md` §6).
   let dat = viewMember(image, "values.dat", blockSize, maxEntries)
   if dat.isErr:
     return err("failed to read values.dat: " & dat.unsafeError)
@@ -960,34 +919,8 @@ proc refresh*(r: var ValueStreamReader, image: ContainerImage,
     return err("failed to read values.idx: " & idx.unsafeError)
   r.spec.refresh(dat.unsafeGet(), ? idx.unsafeGet().contents(), "values")
 
-proc count*(r: ValueStreamReader): uint64 =
-  if r.legacy:
-    r.legacyTable.count()
-  else:
-    r.spec.count
+proc count*(r: ValueStreamReader): uint64 = r.spec.count
 
-proc readLegacyRecord(data: openArray[byte]): Result[seq[VariableValue], string] =
-  ## Decode a legacy ``.off`` VRT value record (pre-M24a-2 framing):
-  ## ``varint count, count × (varint varnameId, varint typeId, varint dataLen,
-  ## data)``. The framing's type id is stepped over: a ``VariableValue``'s
-  ## type id is its CBOR's, in this layout as in the SPEC one.
-  if data.len == 0:
-    return ok(newSeq[VariableValue]())
-  var pos = 0
-  let count = int(?decodeVarint(data, pos))
-  var values = newSeq[VariableValue](count)
-  for i in 0 ..< count:
-    let vnId = ?decodeVarint(data, pos)
-    discard ?decodeVarint(data, pos)
-    let dLen = int(?decodeVarint(data, pos))
-    if pos + dLen > data.len:
-      return err("truncated legacy value data")
-    var d = newSeq[byte](dLen)
-    for j in 0 ..< dLen:
-      d[j] = data[pos + j]
-    pos += dLen
-    values[i] = VariableValue(varnameId: vnId, data: d)
-  ok(values)
 
 proc cacheRecordFor(r: var ValueStreamReader,
     stepIndex: uint64): Result[int, string] =
@@ -1027,11 +960,6 @@ proc noteSkippedTags(r: var ValueStreamReader, skipped: seq[uint8]) =
 proc readStepValues*(r: var ValueStreamReader,
     stepIndex: uint64): Result[seq[VariableValue], string] =
   ## Read all variable values for a given step (record N ↔ step N).
-  if r.legacy:
-    let dataRes = r.legacyTable.read(stepIndex)
-    if dataRes.isErr:
-      return err(dataRes.unsafeError)
-    return readLegacyRecord(dataRes.get())
 
   if stepIndex >= r.spec.count:
     return err("value step index " & $stepIndex & " out of range (count " &
@@ -1056,12 +984,8 @@ proc readStepValues*(r: var ValueStreamReader,
 proc readStepDropVariable*(r: var ValueStreamReader,
     stepIndex: uint64): Result[seq[uint64], string] =
   ## Read the tag-2 ``DropVariable`` events recorded for a given step
-  ## (record N ↔ step N), one interned varname id each.  Legacy ``.off`` VRT
-  ## bundles never carried them, so they report an empty sequence rather than
-  ## an error.
+  ## (record N ↔ step N), one interned varname id each.
   r.lastSkippedTags.setLen(0)
-  if r.legacy:
-    return ok(newSeq[uint64]())
 
   let within = ?r.cacheRecordFor(stepIndex)
   var skipped: seq[uint8] = @[]
@@ -1073,11 +997,8 @@ proc readStepDropVariables*(r: var ValueStreamReader,
     stepIndex: uint64): Result[seq[seq[uint64]], string] =
   ## Read the tag-3 ``DropVariables`` events recorded for a given step
   ## (record N ↔ step N), one ``seq[uint64]`` of interned varname ids per
-  ## event.  Legacy ``.off`` VRT bundles never carried them, so they report an
-  ## empty sequence rather than an error.
+  ## event.
   r.lastSkippedTags.setLen(0)
-  if r.legacy:
-    return ok(newSeq[seq[uint64]]())
 
   let within = ?r.cacheRecordFor(stepIndex)
   var skipped: seq[uint8] = @[]
@@ -1088,11 +1009,8 @@ proc readStepDropVariables*(r: var ValueStreamReader,
 proc readStepAssignments*(r: var ValueStreamReader,
     stepIndex: uint64): Result[seq[AssignmentEventEntry], string] =
   ## Read the tag-9 ``Assignment`` events recorded for a given step
-  ## (record N ↔ step N).  Legacy ``.off`` VRT bundles never carried them, so
-  ## they report an empty sequence rather than an error.
+  ## (record N ↔ step N).
   r.lastSkippedTags.setLen(0)
-  if r.legacy:
-    return ok(newSeq[AssignmentEventEntry]())
 
   let within = ?r.cacheRecordFor(stepIndex)
   var skipped: seq[uint8] = @[]
@@ -1104,11 +1022,6 @@ proc readStepEvents*(r: var ValueStreamReader,
     stepIndex: uint64): Result[seq[DecodedValueEvent], string] =
   ## Every value-stream event of a step's record, tags 0-9, in wire order.
   r.lastSkippedTags.setLen(0)
-  if r.legacy:
-    let vals = ? r.readStepValues(stepIndex)
-    if vals.len == 0:
-      return ok(newSeq[DecodedValueEvent]())
-    return ok(@[DecodedValueEvent(kind: veStepValues, values: vals)])
   let within = ?r.cacheRecordFor(stepIndex)
   var skipped: seq[uint8] = @[]
   let res = decodeRecordEvents(r.spec.record(within), skipped)

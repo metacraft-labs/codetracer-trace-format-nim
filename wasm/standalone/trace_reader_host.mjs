@@ -17,11 +17,10 @@
 // Three containers, because they exercise different decoders:
 //   * `corpus.ct`   — the SPEC framing, plus source views, IO events, spans
 //                     and the line-hit index;
-//   * `legacy.ct`   — the pre-M24a Nim-v4 framing, selected by three meta.dat
-//                     bits this repo's writer never clears;
-//   * `misframed.ct`— those same legacy bytes with meta.dat claiming the SPEC
-//                     framing, to see whether a mis-discriminated container
-//                     fails or answers.
+//   * `legacy.ct`   — a container in the retired record-table layout
+//                     (`values.off`, `events.off`), which the reader refuses;
+//   * `misframed.ct`— the same container with meta.dat claiming the spec
+//                     layout, refused just the same.
 
 import { readFileSync } from "node:fs";
 
@@ -242,69 +241,25 @@ check("linehits[unexecuted position] absent",
   num(NUM.linehitPresent, expected.linehitAbsent), 0);
 
 // ===========================================================================
-// 2. The legacy Nim-v4 framing
+// 2. A container in the retired record-table layout
 // ===========================================================================
 
 load(legacy, "legacy.ct");
+// Refused, naming `values.off`: the stream layout it carries is not part of
+// the trace format.
 check("ct_verify_legacy_input", x.ct_verify_legacy_input(), 0);
-check("ct_open_input (legacy)", x.ct_open_input(), 0);
-
-// The discriminator itself. If any of these were set the container would be
-// SPEC-framed and everything below would be testing the wrong decoder.
-check("legacy meta.has_step_stream", num(NUM.hasStepStreamFlag), 0);
-check("legacy meta.has_value_stream", num(NUM.hasValueStreamFlag), 0);
-check("legacy meta.has_io_event_stream", num(NUM.hasIoStreamFlag), 0);
-check("legacy is line-only", x.ct_column_aware(), 0);
-
-check("legacy step count", x.ct_step_count(), expected.legacy.steps);
-check("legacy path count", x.ct_path_count(), expected.legacy.paths.length);
-expected.legacy.paths.forEach((s, i) =>
-  check(`legacy path[${i}]`, readStr(STR.path, i), s));
-check("legacy function[0]", readStr(STR.func, 0), expected.legacy.function);
-check("legacy type[0]", readStr(STR.type, 0), expected.legacy.type);
-check("legacy varname[0]", readStr(STR.varname, 0), expected.legacy.varname);
-
-expected.legacy.gli.forEach((want, i) =>
-  check(`legacy step[${i}].position`, x.ct_step_position(BigInt(i)), want));
-
-expected.legacy.valuesHex.forEach((wantHex, i) => {
-  check(`legacy values[${i}].count`, num(NUM.valueCount, i), 1);
-  const want = wantHex.match(/../g) ?? [];
-  const got = want.map((_, k) => Number(num(NUM.valueByte, i, k)))
-    .map((v) => v.toString(16).padStart(2, "0")).join("");
-  check(`legacy values[${i}]`, got, wantHex);
-});
-
-check("legacy io count", num(NUM.ioCount), expected.legacy.io.length);
-expected.legacy.io.forEach((e, i) => {
-  check(`legacy io[${i}].kind`, num(NUM.ioKind, i), e.kind);
-  check(`legacy io[${i}].step`, num(NUM.ioStep, i), e.step);
-  check(`legacy io[${i}].data`, readHex(STR.ioData, i), e.dataHex);
-  // The legacy record has no metadata field at all; a SPEC-mode decode of the
-  // same bytes would produce one.
-  check(`legacy io[${i}].metadata`, readHex(STR.ioMeta, i), "");
-});
+check("ct_open_input (legacy) is refused", x.ct_open_input(), 1);
 
 // ===========================================================================
-// 3. Legacy bytes, SPEC-framing flags
+// 3. The same container, its meta.dat claiming the spec layout
 // ===========================================================================
 //
-// Bits: 1 opened, 2 a step count came back, 4 that count was wrong,
-//       8 a position resolved, 16 that position was wrong.
-// The claim is that wasm agrees with the host about what happens, not that the
-// outcome is the desired one — the host measured it, and it is recorded in
-// `corpus.json` rather than predicted here.
+// Bits: 1 opened, 2 a step count came back, 8 a position resolved. The flags
+// decide nothing, so it is refused like the other: 0.
 
 load(misframed, "misframed.ct");
 const bits = x.ct_probe_misframed();
 check("ct_probe_misframed", bits, expected.misframedBits);
-if ((bits & 4) !== 0 || (bits & 16) !== 0) {
-  console.log(`    NOTE: a mis-discriminated container answered with WRONG` +
-    ` data (bits ${bits}) rather than refusing`);
-} else {
-  console.log(`    mis-discriminated container refuses rather than answering` +
-    ` (bits ${bits})`);
-}
 
 // ===========================================================================
 // 4. The module's own container, for the round-trip comparison
@@ -337,5 +292,5 @@ console.log(`    ${expected.steps} steps, ${expected.probes.length} decoded posi
   ` ${expected.paths.length + expected.functions.length + expected.types.length + expected.varnames.length}` +
   ` interned strings, ${expected.views.length} source views,` +
   ` ${expected.ioEvents.length} IO events, ${expected.spans.length} spans,` +
-  ` ${expected.linehitProbes.length} line-hit lists,` +
-  ` ${expected.legacy.steps} legacy-framed steps — all as expected`);
+  ` ${expected.linehitProbes.length} line-hit lists, and the retired layout` +
+  ` refused — all as expected`);
