@@ -257,6 +257,8 @@ task test, "Run all tests":
   # reader (library, legacy TraceReader, C ABI, ct-print) refuses a container
   # carrying either, by name, and the C ABI refuses the formats that wrote one.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src -p:tests tests/test_retired_streams_are_refused.nim"
+  # A refresh follows a container being written incrementally (`ctfs-container.md` §6).
+  exec "nim c -r -p:src tests/test_follow_is_incremental.nim"
   # ct-print reports a step position it cannot resolve instead of emitting
   # the plausible wrong (path, line) the unchecked inverse produces.
   exec "nim c -r -d:release -p:src tests/test_ct_print_unresolvable_position.nim"

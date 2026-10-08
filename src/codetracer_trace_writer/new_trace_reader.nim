@@ -13,6 +13,7 @@ import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
 import ../codetracer_ctfs/variable_record_table
 import ../codetracer_ctfs/member_view
+import ../codetracer_ctfs/base40
 import ./meta_dat
 import ./interning_table
 import ./exec_stream
@@ -794,15 +795,61 @@ when ctHasFilesystem:
       assumeColumnAwarePaths)
 
   proc refresh*(r: var NewTraceReader, path: string): Result[void, string] =
-    ## Re-read a growing CTFS container into this handle and invalidate every
-    ## lazily-opened stream reader whose chunk table may have grown.
-    ## Re-opens under the same ``assumeColumnAwarePaths`` reading this
-    ## handle was created with.
-    var reopened = openNewTrace(path,
-      assumeColumnAwarePaths = r.assumedColumnAwarePaths)
-    if reopened.isErr:
-      return err(reopened.unsafeError)
-    r = move reopened.get()
+    ## Follow a container that is being written (`ctfs-container.md` §6,
+    ## "Live progress: per-stream following"): make what its writer has
+    ## published since this handle was opened or last refreshed readable.
+    ##
+    ## The root directory is read again; the metadata, the interning tables
+    ## and the source views, which are small, are read again whole; and each
+    ## stream reader already opened is extended by the chunks published since,
+    ## decoding only the new last chunk to count its records and keeping every
+    ## chunk it holds. A container that changed as no writer changes one -- a
+    ## member that shrank, a published chunk that moved -- is refused, naming
+    ## the member; the handle is then to be closed. A container this handle
+    ## holds whole rather than reading from its file is opened again.
+    let incremental = r.image.readsFromFile and
+      (not r.execLoaded or r.meta.hasStepStream) and
+      (not r.valueLoaded or r.meta.hasValueStream) and
+      (not r.ioEventLoaded or r.meta.hasIoEventStream)
+    if not incremental:
+      var reopened = openNewTrace(path,
+        assumeColumnAwarePaths = r.assumedColumnAwarePaths)
+      if reopened.isErr:
+        return err(reopened.unsafeError)
+      r = move reopened.get()
+      return ok()
+    let before = rootMembers(r.image.bytes, r.maxEntries)
+    ? r.image.refresh(r.maxEntries)
+    let after = rootMembers(r.image.bytes, r.maxEntries)
+    for old in before:
+      for now in after:
+        if now.name == old.name and now.size < old.size:
+          return err("member " & base40Decode(old.name) & " shrank from " &
+            $old.size & " to " & $now.size &
+            " bytes while the container was followed")
+    if r.execLoaded:
+      ? r.execReader.refresh(r.image, int(r.blockSize), int(r.maxEntries))
+    if r.valueLoaded:
+      ? r.valueReader.refresh(r.image, r.blockSize, r.maxEntries)
+    if r.callLoaded:
+      ? r.callReader.refresh(r.image, r.blockSize, r.maxEntries)
+    if r.ioEventLoaded:
+      ? r.ioEventReader.refresh(r.image, r.blockSize, r.maxEntries)
+    var fresh = ? openNewTraceFromImage(r.image, r.blockSize, r.maxEntries,
+      r.assumedColumnAwarePaths)
+    if r.execLoaded:
+      fresh.execReader = move r.execReader
+      fresh.execLoaded = true
+    if r.valueLoaded:
+      fresh.valueReader = move r.valueReader
+      fresh.valueLoaded = true
+    if r.callLoaded:
+      fresh.callReader = move r.callReader
+      fresh.callLoaded = true
+    if r.ioEventLoaded:
+      fresh.ioEventReader = move r.ioEventReader
+      fresh.ioEventLoaded = true
+    r = move fresh
     ok()
 
 # ---------------------------------------------------------------------------

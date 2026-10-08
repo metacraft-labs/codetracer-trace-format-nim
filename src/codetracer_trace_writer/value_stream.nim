@@ -944,6 +944,22 @@ proc initValueStreamReader*(image: ContainerImage,
     ? idxRes.get().contents(), "values", "value",
     isCompactContainer(image.bytes))))
 
+proc refresh*(r: var ValueStreamReader, image: ContainerImage,
+    blockSize: uint32 = DefaultBlockSize,
+    maxEntries: uint32 = DefaultMaxRootEntries): Result[void, string] =
+  ## Extend the reader by the chunks the container in `image` has published
+  ## since it was opened or last refreshed (`ctfs-container.md` §6). A legacy
+  ## `.off` layout is never written live and is not followed.
+  if r.legacy:
+    return err("values.dat: a legacy value table is not followed")
+  let dat = viewMember(image, "values.dat", blockSize, maxEntries)
+  if dat.isErr:
+    return err("failed to read values.dat: " & dat.unsafeError)
+  let idx = viewMember(image, "values.idx", blockSize, maxEntries)
+  if idx.isErr:
+    return err("failed to read values.idx: " & idx.unsafeError)
+  r.spec.refresh(dat.unsafeGet(), ? idx.unsafeGet().contents(), "values")
+
 proc count*(r: ValueStreamReader): uint64 =
   if r.legacy:
     r.legacyTable.count()

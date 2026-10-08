@@ -415,6 +415,24 @@ proc initCallStreamReader*(image: ContainerImage,
   openCallStream(move datRes.get(), ? idxRes.get().contents(),
     isCompactContainer(image.bytes))
 
+proc refresh*(r: var CallStreamReader, image: ContainerImage,
+    blockSize: uint32 = DefaultBlockSize,
+    maxEntries: uint32 = DefaultMaxRootEntries): Result[void, string] =
+  ## Extend the reader by the chunks the container in `image` has published
+  ## since it was opened or last refreshed (`ctfs-container.md` §6). A legacy
+  ## `.off` layout is never written live and is not followed.
+  if r.legacy.isSome:
+    return err("calls.dat: a legacy call table is not followed")
+  let dat = viewMember(image, "calls.dat", blockSize, maxEntries)
+  if dat.isErr:
+    return err("failed to read calls.dat: " & dat.unsafeError)
+  let idx = viewMember(image, "calls.idx", blockSize, maxEntries)
+  if idx.isErr:
+    return err("failed to read calls.idx: " & idx.unsafeError)
+  ? r.spec.refresh(dat.unsafeGet(), ? idx.unsafeGet().contents(), "calls")
+  r.recordCount = r.spec.count
+  ok()
+
 template readCallInto*(r: var CallStreamReader, callKey: uint64) =
   ## `readCall`'s body, for a proc returning `Result[CallRecord, string]` that
   ## reads a call record and returns it: the record is built in that proc's

@@ -101,6 +101,15 @@ proc initChunkCache*[M](numChunks: int,
     c.index[i] = -1
   c
 
+proc grow*[M](c: var ChunkCache[M], numChunks: int) =
+  ## Make room in the index for a stream that now has ``numChunks`` chunks,
+  ## keeping every chunk already resident.
+  let old = c.index.len
+  if numChunks > old:
+    c.index.setLen(numChunks)
+    for i in old ..< numChunks:
+      c.index[i] = -1
+
 # ---------------------------------------------------------------------------
 # Intrusive LRU list helpers
 # ---------------------------------------------------------------------------

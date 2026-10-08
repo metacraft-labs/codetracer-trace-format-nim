@@ -386,6 +386,22 @@ proc initIOEventStreamReader*(image: ContainerImage,
     ? idxRes.get().contents(), "events", "io event",
     isCompactContainer(image.bytes))))
 
+proc refresh*(r: var IOEventStreamReader, image: ContainerImage,
+    blockSize: uint32 = DefaultBlockSize,
+    maxEntries: uint32 = DefaultMaxRootEntries): Result[void, string] =
+  ## Extend the reader by the chunks the container in `image` has published
+  ## since it was opened or last refreshed (`ctfs-container.md` §6). A legacy
+  ## `.off` layout is never written live and is not followed.
+  if r.legacy:
+    return err("events.dat: a legacy event table is not followed")
+  let dat = viewMember(image, "events.dat", blockSize, maxEntries)
+  if dat.isErr:
+    return err("failed to read events.dat: " & dat.unsafeError)
+  let idx = viewMember(image, "events.idx", blockSize, maxEntries)
+  if idx.isErr:
+    return err("failed to read events.idx: " & idx.unsafeError)
+  r.spec.refresh(dat.unsafeGet(), ? idx.unsafeGet().contents(), "events")
+
 proc count*(r: IOEventStreamReader): uint64 =
   if r.legacy:
     r.legacyTable.count()

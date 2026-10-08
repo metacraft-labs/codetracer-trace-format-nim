@@ -59,6 +59,7 @@ import ../codetracer_ctfs/streaming
 import ../codetracer_ctfs/zstd_bindings
 import ../codetracer_ctfs/chunk_cache
 import ../codetracer_ctfs/member_view
+import ./record_chunk
 import ./step_encoding
 import ./gdh2_arms
 import ./varint
@@ -468,7 +469,10 @@ proc openExecStream(datData: sink MemberView, idxData: seq[byte],
     else:
       let lastChunk = numChunks - 1
       let startOff = int(offsets[lastChunk])
-      let endOff = datData.len
+      if startOff > datData.len:
+        return err("last chunk offset past end of steps.dat")
+      var frameScratch: seq[byte]
+      let endOff = ? chunkEnd(datData, offsets, lastChunk, stored, frameScratch)
       if startOff > endOff:
         return err("last chunk offset past end of steps.dat")
       var scratch: seq[byte]
@@ -544,6 +548,56 @@ proc initExecStreamReader*(image: ContainerImage,
   openExecStream(move datRes.get(), ? idxRes.get().contents(),
     isCompactContainer(image.bytes), legacy, cacheBytes, allowSourceReload)
 
+proc refresh*(r: var ExecStreamReader, image: ContainerImage,
+    blockSize: int = 4096, maxEntries: int = 170): Result[void, string] =
+  ## Extend the reader by the chunks the container in `image` has published
+  ## since it was opened or last refreshed (`ctfs-container.md` §6). Only the
+  ## new last chunk is decoded, to count its records; every chunk already
+  ## inflated stays resident. An index that does not extend the one already
+  ## read is refused. The legacy framing is never written live and is not
+  ## followed.
+  if r.legacy:
+    return err("steps.dat: a legacy step stream is not followed")
+  let dat = viewMember(image, "steps.dat", uint32(blockSize), uint32(maxEntries))
+  if dat.isErr:
+    return err("failed to read steps.dat: " & dat.unsafeError)
+  let idxView = viewMember(image, "steps.idx", uint32(blockSize),
+    uint32(maxEntries))
+  if idxView.isErr:
+    return err("failed to read steps.idx: " & idxView.unsafeError)
+  let idx = ? idxView.unsafeGet().contents()
+  if idx.len < 4:
+    return err("steps.idx too small for chunk_size header")
+  let chunkSize = int(uint32(idx[0]) or (uint32(idx[1]) shl 8) or
+    (uint32(idx[2]) shl 16) or (uint32(idx[3]) shl 24))
+  if (idx.len - 4) mod 8 != 0:
+    return err("steps.idx has trailing bytes in offset region")
+  let numChunks = (idx.len - 4) div 8
+  var offsets = newSeqUninit[uint64](numChunks)
+  for i in 0 ..< numChunks:
+    var v = 0'u64
+    for j in 0 ..< 8:
+      v = v or (uint64(idx[4 + i * 8 + j]) shl (8 * j))
+    offsets[i] = v
+  var data = dat.unsafeGet()
+  ? checkExtends("steps", int(r.chunkSize), r.offsets, chunkSize, offsets,
+    data.len)
+  if numChunks != r.offsets.len:
+    let last = numChunks - 1
+    let startOff = int(offsets[last])
+    let endOff = ? chunkEnd(data, offsets, last, r.stored, r.frameScratch)
+    var lastCount = 0
+    data.ensureLoaded(startOff, endOff - startOff)
+    data.withSpan(startOff, endOff - startOff, r.frameScratch, frame):
+      lastCount = ? decodeSpecChunkRecordCount(frame, r.allowSourceReload,
+        r.stored)
+    inc r.chunkDecompressions
+    r.totalEventsVal = uint64(last) * uint64(chunkSize) + uint64(lastCount)
+    r.cache.grow(numChunks)
+  r.data = move data
+  r.offsets = move offsets
+  ok()
+
 proc totalEvents*(r: ExecStreamReader): uint64 = r.totalEventsVal
 
 proc chunkDecompressions*(r: ExecStreamReader): uint64 = r.chunkDecompressions
@@ -598,11 +652,8 @@ proc chunkSlot(r: var ExecStreamReader,
     return err("chunk index out of range: " & $chunkIdx)
 
   let startOff = r.offsets[chunkIdx]
-  let endOff =
-    if chunkIdx + 1 < r.offsets.len:
-      r.offsets[chunkIdx + 1]
-    else:
-      uint64(r.data.len)
+  let endOff = uint64(? chunkEnd(r.data, r.offsets, chunkIdx,
+    r.stored or r.legacy, r.frameScratch))
   if startOff > endOff or endOff > uint64(r.data.len):
     return err("chunk " & $chunkIdx & " offsets out of range")
   let compressedLen = endOff - startOff

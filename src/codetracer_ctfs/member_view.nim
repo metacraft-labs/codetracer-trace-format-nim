@@ -150,6 +150,35 @@ proc blocksRead*(image: ContainerImage): int =
 proc isLoaded(image: ContainerImage, at: int): bool {.inline.} =
   not image.readsFromFile or image.loaded[at div image.blockSize]
 
+proc rootEnd(d: openArray[byte], maxEntries: uint32): int =
+  ## Where the root directory of the container image `d` ends: the entry
+  ## array after the header, as many entries as the header or the reader
+  ## allows, whichever is more, and no further than the image.
+  let base = if d[5] == CtfsVersionV6: V6HeaderSize else: HeaderSize + ExtHeaderSize
+  let declared = uint32(d[12]) or (uint32(d[13]) shl 8) or
+    (uint32(d[14]) shl 16) or (uint32(d[15]) shl 24)
+  int(min(uint64(base) + uint64(max(declared, maxEntries)) *
+    uint64(FileEntrySize), uint64(d.len)))
+
+proc loadRoot(image: ContainerImage, maxEntries: uint32): Result[void, string] =
+  ## Read the root directory of an image read from its file.
+  image.loadRange(0, rootEnd(image.bytes, maxEntries))
+
+proc rootMembers*(d: openArray[byte], maxEntries: uint32):
+    seq[tuple[name, size: uint64]] =
+  ## The root directory of the container image `d`: each populated entry's
+  ## base40 name and `Size`, in slot order.
+  let base = if d[5] == CtfsVersionV6: V6HeaderSize else: HeaderSize + ExtHeaderSize
+  var at = base
+  while at + FileEntrySize <= rootEnd(d, maxEntries):
+    var size, name = 0'u64
+    for i in 0 ..< 8:
+      size = size or (uint64(d[at + i]) shl (8 * i))
+      name = name or (uint64(d[at + 16 + i]) shl (8 * i))
+    if name != 0:
+      result.add((name: name, size: size))
+    at += FileEntrySize
+
 when fileImages:
   proc openFileImage*(path: string,
       blockSize: uint32 = DefaultBlockSize,
@@ -188,15 +217,33 @@ when fileImages:
       closeRead(image.file)
       image.file = nil
       return ok(image)
-    # The root directory: the entry array after the header, as many entries as
-    # the header or the reader allows, whichever is more.
-    let base = if d[5] == CtfsVersionV6: V6HeaderSize else: HeaderSize + ExtHeaderSize
-    let declared = uint32(d[12]) or (uint32(d[13]) shl 8) or
-      (uint32(d[14]) shl 16) or (uint32(d[15]) shl 24)
-    let rootEnd = min(uint64(base) + uint64(max(declared, maxEntries)) *
-      uint64(FileEntrySize), uint64(image.bytes.len))
-    ? image.loadRange(0, int(rootEnd))
+    ? image.loadRoot(maxEntries)
     ok(image)
+
+when fileImages:
+  proc refresh*(image: ContainerImage,
+      maxEntries: uint32 = DefaultMaxRootEntries): Result[void, string] =
+    ## Make what has been written to the file of an image read as it is used
+    ## readable (`ctfs-container.md` §6, "Live progress: per-stream
+    ## following"): the image takes the file's new length and its root
+    ## directory is read again. A block read before may since have had bytes
+    ## appended to it -- a member's last block, a mapping block -- so every
+    ## block is read again when it is next asked for; nothing is read now but
+    ## the root directory. A file that shrank is refused.
+    if not image.readsFromFile:
+      return err("this container image is held whole, not read from its file")
+    var size: int64
+    try:
+      size = image.file.getFileSize()
+    except IOError, OSError:
+      return err("container file " & image.path & " cannot be read")
+    if size < int64(image.bytes.len):
+      return err("container file " & image.path & " shrank from " &
+        $image.bytes.len & " to " & $size & " bytes")
+    image.bytes.setLen(int(size))
+    image.loaded = newSeq[bool](image.bytes.len div image.blockSize +
+      ord(image.bytes.len mod image.blockSize != 0))
+    image.loadRoot(maxEntries)
 
 proc init(image: ContainerImage, runs: sink seq[MemberRun]): MemberView =
   result = MemberView(image: image, runs: runs)

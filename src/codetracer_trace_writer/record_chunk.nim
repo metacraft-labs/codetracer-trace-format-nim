@@ -180,11 +180,31 @@ type
     chunk: RecordChunk
     what: string             ## "value", "call", ... for refusals
 
+proc chunkEnd*(data: MemberView, offsets: openArray[uint64], c: int,
+    stored: bool, scratch: var seq[byte]): Result[int, string] =
+  ## Where chunk `c` of a chunked stream ends in its data member `data`: at
+  ## the next chunk's offset, or -- for the last indexed chunk -- at the end
+  ## of its zstd frame (`ctfs-container.md` §6, "Live progress"). A writer
+  ## publishes a chunk's bytes before the index entry that locates it, so the
+  ## data member of a container being written can already hold a chunk no
+  ## entry names yet. A stored chunk, or bytes that do not begin with a whole
+  ## frame, end at the end of the member; the decode then refuses what is not
+  ## a chunk.
+  if c + 1 < offsets.len:
+    return ok(int(offsets[c + 1]))
+  let start = int(offsets[c])
+  if stored or start >= data.len:
+    return ok(data.len)
+  data.ensureLoaded(start, data.len - start)
+  let p = data.span(start, data.len - start, scratch)
+  let n = ZSTD_findFrameCompressedSize(p, csize_t(data.len - start))
+  if ZSTD_isError(n) != 0:
+    return ok(data.len)
+  ok(start + int(n))
+
 proc loadChunk(r: var ChunkedRecords, c: int): Result[void, string] =
   let startOff = int(r.offsets[c])
-  let endOff =
-    if c + 1 < r.offsets.len: int(r.offsets[c + 1])
-    else: r.data.len
+  let endOff = ? chunkEnd(r.data, r.offsets, c, r.stored, r.scratch)
   if startOff > endOff or endOff > r.data.len:
     return err(r.what & " chunk offsets out of range")
   r.data.ensureLoaded(startOff, endOff - startOff)
@@ -225,6 +245,64 @@ proc openChunkedRecords*(data: sink MemberView, idx: openArray[byte],
     ? r.loadChunk(last)
     r.count = uint64(last) * uint64(chunkSize) + uint64(? r.chunk.count(what))
   ok(r)
+
+proc checkExtends*(name: string, oldChunkSize: int, old: openArray[uint64],
+    chunkSize: int, offsets: openArray[uint64], dataLen: int): Result[void, string] =
+  ## Refuse a re-read `<name>.idx` that does not extend the one already read
+  ## (`ctfs-container.md` §6): a changed `chunk_size`, a published offset that
+  ## moved or vanished, offsets that go backwards, or a last chunk that starts
+  ## past the data member's `dataLen` bytes.
+  if chunkSize != oldChunkSize:
+    return err(name & ".idx: chunk_size changed from " & $oldChunkSize &
+      " to " & $chunkSize & " while the container was followed")
+  if offsets.len < old.len:
+    return err(name & ".idx: " & $(old.len - offsets.len) &
+      " published chunk(s) disappeared while the container was followed")
+  for k in 0 ..< old.len:
+    if offsets[k] != old[k]:
+      return err(name & ".idx: published chunk " & $k & " moved from offset " &
+        $old[k] & " to " & $offsets[k] & " while the container was followed")
+  for k in 1 ..< offsets.len:
+    if offsets[k] < offsets[k - 1]:
+      return err(name & ".idx: chunk " & $k & " starts before chunk " & $(k - 1))
+  if offsets.len > 0 and int(offsets[^1]) > dataLen:
+    return err(name & ".idx: its last chunk starts at offset " & $offsets[^1] &
+      ", past the " & $dataLen & " bytes of its data member")
+  ok()
+
+proc refresh*(r: var ChunkedRecords, data: sink MemberView,
+    idx: openArray[byte], name: string): Result[void, string] =
+  ## Extend the stream by the chunks published since it was opened or last
+  ## refreshed (`ctfs-container.md` §6): `data` and `idx` are its members as
+  ## re-read from the container. Only the new last chunk is inflated, to
+  ## count its records, and not into the chunk held, which stays held. An
+  ## index that does not extend the one already read is refused.
+  if idx.len < 4:
+    return err(name & ".idx too small for chunk_size header")
+  let chunkSize = int(uint32(idx[0]) or (uint32(idx[1]) shl 8) or
+    (uint32(idx[2]) shl 16) or (uint32(idx[3]) shl 24))
+  let numChunks = (idx.len - 4) div 8
+  var offsets = newSeqUninit[uint64](numChunks)
+  for i in 0 ..< numChunks:
+    var v = 0'u64
+    for j in 0 ..< 8:
+      v = v or (uint64(idx[4 + i * 8 + j]) shl (8 * j))
+    offsets[i] = v
+  ? checkExtends(name, r.chunkSize, r.offsets, chunkSize, offsets, data.len)
+  if numChunks != r.offsets.len:
+    let last = numChunks - 1
+    let startOff = int(offsets[last])
+    let endOff = ? chunkEnd(data, offsets, last, r.stored, r.scratch)
+    if startOff > endOff or endOff > data.len:
+      return err(r.what & " chunk offsets out of range")
+    var counting = initRecordChunk()
+    data.ensureLoaded(startOff, endOff - startOff)
+    data.withSpan(startOff, endOff - startOff, r.scratch, frame):
+      ? counting.load(last, frame, r.what, r.stored)
+    r.count = uint64(last) * uint64(chunkSize) + uint64(? counting.count(r.what))
+  r.data = data
+  r.offsets = move offsets
+  ok()
 
 proc reach(r: var ChunkedRecords, c, within: int, why: var string): bool =
   ## `locate` past its fast path: load chunk `c` unless it is held, and frame
