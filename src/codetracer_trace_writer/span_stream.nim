@@ -180,15 +180,11 @@ when defined(nimPreviewSlimSystem):
 ##
 ## Two details make that safe against a writer that is mid-chunk:
 ##
-## 1. **The writer appends chunk data BEFORE the index entry** and syncs the
-##    data file entry before the index file entry.  An index entry therefore
-##    always means "this chunk is complete and starts here".  The spec's §7
-##    "Writer Protocol" lists the index append (step c) before the data write
-##    (step d); taken literally that publishes an offset for bytes that are not
-##    on disk yet, which contradicts the same section's own guarantee that
-##    "concurrent readers see new chunks as soon as the index entry is synced".
-##    The on-disk *layout* is identical either way — ordering is purely a
-##    runtime concern — so we use the safe order.
+## 1. **The writer publishes chunk data BEFORE the index entry**: the chunk is
+##    written and `spans.dat`'s entry synced, and only then is the offset
+##    appended to `spans.idx` and its entry synced (data before the entry that
+##    publishes it, `ctfs-container.md` §6).  An index entry therefore always
+##    means "this chunk is complete and starts here".
 ## 2. **The last indexed chunk's end offset is found from the zstd frame**, via
 ##    `ZSTD_findFrameCompressedSize`, not from the `spans.dat` file size.
 ##    While writing, `spans.dat` may already carry the leading bytes of the
@@ -575,8 +571,7 @@ proc flushChunk(ctfs: var Ctfs, w: var SpanStreamWriter): Result[void, string] =
   ## `spans.dat` and that file entry synced FIRST, and only then is the
   ## chunk's byte offset appended to `spans.idx` and synced.  A reader that
   ## observes N index entries can therefore always assume chunks 0..N-1 are
-  ## complete on disk.  See the module header for why this deviates from the
-  ## literal step ordering in CTFS §7's "Writer Protocol".
+  ## complete on disk.
   if w.recordCount == 0:
     return ok()
 
@@ -592,11 +587,13 @@ proc flushChunk(ctfs: var Ctfs, w: var SpanStreamWriter): Result[void, string] =
 
   let chunkStart = w.dataOffset
 
-  # 1. Chunk body; it is published with the index entry below.
+  # 1. Chunk body, published on its own: `spans.dat`'s entry grows before
+  #    `spans.idx` names the chunk.
   let datRes = ctfs.writeToFile(w.dataFile,
       compressed.toOpenArray(0, int(compressedSize) - 1))
   if datRes.isErr:
     return err("failed to write span chunk: " & datRes.error)
+  ctfs.syncEntry(w.dataFile)
 
   # 2. Only now does the index entry appear — it means "chunk complete".
   #    The entry publishes WHERE the chunk starts and HOW MANY records the
