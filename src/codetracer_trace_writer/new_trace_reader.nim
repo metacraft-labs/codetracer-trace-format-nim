@@ -124,10 +124,6 @@ type
     pathVersionsBuilt: bool
     pathVersionsError: string
       ## Why the ordinals could not be computed, when they could not.
-    # Advisory: the trace declares line-only paths.dat records, yet every
-    # record also decodes as a complete Layout A record.  Surfaced by
-    # `columnAwarePathsSuspected`; never used to reinterpret data.
-    layoutASuspected: bool
     # The `assumeColumnAwarePaths` override this handle was opened with,
     # kept so `refresh` re-opens the container under the same reading.
     assumedColumnAwarePaths: bool
@@ -690,7 +686,8 @@ proc openNewTraceFromImage(image: ContainerImage, blockSize: uint32,
   # promoted.  When its records nonetheless look like Layout A the
   # reader names the condition through ``columnAwarePathsSuspected``
   # (and ct-print's ``column_aware_paths_suspected`` flag) so an
-  # affected trace is reported rather than silently reinterpreted.
+  # affected trace is reported rather than silently reinterpreted. That
+  # probe reads ``paths.dat``, so it runs when it is asked, not here.
   if reader.pathReader.count() > 0:
     if reader.meta.hasColumnAwareSteps or assumeColumnAwarePaths:
       let parsed = parseLayoutAPathRecords(reader.pathReader, probe = false)
@@ -712,9 +709,6 @@ proc openNewTraceFromImage(image: ContainerImage, blockSize: uint32,
         return err(parsed.unsafeError)
       reader.lineCountPayloads = parsed.get().payloads
       reader.lineCounts = parsed.get().counts
-    else:
-      reader.layoutASuspected =
-        parseLayoutAPathRecords(reader.pathReader, probe = true).isOk
 
   # Alternate source views (spec §"Alternate Source Views
   # (Deminification Support)").  Found by the member's presence, not by
@@ -901,9 +895,15 @@ proc columnAwarePathsSuspected*(r: NewTraceReader): bool =
   ## grounds to believe the recorder was affected reopens the trace with
   ## ``assumeColumnAwarePaths = true``.
   ##
-  ## Always false when the trace declares column-aware steps: there is
-  ## nothing to suspect, the layout is stated.
-  r.layoutASuspected
+  ## Always false when the trace declares column-aware steps, or a
+  ## line-count table: there is nothing to suspect, the layout is stated.
+  ##
+  ## Probed on each call (it reads ``paths.dat``, which an open that only
+  ## wants a step's location does not); the probe usually stops at the
+  ## first record.
+  r.pathReader.count() > 0 and not r.meta.hasColumnAwareSteps and
+    not r.meta.hasLineCountTable and
+    parseLayoutAPathRecords(r.pathReader, probe = true).isOk
 
 proc pathCount*(r: NewTraceReader): uint64 =
   r.pathReader.count()
