@@ -904,6 +904,14 @@ uint64_t trace_writer_next_step_index(trace_writer_t handle);
  */
 uint8_t* ct_spans_json(const char* path, int settled, size_t* out_len);
 
+/*
+ * The span-type index (spantype.ns) of the .ct container at `path`, as a JSON
+ * array of {"type_id", "name", "span_ids"} objects in the index's order.
+ * Returns NULL with *out_len = 0 on failure, including a container with no
+ * span-type index (see trace_writer_last_error).  Free with ct_free_buffer.
+ */
+uint8_t* ct_span_types_json(const char* path, size_t* out_len);
+
 /* --------------------------------------------------------------------------
  * Thread lifecycle events
  *

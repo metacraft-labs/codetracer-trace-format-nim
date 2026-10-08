@@ -3727,30 +3727,32 @@ proc trace_writer_next_step_index(handle: TraceWriterHandle): uint64
 # Span stream — read side
 # ---------------------------------------------------------------------------
 
+proc jsonStringLiteral(s: string): string =
+  ## `s` as a JSON string literal; bytes at or above 0x20 pass through.
+  result = "\""
+  for ch in s:
+    case ch
+    of '"': result.add("\\\"")
+    of '\\': result.add("\\\\")
+    of '\n': result.add("\\n")
+    of '\r': result.add("\\r")
+    of '\t': result.add("\\t")
+    else:
+      if ch < ' ':
+        const hexDigits = "0123456789abcdef"
+        result.add("\\u00")
+        result.add(hexDigits[int(uint8(ch) shr 4)])
+        result.add(hexDigits[int(uint8(ch) and 0x0f)])
+      else:
+        result.add(ch)
+  result.add("\"")
+
 proc spanRecordToJson(s: SpanRecord): string =
   ## One settled span as JSON, with the wire field names the spec uses
   ## (`CTFS-Request-Span-Streams.md` §"Record Model") so a consumer reads the
   ## same names it would find in the binary record.  Metadata is an ARRAY of
   ## `[key, value]` pairs, never an object: metadata order is part of the wire
   ## contract and a JSON object does not promise to preserve it.
-  proc esc(s: string): string =
-    result = "\""
-    for ch in s:
-      case ch
-      of '"': result.add("\\\"")
-      of '\\': result.add("\\\\")
-      of '\n': result.add("\\n")
-      of '\r': result.add("\\r")
-      of '\t': result.add("\\t")
-      else:
-        if ch < ' ':
-          const hexDigits = "0123456789abcdef"
-          result.add("\\u00")
-          result.add(hexDigits[int(uint8(ch) shr 4)])
-          result.add(hexDigits[int(uint8(ch) and 0x0f)])
-        else:
-          result.add(ch)
-    result.add("\"")
 
   result = "{\"span_id\":" & $s.spanId &
     ",\"parent_span_id\":" & $s.parentSpanId &
@@ -3763,10 +3765,10 @@ proc spanRecordToJson(s: SpanRecord): string =
     ",\"thread_id\":" & $s.threadId &
     ",\"start_step\":" & $s.startStep &
     ",\"end_step\":" & $s.endStep &
-    ",\"external_recording\":" & esc(s.externalRecording) &
-    ",\"external_path\":" & esc(s.externalPath) &
-    ",\"span_type\":" & esc(s.spanType) &
-    ",\"label\":" & esc(s.label) &
+    ",\"external_recording\":" & jsonStringLiteral(s.externalRecording) &
+    ",\"external_path\":" & jsonStringLiteral(s.externalPath) &
+    ",\"span_type\":" & jsonStringLiteral(s.spanType) &
+    ",\"label\":" & jsonStringLiteral(s.label) &
     ",\"contiguous_on_one_thread\":" &
       (if s.contiguousOnOneThread: "true" else: "false") &
     ",\"shares_timeline\":" & (if s.sharesTimeline: "true" else: "false") &
@@ -3775,7 +3777,7 @@ proc spanRecordToJson(s: SpanRecord): string =
     ",\"metadata\":["
   for i, (k, v) in s.metadata:
     if i > 0: result.add(",")
-    result.add("[" & esc(k) & "," & esc(v) & "]")
+    result.add("[" & jsonStringLiteral(k) & "," & jsonStringLiteral(v) & "]")
   result.add("]}")
 
 proc ct_spans_json(path: cstring, settled: cint,
@@ -3840,6 +3842,57 @@ proc ct_spans_json(path: cstring, settled: cint,
   if buf.isNil:
     outLen[] = 0
     setError("ct_spans_json: out of memory")
+    return nil
+  copyMem(buf, unsafeAddr doc[0], doc.len)
+  buf
+
+proc ct_span_types_json(path: cstring,
+    outLen: ptr csize_t): ptr uint8 {.exportc, cdecl, dynlib, ffiGuard.} =
+  ## Decode the span-type index (`spantype.ns`) of the `.ct` container at
+  ## `path` as a JSON array of `{"type_id", "name", "span_ids"}` objects, in
+  ## the index's own order.  The read counterpart of the index the span writer
+  ## builds at close, through the canonical `parseSpanTypeNamespace`.
+  ##
+  ## Returns NULL with `*outLen = 0` and `trace_writer_last_error` set on
+  ## failure, including a container with no `spantype.ns`.  The caller frees
+  ## the buffer with `ct_free_buffer`.
+  if outLen.isNil:
+    setError("ct_span_types_json: NULL outLen")
+    return nil
+  outLen[] = 0
+  if path.isNil:
+    setError("ct_span_types_json: NULL path")
+    return nil
+  let p = $path
+  var raw: string
+  try:
+    raw = readFile(p)
+  except IOError, OSError:
+    setError("ct_span_types_json: cannot read " & p)
+    return nil
+  var bytes = newSeq[byte](raw.len)
+  for i in 0 ..< raw.len:
+    bytes[i] = byte(raw[i])
+  let entriesRes = readSpanTypeNamespace(bytes)
+  if entriesRes.isErr:
+    setError("ct_span_types_json: " & entriesRes.error)
+    return nil
+  var doc = "["
+  for i, e in entriesRes.get():
+    if i > 0: doc.add(",")
+    doc.add("{\"type_id\":" & $e.typeId & ",\"name\":")
+    doc.add(jsonStringLiteral(e.name))
+    doc.add(",\"span_ids\":[")
+    for j, id in e.spanIds:
+      if j > 0: doc.add(",")
+      doc.add($id)
+    doc.add("]}")
+  doc.add("]")
+  outLen[] = csize_t(doc.len)
+  let buf = cast[ptr uint8](alloc(doc.len))
+  if buf.isNil:
+    outLen[] = 0
+    setError("ct_span_types_json: out of memory")
     return nil
   copyMem(buf, unsafeAddr doc[0], doc.len)
   buf
