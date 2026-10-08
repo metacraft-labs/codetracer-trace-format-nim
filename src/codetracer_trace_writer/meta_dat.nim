@@ -810,6 +810,8 @@ proc readStringInto(data: openArray[byte], pos: var int, dest: var string,
   dest = newString(sLen)
   for i in 0 ..< sLen:
     dest[i] = char(data[pos + i])
+  if validateUtf8(dest) >= 0:
+    refuse("meta.dat: a string at byte " & $pos & " is not UTF-8")
   pos += sLen
   true
 
