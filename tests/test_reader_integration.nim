@@ -116,9 +116,9 @@ proc writeFullTrace(): seq[byte] {.raises: [].} =
 
     # Each step has 1-2 values
     var vals: seq[VariableValue]
-    vals.add(VariableValue(varnameId: 0, typeId: 0, data: intToStr(i).toBytes))
+    vals.add(VariableValue(varnameId: 0, data: intToStr(i).toBytes))
     if i mod 5 == 0:
-      vals.add(VariableValue(varnameId: 1, typeId: 1,
+      vals.add(VariableValue(varnameId: 1,
         data: ("step_" & intToStr(i)).toBytes))
     let vr = ctfs.writeStepValues(valW, vals)
     doAssert vr.isOk
@@ -423,7 +423,7 @@ proc test_reader_cache_eviction() {.raises: [].} =
     doAssert r.isOk
 
     let vr = ctfs.writeStepValues(valW, @[
-      VariableValue(varnameId: 0, typeId: 0, data: intToStr(i).toBytes)])
+      VariableValue(varnameId: 0, data: intToStr(i).toBytes)])
     doAssert vr.isOk
 
   let flushRes = ctfs.flush(execW)
@@ -525,7 +525,7 @@ proc writeTraceWithSortedCalls(): seq[byte] {.raises: [].} =
     let wr = ctfs.writeEvent(execW, ev)
     doAssert wr.isOk
     let vr = ctfs.writeStepValues(valW, @[
-      VariableValue(varnameId: 0, typeId: 0, data: intToStr(i).toBytes)])
+      VariableValue(varnameId: 0, data: intToStr(i).toBytes)])
     doAssert vr.isOk
 
   # Call 0: root call spanning all steps (depth 0)

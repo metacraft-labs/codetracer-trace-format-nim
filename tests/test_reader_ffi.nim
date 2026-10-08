@@ -150,16 +150,16 @@ proc writeTestTrace(path: string) =
   # §"Encoding Rules").
   doAssert ctfs.writeEvent(execW, StepEvent(kind: sekAbsoluteStep, globalLineIndex: 1000)).isOk
   doAssert ctfs.writeStepValues(valW, @[
-    VariableValue(varnameId: 0, typeId: 0,
+    VariableValue(varnameId: 0,
       data: cborOf(ValueRecord(kind: vrkInt, intVal: 42, intTypeId: IntTypeId))),
-    VariableValue(varnameId: 1, typeId: 1,
+    VariableValue(varnameId: 1,
       data: cborOf(ValueRecord(kind: vrkString, text: "hello",
         strTypeId: StrTypeId)))]).isOk
 
   # Step 1: delta step +1
   doAssert ctfs.writeEvent(execW, StepEvent(kind: sekDeltaStep, lineDelta: 1)).isOk
   doAssert ctfs.writeStepValues(valW, @[
-    VariableValue(varnameId: 0, typeId: 0,
+    VariableValue(varnameId: 0,
       data: cborOf(ValueRecord(kind: vrkInt, intVal: 43,
         intTypeId: IntTypeId)))]).isOk
 

@@ -88,7 +88,7 @@ proc buildSplitBundle(path: string): seq[byte] =
   doAssert w.registerStep(p0, 1'u64, @[]).isOk
   doAssert w.registerCall(fnMain, @[]).isOk
   # CBOR uint 42 == 0x18 0x2a.
-  let vals = @[VariableValue(varnameId: vnX, typeId: tInt,
+  let vals = @[VariableValue(varnameId: vnX,
     data: @[byte(0x18), byte(0x2a)])]
   doAssert w.registerStep(p0, 2'u64, vals).isOk
   doAssert w.registerReturn().isOk

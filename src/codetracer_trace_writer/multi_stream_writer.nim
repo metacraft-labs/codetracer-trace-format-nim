@@ -35,7 +35,8 @@ import ./step_map_builder
 import ./uuid_v7
 import ../codetracer_trace_types
 
-export results, value_stream.VariableValue, io_event_stream.EventLogKind,
+export results, value_stream.VariableValue, value_stream.typeId,
+       io_event_stream.EventLogKind,
        codetracer_trace_types.FilterProvenance, uuid_v7
 
 # The line-only address-space stride, re-exported for the consumers that

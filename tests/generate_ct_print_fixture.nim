@@ -80,7 +80,7 @@ proc main() =
 
   # ----- Step 0: enter main, x = 42 -----
   var step0Vals = @[
-    VariableValue(varnameId: vnX, typeId: tInt, data: encodeValue(
+    VariableValue(varnameId: vnX, data: encodeValue(
       ValueRecord(kind: vrkInt, intVal: 42, intTypeId: TypeId(tInt))))
   ]
   doAssert w.registerStep(p0.get(), 1'u64, step0Vals).isOk
@@ -88,16 +88,16 @@ proc main() =
 
   # ----- Step 1: name = "hello" -----
   var step1Vals = @[
-    VariableValue(varnameId: vnName, typeId: tStr, data: encodeValue(
+    VariableValue(varnameId: vnName, data: encodeValue(
       ValueRecord(kind: vrkString, text: "hello", strTypeId: TypeId(tStr))))
   ]
   doAssert w.registerStep(p0.get(), 2'u64, step1Vals).isOk
 
   # ----- Step 2: flag = true; pi = 3.14 -----
   var step2Vals = @[
-    VariableValue(varnameId: vnFlag, typeId: tBool, data: encodeValue(
+    VariableValue(varnameId: vnFlag, data: encodeValue(
       ValueRecord(kind: vrkBool, boolVal: true, boolTypeId: TypeId(tBool)))),
-    VariableValue(varnameId: vnPi, typeId: tFloat, data: encodeValue(
+    VariableValue(varnameId: vnPi, data: encodeValue(
       ValueRecord(kind: vrkFloat, floatVal: 3.14, floatTypeId: TypeId(tFloat))))
   ]
   doAssert w.registerStep(p0.get(), 3'u64, step2Vals).isOk
@@ -113,9 +113,9 @@ proc main() =
     isSlice: false,
     seqTypeId: TypeId(tList))
   var step3Vals = @[
-    VariableValue(varnameId: vnNothing, typeId: tNone, data: encodeValue(
+    VariableValue(varnameId: vnNothing, data: encodeValue(
       ValueRecord(kind: vrkNone, noneTypeId: TypeId(tNone)))),
-    VariableValue(varnameId: vnNumbers, typeId: tList, data: encodeValue(listVal))
+    VariableValue(varnameId: vnNumbers, data: encodeValue(listVal))
   ]
   doAssert w.registerStep(p0.get(), 4'u64, step3Vals).isOk
 
@@ -128,7 +128,7 @@ proc main() =
     ],
     tupleTypeId: TypeId(tTuple))
   var step4Vals = @[
-    VariableValue(varnameId: vnPair, typeId: tTuple, data: encodeValue(tupleVal))
+    VariableValue(varnameId: vnPair, data: encodeValue(tupleVal))
   ]
   doAssert w.registerStep(p0.get(), 5'u64, step4Vals).isOk
 
@@ -150,7 +150,7 @@ proc main() =
     ],
     structTypeId: TypeId(tStruct))
   var step6Vals = @[
-    VariableValue(varnameId: vnPoint, typeId: tStruct, data: encodeValue(structVal))
+    VariableValue(varnameId: vnPoint, data: encodeValue(structVal))
   ]
   doAssert w.registerStep(p1.get(), 1'u64, step6Vals).isOk
 
@@ -166,7 +166,7 @@ proc main() =
       structTypeId: TypeId(tStruct))],
     variantTypeId: TypeId(tVariant))
   var step7Vals = @[
-    VariableValue(varnameId: vnShape, typeId: tVariant, data: encodeValue(variantVal))
+    VariableValue(varnameId: vnShape, data: encodeValue(variantVal))
   ]
   doAssert w.registerStep(p1.get(), 2'u64, step7Vals).isOk
 

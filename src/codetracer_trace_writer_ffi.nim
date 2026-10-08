@@ -1658,7 +1658,7 @@ proc registerVariableIntById(
       discard sve.writeInt(value, uint64(typeId))
       let data = sve.takeBytes()
       handle.pendingValues.add(VariableValue(
-        varnameId: vnId, typeId: uint64(typeId), data: data))
+        varnameId: vnId, data: data))
     return
 
   # Emit variable name event
@@ -1714,7 +1714,7 @@ proc registerVariableRawById(
       discard sve.writeRaw(toNimStr(value_repr), uint64(typeId))
       let data = sve.takeBytes()
       handle.pendingValues.add(VariableValue(
-        varnameId: vnId, typeId: uint64(typeId), data: data))
+        varnameId: vnId, data: data))
     return
 
   # Emit variable name event
@@ -1779,7 +1779,7 @@ proc trace_writer_register_variable_cbor(
         copyMem(addr data[0], cbor_data, int(cbor_len))
       # Use type_id 0 — the actual type is already encoded in the CBOR bytes
       handle.pendingValues.add(VariableValue(
-        varnameId: vnId, typeId: 0'u64, data: data))
+        varnameId: vnId, data: data))
     return
 
   # Legacy path: fall back to raw representation (extract is not feasible from

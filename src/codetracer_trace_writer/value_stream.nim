@@ -58,11 +58,9 @@
 ##
 ## The Rust ``StepValues`` pair is ``(name_id, CBOR value)`` — there is NO
 ## separate ``type_id`` field, because the type id is already embedded inside
-## the CBOR ``ValueRecord``.  The Nim ``VariableValue`` keeps a convenience
-## ``typeId`` field; on read it is reconstructed from the CBOR value's
-## top-level ``type_id`` (``topLevelTypeId``).  Recorders pass a ``typeId`` that
-## equals the value's own top-level type id, so the round-trip is lossless for
-## the production path; the redundant field is simply dropped from the wire.
+## the CBOR ``ValueRecord``.  The Nim ``VariableValue`` is the same pair; its
+## ``typeId`` accessor reads the CBOR value's top-level ``type_id`` when it is
+## asked for, and the reader does not derive it while it decodes.
 ##
 ## # Backward compatibility (legacy Nim-v4 bundles)
 ##
@@ -155,8 +153,11 @@ const
 
 type
   VariableValue* = object
+    ## One variable's value at a step: its interned name and its CBOR
+    ## ``ValueRecord``, the ``(name_id, CBOR)`` pair Rust's ``StepValues``
+    ## carries. The value's type id is inside the CBOR; ``typeId`` reads it
+    ## when asked, so a reader that never asks never pays for it.
     varnameId*: uint64
-    typeId*: uint64
     data*: seq[byte]  ## CBOR-encoded value bytes
 
   AssignmentEventEntry* = object
@@ -234,12 +235,13 @@ proc topLevelTypeId*(v: ValueRecord): uint64 =
   of vrkEnum: uint64(v.enumTypeId)
   of vrkCell, vrkValueRef: 0'u64
 
-proc decodeCborTopLevelTypeId(data: openArray[byte]): uint64 =
-  ## The CBOR ``ValueRecord`` in ``data``'s top-level ``type_id``, read
-  ## without decoding the value (``cborTopLevelTypeId``).  0 when it has none
-  ## or does not parse (the data is still surfaced verbatim; only the
-  ## convenience type id is unavailable).
-  cborTopLevelTypeId(data)
+proc typeId*(v: VariableValue): uint64 =
+  ## The top-level ``type_id`` of ``v``'s CBOR ``ValueRecord``, read without
+  ## decoding the value (``cborTopLevelTypeId``). 0 when it has none or does
+  ## not parse (``data`` is still the value's bytes verbatim). It is read on
+  ## every call; a caller that asks for one value's type more than once keeps
+  ## the answer.
+  cborTopLevelTypeId(v.data)
 
 # ---------------------------------------------------------------------------
 # Per-record encode/decode (SPEC tag-0 StepValues, parallel-indexed by step)
@@ -453,8 +455,7 @@ proc decodeOneValueEvent(data: openArray[byte], pos: var int, tag: uint8,
       let dLen = int(varintOrFail(data, pos, why))
       if dLen < 0 or dLen > data.len - pos:
         refuse("truncated value data in StepValues record")
-      template d: untyped = data.toOpenArray(pos, pos + dLen - 1)
-      let v = VariableValue(varnameId: vnId, typeId: decodeCborTopLevelTypeId(d),
+      let v = VariableValue(varnameId: vnId,
         data: fieldBytes(data, pos, dLen))
       when target == wtValues:
         values[i] = v
@@ -953,7 +954,8 @@ proc count*(r: ValueStreamReader): uint64 =
 proc readLegacyRecord(data: openArray[byte]): Result[seq[VariableValue], string] =
   ## Decode a legacy ``.off`` VRT value record (pre-M24a-2 framing):
   ## ``varint count, count × (varint varnameId, varint typeId, varint dataLen,
-  ## data)``.
+  ## data)``. The framing's type id is stepped over: a ``VariableValue``'s
+  ## type id is its CBOR's, in this layout as in the SPEC one.
   if data.len == 0:
     return ok(newSeq[VariableValue]())
   var pos = 0
@@ -961,7 +963,7 @@ proc readLegacyRecord(data: openArray[byte]): Result[seq[VariableValue], string]
   var values = newSeq[VariableValue](count)
   for i in 0 ..< count:
     let vnId = ?decodeVarint(data, pos)
-    let tId = ?decodeVarint(data, pos)
+    discard ?decodeVarint(data, pos)
     let dLen = int(?decodeVarint(data, pos))
     if pos + dLen > data.len:
       return err("truncated legacy value data")
@@ -969,7 +971,7 @@ proc readLegacyRecord(data: openArray[byte]): Result[seq[VariableValue], string]
     for j in 0 ..< dLen:
       d[j] = data[pos + j]
     pos += dLen
-    values[i] = VariableValue(varnameId: vnId, typeId: tId, data: d)
+    values[i] = VariableValue(varnameId: vnId, data: d)
   ok(values)
 
 proc cacheRecordFor(r: var ValueStreamReader,

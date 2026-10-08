@@ -54,7 +54,7 @@ proc makeValues(rng: var Rng, count: int): seq[VariableValue] =
     let vnId = rng.next() mod 10000
     let tId = rng.next() mod 500
     let iv = int64(rng.next() mod 1_000_000)
-    vals[i] = VariableValue(varnameId: vnId, typeId: tId, data: encInt(iv, tId))
+    vals[i] = VariableValue(varnameId: vnId, data: encInt(iv, tId))
   vals
 
 proc assertEqualVals(got, expected: seq[VariableValue], ctx: string) =
@@ -245,11 +245,36 @@ proc test_value_stream_legacy_back_compat() {.raises: [].} =
   for i in 0 ..< 50:
     let got = readStepValues(reader, uint64(i))
     doAssert got.isOk, "legacy readStepValues failed at " & $i & ": " & got.error
-    # In legacy mode the verbatim typeId is read straight off the wire (NOT
-    # reconstructed from CBOR), so it round-trips exactly.
     assertEqualVals(got.get(), steps[i], "legacy step " & $i)
 
   echo "PASS: test_value_stream_legacy_back_compat"
+
+proc test_value_stream_legacy_type_id_is_the_values() {.raises: [].} =
+  ## The legacy framing stores a type id beside each value. A
+  ## ``VariableValue``'s type id is its CBOR's, in that layout as in the SPEC
+  ## one, so a framing id that disagrees with the value's is not reported.
+  var ctfs = createCtfs()
+  let tableRes = initVariableRecordTableWriter(ctfs, "values")
+  doAssert tableRes.isOk
+  var table = tableRes.get()
+  let data = encInt(1, 3)
+  var rec: seq[byte] = @[]
+  encodeVarint(1'u64, rec)   # count
+  encodeVarint(9'u64, rec)   # varname id
+  encodeVarint(7'u64, rec)   # the framing's type id, not the value's
+  encodeVarint(uint64(data.len), rec)
+  rec.add(data)
+  doAssert ctfs.append(table, rec).isOk
+  let rawBytes = ctfs.toBytes()
+  var reader = initValueStreamReader(rawBytes, legacy = true).get()
+  let got = readStepValues(reader, 0)
+  doAssert got.isOk, got.error
+  doAssert got.get().len == 1 and got.get()[0].varnameId == 9
+  doAssert got.get()[0].data == data
+  doAssert got.get()[0].typeId == 3,
+    "legacy type id: got " & $got.get()[0].typeId & ", the value's is 3"
+
+  echo "PASS: test_value_stream_legacy_type_id_is_the_values"
 
 # ---------------------------------------------------------------------------
 # test_value_stream_assignment_events — tag-9 Assignment rides in the same
@@ -779,6 +804,7 @@ test_value_stream_write_read()
 test_value_stream_empty_record()
 test_value_stream_many_variables()
 test_value_stream_legacy_back_compat()
+test_value_stream_legacy_type_id_is_the_values()
 test_value_stream_assignment_events()
 test_value_stream_drop_variables_events()
 test_value_stream_drop_variable_events()

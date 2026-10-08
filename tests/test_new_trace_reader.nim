@@ -99,8 +99,8 @@ proc writeSmallTrace(): seq[byte] {.raises: [].} =
   let wr0 = ctfs.writeEvent(execW, StepEvent(kind: sekAbsoluteStep, globalLineIndex: 1))
   doAssert wr0.isOk
   let v0 = ctfs.writeStepValues(valW, @[
-    VariableValue(varnameId: 0, typeId: 0, data: "42".toBytes),
-    VariableValue(varnameId: 1, typeId: 1, data: "hello".toBytes)])
+    VariableValue(varnameId: 0, data: "42".toBytes),
+    VariableValue(varnameId: 1, data: "hello".toBytes)])
   doAssert v0.isOk
 
   for i in 1 .. 4:
@@ -108,14 +108,14 @@ proc writeSmallTrace(): seq[byte] {.raises: [].} =
     doAssert wr.isOk
     if i < 3:
       let vr = ctfs.writeStepValues(valW, @[
-        VariableValue(varnameId: 0, typeId: 0, data: "42".toBytes),
-        VariableValue(varnameId: 1, typeId: 1, data: "hello".toBytes)])
+        VariableValue(varnameId: 0, data: "42".toBytes),
+        VariableValue(varnameId: 1, data: "hello".toBytes)])
       doAssert vr.isOk
     elif i == 3:
       let vr = ctfs.writeStepValues(valW, @[
-        VariableValue(varnameId: 0, typeId: 0, data: "42".toBytes),
-        VariableValue(varnameId: 1, typeId: 1, data: "hello".toBytes),
-        VariableValue(varnameId: 2, typeId: 0, data: "52".toBytes)])
+        VariableValue(varnameId: 0, data: "42".toBytes),
+        VariableValue(varnameId: 1, data: "hello".toBytes),
+        VariableValue(varnameId: 2, data: "52".toBytes)])
       doAssert vr.isOk
     else:
       let vr = ctfs.writeStepValues(valW, @[])
@@ -215,7 +215,7 @@ proc writeLargeTrace(numSteps: int, chunkSize: int = DefaultExecChunkSize): seq[
     for j in 0 ..< iStr.len:
       iBytes[j] = byte(iStr[j])
     let vr = ctfs.writeStepValues(valW, @[
-      VariableValue(varnameId: 0, typeId: 0, data: iBytes)])
+      VariableValue(varnameId: 0, data: iBytes)])
     doAssert vr.isOk
 
   let flushRes = ctfs.flush(execW)

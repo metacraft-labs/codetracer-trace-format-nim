@@ -77,7 +77,7 @@ proc buildCorpus*(): Result[seq[byte], string] =
   for i in 0 ..< CorpusSteps:
     var values: seq[VariableValue] = @[]
     if i mod CorpusValueEvery == 0:
-      values.add(VariableValue(varnameId: 0'u64, typeId: 0'u64,
+      values.add(VariableValue(varnameId: 0'u64,
                                data: @[0x18'u8, CorpusValueByte]))
     let r = w.registerStepWithColumn(corpusFile(i), corpusLine(i),
                                      corpusColumnDelta(i), values)
@@ -251,7 +251,7 @@ proc buildLegacyCorpusFlagged(claimSpecFraming: bool):
   var valTable = valTableRes.get()
   for i in 0 ..< LegacySteps:
     let rec = encodeLegacyValueRecord(
-      [VariableValue(varnameId: 0'u64, typeId: 0'u64,
+      [VariableValue(varnameId: 0'u64,
                      data: legacyValueBytes(i))])
     let a = ctfs.append(valTable, rec)
     if a.isErr: return err("append legacy value: " & a.error)

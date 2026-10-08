@@ -1,6 +1,6 @@
 ## `cborTopLevelTypeId` reads a CBOR `ValueRecord`'s top-level `type_id`
-## without decoding the value. The value reader fills every
-## `VariableValue.typeId` with it, so it must answer what a full decode does:
+## without decoding the value. `VariableValue.typeId` answers with it, so it
+## must answer what a full decode does:
 ## `topLevelTypeId(decodeCborValueRecord(bytes))`.
 ##
 ## The corpus is every `ValueRecord` kind, alone and nested inside each
@@ -91,3 +91,13 @@ suite "a value's top-level type id, read without decoding it":
     check cborTopLevelTypeId([]) == 0
     check cborTopLevelTypeId([0x18'u8]) == 0      # a truncated integer head
     check cborTopLevelTypeId([0xBF'u8, 0xFF]) == 0 # an indefinite-length map
+
+  test "a value's type id is its CBOR's, whoever built the value":
+    # A `VariableValue` is the `(name id, CBOR)` pair; nothing else carries
+    # a type id that could disagree with the one in its bytes.
+    check not compiles(VariableValue(varnameId: 1, typeId: 2))
+    for v in corpus():
+      check VariableValue(varnameId: 1, data: encode(v)).typeId ==
+        topLevelTypeId(v)
+    check VariableValue(varnameId: 1).typeId == 0
+

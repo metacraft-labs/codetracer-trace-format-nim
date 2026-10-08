@@ -52,7 +52,7 @@ proc recording(): seq[byte] =
   for i in 0 ..< 9000:
     if i mod 1000 == 999:
       doAssert w.registerThreadSwitch(uint64(i div 1000)).isOk
-    let vals = @[VariableValue(varnameId: uint64(i mod 5), typeId: 0,
+    let vals = @[VariableValue(varnameId: uint64(i mod 5),
       data: @[byte(i and 0xff), byte(i shr 8)])]
     doAssert w.registerStep(uint64(i mod 3), uint64(1 + (i * 7) mod 300),
       vals).isOk

@@ -41,8 +41,7 @@ proc test_a_killed_recording_reads_up_to_its_last_sealed_chunk() =
   discard f
   let vn = w.registerVarname("x").get()
   for i in 2 .. 2 * ChunkSize + 3:      # 19 steps: 2 chunks sealed, 3 pending
-    doAssert w.registerStep(p, uint64(i), [VariableValue(varnameId: vn,
-      typeId: 0, data: @[0x01'u8])]).isOk
+    doAssert w.registerStep(p, uint64(i), [VariableValue(varnameId: vn, data: @[0x01'u8])]).isOk
 
   block sealed_chunks_and_their_interning_are_on_disk:
     var r = openNewTrace(path)

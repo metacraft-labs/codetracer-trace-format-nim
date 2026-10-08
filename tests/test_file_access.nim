@@ -89,7 +89,7 @@ proc test_file_write_read_roundtrip() {.raises: [].} =
     let line = uint64((i mod 50) + 1)
     let iStr = intToStr(i)
     let vals = @[VariableValue(
-      varnameId: 0, typeId: 0, data: iStr.toBytes)]
+      varnameId: 0, data: iStr.toBytes)]
     let res = w.registerStep(pathId, line, vals)
     doAssert res.isOk, "registerStep " & $i & " failed: " & res.error
 
@@ -173,7 +173,7 @@ proc test_file_random_access() {.raises: [].} =
 
   for i in 0 ..< numSteps:
     let iStr = intToStr(i)
-    let vals = @[VariableValue(varnameId: 0, typeId: 0, data: iStr.toBytes)]
+    let vals = @[VariableValue(varnameId: 0, data: iStr.toBytes)]
     let res = w.registerStep(0'u64, uint64((i mod 100) + 1), vals)
     doAssert res.isOk
 
@@ -239,7 +239,7 @@ proc test_chunk_index_lookup() {.raises: [].} =
 
   for i in 0 ..< numSteps:
     let iStr = intToStr(i)
-    let vals = @[VariableValue(varnameId: 0, typeId: 0, data: iStr.toBytes)]
+    let vals = @[VariableValue(varnameId: 0, data: iStr.toBytes)]
     let res = w.registerStep(0'u64, uint64((i mod 200) + 1), vals)
     doAssert res.isOk
 
@@ -317,7 +317,7 @@ proc bench_file_read_latency() {.raises: [].} =
 
   for i in 0 ..< numSteps:
     let iStr = intToStr(i)
-    let vals = @[VariableValue(varnameId: 0, typeId: 0, data: iStr.toBytes)]
+    let vals = @[VariableValue(varnameId: 0, data: iStr.toBytes)]
     let res = w.registerStep(0'u64, uint64((i mod 100) + 1), vals)
     doAssert res.isOk
 

@@ -24,6 +24,9 @@ import ./varint
 import ./global_line_index
 import ../codetracer_ctfs/compact
 
+# What `values` returns, and its type id, read from the value's CBOR.
+export value_stream.VariableValue, value_stream.typeId
+
 const ctHasFilesystem* = defined(posix) or defined(windows)
   ## Whether the target this reader is being compiled for has an
   ## operating-system filesystem.

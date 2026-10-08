@@ -176,8 +176,8 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
     kind: sekAbsoluteStep, globalLineIndex: step0Idx))
   doAssert wr0.isOk, "step0 failed: " & wr0.error
   let vr0 = ctfs.writeStepValues(valWriter, @[
-    VariableValue(varnameId: 0, typeId: 0, data: cborInt(42, 0)),
-    VariableValue(varnameId: 1, typeId: 1, data: cborStr("hello", 1)),
+    VariableValue(varnameId: 0, data: cborInt(42, 0)),
+    VariableValue(varnameId: 1, data: cborStr("hello", 1)),
   ])
   doAssert vr0.isOk, "values0 failed: " & vr0.error
 
@@ -186,8 +186,8 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
     kind: sekDeltaStep, lineDelta: 1))
   doAssert wr1.isOk, "step1 failed: " & wr1.error
   let vr1 = ctfs.writeStepValues(valWriter, @[
-    VariableValue(varnameId: 0, typeId: 0, data: cborInt(42, 0)),
-    VariableValue(varnameId: 1, typeId: 1, data: cborStr("hello", 1)),
+    VariableValue(varnameId: 0, data: cborInt(42, 0)),
+    VariableValue(varnameId: 1, data: cborStr("hello", 1)),
   ])
   doAssert vr1.isOk, "values1 failed: " & vr1.error
 
@@ -196,9 +196,9 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
     kind: sekDeltaStep, lineDelta: 1))
   doAssert wr2.isOk, "step2 failed: " & wr2.error
   let vr2 = ctfs.writeStepValues(valWriter, @[
-    VariableValue(varnameId: 0, typeId: 0, data: cborInt(42, 0)),
-    VariableValue(varnameId: 1, typeId: 1, data: cborStr("hello", 1)),
-    VariableValue(varnameId: 2, typeId: 0, data: cborInt(52, 0)),
+    VariableValue(varnameId: 0, data: cborInt(42, 0)),
+    VariableValue(varnameId: 1, data: cborStr("hello", 1)),
+    VariableValue(varnameId: 2, data: cborInt(52, 0)),
   ])
   doAssert vr2.isOk, "values2 failed: " & vr2.error
 
@@ -207,9 +207,9 @@ proc test_multi_stream_writer_integration() {.raises: [].} =
     kind: sekDeltaStep, lineDelta: 1))
   doAssert wr3.isOk, "step3 failed: " & wr3.error
   let vr3 = ctfs.writeStepValues(valWriter, @[
-    VariableValue(varnameId: 0, typeId: 0, data: cborInt(42, 0)),
-    VariableValue(varnameId: 1, typeId: 1, data: cborStr("hello", 1)),
-    VariableValue(varnameId: 2, typeId: 0, data: cborInt(52, 0)),
+    VariableValue(varnameId: 0, data: cborInt(42, 0)),
+    VariableValue(varnameId: 1, data: cborStr("hello", 1)),
+    VariableValue(varnameId: 2, data: cborInt(52, 0)),
   ])
   doAssert vr3.isOk, "values3 failed: " & vr3.error
 
@@ -615,7 +615,7 @@ proc bench_multi_stream_write_throughput() {.raises: [].} =
     for j in 0 ..< iStr.len:
       iBytes[j] = byte(iStr[j])
     let vr = ctfs.writeStepValues(valW, @[
-      VariableValue(varnameId: 0, typeId: 0, data: iBytes)])
+      VariableValue(varnameId: 0, data: iBytes)])
     doAssert vr.isOk
 
   # Write calls
@@ -705,7 +705,7 @@ proc bench_multi_stream_trace_size() {.raises: [].} =
     doAssert r.isOk
 
     let vr = ctfs.writeStepValues(valW, @[
-      VariableValue(varnameId: 0, typeId: 0, data: "42".toBytes)])
+      VariableValue(varnameId: 0, data: "42".toBytes)])
     doAssert vr.isOk
 
   let flushRes = ctfs.flush(execW)

@@ -459,7 +459,7 @@ proc writeLargeTrace(numSteps: int): seq[byte] =
     for j in 0 ..< iStr.len:
       iBytes[j] = byte(iStr[j])
     let vr = ctfs.writeStepValues(valW, @[
-      VariableValue(varnameId: 0, typeId: 0, data: iBytes)])
+      VariableValue(varnameId: 0, data: iBytes)])
     doAssert vr.isOk
 
   let flushRes = ctfs.flush(execW)

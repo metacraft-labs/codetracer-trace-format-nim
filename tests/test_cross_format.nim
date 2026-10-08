@@ -113,14 +113,14 @@ proc test_new_format_write_read_roundtrip() =
   let wr0 = ctfs.writeEvent(execW, StepEvent(kind: sekAbsoluteStep, globalLineIndex: 1))
   doAssert wr0.isOk
   let v0 = ctfs.writeStepValues(valW, @[
-    VariableValue(varnameId: 0, typeId: 0, data: "42".toBytes)])
+    VariableValue(varnameId: 0, data: "42".toBytes)])
   doAssert v0.isOk
 
   let wr1 = ctfs.writeEvent(execW, StepEvent(kind: sekDeltaStep, lineDelta: 1))
   doAssert wr1.isOk
   let v1 = ctfs.writeStepValues(valW, @[
-    VariableValue(varnameId: 0, typeId: 0, data: "42".toBytes),
-    VariableValue(varnameId: 1, typeId: 1, data: "hello".toBytes)])
+    VariableValue(varnameId: 0, data: "42".toBytes),
+    VariableValue(varnameId: 1, data: "hello".toBytes)])
   doAssert v1.isOk
 
   let wr2 = ctfs.writeEvent(execW, StepEvent(kind: sekDeltaStep, lineDelta: 2))
@@ -131,7 +131,7 @@ proc test_new_format_write_read_roundtrip() =
   let wr3 = ctfs.writeEvent(execW, StepEvent(kind: sekDeltaStep, lineDelta: -1))
   doAssert wr3.isOk
   let v3 = ctfs.writeStepValues(valW, @[
-    VariableValue(varnameId: 0, typeId: 0, data: "99".toBytes)])
+    VariableValue(varnameId: 0, data: "99".toBytes)])
   doAssert v3.isOk
 
   # Write calls

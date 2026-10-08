@@ -41,7 +41,7 @@ proc runOnce(path: string): (float, int) =
     of 2: doAssert w.registerReturn(@[0xFF'u8]).isOk
     of 3:
       let vn = w.registerVarname("var_" & $(i mod 200)).get()
-      pending.add(VariableValue(varnameId: vn, typeId: 7,
+      pending.add(VariableValue(varnameId: vn,
         data: @[0xA2'u8, 0x61, 0x69, byte(i and 0x17), 0x61, 0x74, 0x07]))
     of 4: discard w.registerPath("/src/late_" & $i & ".nr").get()
     of 5: discard w.registerFunction("func_" & $i).get()
