@@ -210,7 +210,8 @@ type
       ## (100000 lines of 1024), held as its rule rather than spelled out;
       ## on a line-only writer every entry is empty and unused.
     pathLineCounts: seq[uint64]
-    pendingFuncs: seq[tuple[path: string, line: uint64, name: string]]
+    pendingFuncs: seq[tuple[path: string, line: uint64, name: string,
+        pathId: Option[uint64]]]
       ## `funcs.dat` records, held until `close`.
       ##
       ## THE TABLE IS DEFERRED BECAUSE ITS RECORD NEEDS AN ADDRESS THAT DOES NOT
@@ -1429,7 +1430,11 @@ proc registerFunctionAt*(w: var MultiStreamTraceWriter,
   if existing != high(uint64):
     return ok(existing)
   let id = uint64(w.pendingFuncs.len)
-  w.pendingFuncs.add((path: path, line: line, name: key))
+  # The declaration file's id is the version current NOW, when the path is
+  # registered already (`internal-files.md` §"`paths.dat` path versions"); a
+  # version registered later must not move the function into its range.
+  let pathId = if path.len > 0: w.pathIdIfRegistered(path) else: none(uint64)
+  w.pendingFuncs.add((path: path, line: line, name: key, pathId: pathId))
   w.funcIds[key] = id
   ok(id)
 
@@ -2708,7 +2713,9 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   # Indexed rather than `pairs`, which copies each element's two strings.
   for i in 0 ..< w.pendingFuncs.len:
     template pf: untyped = w.pendingFuncs[i]
-    if pf.path.len > 0:
+    if pf.pathId.isSome:
+      funcPathIds[i] = pf.pathId.get()
+    elif pf.path.len > 0:
       let idRes = w.registerPath(pf.path)
       if idRes.isErr:
         return err("close: function " & pf.name & " is declared at " &

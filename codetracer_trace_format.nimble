@@ -202,6 +202,7 @@ task test, "Run all tests":
   # A function declared in a file no step visited is written at close, with its
   # path in the space its address is computed in (and in meta.dat's list).
   exec "nim c -r -d:release -p:src tests/test_function_in_a_file_with_no_steps.nim"
+  exec "nim c -r -d:release -p:src tests/test_function_declared_before_a_version.nim"
   # A funcs.dat/types.dat record that is a bare name (the pre-b891a0f writer's
   # shape) is refused with a message that says so.
   exec "nim c -r -d:release -p:src tests/test_name_only_funcs_refusal.nim"
