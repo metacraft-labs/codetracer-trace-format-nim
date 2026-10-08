@@ -1847,11 +1847,16 @@ proc registerCall*(w: var MultiStreamTraceWriter, functionId: uint64,
   ok()
 
 proc registerReturn*(w: var MultiStreamTraceWriter,
-    returnValue: seq[byte] = @[]): Result[void, string] =
+    returnValue: seq[byte] = @[],
+    exception: seq[byte] = @[]): Result[void, string] =
   ## Register a function return. Pops the call stack and buffers the
   ## CallRecord under its entry-allocated call_key. The buffer flushes
   ## (in call_key order) once `callStack` becomes empty, ensuring the
   ## record position in the call stream equals its entry-order call_key.
+  ##
+  ## `exception` is the CBOR value of the exception the call exited by,
+  ## when it exited by one (`trace-events.md` §"Call Stream Records",
+  ## `exception`); empty when it returned.
   if w.closed:
     return err("writer is closed")
   ? w.commitMeta()
@@ -1900,7 +1905,7 @@ proc registerReturn*(w: var MultiStreamTraceWriter,
     depth: pending.depth,
     args: pending.args,
     returnValue: retVal,
-    exception: @[],
+    exception: exception,
     children: pending.children,
   )
 

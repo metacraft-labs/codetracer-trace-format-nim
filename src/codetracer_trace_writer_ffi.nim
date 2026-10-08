@@ -2674,6 +2674,75 @@ proc trace_writer_register_thread_exit(
     threadExitId: ThreadId(thread_id),
   ))
 
+proc trace_writer_register_raise(
+    handle: TraceWriterHandle,
+    exception_type_id: uint64,
+    message: ptr uint8,
+    message_len: csize_t,
+) {.exportc, cdecl, dynlib, ffiGuard.} =
+  ## Register a Raise event: an exception of the interned type
+  ## `exception_type_id` is raised, with `message_len` bytes of message
+  ## (`message` may be NULL when the length is 0). The split-stream writer
+  ## only; the legacy writer refuses it by name.
+  if handle.isNil:
+    return
+  if message.isNil and message_len > 0:
+    setError("trace_writer_register_raise: NULL message with length " &
+      $message_len)
+    return
+  if not handle.useMultiStream:
+    setError("trace_writer_register_raise: the legacy writer records no " &
+      "Raise events; use the split-stream writer")
+    return
+  if not handle.msWriterReady:
+    return
+  var msg = newSeq[byte](int(message_len))
+  if message_len > 0:
+    copyMem(addr msg[0], message, int(message_len))
+  discard flushPendingStep(handle)
+  failIfErr handle.msWriter.registerRaise(exception_type_id, msg)
+
+proc trace_writer_register_catch(
+    handle: TraceWriterHandle,
+    exception_type_id: uint64,
+) {.exportc, cdecl, dynlib, ffiGuard.} =
+  ## Register a Catch event: an exception of the interned type
+  ## `exception_type_id` is caught. The split-stream writer only.
+  if handle.isNil:
+    return
+  if not handle.useMultiStream:
+    setError("trace_writer_register_catch: the legacy writer records no " &
+      "Catch events; use the split-stream writer")
+    return
+  if not handle.msWriterReady:
+    return
+  discard flushPendingStep(handle)
+  failIfErr handle.msWriter.registerCatch(exception_type_id)
+
+proc trace_writer_register_return_exception(
+    handle: TraceWriterHandle,
+    exception_cbor: ptr uint8,
+    exception_len: csize_t,
+) {.exportc, cdecl, dynlib, ffiGuard.} =
+  ## Register the innermost call's exit by an exception: its call record
+  ## carries the `exception_len` bytes of CBOR at `exception_cbor` as its
+  ## `exception`, and no return value. The split-stream writer only.
+  if handle.isNil:
+    return
+  if exception_cbor.isNil or exception_len == 0:
+    setError("trace_writer_register_return_exception: an exception is " &
+      "required; a call that returned is registered with " &
+      "trace_writer_register_return")
+    return
+  if not handle.useMultiStream:
+    setError("trace_writer_register_return_exception: the legacy writer " &
+      "records no call exceptions; use the split-stream writer")
+    return
+  var exc = newSeq[byte](int(exception_len))
+  copyMem(addr exc[0], exception_cbor, int(exception_len))
+  discard flushPendingStep(handle)
+  returnIfErr handle.msWriter.registerReturn(exception = exc)
+
 proc trace_writer_register_thread_switch(
     handle: TraceWriterHandle,
     thread_id: uint64,

@@ -342,6 +342,7 @@ task test, "Run all tests":
   # not to a thread-switch record after it, even across a value-chunk boundary.
   # Same FFI-`include` compile requirements as the tests above.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_trailing_values_attach_to_the_last_step.nim"
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_exceptions_reach_the_container.nim"
   # A reload marker written through the C ABI follows the step registered
   # before it (the pending step is flushed first). Same FFI-`include` compile
   # requirements as the tests above.
