@@ -261,6 +261,41 @@ proc bench_delta_step_bytes_per_step() {.raises: [].} =
 
   echo "PASS: bench_delta_step_bytes_per_step"
 
+proc test_one_varint_records_decode_and_refuse_alike() =
+  ## Every record whose payload is one varint, with a one-byte, a long and a
+  ## truncated varint: each decodes to what was encoded, advancing past it,
+  ## and a truncated one is refused with the varint's refusal and leaves the
+  ## position where the record starts.
+  let events = @[
+    StepEvent(kind: sekAbsoluteStep, globalLineIndex: 5),
+    StepEvent(kind: sekAbsoluteStep, globalLineIndex: 1'u64 shl 40),
+    StepEvent(kind: sekDeltaStep, lineDelta: -3),
+    StepEvent(kind: sekDeltaStep, lineDelta: -(1'i64 shl 50)),
+    StepEvent(kind: sekThreadSwitch, threadId: 7),
+    StepEvent(kind: sekThreadStart, startThreadId: 300),
+    StepEvent(kind: sekThreadExit, exitThreadId: 2),
+    StepEvent(kind: sekCatch, catchExceptionTypeId: 1000),
+    StepEvent(kind: sekDeltaColumn, columnDelta: 9)]
+  for ev in events:
+    var buf: seq[byte]
+    encodeStepEvent(ev, buf)
+    buf.add(0xAA)   # a byte after the record, not read
+    var pos = 0
+    let got = decodeStepEvent(buf, pos)
+    doAssert got.isOk, $ev & ": " & got.error
+    var again: seq[byte]
+    encodeStepEvent(got.get(), again)
+    doAssert got.get().kind == ev.kind and again == buf[0 ..< buf.len - 1],
+      $got.get() & " != " & $ev
+    doAssert pos == buf.len - 1, $ev & ": stopped at " & $pos
+    let cut = buf[0 ..< buf.len - 2]   # the record's last varint byte cut
+    if cut.len > 1:
+      var p2 = 0
+      let refused = decodeStepEvent(cut, p2)
+      doAssert refused.isErr, $ev & " decoded from a cut record"
+      doAssert "varint" in refused.error, refused.error
+  echo "PASS: test_one_varint_records_decode_and_refuse_alike"
+
 test_global_line_index_roundtrip()
 test_delta_step_encode_decode()
 test_delta_column_tag_byte()
@@ -268,5 +303,6 @@ test_delta_column_roundtrip()
 test_mixed_event_sequence_roundtrip()
 test_source_reload_tag_byte()
 test_source_reload_roundtrip()
+test_one_varint_records_decode_and_refuse_alike()
 bench_delta_step_bytes_per_step()
 echo "ALL PASS: test_step_encoding"
