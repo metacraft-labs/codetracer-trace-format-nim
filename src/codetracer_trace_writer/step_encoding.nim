@@ -292,26 +292,10 @@ proc decodeOtherStepEvent(data: openArray[byte], pos: var int,
   else:
     err("unknown step event tag: " & $tag)
 
-proc decodeStepEvent*(data: openArray[byte], pos: var int,
-    allowSourceReload: bool = false): Result[StepEvent, string] {.inline.} =
-  ## Decode one step event from data starting at pos.
-  ##
-  ## A record whose payload is one varint (a position step, a thread switch,
-  ## start or exit, a catch, a column step), when the varint decodes, is
-  ## decoded here; every other record, and every record that does not decode,
-  ## by `decodeOtherStepEvent`, which names the refusal.
-  ##
-  ## ``allowSourceReload`` mirrors the container's declaration: tag 0x08
-  ## (``TagSourceReload``) is accepted only when ``meta.dat`` carries
-  ## ``FlagExtHasSourceReload``.  The default is FALSE so that every
-  ## caller that has not been taught to consult the flag refuses the tag
-  ## rather than decoding it — the strict-rejection contract bit 13's
-  ## documentation states (``meta_dat.nim``), applied one layer down.
-  ##
-  ## The alternative — SKIPPING an unknown tag — is what this signature
-  ## exists to make impossible.  A skip cannot know the record's length,
-  ## so the payload varints are re-read as further events and the stream
-  ## decodes SHORTER and plausibly: wrong bytes instead of an error.
+template decodeStepEventBody(data: openArray[byte], pos: var int,
+    allowSourceReload: bool) {.dirty.} =
+  ## The body of `decodeStepEvent` and `decodeStepEventHot`, for a proc
+  ## returning `Result[StepEvent, string]`.
   if pos >= 0 and pos < data.len:
     let tag = data[pos]
     if tag in {TagAbsoluteStep, TagDeltaStep, TagThreadSwitch, TagThreadStart,
@@ -331,4 +315,32 @@ proc decodeStepEvent*(data: openArray[byte], pos: var int,
           of TagThreadExit: ok(StepEvent(kind: sekThreadExit, exitThreadId: v))
           of TagCatch: ok(StepEvent(kind: sekCatch, catchExceptionTypeId: v))
           else: ok(StepEvent(kind: sekDeltaColumn, columnDelta: signed()))
-  decodeOtherStepEvent(data, pos, allowSourceReload)
+  result = decodeOtherStepEvent(data, pos, allowSourceReload)
+
+proc decodeStepEvent*(data: openArray[byte], pos: var int,
+    allowSourceReload: bool = false): Result[StepEvent, string] =
+  ## Decode one step event from data starting at pos.
+  ##
+  ## A record whose payload is one varint (a position step, a thread switch,
+  ## start or exit, a catch, a column step), when the varint decodes, is
+  ## decoded here; every other record, and every record that does not decode,
+  ## by `decodeOtherStepEvent`, which names the refusal.
+  ##
+  ## ``allowSourceReload`` mirrors the container's declaration: tag 0x08
+  ## (``TagSourceReload``) is accepted only when ``meta.dat`` carries
+  ## ``FlagExtHasSourceReload``.  The default is FALSE so that every
+  ## caller that has not been taught to consult the flag refuses the tag
+  ## rather than decoding it — the strict-rejection contract bit 13's
+  ## documentation states (``meta_dat.nim``), applied one layer down.
+  ##
+  ## The alternative — SKIPPING an unknown tag — is what this signature
+  ## exists to make impossible.  A skip cannot know the record's length,
+  ## so the payload varints are re-read as further events and the stream
+  ## decodes SHORTER and plausibly: wrong bytes instead of an error.
+  decodeStepEventBody(data, pos, allowSourceReload)
+
+proc decodeStepEventHot*(data: openArray[byte], pos: var int,
+    allowSourceReload: bool): Result[StepEvent, string] {.inline.} =
+  ## `decodeStepEvent`, inlined: for the walk that decodes every record of a
+  ## chunk in turn. Everywhere else the call keeps the module small.
+  decodeStepEventBody(data, pos, allowSourceReload)

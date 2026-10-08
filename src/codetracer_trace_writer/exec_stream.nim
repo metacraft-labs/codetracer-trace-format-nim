@@ -550,6 +550,10 @@ proc chunkDecompressions*(r: ExecStreamReader): uint64 = r.chunkDecompressions
   ## Distinct Zstd chunk inflations performed so far (bounded-decompression
   ## probe; see the ``chunkDecompressions`` field).
 
+proc positionRefusal(chunkIdx, i: int, what: string): string {.noinline.} =
+  ## A refusal of record `i` of a steps chunk's position, for `what`.
+  "steps.dat chunk " & $chunkIdx & ": record " & $i & what
+
 proc advanceCursor(ev: StepEvent, i: int, chunkIdx: int, cursor: var uint64,
     anchored: var bool, why: var string): bool =
   ## Move a chunk's cursor past record `i`, `ev` (`trace-events.md`
@@ -562,16 +566,15 @@ proc advanceCursor(ev: StepEvent, i: int, chunkIdx: int, cursor: var uint64,
     anchored = true
   of sekDeltaStep, sekDeltaColumn:
     if not anchored:
-      why = "steps.dat chunk " & $chunkIdx & ": record " & $i & " is a " &
+      why = positionRefusal(chunkIdx, i, " is a " &
         (if ev.kind == sekDeltaStep: "DeltaStep" else: "DeltaColumn") &
         " before the chunk's first AbsoluteStep, so it has no position to " &
-        "be relative to"
+        "be relative to")
       return false
     let d = if ev.kind == sekDeltaStep: ev.lineDelta else: ev.columnDelta
     let p = int64(cursor) + d
     if p < 0:
-      why = "steps.dat chunk " & $chunkIdx & ": record " & $i &
-        " resolves to a negative position"
+      why = positionRefusal(chunkIdx, i, " resolves to a negative position")
       return false
     cursor = uint64(p)
   else:
@@ -676,7 +679,7 @@ proc decodeNext(r: var ExecStreamReader, slot: int,
   let i = m.known
   var pos = m.nextPos
   # Decoded into the result, which is returned as it is.
-  result = decodeStepEvent(r.cache.data(slot), pos, r.allowSourceReload)
+  result = decodeStepEventHot(r.cache.data(slot), pos, r.allowSourceReload)
   if result.isErr:
     return err("failed to decode event " & $i & " of chunk " & $chunkIdx &
       ": " & result.unsafeError)
@@ -700,7 +703,7 @@ proc decodeThrough(r: var ExecStreamReader, slot: int, chunkIdx: int,
   ok()
 
 proc resolveThrough(r: var ExecStreamReader, slot: int, chunkIdx: int,
-    i: int): Result[void, string] =
+    i: int): Result[void, string] {.noinline.} =
   ## Resolve the positions of the chunk in ``slot`` through record ``i``, or
   ## to the first refused one: each record is decoded again from where it was
   ## noted to start, and the cursor moved past it (`advanceCursor`). Record
@@ -712,11 +715,9 @@ proc resolveThrough(r: var ExecStreamReader, slot: int, chunkIdx: int,
   while m.resolved <= i and m.posRefusedAt == high(int):
     let k = m.resolved
     var pos = m.resolvePos
+    # Record `k` was decoded before, so it decodes again.
     let ev = decodeStepEvent(r.cache.data(slot), pos, r.allowSourceReload)
-    if ev.isErr:
-      return err("failed to decode event " & $k & " of chunk " & $chunkIdx &
-        ": " & ev.unsafeError)
-    if advanceCursor(ev.get(), k, chunkIdx, m.cursor, m.anchored,
+    if advanceCursor(ev.unsafeGet(), k, chunkIdx, m.cursor, m.anchored,
         m.posRefusal):
       m.positions[k] = m.cursor
       m.resolved = k + 1

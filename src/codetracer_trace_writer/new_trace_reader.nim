@@ -605,6 +605,19 @@ proc openNewTraceFromBytes*(data: sink seq[byte],
   openNewTraceFromImage(newContainerImage(move bytes), blockSize, maxEntries,
     assumeColumnAwarePaths)
 
+proc loadTable(image: ContainerImage, name: string, blockSize: uint32,
+    maxEntries: uint32, dest: var InterningTableReader): Result[void, string] =
+  ## The interning table `name` into `dest`. A table that is absent is empty;
+  ## a table that is present but does not read is refused, not answered as
+  ## empty (`ctfs-container.md` §4, "A null is not an absence").
+  if hasInternalFile(image.bytes, name & ".dat", maxEntries) or
+      hasInternalFile(image.bytes, name & ".off", maxEntries):
+    var tr = initInterningTableReader(image, name, blockSize, maxEntries)
+    if tr.isErr:
+      return err(name & ".dat: " & tr.unsafeError)
+    dest = move tr.get()
+  ok()
+
 proc openNewTraceFromImage(image: ContainerImage, blockSize: uint32,
     maxEntries: uint32, assumeColumnAwarePaths: bool):
     Result[NewTraceReader, string] =
@@ -641,18 +654,11 @@ proc openNewTraceFromImage(image: ContainerImage, blockSize: uint32,
   # Load interning tables (these are small, load at startup). A table that
   # is absent is empty; a table that is present but does not read is refused,
   # not answered as empty (`ctfs-container.md` §4, "A null is not an absence").
-  template loadTable(name: string, dest: untyped) =
-    if hasInternalFile(reader.image.bytes, name & ".dat", maxEntries) or
-        hasInternalFile(reader.image.bytes, name & ".off", maxEntries):
-      var tr = initInterningTableReader(reader.image, name, blockSize,
-        maxEntries)
-      if tr.isErr:
-        return err(name & ".dat: " & tr.unsafeError)
-      dest = move tr.get()
-  loadTable("paths", reader.pathReader)
-  loadTable("funcs", reader.funcReader)
-  loadTable("types", reader.typeReader)
-  loadTable("varnames", reader.varnameReader)
+  ? loadTable(reader.image, "paths", blockSize, maxEntries, reader.pathReader)
+  ? loadTable(reader.image, "funcs", blockSize, maxEntries, reader.funcReader)
+  ? loadTable(reader.image, "types", blockSize, maxEntries, reader.typeReader)
+  ? loadTable(reader.image, "varnames", blockSize, maxEntries,
+    reader.varnameReader)
 
   # P6.5 / Layout A — the shape of a ``paths.dat`` record is decided by
   # ``meta.dat`` bit 4 (``FlagHasColumnAwareSteps``).  When it is set
