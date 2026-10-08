@@ -110,6 +110,24 @@ block chunks_close_after_the_record_that_reaches_64_KiB:
       doAssert got == want, "lookup (" & $path & ", " & $probe & ")"
   echo "PASS chunks_close_after_the_record_that_reaches_64_KiB"
 
+block the_loaded_index_holds_every_id_in_one_list:
+  var b = initStepMapBuilder()
+  for (path, line, step) in [(0'u64, 3'u64, 1'u64), (0, 3, 4), (0, 9, 2),
+      (4, 1, 0), (4, 1, 5), (4, 1, 6)]:
+    b.recordStep(path, line, step)
+  let idx = openStepMap(b.serialize()).get().loadAll().get()
+  doAssert idx.len == 3
+  doAssert idx.ids == @[1'i64, 4, 2, 0, 5, 6]
+  doAssert (idx.pathId(2), idx.line(2)) == (4'u64, 1'u32)
+  doAssert @(idx.steps(0)) == @[1'i64, 4] and @(idx.steps(1)) == @[2'i64]
+  doAssert @(idx.steps(2)) == @[0'i64, 5, 6]
+  doAssert idx.find(0, 9) == 1 and idx.find(4, 1) == 2
+  doAssert idx.find(0, 4) == -1 and idx.find(3, 1) == -1
+  doAssert idx.find(4, 0) == 2, "line 0 is looked up as line 1"
+  doAssert idx.find(0, 1'u64 shl 33) == -1
+  doAssert idx[0] == (0'u64, 3'u32, @[1'i64, 4])
+  echo "PASS the_loaded_index_holds_every_id_in_one_list"
+
 block an_empty_map_is_the_header_alone:
   let m = initStepMapBuilder().serialize()
   doAssert m.len == 26
