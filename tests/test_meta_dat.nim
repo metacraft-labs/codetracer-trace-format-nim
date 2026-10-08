@@ -6,7 +6,7 @@ import std/[options, os, strutils]
 import results
 import codetracer_ctfs
 import codetracer_trace_types
-import codetracer_trace_writer
+import codetracer_trace_writer/multi_stream_writer
 import codetracer_trace_writer/meta_dat
 import codetracer_trace_writer/interning_table
 import codetracer_trace_writer/varint
@@ -751,7 +751,7 @@ proc test_meta_dat_reader_rejects_missing_recording_id() {.raises: [].} =
 
 
 proc test_meta_dat_writer_mints_when_blank() {.raises: [].} =
-  ## newTraceWriter with empty recordingId mints a fresh UUIDv7.
+  ## A writer given no recordingId mints a fresh UUIDv7.
   ## Two writers in a row produce different ids.
   let tmpDir = getTempDir() / "test_meta_dat_writer_mints"
   try:
@@ -762,14 +762,14 @@ proc test_meta_dat_writer_mints_when_blank() {.raises: [].} =
   let path1 = tmpDir / "a.ct"
   let path2 = tmpDir / "b.ct"
 
-  let w1Res = newTraceWriter(path1, "p", @["arg"])
-  doAssert w1Res.isOk, "newTraceWriter failed: " & w1Res.error
+  let w1Res = initMultiStreamWriter(path1, "p")
+  doAssert w1Res.isOk, "initMultiStreamWriter failed: " & w1Res.error
   var w1 = w1Res.get()
   let id1 = w1.metadata.recordingId
   doAssert validateRecordingIdStr(id1).isOk,
     "minted id1 is not a canonical UUIDv7: '" & id1 & "'"
 
-  let w2Res = newTraceWriter(path2, "p", @["arg"])
+  let w2Res = initMultiStreamWriter(path2, "p")
   doAssert w2Res.isOk
   var w2 = w2Res.get()
   let id2 = w2.metadata.recordingId
@@ -778,7 +778,9 @@ proc test_meta_dat_writer_mints_when_blank() {.raises: [].} =
     "two freshly-minted ids should differ; both were '" & id1 & "'"
 
   doAssert w1.close().isOk
+  doAssert w1.closeCtfs().isOk
   doAssert w2.close().isOk
+  doAssert w2.closeCtfs().isOk
 
   try:
     removeFile(path1)

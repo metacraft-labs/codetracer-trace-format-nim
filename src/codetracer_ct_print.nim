@@ -22,7 +22,6 @@ when defined(nimPreviewSlimSystem):
 
 import std/[os, parseopt, json, strutils, base64, algorithm]
 import results
-import codetracer_trace_reader
 import codetracer_trace_writer/new_trace_reader
 import codetracer_trace_writer/meta_dat
 import codetracer_trace_writer/meta_flags_json
@@ -1309,7 +1308,7 @@ proc main() =
   # ----- Span stream -----
   # Handled before the reader selection below because the span stream is read
   # straight off the container and is therefore independent of which event
-  # reader (v4 split / legacy events.log / native shard) the bundle needs.
+  # reader (split streams / native shard) the bundle needs.
   if format == "spans":
     printSpans(filePath, jsonOut)
     return
@@ -1352,38 +1351,13 @@ proc main() =
     of adkV4MultiStream, adkUnreadable:
       discard  # fall through to v4 reader (or v2/v3 reader if v4 fails)
 
-  # M23e-1: decide between the split-stream (v4) reader and the legacy
-  # combined-stream (`events.log`) reader by inspecting the on-disk layout.
+  # A container that carries a member that is not part of the trace format
+  # (`events.log`, `events.fmt`) is refused by name, and one with no
+  # `steps.dat` -- the stream every recording is read from -- is refused rather
+  # than printed as an empty program with zero counts.
   #
-  # The v4 ``NewTraceReader`` sources every event from the split per-kind
-  # streams (``steps.dat`` / ``calls.dat`` / ``values.dat`` / ``events.dat``
-  # + the four interning tables) and NEVER consults ``events.log``.  It opens
-  # successfully on ANY CTFS bundle that merely carries ``meta.dat`` + the
-  # interning tables — including a legacy bundle that has ONLY ``events.log``
-  # and no split streams.  In that degenerate case the lazy stream readers
-  # find nothing and ct-print silently emitted an (almost) empty event array.
-  #
-  # Prefer the split streams ONLY for the production split-stream format: the
-  # Nim ``MultiStreamTraceWriter`` emits the split per-kind streams and NO
-  # ``events.log``.  The v4 ``NewTraceReader`` is matched to THAT writer's wire
-  # formats.  When a combined ``events.log`` is present we fall through to the
-  # v2/v3 reader, which decodes ``events.log``.
-  #
-  # M23e-4 boundary: the SECONDARY Rust ``CtfsTraceWriter`` now also default-
-  # emits the split streams, but ADDITIVELY — alongside ``events.log`` — and its
-  # ``steps.dat`` / ``values.dat`` / ``events.dat`` wire formats are NOT v4-
-  # readable (the Rust index carries a bare ``[chunk_size][offsets…]`` layout
-  # with header-less, content-size-omitting zstd chunks, whereas the v4 exec/
-  # value/event readers expect a ``total_events`` header+trailer, a per-chunk
-  # u32 count, and pledged-content-size frames; only ``calls.dat`` (M20) and the
-  # interning tables (M23d) were cross-matched).  Routing such a bundle through
-  # the v4 reader would yield an empty/garbled event array.  So ANY bundle that
-  # carries ``events.log`` is read via the legacy reader — production Nim split
-  # bundles are ``events.log``-free and stay on the v4 path byte-for-byte; the
-  # secondary Rust-writer combined bundle reads correctly via ``events.log``.
-  # Follow mode keeps its existing v4 polling path untouched — it reopens the
-  # trace each tick and is only meaningful for a live split-stream writer.
-  var preferSplit = true
+  # Follow mode polls a growing container whose streams may not exist yet; it
+  # refuses retired members through the reader's own check at each open.
   block decideLayout:
     if follow:
       break decideLayout
@@ -1392,73 +1366,31 @@ proc main() =
       break decideLayout  # unreadable here ⇒ let openNewTrace surface the error
     let layoutBytes = dataR.get()
     if not ctfs_container.hasCtfsMagic(layoutBytes):
-      break decideLayout  # non-CTFS ⇒ legacy v2/v3 reader handles it below
-    let hasEventsLog = ctfs_container.hasInternalFile(layoutBytes, "events.log")
-    let hasSteps = ctfs_container.hasInternalFile(layoutBytes, "steps.dat")
-    # Divert to the legacy reader whenever a combined ``events.log`` is present:
-    # a bundle carrying one is read through it, as before.
-    if hasEventsLog:
-      preferSplit = false
-    # AND REFUSE A CONTAINER THAT CARRIES NEITHER, rather than reading it as a
-    # v4 recording that happens to be empty.
-    #
-    # Choosing the split reader by the ABSENCE of ``events.log`` worked only
-    # while some writer still emitted that stream to be absent from. None does
-    # now, so absence stopped distinguishing anything: a truncated stub, a
-    # zero-filled file, any garbage past the magic — all of it classified as v4
-    # and printed as an empty program with zero counts, exit 0. Measured on a
-    # 512-byte head of a real container, which this tool used to refuse.
-    #
-    # ``steps.dat`` is what the v4 path actually reads, so requiring it is a
-    # POSITIVE test and cannot answer "v4" for a file that contains nothing.
-    if not hasEventsLog and not hasSteps:
+      break decideLayout  # non-CTFS ⇒ openNewTrace reports it
+    let retired = refuseRetiredMembers(layoutBytes, DefaultMaxRootEntries)
+    if retired.isErr:
+      quit("ct-print: " & filePath & ": " & retired.error)
+    if not ctfs_container.hasInternalFile(layoutBytes, "steps.dat"):
       stderr.writeLine("ct-print: " & filePath &
-        " carries neither `events.log` (the legacy combined stream) nor " &
-        "`steps.dat` (the v4 execution stream). It is truncated, or it is not " &
-        "a trace container.")
+        " carries no `steps.dat` (the execution stream). It is truncated, or " &
+        "it is not a trace container.")
       quit(1)
 
-  # Try v4 multi-stream reader first (unless the layout check above selected
-  # the legacy combined-stream reader for an events.log-only bundle).
-  let newReaderRes =
-    if preferSplit:
-      openNewTrace(filePath)
-    else: Result[NewTraceReader, string].err("events.log-only: use legacy reader")
-  if newReaderRes.isOk:
-    if follow:
-      followV4(filePath, pollMs)
-    else:
-      var reader = newReaderRes.get()
-      case format
-      of "summary": printSummaryV4(reader)
-      of "markers": printMarkersV4(reader, opts)
-      of "meta-json": printMetaJsonV4(reader)
-      of "json": printJsonV4(reader)
-      of "json-events": printJsonEventsV4(reader)
-      of "full": printFullV4(reader, opts)
-      of "events": printEventsJsonlV4(reader, opts)
-      else: printTextV4(reader)
-    return
-
-  # Fall back to old v2/v3 reader
-  let readerRes = openTrace(filePath)
-  if readerRes.isErr:
-    quit("Error: " & readerRes.unsafeError)
-  var reader = readerRes.get()
-
-  let readRes = reader.readEvents()
-  if readRes.isErr:
-    quit("Error reading events: " & readRes.unsafeError)
-
-  case format
-  of "json": echo reader.toJson()
-  of "json-events": echo reader.toJsonEvents()
-  of "summary": echo reader.toSummary()
-  of "full":
-    # The legacy v2/v3 reader's toJson already includes full event content.
-    echo reader.toJson()
-  of "events":
-    echo reader.toJsonEvents()
-  else: echo reader.toPrettyText()
+  let newReaderRes = openNewTrace(filePath)
+  if newReaderRes.isErr:
+    quit("Error: " & newReaderRes.unsafeError)
+  if follow:
+    followV4(filePath, pollMs)
+  else:
+    var reader = newReaderRes.get()
+    case format
+    of "summary": printSummaryV4(reader)
+    of "markers": printMarkersV4(reader, opts)
+    of "meta-json": printMetaJsonV4(reader)
+    of "json": printJsonV4(reader)
+    of "json-events": printJsonEventsV4(reader)
+    of "full": printFullV4(reader, opts)
+    of "events": printEventsJsonlV4(reader, opts)
+    else: printTextV4(reader)
 
 main()

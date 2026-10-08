@@ -31,7 +31,6 @@
 ##      trace_writer_register_return / _int / _raw, trace_writer_register_special_event
 ##      are all supported with the same signatures as Rust.
 
-import codetracer_trace_writer
 import codetracer_trace_types
 # Import the CTFS submodules this file needs, one by one — NOT the
 # `codetracer_ctfs` umbrella. The umbrella re-exports `split_trace`,
@@ -182,14 +181,8 @@ type
       ## and of any internal error an entry point caught. `trace_writer_close`
       ## reports it, so a recording that lost an event cannot close as a
       ## success. Empty while every call has succeeded.
-    # Old writer (single-stream CTFS)
-    writer: TraceWriter
-    writerReady: bool  # true once .ct file has been created
-
-    # New writer (multi-stream CTFS)
     msWriter: MultiStreamTraceWriter
     msWriterReady: bool
-    useMultiStream: bool
     attachedToShared: bool  ## true when msWriter attached to MCR's shared container
 
     # Pending step buffering for multi-stream mode:
@@ -309,12 +302,6 @@ type
     # Type registry: kind+langType -> id
     types: seq[TypeEntry]
     typeIndex: Table[string, csize_t]  # "kind\0langType" -> index
-    # M14 variable registry: name -> id. Required so the new
-    # ct_bind_variable / ct_assignment entry points can intern names
-    # without re-walking the existing single-stream / multi-stream
-    # accounting code.
-    variables: seq[string]
-    variableIndex: Table[string, csize_t]
 
   TraceWriterHandle = ptr TraceWriterState
 
@@ -588,14 +575,21 @@ proc trace_writer_new(
   ## The .ct file is NOT created here — it is deferred to trace_writer_begin_events
   ## which receives the output path from the Python recorder. This ensures the .ct
   ## file ends up in the correct output directory rather than the current working dir.
-  ## Returns NULL on allocation failure (check trace_writer_last_error).
+  ##
+  ## `format` must be `FFI_TRACE_FORMAT_BINARY`, the split-stream container.
+  ## The other two values selected a single combined `events.log` stream,
+  ## which is not part of the trace format; they are refused, returning NULL
+  ## with `trace_writer_last_error` naming the stream.
+  if format != ffiBinary:
+    setError("trace_writer_new: format " & $ord(format) & " selects the " &
+      "combined `events.log` stream, which is not part of the trace format; " &
+      "use FFI_TRACE_FORMAT_BINARY")
+    return nil
   let prog = toNimStr(program)
 
   let state = cast[TraceWriterHandle](alloc0(sizeof(TraceWriterState)))
   state[] = TraceWriterState(
-    writerReady: false,
     msWriterReady: false,
-    useMultiStream: format == ffiBinary,
     hasPendingStep: false,
     pendingColumnDelta: 0,
     inMemory: false,
@@ -634,34 +628,28 @@ proc trace_writer_free(handle: TraceWriterHandle) {.exportc, cdecl, dynlib, ffiG
   # container the caller was told nothing about.  `free` has no return channel,
   # so the failure is recorded in the FFI's last-error slot, which
   # `trace_writer_last_error` reports.
-  if handle.useMultiStream:
-    if handle.msWriterReady:
-      if not handle.msWriter.isClosed():
-        let flushRc = flushPendingStep(handle)
-        if flushRc != 0:
-          setError("trace_writer_free: failed to flush the pending step: " &
-            lastError())
-        # The same terminus `close` runs. A caller that releases the handle
-        # without closing it first — which is what a wrapper's destructor does
-        # when `close()` was never called — finalizes the container through
-        # here, and skipping this dropped every value staged after the last
-        # step with nothing to report it.
-        let trailingRc = flushTrailingValues(handle)
-        if trailingRc != 0:
-          setError("trace_writer_free: failed to record the trailing " &
-            "values: " & lastError())
-      # close() is idempotent — safe to call even if already closed
-      let closeRes = handle.msWriter.close()
-      if closeRes.isErr:
-        setError("trace_writer_free: close failed: " & closeRes.error)
-      let ctfsRes = handle.msWriter.closeCtfs()
-      if ctfsRes.isErr:
-        setError("trace_writer_free: closeCtfs failed: " & ctfsRes.error)
-  else:
-    if handle.writerReady and not handle.writer.closed:
-      let closeRes = handle.writer.close()
-      if closeRes.isErr:
-        setError("trace_writer_free: close failed: " & closeRes.error)
+  if handle.msWriterReady:
+    if not handle.msWriter.isClosed():
+      let flushRc = flushPendingStep(handle)
+      if flushRc != 0:
+        setError("trace_writer_free: failed to flush the pending step: " &
+          lastError())
+      # The same terminus `close` runs. A caller that releases the handle
+      # without closing it first — which is what a wrapper's destructor does
+      # when `close()` was never called — finalizes the container through
+      # here, and skipping this dropped every value staged after the last
+      # step with nothing to report it.
+      let trailingRc = flushTrailingValues(handle)
+      if trailingRc != 0:
+        setError("trace_writer_free: failed to record the trailing " &
+          "values: " & lastError())
+    # close() is idempotent — safe to call even if already closed
+    let closeRes = handle.msWriter.close()
+    if closeRes.isErr:
+      setError("trace_writer_free: close failed: " & closeRes.error)
+    let ctfsRes = handle.msWriter.closeCtfs()
+    if ctfsRes.isErr:
+      setError("trace_writer_free: closeCtfs failed: " & ctfsRes.error)
   try:
     `=destroy`(handle[])
   except:
@@ -763,91 +751,67 @@ proc trace_writer_begin_events(
     setError("this writer is already open in memory; call trace_writer_begin_in_memory or trace_writer_begin_events, not both")
     return 1.cint
 
-  if handle.useMultiStream:
-    if handle.msWriterReady:
-      return 0.cint
-
-    let eventsPath = toNimStr(path)
-    let outDir = parentDir(eventsPath)
-    let (_, progBase, _) = splitFile(handle.programName)
-    let ctPath = outDir / (progBase & ".ct")
-
-    # Mixed-trace shared container (Stage C): when this recorder runs INSIDE an
-    # MCR recording (the patched engine links both this CTFS writer and the MCR
-    # cooperative recorder), MCR has already created the streaming container just
-    # before main and publishes it via the C-ABI `ct_mcr_shared_ctfs()`. If that
-    # symbol resolves and returns a non-nil container, ATTACH our VM streams to
-    # it (initMultiStreamWriterAttached) instead of creating our own .ct: the two
-    # recorders write distinct stream names (MCR: tNNN/iNNN/meta.dat; us:
-    # steps/values/calls/paths) into ONE container, and MCR owns meta.dat + the
-    # container lifetime. Absent (standalone) -> create our own, byte-identical to
-    # before. Resolved weakly via dlsym(RTLD_DEFAULT) so a build without MCR links
-    # and runs unchanged.
-    let sharedCtfs = ctMcrSharedContainer()
-    if not sharedCtfs.isNil:
-      # IC-M2 — also bind to MCR's owner interning tables so both producers share
-      # ONE set (one addFile per table, one nextId/lookup per kind).  Qualify our
-      # entries with the VM language so native vs VM strings are distinct by
-      # construction.  If MCR does not export the interning accessor (older build),
-      # sharedInterning is nil and the attach creates its own tables — the M61
-      # dup-name guard would then reject a --source MCR, which is exactly the
-      # latent collision IC-M2 removes.
-      let sharedInterning = ctMcrSharedInterning()
-      # `handle.recordingId` is deliberately NOT passed here. An attached writer
-      # does not own `meta.dat` — MCR does, and MCR has already written the
-      # recording identity into the container this writer is joining. Handing a
-      # second id to the attach would either be ignored or would contradict the
-      # owner's, and neither is something a caller could act on.
-      let ares = initMultiStreamWriterAttached(sharedCtfs, handle.programName,
-        sharedInterning = sharedInterning, qualifier = handle.interningQualifier)
-      if ares.isErr:
-        setError(ares.error)
-        return 1.cint
-      handle.msWriter = ares.get()
-      handle.msWriter.metadata.workdir = handle.workdir
-      handle.msWriter.metadata.args = handle.metaArgs
-      handle.msWriterReady = true
-      handle.attachedToShared = true
-      handle.ctFilePath = ""  # owner (MCR) owns the container path
-      return 0.cint
-
-    # Standalone: the multi-stream writer always streams to disk as chunks seal
-    # (createCtfsStreaming). ctPath == handle.ctFilePath.
-    let res = initMultiStreamWriter(ctPath, handle.programName,
-      recordingId = handle.recordingId)
-    if res.isErr:
-      setError(res.error)
-      return 1.cint
-
-    handle.msWriter = res.get()
-    handle.msWriter.metadata.workdir = handle.workdir
-    handle.msWriter.metadata.args = handle.metaArgs
-    handle.msWriterReady = true
-    handle.ctFilePath = ctPath
-    return 0.cint
-
-  # Old single-stream path
-  if handle.writerReady:
-    # Already initialized — nothing to do (idempotent)
+  if handle.msWriterReady:
     return 0.cint
 
   let eventsPath = toNimStr(path)
   let outDir = parentDir(eventsPath)
-  # Place the .ct file in the same directory as the events path.
-  # Use only the base filename of the program (strip directory and extension),
-  # since programName may be a full path like "/tmp/test_recorder.py".
   let (_, progBase, _) = splitFile(handle.programName)
   let ctPath = outDir / (progBase & ".ct")
 
-  let res = newTraceWriter(ctPath, handle.programName, @[], handle.workdir,
+  # Mixed-trace shared container (Stage C): when this recorder runs INSIDE an
+  # MCR recording (the patched engine links both this CTFS writer and the MCR
+  # cooperative recorder), MCR has already created the streaming container just
+  # before main and publishes it via the C-ABI `ct_mcr_shared_ctfs()`. If that
+  # symbol resolves and returns a non-nil container, ATTACH our VM streams to
+  # it (initMultiStreamWriterAttached) instead of creating our own .ct: the two
+  # recorders write distinct stream names (MCR: tNNN/iNNN/meta.dat; us:
+  # steps/values/calls/paths) into ONE container, and MCR owns meta.dat + the
+  # container lifetime. Absent (standalone) -> create our own, byte-identical to
+  # before. Resolved weakly via dlsym(RTLD_DEFAULT) so a build without MCR links
+  # and runs unchanged.
+  let sharedCtfs = ctMcrSharedContainer()
+  if not sharedCtfs.isNil:
+    # IC-M2 — also bind to MCR's owner interning tables so both producers share
+    # ONE set (one addFile per table, one nextId/lookup per kind).  Qualify our
+    # entries with the VM language so native vs VM strings are distinct by
+    # construction.  If MCR does not export the interning accessor (older build),
+    # sharedInterning is nil and the attach creates its own tables — the M61
+    # dup-name guard would then reject a --source MCR, which is exactly the
+    # latent collision IC-M2 removes.
+    let sharedInterning = ctMcrSharedInterning()
+    # `handle.recordingId` is deliberately NOT passed here. An attached writer
+    # does not own `meta.dat` — MCR does, and MCR has already written the
+    # recording identity into the container this writer is joining. Handing a
+    # second id to the attach would either be ignored or would contradict the
+    # owner's, and neither is something a caller could act on.
+    let ares = initMultiStreamWriterAttached(sharedCtfs, handle.programName,
+      sharedInterning = sharedInterning, qualifier = handle.interningQualifier)
+    if ares.isErr:
+      setError(ares.error)
+      return 1.cint
+    handle.msWriter = ares.get()
+    handle.msWriter.metadata.workdir = handle.workdir
+    handle.msWriter.metadata.args = handle.metaArgs
+    handle.msWriterReady = true
+    handle.attachedToShared = true
+    handle.ctFilePath = ""  # owner (MCR) owns the container path
+    return 0.cint
+
+  # Standalone: the multi-stream writer always streams to disk as chunks seal
+  # (createCtfsStreaming). ctPath == handle.ctFilePath.
+  let res = initMultiStreamWriter(ctPath, handle.programName,
     recordingId = handle.recordingId)
   if res.isErr:
     setError(res.error)
     return 1.cint
 
-  handle.writer = res.get()
-  handle.writerReady = true
-  0.cint
+  handle.msWriter = res.get()
+  handle.msWriter.metadata.workdir = handle.workdir
+  handle.msWriter.metadata.args = handle.metaArgs
+  handle.msWriterReady = true
+  handle.ctFilePath = ctPath
+  return 0.cint
 
 proc trace_writer_begin_in_memory(
     handle: TraceWriterHandle,
@@ -861,10 +825,9 @@ proc trace_writer_begin_in_memory(
   ## constructor on this C ABI was file-based.
   ##
   ## The layer below was already in memory. `initMultiStreamWriter` builds on
-  ## `createCtfs()` and keeps `path` only as `filePath` metadata, and
-  ## `newTraceWriterInMemory` is the single-stream equivalent. What was
-  ## missing was a way to reach either of them from C, and a way to get the
-  ## finished bytes back. This is that way; `trace_writer_container_ptr` and
+  ## `createCtfs()` and keeps `path` only as `filePath` metadata. What was
+  ## missing was a way to reach it from C, and a way to get the finished
+  ## bytes back. This is that way; `trace_writer_container_ptr` and
   ## `trace_writer_container_len` are the other half.
   ##
   ## Call this OR `trace_writer_begin_events`, never both: the second call
@@ -874,47 +837,28 @@ proc trace_writer_begin_in_memory(
     setError("NULL handle")
     return 1.cint
 
-  if handle.useMultiStream:
-    if handle.msWriterReady:
-      if not handle.inMemory:
-        setError("this writer is already open on a file; in-memory mode must be chosen before the first begin")
-        return 1.cint
-      return 0.cint
-
-    # The empty path is deliberate and is not a placeholder for a real one:
-    # `filePath` is metadata the container never reads back, and an in-memory
-    # writer has no file to name. `trace_writer_close` refuses to write one.
-    let res = initMultiStreamWriter("", handle.programName,
-      recordingId = handle.recordingId)
-    if res.isErr:
-      setError(res.error)
-      return 1.cint
-
-    handle.msWriter = res.get()
-    handle.msWriter.metadata.workdir = handle.workdir
-    handle.msWriter.metadata.args = handle.metaArgs
-    handle.msWriterReady = true
-    handle.inMemory = true
-    handle.ctFilePath = ""
-    return 0.cint
-
-  if handle.writerReady:
+  if handle.msWriterReady:
     if not handle.inMemory:
       setError("this writer is already open on a file; in-memory mode must be chosen before the first begin")
       return 1.cint
     return 0.cint
 
-  let res = newTraceWriterInMemory(handle.programName, @[], handle.workdir,
+  # The empty path is deliberate and is not a placeholder for a real one:
+  # `filePath` is metadata the container never reads back, and an in-memory
+  # writer has no file to name. `trace_writer_close` refuses to write one.
+  let res = initMultiStreamWriter("", handle.programName,
     recordingId = handle.recordingId)
   if res.isErr:
     setError(res.error)
     return 1.cint
 
-  handle.writer = res.get()
-  handle.writerReady = true
+  handle.msWriter = res.get()
+  handle.msWriter.metadata.workdir = handle.workdir
+  handle.msWriter.metadata.args = handle.metaArgs
+  handle.msWriterReady = true
   handle.inMemory = true
   handle.ctFilePath = ""
-  0.cint
+  return 0.cint
 
 proc trace_writer_container_len(
     handle: TraceWriterHandle,
@@ -958,17 +902,8 @@ proc trace_writer_finish_events(handle: TraceWriterHandle): cint {.exportc, cdec
   if handle.isNil:
     setError("NULL handle")
     return 1.cint
-  if handle.useMultiStream:
-    # Multi-stream writer flushes on close; nothing to do here
-    return 0.cint
-  if not handle.writerReady:
-    return 0.cint
-  # Flush (sync) current events
-  let res = handle.writer.sync()
-  if res.isErr:
-    setError(res.error)
-    return 1.cint
-  0.cint
+  # Multi-stream writer flushes on close; nothing to do here
+  return 0.cint
 
 proc trace_writer_begin_paths(
     handle: TraceWriterHandle,
@@ -1080,62 +1015,55 @@ proc trace_writer_start(
     return
   let p = toNimStr(path)
 
-  if handle.useMultiStream:
-    if not handle.msWriterReady:
-      return
-    # GDH-M1 §6.1: the string-taking step path resolves to the path’s
-    # CURRENT version. Identical to `registerPath(p)` for every recorder
-    # that never registers a second version of a file.
-    let pathIdRes = handle.msWriter.pathIdForStep(p)
-    if pathIdRes.isErr:
-      # These entry points return void, so `last_error` is the only signal
-      # a C caller has. Returning silently makes a refused registration
-      # indistinguishable from a successful one, and the step that would
-      # have followed simply never appears in the trace. That matters most
-      # under the line-count table, where interning a path the caller
-      # never gave a count for is REFUSED — the caller has to be able to
-      # see why its steps went missing.
-      setError(pathIdRes.error)
-      return
-    let pathId = pathIdRes.get()
+  if not handle.msWriterReady:
+    return
+  # GDH-M1 §6.1: the string-taking step path resolves to the path’s
+  # CURRENT version. Identical to `registerPath(p)` for every recorder
+  # that never registers a second version of a file.
+  let pathIdRes = handle.msWriter.pathIdForStep(p)
+  if pathIdRes.isErr:
+    # These entry points return void, so `last_error` is the only signal
+    # a C caller has. Returning silently makes a refused registration
+    # indistinguishable from a successful one, and the step that would
+    # have followed simply never appears in the trace. That matters most
+    # under the line-count table, where interning a path the caller
+    # never gave a count for is REFUSED — the caller has to be able to
+    # see why its steps went missing.
+    setError(pathIdRes.error)
+    return
+  let pathId = pathIdRes.get()
 
-    # THE `<toplevel>` FRAME, before the entry step.
-    #
-    # `trace-events.md` §"Recorder Integration — Starting a Recording" gives
-    # `start` three effects in this order: the `<toplevel>` function record,
-    # its opening call with no arguments, and the entry step. This entry point
-    # used to emit only the third, so a recording made through it had no root
-    # to hang the call tree from — readers root the tree at call_key 0 — while
-    # the same `start` on the pure-Rust writer emitted all three. Two writers
-    # behind one method name, disagreeing about what calling it does.
-    #
-    # Registering it HERE rather than leaving it to each recorder is what makes
-    # the two agree: a recorder should not have to know which backend it was
-    # handed in order to produce a well-formed call tree.
-    let fnIdRes = handle.msWriter.registerFunctionAt(p, uint64(max(line, 1)),
-      TopLevelFunctionName)
-    if fnIdRes.isErr:
-      setError("trace_writer_start: could not register <toplevel>: " & fnIdRes.error)
-      return
-    let fnId = fnIdRes.get()
-    let callRes = handle.msWriter.registerCall(fnId, @[])
-    if callRes.isErr:
-      setError("trace_writer_start: could not open the <toplevel> call: " &
-        callRes.error)
-      return
-
-    # Buffer this as the first pending step
-    handle.pendingStepPathId = pathId
-    handle.pendingStepLine = uint64(line)
-    handle.hasPendingStep = true
-    handle.started = true
+  # THE `<toplevel>` FRAME, before the entry step.
+  #
+  # `trace-events.md` §"Recorder Integration — Starting a Recording" gives
+  # `start` three effects in this order: the `<toplevel>` function record,
+  # its opening call with no arguments, and the entry step. This entry point
+  # used to emit only the third, so a recording made through it had no root
+  # to hang the call tree from — readers root the tree at call_key 0 — while
+  # the same `start` on the pure-Rust writer emitted all three. Two writers
+  # behind one method name, disagreeing about what calling it does.
+  #
+  # Registering it HERE rather than leaving it to each recorder is what makes
+  # the two agree: a recorder should not have to know which backend it was
+  # handed in order to produce a well-formed call tree.
+  let fnIdRes = handle.msWriter.registerFunctionAt(p, uint64(max(line, 1)),
+    TopLevelFunctionName)
+  if fnIdRes.isErr:
+    setError("trace_writer_start: could not register <toplevel>: " & fnIdRes.error)
+    return
+  let fnId = fnIdRes.get()
+  let callRes = handle.msWriter.registerCall(fnId, @[])
+  if callRes.isErr:
+    setError("trace_writer_start: could not open the <toplevel> call: " &
+      callRes.error)
     return
 
-  # Register path
-  failIfErr handle.writer.writePath(p)
-  # Write the first step at pathId 0 (first registered path)
-  failIfErr handle.writer.writeStep(0'u64, line)
+  # Buffer this as the first pending step
+  handle.pendingStepPathId = pathId
+  handle.pendingStepLine = uint64(line)
+  handle.hasPendingStep = true
   handle.started = true
+  return
 
 proc trace_writer_set_compact_threshold(
     handle: TraceWriterHandle,
@@ -1146,9 +1074,6 @@ proc trace_writer_set_compact_threshold(
   ## §1e), full otherwise; 0 writes the full profile always. See the header.
   if handle.isNil:
     setError("NULL handle")
-    return 1.cint
-  if not handle.useMultiStream:
-    setError("the container profile is chosen only in CTFS multi-stream mode")
     return 1.cint
   handle.compactThreshold = raw_bytes
   0.cint
@@ -1164,14 +1089,11 @@ proc trace_writer_set_workdir(
   if handle.isNil:
     return
   let wd = toNimStr(workdir)
-  if handle.useMultiStream:
-    if handle.msWriterReady:
-      let r = handle.msWriter.setWorkdir(wd)
-      if r.isErr:
-        setError("trace_writer_set_workdir: " & r.error)
-        return
-  elif handle.writerReady:
-    handle.writer.metadata.workdir = wd
+  if handle.msWriterReady:
+    let r = handle.msWriter.setWorkdir(wd)
+    if r.isErr:
+      setError("trace_writer_set_workdir: " & r.error)
+      return
   handle.workdir = wd
 
 proc trace_writer_set_recording_id(
@@ -1198,7 +1120,7 @@ proc trace_writer_set_recording_id(
   if handle.isNil:
     setError("NULL handle")
     return 1.cint
-  if handle.writerReady or handle.msWriterReady:
+  if handle.msWriterReady:
     setError("the recording id must be set before the writer is begun; this writer is already open")
     return 1.cint
   let id = toNimStr(recording_id)
@@ -1227,7 +1149,7 @@ proc trace_writer_set_interning_qualifier(
   if handle.isNil:
     return
   handle.interningQualifier = toNimStr(qualifier)
-  if handle.useMultiStream and handle.msWriterReady:
+  if handle.msWriterReady:
     handle.msWriter.qualifier = handle.interningQualifier
 
 proc trace_writer_set_args(
@@ -1255,7 +1177,7 @@ proc trace_writer_set_args(
         copyMem(addr argSeq[i][0], aPtr, int(aLen))
   # Propagate to the multi-stream writer's metadata if already created; it
   # refuses once meta.dat is written (at the first record).
-  if handle.useMultiStream and handle.msWriterReady:
+  if handle.msWriterReady:
     let r = handle.msWriter.setArgs(argSeq)
     if r.isErr:
       setError("trace_writer_set_args: " & r.error)
@@ -1305,38 +1227,31 @@ proc trace_writer_register_step(
     return
   let p = toNimStr(path)
 
-  if handle.useMultiStream:
-    if not handle.msWriterReady:
-      return
-    # Flush the previous pending step (with its accumulated values)
-    discard flushPendingStep(handle)
-
-    # GDH-M1 §6.1: the string-taking step path resolves to the path’s
-    # CURRENT version. Identical to `registerPath(p)` for every recorder
-    # that never registers a second version of a file.
-    let pathIdRes = handle.msWriter.pathIdForStep(p)
-    if pathIdRes.isErr:
-      # These entry points return void, so `last_error` is the only signal
-      # a C caller has. Returning silently makes a refused registration
-      # indistinguishable from a successful one, and the step that would
-      # have followed simply never appears in the trace. That matters most
-      # under the line-count table, where interning a path the caller
-      # never gave a count for is REFUSED — the caller has to be able to
-      # see why its steps went missing.
-      setError(pathIdRes.error)
-      return
-    let pathId = pathIdRes.get()
-    # Buffer this as the new pending step
-    handle.pendingStepPathId = pathId
-    handle.pendingStepLine = uint64(line)
-    handle.hasPendingStep = true
+  if not handle.msWriterReady:
     return
+  # Flush the previous pending step (with its accumulated values)
+  discard flushPendingStep(handle)
 
-  # Register path (dedup handled by paths list — emit every time like Rust)
-  failIfErr handle.writer.writePath(p)
-  # pathId is the count of paths registered so far minus 1
-  let pathId = uint64(handle.writer.paths.len - 1)
-  failIfErr handle.writer.writeStep(pathId, line)
+  # GDH-M1 §6.1: the string-taking step path resolves to the path’s
+  # CURRENT version. Identical to `registerPath(p)` for every recorder
+  # that never registers a second version of a file.
+  let pathIdRes = handle.msWriter.pathIdForStep(p)
+  if pathIdRes.isErr:
+    # These entry points return void, so `last_error` is the only signal
+    # a C caller has. Returning silently makes a refused registration
+    # indistinguishable from a successful one, and the step that would
+    # have followed simply never appears in the trace. That matters most
+    # under the line-count table, where interning a path the caller
+    # never gave a count for is REFUSED — the caller has to be able to
+    # see why its steps went missing.
+    setError(pathIdRes.error)
+    return
+  let pathId = pathIdRes.get()
+  # Buffer this as the new pending step
+  handle.pendingStepPathId = pathId
+  handle.pendingStepLine = uint64(line)
+  handle.hasPendingStep = true
+  return
 
 proc trace_writer_ensure_function_id(
     handle: TraceWriterHandle,
@@ -1359,44 +1274,32 @@ proc trace_writer_ensure_function_id(
   if existing != high(csize_t):
     return existing
 
-  if handle.useMultiStream:
-    # THE INTERNED ID IS THE ID, for the same reason it is for types: a private
-    # counter here and the `funcs.dat` counter are two id spaces, and they agree
-    # only while nothing advances one without the other. `start` registering
-    # `<toplevel>` directly on the writer does exactly that, so a private
-    # counter would hand out an id one too low for every function after it —
-    # and calls would be attributed to the function next door.
-    #
-    # Intern WITH the declaration site: `funcs.dat`'s record carries a
-    # `global_line_index` (internal-files.md:46), so the path and line this call
-    # receives are not dropped; the writer buffers them and computes the address
-    # at close, when the path table is complete.
-    if not handle.msWriterReady:
-      setError("trace_writer_ensure_function_id: writer is not ready")
-      return high(csize_t)
-    let internedRes = handle.msWriter.registerFunctionAt(p, uint64(max(line, 1)), n)
-    if internedRes.isErr:
-      setError("trace_writer_ensure_function_id: " & internedRes.error)
-      return high(csize_t)
-    let interned = csize_t(internedRes.get())
-    handle.functionIndex[key] = interned
-    # `handle.functions` is indexed BY id (register_call reads it to resolve a
-    # callee's definition site), so grow it to fit rather than appending.
-    if handle.functions.len <= int(interned):
-      handle.functions.setLen(int(interned) + 1)
-    handle.functions[int(interned)] = FunctionEntry(name: n, path: p, line: line)
-    return interned
-
-  let id = csize_t(handle.functions.len)
-  handle.functions.add(FunctionEntry(name: n, path: p, line: line))
-  handle.functionIndex[key] = id
-
-  block:
-    # Emit function event: use pathId 0 for now (callers should register paths first)
-    # In practice recorders call ensure_function_id with the path they already registered
-    failIfErr handle.writer.writeFunction(0'u64, line, n)
-
-  return id
+  # THE INTERNED ID IS THE ID, for the same reason it is for types: a private
+  # counter here and the `funcs.dat` counter are two id spaces, and they agree
+  # only while nothing advances one without the other. `start` registering
+  # `<toplevel>` directly on the writer does exactly that, so a private
+  # counter would hand out an id one too low for every function after it —
+  # and calls would be attributed to the function next door.
+  #
+  # Intern WITH the declaration site: `funcs.dat`'s record carries a
+  # `global_line_index` (internal-files.md:46), so the path and line this call
+  # receives are not dropped; the writer buffers them and computes the address
+  # at close, when the path table is complete.
+  if not handle.msWriterReady:
+    setError("trace_writer_ensure_function_id: writer is not ready")
+    return high(csize_t)
+  let internedRes = handle.msWriter.registerFunctionAt(p, uint64(max(line, 1)), n)
+  if internedRes.isErr:
+    setError("trace_writer_ensure_function_id: " & internedRes.error)
+    return high(csize_t)
+  let interned = csize_t(internedRes.get())
+  handle.functionIndex[key] = interned
+  # `handle.functions` is indexed BY id (register_call reads it to resolve a
+  # callee's definition site), so grow it to fit rather than appending.
+  if handle.functions.len <= int(interned):
+    handle.functions.setLen(int(interned) + 1)
+  handle.functions[int(interned)] = FunctionEntry(name: n, path: p, line: line)
+  return interned
 
 proc trace_writer_ensure_type_id(
     handle: TraceWriterHandle,
@@ -1414,46 +1317,28 @@ proc trace_writer_ensure_type_id(
   if existing != high(csize_t):
     return existing
 
-  if handle.useMultiStream:
-    # THE INTERNED ID IS THE ID. It used to be discarded and a private counter
-    # returned in its place, which meant two id spaces: this one advanced once
-    # per distinct (kind, lang_type), and `types.dat` advanced once per record
-    # it actually appended. They agreed only while nothing made them disagree.
-    # Values carry the id returned from here and a reader resolves it against
-    # `types.dat`, so any drift renamed a value's type to whichever record
-    # happened to sit at that index.
-    if not handle.msWriterReady:
-      setError("trace_writer_ensure_type_id: writer is not ready")
-      return high(csize_t)
-    let internedRes = handle.msWriter.registerType(lt, uint8(ord(tk)))
-    if internedRes.isErr:
-      setError("trace_writer_ensure_type_id: " & internedRes.error)
-      return high(csize_t)
-    let interned = csize_t(internedRes.get())
-    handle.typeIndex[key] = interned
-    # Mirror the entry so `typeIdIsRegistered` can answer for this id. The
-    # table is indexed BY id, so it is grown to fit rather than appended to.
-    if handle.types.len <= int(interned):
-      handle.types.setLen(int(interned) + 1)
-    handle.types[int(interned)] = TypeEntry(kind: tk, langType: lt)
-    return interned
-
-  let id = csize_t(handle.types.len)
-  handle.types.add(TypeEntry(kind: tk, langType: lt))
-  handle.typeIndex[key] = id
-
-  block:
-    # Emit type event
-    failIfErr handle.writer.writeEvent(TraceLowLevelEvent(
-      kind: tleType,
-      typeRecord: TypeRecord(
-        kind: tk,
-        langType: lt,
-        specificInfo: TypeSpecificInfo(kind: tsikNone),
-      ),
-    ))
-
-  return id
+  # THE INTERNED ID IS THE ID. It used to be discarded and a private counter
+  # returned in its place, which meant two id spaces: this one advanced once
+  # per distinct (kind, lang_type), and `types.dat` advanced once per record
+  # it actually appended. They agreed only while nothing made them disagree.
+  # Values carry the id returned from here and a reader resolves it against
+  # `types.dat`, so any drift renamed a value's type to whichever record
+  # happened to sit at that index.
+  if not handle.msWriterReady:
+    setError("trace_writer_ensure_type_id: writer is not ready")
+    return high(csize_t)
+  let internedRes = handle.msWriter.registerType(lt, uint8(ord(tk)))
+  if internedRes.isErr:
+    setError("trace_writer_ensure_type_id: " & internedRes.error)
+    return high(csize_t)
+  let interned = csize_t(internedRes.get())
+  handle.typeIndex[key] = interned
+  # Mirror the entry so `typeIdIsRegistered` can answer for this id. The
+  # table is indexed BY id, so it is grown to fit rather than appended to.
+  if handle.types.len <= int(interned):
+    handle.types.setLen(int(interned) + 1)
+  handle.types[int(interned)] = TypeEntry(kind: tk, langType: lt)
+  return interned
 
 proc trace_writer_register_call_arg(
     handle: TraceWriterHandle,
@@ -1468,12 +1353,7 @@ proc trace_writer_register_call_arg(
   ## The arguments are consumed (and the buffer cleared) by the next
   ## register_call. Calling ``trace_writer_register_call`` without staging
   ## any args is still valid and yields a call record with empty ``args``.
-  ##
-  ## Only meaningful in multi-stream (CTFS) mode. In legacy single-stream
-  ## mode this is a no-op.
   if handle.isNil:
-    return
-  if not handle.useMultiStream:
     return
   if not handle.msWriterReady:
     return
@@ -1505,32 +1385,26 @@ proc trace_writer_register_call(
   ## where the arguments are in scope — see ``flushPendingStep``.
   if handle.isNil:
     return
-  if handle.useMultiStream:
-    # The pending step is written BEFORE the call opens, always: it is the
-    # caller's step, and the call's `first_step_id` is the first step of its
-    # own body (`trace-events.md` §"Call Stream Records"). Flushing only once
-    # some step had been flushed left the `start` entry step — and, without
-    # `start`, the caller's first step — pending across the call, and made it
-    # the callee's first step. A refused flush is reported by
-    # `flushPendingStep` itself and latched by the entry-point guard.
-    discard flushPendingStep(handle)
-    failIfErr handle.msWriter.registerCall(uint64(function_id),
-        handle.pendingCallArgs)
-    handle.pendingCallArgs.setLen(0)
-    return
-  # Legacy single-stream path doesn't support call args yet.
+  # The pending step is written BEFORE the call opens, always: it is the
+  # caller's step, and the call's `first_step_id` is the first step of its
+  # own body (`trace-events.md` §"Call Stream Records"). Flushing only once
+  # some step had been flushed left the `start` entry step — and, without
+  # `start`, the caller's first step — pending across the call, and made it
+  # the callee's first step. A refused flush is reported by
+  # `flushPendingStep` itself and latched by the entry-point guard.
+  discard flushPendingStep(handle)
+  failIfErr handle.msWriter.registerCall(uint64(function_id),
+      handle.pendingCallArgs)
   handle.pendingCallArgs.setLen(0)
-  failIfErr handle.writer.writeCall(uint64(function_id))
+  return
 
 proc trace_writer_register_return(handle: TraceWriterHandle) {.exportc, cdecl, dynlib, ffiGuard.} =
   ## Register a function return with no explicit return value.
   if handle.isNil:
     return
-  if handle.useMultiStream:
-    discard flushPendingStep(handle)
-    returnIfErr handle.msWriter.registerReturn()
-    return
-  failIfErr handle.writer.writeReturn()
+  discard flushPendingStep(handle)
+  returnIfErr handle.msWriter.registerReturn()
+  return
 
 # ---------------------------------------------------------------------------
 # Registering a variable whose type is already interned
@@ -1571,25 +1445,13 @@ const IntValueCborCapacity = 48
 
 proc registerReturnIntById(handle: TraceWriterHandle, value: int64, typeId: csize_t) =
 
-  if handle.useMultiStream:
-    # Encode the return value as CBOR bytes using the streaming encoder
-    var sve = StreamingValueEncoder.init(IntValueCborCapacity)
-    discard sve.writeInt(value, uint64(typeId))
-    let retBytes = sve.takeBytes()
-    discard flushPendingStep(handle)
-    returnIfErr handle.msWriter.registerReturn(retBytes)
-    return
-
-  failIfErr handle.writer.writeEvent(TraceLowLevelEvent(
-    kind: tleReturn,
-    returnRecord: ReturnRecord(
-      returnValue: ValueRecord(
-        kind: vrkInt,
-        intVal: value,
-        intTypeId: TypeId(typeId),
-      ),
-    ),
-  ))
+  # Encode the return value as CBOR bytes using the streaming encoder
+  var sve = StreamingValueEncoder.init(IntValueCborCapacity)
+  discard sve.writeInt(value, uint64(typeId))
+  let retBytes = sve.takeBytes()
+  discard flushPendingStep(handle)
+  returnIfErr handle.msWriter.registerReturn(retBytes)
+  return
 
 proc trace_writer_register_return_int(
     handle: TraceWriterHandle,
@@ -1627,54 +1489,29 @@ proc trace_writer_register_return_raw(
     return
   let typeId = trace_writer_ensure_type_id(handle, type_kind, type_name)
 
-  if handle.useMultiStream:
-    var sve = StreamingValueEncoder.init()
-    discard sve.writeRaw(toNimStr(value_repr), uint64(typeId))
-    let retBytes = sve.takeBytes()
-    discard flushPendingStep(handle)
-    returnIfErr handle.msWriter.registerReturn(retBytes)
-    return
-
-  failIfErr handle.writer.writeEvent(TraceLowLevelEvent(
-    kind: tleReturn,
-    returnRecord: ReturnRecord(
-      returnValue: ValueRecord(
-        kind: vrkRaw,
-        rawStr: toNimStr(value_repr),
-        rawTypeId: TypeId(typeId),
-      ),
-    ),
-  ))
+  var sve = StreamingValueEncoder.init()
+  discard sve.writeRaw(toNimStr(value_repr), uint64(typeId))
+  let retBytes = sve.takeBytes()
+  discard flushPendingStep(handle)
+  returnIfErr handle.msWriter.registerReturn(retBytes)
+  return
 
 proc registerVariableIntById(
     handle: TraceWriterHandle, name: cstring, value: int64, typeId: csize_t) =
 
-  if handle.useMultiStream:
-    # Intern the variable name
-    if handle.msWriterReady:
-      let vnIdRes = handle.msWriter.registerVarname(toNimStr(name))
-      if vnIdRes.isErr:
-        return
-      let vnId = vnIdRes.get()
-      # Encode the value as CBOR
-      var sve = StreamingValueEncoder.init(IntValueCborCapacity)
-      discard sve.writeInt(value, uint64(typeId))
-      let data = sve.takeBytes()
-      handle.pendingValues.add(VariableValue(
-        varnameId: vnId, data: data))
-    return
-
-  # Emit variable name event
-  failIfErr handle.writer.writeEvent(TraceLowLevelEvent(
-    kind: tleVariableName,
-    varName: toNimStr(name),
-  ))
-  # Emit value event with variableId = 0 (simplified — real recorders track IDs)
-  failIfErr handle.writer.writeValue(0'u64, ValueRecord(
-    kind: vrkInt,
-    intVal: value,
-    intTypeId: TypeId(typeId),
-  ))
+  # Intern the variable name
+  if handle.msWriterReady:
+    let vnIdRes = handle.msWriter.registerVarname(toNimStr(name))
+    if vnIdRes.isErr:
+      return
+    let vnId = vnIdRes.get()
+    # Encode the value as CBOR
+    var sve = StreamingValueEncoder.init(IntValueCborCapacity)
+    discard sve.writeInt(value, uint64(typeId))
+    let data = sve.takeBytes()
+    handle.pendingValues.add(VariableValue(
+      varnameId: vnId, data: data))
+  return
 
 proc trace_writer_register_variable_int(
     handle: TraceWriterHandle,
@@ -1705,32 +1542,19 @@ proc trace_writer_register_variable_int_by_type_id(
 proc registerVariableRawById(
     handle: TraceWriterHandle, name: cstring, value_repr: cstring, typeId: csize_t) =
 
-  if handle.useMultiStream:
-    # Intern the variable name
-    if handle.msWriterReady:
-      let vnIdRes = handle.msWriter.registerVarname(toNimStr(name))
-      if vnIdRes.isErr:
-        return
-      let vnId = vnIdRes.get()
-      # Encode the value as CBOR
-      var sve = StreamingValueEncoder.init()
-      discard sve.writeRaw(toNimStr(value_repr), uint64(typeId))
-      let data = sve.takeBytes()
-      handle.pendingValues.add(VariableValue(
-        varnameId: vnId, data: data))
-    return
-
-  # Emit variable name event
-  failIfErr handle.writer.writeEvent(TraceLowLevelEvent(
-    kind: tleVariableName,
-    varName: toNimStr(name),
-  ))
-  # Emit value event
-  failIfErr handle.writer.writeValue(0'u64, ValueRecord(
-    kind: vrkRaw,
-    rawStr: toNimStr(value_repr),
-    rawTypeId: TypeId(typeId),
-  ))
+  # Intern the variable name
+  if handle.msWriterReady:
+    let vnIdRes = handle.msWriter.registerVarname(toNimStr(name))
+    if vnIdRes.isErr:
+      return
+    let vnId = vnIdRes.get()
+    # Encode the value as CBOR
+    var sve = StreamingValueEncoder.init()
+    discard sve.writeRaw(toNimStr(value_repr), uint64(typeId))
+    let data = sve.takeBytes()
+    handle.pendingValues.add(VariableValue(
+      varnameId: vnId, data: data))
+  return
 
 proc trace_writer_register_variable_raw(
     handle: TraceWriterHandle,
@@ -1771,31 +1595,18 @@ proc trace_writer_register_variable_cbor(
   if handle.isNil:
     return
 
-  if handle.useMultiStream:
-    if handle.msWriterReady:
-      let vnIdRes = handle.msWriter.registerVarname(toNimStr(name))
-      if vnIdRes.isErr:
-        return
-      let vnId = vnIdRes.get()
-      var data = newSeq[byte](int(cbor_len))
-      if not cbor_data.isNil and cbor_len > 0.csize_t:
-        copyMem(addr data[0], cbor_data, int(cbor_len))
-      # Use type_id 0 — the actual type is already encoded in the CBOR bytes
-      handle.pendingValues.add(VariableValue(
-        varnameId: vnId, data: data))
-    return
-
-  # Legacy path: fall back to raw representation (extract is not feasible from
-  # opaque CBOR, so emit the CBOR length as a placeholder).
-  failIfErr handle.writer.writeEvent(TraceLowLevelEvent(
-    kind: tleVariableName,
-    varName: toNimStr(name),
-  ))
-  failIfErr handle.writer.writeValue(0'u64, ValueRecord(
-    kind: vrkRaw,
-    rawStr: "<cbor:" & $cbor_len & ">",
-    rawTypeId: TypeId(0),
-  ))
+  if handle.msWriterReady:
+    let vnIdRes = handle.msWriter.registerVarname(toNimStr(name))
+    if vnIdRes.isErr:
+      return
+    let vnId = vnIdRes.get()
+    var data = newSeq[byte](int(cbor_len))
+    if not cbor_data.isNil and cbor_len > 0.csize_t:
+      copyMem(addr data[0], cbor_data, int(cbor_len))
+    # Use type_id 0 — the actual type is already encoded in the CBOR bytes
+    handle.pendingValues.add(VariableValue(
+      varnameId: vnId, data: data))
+  return
 
 proc trace_writer_register_assignment(
     handle: TraceWriterHandle,
@@ -1833,44 +1644,16 @@ proc trace_writer_register_assignment(
   if not rvalue_cbor.isNil and rvalue_cbor_len > 0.csize_t:
     copyMem(addr rvalue[0], rvalue_cbor, int(rvalue_cbor_len))
 
-  if handle.useMultiStream:
-    if not handle.msWriterReady:
-      setError("trace_writer_register_assignment: writer is not ready")
-      return 1.cint
-    let vnIdRes = handle.msWriter.registerVarname(name)
-    if vnIdRes.isErr:
-      setError("trace_writer_register_assignment: " & vnIdRes.error)
-      return 1.cint
-    encodeAssignmentEvent(vnIdRes.get(), pass_by, rvalue,
-      handle.pendingExtraValueEvents)
-    return 0.cint
-
-  # Legacy single-stream path.  It carries the full `AssignmentRecord` in the
-  # event stream, so the CBOR RValue is decoded back into the typed record
-  # rather than stored opaquely.  The target is named by a preceding
-  # `VariableName` event and referenced by id 0 — the same (degraded)
-  # convention `trace_writer_register_variable_cbor`'s legacy arm uses, since
-  # this path keeps no varname table.
-  var dec = CborDecoder.init(rvalue)
-  let rvRes = dec.decodeCborRValue()
-  if rvRes.isErr:
-    setError("trace_writer_register_assignment: undecodable RValue CBOR: " &
-      rvRes.error)
+  if not handle.msWriterReady:
+    setError("trace_writer_register_assignment: writer is not ready")
     return 1.cint
-  failIfErr handle.writer.writeEvent(TraceLowLevelEvent(
-    kind: tleVariableName,
-    varName: name,
-  ))
-  let wRes = handle.writer.writeEvent(TraceLowLevelEvent(
-    kind: tleAssignment,
-    assignment: AssignmentRecord(
-      to: VariableId(0),
-      passBy: (if pass_by == 0'u8: pbValue else: pbReference),
-      frm: rvRes.get())))
-  if wRes.isErr:
-    setError("trace_writer_register_assignment: " & wRes.error)
+  let vnIdRes = handle.msWriter.registerVarname(name)
+  if vnIdRes.isErr:
+    setError("trace_writer_register_assignment: " & vnIdRes.error)
     return 1.cint
-  0.cint
+  encodeAssignmentEvent(vnIdRes.get(), pass_by, rvalue,
+    handle.pendingExtraValueEvents)
+  return 0.cint
 
 # ---------------------------------------------------------------------------
 # The place model: value-stream tags 1 and 4-8 (`trace-events.md` §"Value
@@ -1889,10 +1672,6 @@ template placeModelEntry(handle: TraceWriterHandle, entry: string,
     body: untyped) =
   if handle.isNil:
     setError(entry & ": NULL handle")
-    return 1.cint
-  if not handle.useMultiStream:
-    setError(entry & ": the single-stream writer does not record the place " &
-      "model; open the writer in the binary (multi-stream) format")
     return 1.cint
   if not handle.msWriterReady:
     setError(entry & ": writer is not ready")
@@ -1999,38 +1778,18 @@ proc trace_writer_register_drop_variables(
   for i in 0 ..< int(count):
     collected[i] = toNimStr(names[i])
 
-  if handle.useMultiStream:
-    if not handle.msWriterReady:
-      setError("trace_writer_register_drop_variables: writer is not ready")
-      return 1.cint
-    var ids = newSeq[uint64](collected.len)
-    for i, n in collected:
-      let vnIdRes = handle.msWriter.registerVarname(n)
-      if vnIdRes.isErr:
-        setError("trace_writer_register_drop_variables: " & vnIdRes.error)
-        return 1.cint
-      ids[i] = vnIdRes.get()
-    encodeDropVariablesEvent(ids, handle.pendingExtraValueEvents)
-    return 0.cint
-
-  # Legacy single-stream path.  It keeps no varname table, so each name is
-  # announced by its own preceding `VariableName` event and the drop refers to
-  # them positionally as ids 0..count-1 — the same (degraded) convention
-  # `trace_writer_register_assignment` uses for its single target.
-  var legacyIds = newSeq[VariableId](collected.len)
-  for i, n in collected:
-    failIfErr handle.writer.writeEvent(TraceLowLevelEvent(
-      kind: tleVariableName,
-      varName: n,
-    ))
-    legacyIds[i] = VariableId(i)
-  let dRes = handle.writer.writeEvent(TraceLowLevelEvent(
-    kind: tleDropVariables,
-    dropVarIds: legacyIds))
-  if dRes.isErr:
-    setError("trace_writer_register_drop_variables: " & dRes.error)
+  if not handle.msWriterReady:
+    setError("trace_writer_register_drop_variables: writer is not ready")
     return 1.cint
-  0.cint
+  var ids = newSeq[uint64](collected.len)
+  for i, n in collected:
+    let vnIdRes = handle.msWriter.registerVarname(n)
+    if vnIdRes.isErr:
+      setError("trace_writer_register_drop_variables: " & vnIdRes.error)
+      return 1.cint
+    ids[i] = vnIdRes.get()
+  encodeDropVariablesEvent(ids, handle.pendingExtraValueEvents)
+  return 0.cint
 
 proc trace_writer_register_drop_variable(
     handle: TraceWriterHandle,
@@ -2055,31 +1814,15 @@ proc trace_writer_register_drop_variable(
     return 1.cint
   let n = toNimStr(name)
 
-  if handle.useMultiStream:
-    if not handle.msWriterReady:
-      setError("trace_writer_register_drop_variable: writer is not ready")
-      return 1.cint
-    let vnIdRes = handle.msWriter.registerVarname(n)
-    if vnIdRes.isErr:
-      setError("trace_writer_register_drop_variable: " & vnIdRes.error)
-      return 1.cint
-    encodeDropVariableEvent(vnIdRes.get(), handle.pendingExtraValueEvents)
-    return 0.cint
-
-  # Legacy single-stream path.  It keeps no varname table, so the name is
-  # announced by its own preceding `VariableName` event and the drop refers to
-  # it as id 0 — the same (degraded) convention the other legacy arms use.
-  failIfErr handle.writer.writeEvent(TraceLowLevelEvent(
-    kind: tleVariableName,
-    varName: n,
-  ))
-  let dRes = handle.writer.writeEvent(TraceLowLevelEvent(
-    kind: tleDropVariable,
-    dropVarId: VariableId(0)))
-  if dRes.isErr:
-    setError("trace_writer_register_drop_variable: " & dRes.error)
+  if not handle.msWriterReady:
+    setError("trace_writer_register_drop_variable: writer is not ready")
     return 1.cint
-  0.cint
+  let vnIdRes = handle.msWriter.registerVarname(n)
+  if vnIdRes.isErr:
+    setError("trace_writer_register_drop_variable: " & vnIdRes.error)
+    return 1.cint
+  encodeDropVariableEvent(vnIdRes.get(), handle.pendingExtraValueEvents)
+  return 0.cint
 
 proc trace_writer_register_return_cbor(
     handle: TraceWriterHandle,
@@ -2091,25 +1834,12 @@ proc trace_writer_register_return_cbor(
   if handle.isNil:
     return
 
-  if handle.useMultiStream:
-    var data = newSeq[byte](int(cbor_len))
-    if not cbor_data.isNil and cbor_len > 0.csize_t:
-      copyMem(addr data[0], cbor_data, int(cbor_len))
-    discard flushPendingStep(handle)
-    returnIfErr handle.msWriter.registerReturn(data)
-    return
-
-  # Legacy path: emit a raw return placeholder
-  failIfErr handle.writer.writeEvent(TraceLowLevelEvent(
-    kind: tleReturn,
-    returnRecord: ReturnRecord(
-      returnValue: ValueRecord(
-        kind: vrkRaw,
-        rawStr: "<cbor:" & $cbor_len & ">",
-        rawTypeId: TypeId(0),
-      ),
-    ),
-  ))
+  var data = newSeq[byte](int(cbor_len))
+  if not cbor_data.isNil and cbor_len > 0.csize_t:
+    copyMem(addr data[0], cbor_data, int(cbor_len))
+  discard flushPendingStep(handle)
+  returnIfErr handle.msWriter.registerReturn(data)
+  return
 
 proc ptrLenToString(p: ptr UncheckedArray[byte], n: csize_t): string =
   ## Materialise a (ptr, len) pair.  NOT `$cstring`: a caller's string may
@@ -2150,7 +1880,7 @@ proc trace_writer_ensure_marker_id(
   ## Returns 0 on success, 1 on failure.
   if handle.isNil or out_id.isNil:
     return 1
-  if not handle.useMultiStream or not handle.msWriterReady:
+  if not handle.msWriterReady:
     return 1
   let res = handle.msWriter.ensureMarkerId(
     ptrLenToString(label, label_len))
@@ -2179,7 +1909,7 @@ proc trace_writer_mark_correlation_by_id(
   ## to prevent.
   if handle.isNil:
     return 1
-  if not handle.useMultiStream or not handle.msWriterReady:
+  if not handle.msWriterReady:
     return 1
   let res = handle.msWriter.registerCorrelationMarkerById(
     ptrLenToString(direction, direction_len),
@@ -2231,21 +1961,19 @@ proc trace_writer_mark_correlation(
   let show = ptrLenToString(show_value, show_value_len)
   let desc = ptrLenToString(description, description_len)
 
-  if handle.useMultiStream:
-    # Same guard every other multi-stream entry point uses: a marker that
-    # arrives before `trace_writer_begin_events` created the writer is dropped
-    # rather than indexing an empty stream table, because an unhandled defect
-    # cannot be caught across the C boundary and would kill the RECORDED
-    # process.
-    if not handle.msWriterReady:
-      return 1
-    let res = handle.msWriter.registerCorrelationMarker(
-      dir, boundary, key, show, desc,
-      ptrLenToString(key_text, key_text_len),
-      ptrLenToString(show_text, show_text_len),
-      stepId = some(enclosingStepId(handle)))
-    return (if res.isOk: 0.cint else: 1.cint)
-  1.cint
+  # Same guard every other multi-stream entry point uses: a marker that
+  # arrives before `trace_writer_begin_events` created the writer is dropped
+  # rather than indexing an empty stream table, because an unhandled defect
+  # cannot be caught across the C boundary and would kill the RECORDED
+  # process.
+  if not handle.msWriterReady:
+    return 1
+  let res = handle.msWriter.registerCorrelationMarker(
+    dir, boundary, key, show, desc,
+    ptrLenToString(key_text, key_text_len),
+    ptrLenToString(show_text, show_text_len),
+    stepId = some(enclosingStepId(handle)))
+  return (if res.isOk: 0.cint else: 1.cint)
 
 proc trace_writer_mark_span_coverage(
     handle: TraceWriterHandle,
@@ -2274,7 +2002,7 @@ proc trace_writer_mark_span_coverage(
   if handle.isNil:
     setError("NULL handle")
     return 1.cint
-  if not handle.useMultiStream or not handle.msWriterReady:
+  if not handle.msWriterReady:
     setError("no active CTFS recording")
     return 1.cint
   if trace_id.isNil or span_id.isNil:
@@ -2314,7 +2042,7 @@ proc trace_writer_mark_span_coverage_hex(
   if handle.isNil:
     setError("NULL handle")
     return 1.cint
-  if not handle.useMultiStream or not handle.msWriterReady:
+  if not handle.msWriterReady:
     setError("no active CTFS recording")
     return 1.cint
 
@@ -2338,75 +2066,60 @@ proc trace_writer_register_special_event(
   if handle.isNil:
     return
 
-  if handle.useMultiStream:
-    # Every other multi-stream entry point refuses to touch `msWriter` before
-    # `trace_writer_begin_events` has created it; this one did not, and an
-    # event arriving first (a recorder that hooks stdout before it opens the
-    # trace — the shape a `--trace` wrapper produces) indexed an empty stream
-    # table and killed the RECORDED PROCESS with an IndexDefect, since an
-    # unhandled defect cannot be caught across the C boundary.  Dropping the
-    # event is what the same situation already does for steps and calls.
-    if not handle.msWriterReady:
-      return
-    # M24a-3: the SPEC events.dat record carries both metadata AND content
-    # (previously the multi-stream path dropped metadata).  Pass them through
-    # so the dedicated I/O event stream is byte-consistent with what the Rust
-    # IoEventStreamReader expects, and so the event-log pane can surface the
-    # event's metadata.
-    let metadataStr = toNimStr(metadata)
-    var metaBytes = newSeq[byte](metadataStr.len)
-    for i in 0 ..< metadataStr.len:
-      metaBytes[i] = byte(metadataStr[i])
-    let contentStr = toNimStr(content)
-    var data = newSeq[byte](contentStr.len)
-    for i in 0 ..< contentStr.len:
-      data[i] = byte(contentStr[i])
-    # The step this event belongs to is the step the recorder is CURRENTLY on,
-    # which is not necessarily the last step the multi-stream writer emitted:
-    # `trace_writer_register_step` only BUFFERS its step (so late-arriving
-    # variable values can still be attached to it in `flushPendingStep`), and a
-    # `write` is registered while that buffered step is still pending.  Letting
-    # `registerIOEvent` default to `stepCount - 1` therefore attributed every
-    # `console.log` / `print` to the PREVIOUS step, and the flow view rendered
-    # the output one source line too high (issue #601).
-    #
-    # This is the same accounting `trace_writer_next_step_index` documents: a
-    # buffered-but-unwritten step will take index `msWriter.stepCount`.
-    #
-    # Note we deliberately do NOT `flushPendingStep` here (which would also fix
-    # the attribution): flushing early would strand any variable values
-    # registered AFTER the write but belonging to the same step in
-    # `flushPendingStep`'s orphan branch, where they are re-homed onto a
-    # synthetic step.  The JS instrumenter emits exactly that pattern
-    # (`__ct.write` followed by the statement's write-site values), so the
-    # explicit step id is the non-destructive fix.
-    let currentStepId =
-      if handle.hasPendingStep: handle.msWriter.stepCount
-      elif handle.msWriter.stepCount > 0: handle.msWriter.stepCount - 1
-      else: 0'u64
-    # The kind is the recorder's exact `EventLogKind`; an unassigned value is
-    # refused, never mapped onto a kind (`trace-events.md` §"EventLogKind").
-    let kindRes = eventLogKindFromOrdinal(uint64(cast[int32](kind)))
-    if kindRes.isErr:
-      setError("trace_writer_register_special_event: " & kindRes.error)
-      return
-    failIfErr handle.msWriter.registerIOEvent(kindRes.get(), data,
-      metadata = metaBytes, stepId = some(currentStepId))
+  # Every other multi-stream entry point refuses to touch `msWriter` before
+  # `trace_writer_begin_events` has created it; this one did not, and an
+  # event arriving first (a recorder that hooks stdout before it opens the
+  # trace — the shape a `--trace` wrapper produces) indexed an empty stream
+  # table and killed the RECORDED PROCESS with an IndexDefect, since an
+  # unhandled defect cannot be caught across the C boundary.  Dropping the
+  # event is what the same situation already does for steps and calls.
+  if not handle.msWriterReady:
     return
-
-  let legacyKind = eventLogKindFromOrdinal(uint64(cast[int32](kind)))
-  if legacyKind.isErr:
-    setError("trace_writer_register_special_event: " & legacyKind.error)
+  # M24a-3: the SPEC events.dat record carries both metadata AND content
+  # (previously the multi-stream path dropped metadata).  Pass them through
+  # so the dedicated I/O event stream is byte-consistent with what the Rust
+  # IoEventStreamReader expects, and so the event-log pane can surface the
+  # event's metadata.
+  let metadataStr = toNimStr(metadata)
+  var metaBytes = newSeq[byte](metadataStr.len)
+  for i in 0 ..< metadataStr.len:
+    metaBytes[i] = byte(metadataStr[i])
+  let contentStr = toNimStr(content)
+  var data = newSeq[byte](contentStr.len)
+  for i in 0 ..< contentStr.len:
+    data[i] = byte(contentStr[i])
+  # The step this event belongs to is the step the recorder is CURRENTLY on,
+  # which is not necessarily the last step the multi-stream writer emitted:
+  # `trace_writer_register_step` only BUFFERS its step (so late-arriving
+  # variable values can still be attached to it in `flushPendingStep`), and a
+  # `write` is registered while that buffered step is still pending.  Letting
+  # `registerIOEvent` default to `stepCount - 1` therefore attributed every
+  # `console.log` / `print` to the PREVIOUS step, and the flow view rendered
+  # the output one source line too high (issue #601).
+  #
+  # This is the same accounting `trace_writer_next_step_index` documents: a
+  # buffered-but-unwritten step will take index `msWriter.stepCount`.
+  #
+  # Note we deliberately do NOT `flushPendingStep` here (which would also fix
+  # the attribution): flushing early would strand any variable values
+  # registered AFTER the write but belonging to the same step in
+  # `flushPendingStep`'s orphan branch, where they are re-homed onto a
+  # synthetic step.  The JS instrumenter emits exactly that pattern
+  # (`__ct.write` followed by the statement's write-site values), so the
+  # explicit step id is the non-destructive fix.
+  let currentStepId =
+    if handle.hasPendingStep: handle.msWriter.stepCount
+    elif handle.msWriter.stepCount > 0: handle.msWriter.stepCount - 1
+    else: 0'u64
+  # The kind is the recorder's exact `EventLogKind`; an unassigned value is
+  # refused, never mapped onto a kind (`trace-events.md` §"EventLogKind").
+  let kindRes = eventLogKindFromOrdinal(uint64(cast[int32](kind)))
+  if kindRes.isErr:
+    setError("trace_writer_register_special_event: " & kindRes.error)
     return
-
-  failIfErr handle.writer.writeEvent(TraceLowLevelEvent(
-    kind: tleEvent,
-    recordEvent: RecordEvent(
-      kind: legacyKind.get(),
-      metadata: toNimStr(metadata),
-      content: toNimStr(content),
-    ),
-  ))
+  failIfErr handle.msWriter.registerIOEvent(kindRes.get(), data,
+    metadata = metaBytes, stepId = some(currentStepId))
+  return
 
 # ---------------------------------------------------------------------------
 # M14 — Assignment / BindVariable / column-aware Step
@@ -2414,7 +2127,7 @@ proc trace_writer_register_special_event(
 #
 # These entry points expose the M14 value-origin recorder vocabulary
 # (~Assignment~, ~BindVariable~, column-aware ~Step~) over the same
-# single-stream + multi-stream code paths the older entry points use.
+# writer the older entry points use.
 # Recorders call them only when they have something meaningful to emit;
 # the events are otherwise silently absent from the trace, preserving
 # back-compat with pre-M14 readers (which skip unknown variants).
@@ -2471,50 +2184,25 @@ proc buildRvalue(
   of FfiRValueKind.FunctionReturn:
     RValue(kind: rvkFunctionReturn, frCallKey: CallKey(callKey))
 
-proc internVariable(handle: TraceWriterHandle, name: string): uint64 =
-  ## Intern a variable name and emit the ~VariableName~ event the first
-  ## time it appears.  M14 entry points share this helper.
-  let existing = handle.variableIndex.getOrDefault(name, high(csize_t))
-  if existing != high(csize_t):
-    return uint64(existing)
-  let id = csize_t(handle.variables.len)
-  handle.variables.add(name)
-  handle.variableIndex[name] = id
-  if handle.useMultiStream and handle.msWriterReady:
-    failIfErr handle.msWriter.registerVarname(name)
-  elif handle.writerReady:
-    failIfErr handle.writer.writeEvent(TraceLowLevelEvent(
-      kind: tleVariableName, varName: name))
-  uint64(id)
-
 proc ct_bind_variable(
     handle: TraceWriterHandle,
     variable_name: cstring,
     place: int64,
 ) {.exportc, cdecl, dynlib, ffiGuard.} =
-  ## Emit a BindVariable event associating ~variable_name~ with ~place~.
-  ##
-  ## Currently routed through the single-stream writer only.  The
-  ## multi-stream writer does not yet expose a generic ~writeEvent~
-  ## surface for history events; when it does (tracked in CTFS-M5 /
-  ## history-stream landing) this entry point will route through it too.
+  ## Emit a BindVariable event associating ~variable_name~ with ~place~,
+  ## as a value-stream event of the pending step.
   if handle.isNil:
     return
   let name = toNimStr(variable_name)
-  if handle.useMultiStream:
-    if not handle.msWriterReady:
-      setError("ct_bind_variable: writer is not ready")
-      return
-    let vnIdRes = handle.msWriter.registerVarname(name)
-    if vnIdRes.isErr:
-      setError("ct_bind_variable: " & vnIdRes.error)
-      return
-    encodeBindVariableEvent(vnIdRes.get(), place, handle.pendingExtraValueEvents)
+  if not handle.msWriterReady:
+    setError("ct_bind_variable: writer is not ready")
     return
-  let variableId = internVariable(handle, name)
-  if not handle.writerReady:
+  let vnIdRes = handle.msWriter.registerVarname(name)
+  if vnIdRes.isErr:
+    setError("ct_bind_variable: " & vnIdRes.error)
     return
-  failIfErr handle.writer.writeBindVariable(variableId, place)
+  encodeBindVariableEvent(vnIdRes.get(), place, handle.pendingExtraValueEvents)
+  return
 
 proc ct_assignment(
     handle: TraceWriterHandle,
@@ -2530,36 +2218,26 @@ proc ct_assignment(
 ) {.exportc, cdecl, dynlib, ffiGuard.} =
   ## M14: emit an Assignment event.  The arguments are interpreted per
   ## ~rvalue_kind~; see the Rust FFI's ~ct_assignment~ for the same
-  ## discriminator table.  Currently routed through the single-stream
-  ## writer only (see the note on ~ct_bind_variable~).
+  ## discriminator table.  Written as a value-stream event of the pending
+  ## step.
   if handle.isNil:
     return
   let name = toNimStr(target_name)
   let rvalue = buildRvalue(rvalue_kind, simple_variable_id, compound_ids,
                            compound_len, field_name, index, call_key)
-  if handle.useMultiStream:
-    if not handle.msWriterReady:
-      setError("ct_assignment: writer is not ready")
-      return
-    let vnIdRes = handle.msWriter.registerVarname(name)
-    if vnIdRes.isErr:
-      setError("ct_assignment: " & vnIdRes.error)
-      return
-    var enc = CborEncoder.init()
-    enc.encodeCborRValue(rvalue)
-    encodeAssignmentEvent(vnIdRes.get(),
-      (if toPassBy(pass_by) == pbValue: 0'u8 else: 1'u8), enc.getBytes(),
-      handle.pendingExtraValueEvents)
+  if not handle.msWriterReady:
+    setError("ct_assignment: writer is not ready")
     return
-  let variableId = internVariable(handle, name)
-  if not handle.writerReady:
+  let vnIdRes = handle.msWriter.registerVarname(name)
+  if vnIdRes.isErr:
+    setError("ct_assignment: " & vnIdRes.error)
     return
-  failIfErr handle.writer.writeEvent(TraceLowLevelEvent(
-    kind: tleAssignment,
-    assignment: AssignmentRecord(
-      to: VariableId(variableId),
-      passBy: toPassBy(pass_by),
-      frm: rvalue)))
+  var enc = CborEncoder.init()
+  enc.encodeCborRValue(rvalue)
+  encodeAssignmentEvent(vnIdRes.get(),
+    (if toPassBy(pass_by) == pbValue: 0'u8 else: 1'u8), enc.getBytes(),
+    handle.pendingExtraValueEvents)
+  return
 
 proc ct_assignment_with_column(
     handle: TraceWriterHandle,
@@ -2574,44 +2252,35 @@ proc ct_assignment_with_column(
   if handle.isNil:
     return
   let p = toNimStr(path)
-  if handle.useMultiStream:
-    if not handle.msWriterReady:
-      return
-    discard flushPendingStep(handle)
-    # GDH-M1 §6.1: the string-taking step path resolves to the path’s
-    # CURRENT version. Identical to `registerPath(p)` for every recorder
-    # that never registers a second version of a file.
-    let pathIdRes = handle.msWriter.pathIdForStep(p)
-    if pathIdRes.isErr:
-      # These entry points return void, so `last_error` is the only signal
-      # a C caller has. Returning silently makes a refused registration
-      # indistinguishable from a successful one, and the step that would
-      # have followed simply never appears in the trace. That matters most
-      # under the line-count table, where interning a path the caller
-      # never gave a count for is REFUSED — the caller has to be able to
-      # see why its steps went missing.
-      setError(pathIdRes.error)
-      return
-    let pathId = pathIdRes.get()
-    if has_column != 0:
-      # M14: multi-stream Step events do not yet carry column info
-      # (delta-step encoding only records a global line index).  Until
-      # the exec stream grows a column slot, the column is dropped here
-      # and the FFI behaves as register_step from the recorder's point
-      # of view.
-      setError("ct_assignment_with_column: multi-stream Step does not yet carry column; falling back to no-column")
-    handle.pendingStepPathId = pathId
-    handle.pendingStepLine = uint64(line)
-    handle.hasPendingStep = true
+  if not handle.msWriterReady:
     return
-  if not handle.writerReady:
+  discard flushPendingStep(handle)
+  # GDH-M1 §6.1: the string-taking step path resolves to the path’s
+  # CURRENT version. Identical to `registerPath(p)` for every recorder
+  # that never registers a second version of a file.
+  let pathIdRes = handle.msWriter.pathIdForStep(p)
+  if pathIdRes.isErr:
+    # These entry points return void, so `last_error` is the only signal
+    # a C caller has. Returning silently makes a refused registration
+    # indistinguishable from a successful one, and the step that would
+    # have followed simply never appears in the trace. That matters most
+    # under the line-count table, where interning a path the caller
+    # never gave a count for is REFUSED — the caller has to be able to
+    # see why its steps went missing.
+    setError(pathIdRes.error)
     return
-  failIfErr handle.writer.writePath(p)
-  let pathId = uint64(handle.writer.paths.len - 1)
+  let pathId = pathIdRes.get()
   if has_column != 0:
-    failIfErr handle.writer.writeStepWithColumn(pathId, line, column)
-  else:
-    failIfErr handle.writer.writeStep(pathId, line)
+    # M14: multi-stream Step events do not yet carry column info
+    # (delta-step encoding only records a global line index).  Until
+    # the exec stream grows a column slot, the column is dropped here
+    # and the FFI behaves as register_step from the recorder's point
+    # of view.
+    setError("ct_assignment_with_column: multi-stream Step does not yet carry column; falling back to no-column")
+  handle.pendingStepPathId = pathId
+  handle.pendingStepLine = uint64(line)
+  handle.hasPendingStep = true
+  return
 
 # ---------------------------------------------------------------------------
 # Thread lifecycle events
@@ -2627,9 +2296,7 @@ proc ct_assignment_with_column(
 # Multi-stream path: events go to the exec stream as new step-event kinds
 # (TagThreadStart=0x05, TagThreadExit=0x06, TagThreadSwitch=0x04) and bump
 # stepCount so the value stream stays aligned (each event is paired with an
-# empty values record).  Legacy single-stream path: events are written
-# verbatim as TraceLowLevelEvent kinds tleThreadStart / tleThreadExit /
-# tleThreadSwitch.
+# empty values record).
 
 proc trace_writer_register_thread_start(
     handle: TraceWriterHandle,
@@ -2639,21 +2306,13 @@ proc trace_writer_register_thread_start(
   if handle.isNil:
     return
 
-  if handle.useMultiStream:
-    if not handle.msWriterReady:
-      return
-    # Flush any buffered step before we emit the thread event so the
-    # exec / value streams stay in lock-step.
-    discard flushPendingStep(handle)
-    failIfErr handle.msWriter.registerThreadStart(thread_id)
+  if not handle.msWriterReady:
     return
-
-  if not handle.writerReady:
-    return
-  failIfErr handle.writer.writeEvent(TraceLowLevelEvent(
-    kind: tleThreadStart,
-    threadStartId: ThreadId(thread_id),
-  ))
+  # Flush any buffered step before we emit the thread event so the
+  # exec / value streams stay in lock-step.
+  discard flushPendingStep(handle)
+  failIfErr handle.msWriter.registerThreadStart(thread_id)
+  return
 
 proc trace_writer_register_thread_exit(
     handle: TraceWriterHandle,
@@ -2663,19 +2322,11 @@ proc trace_writer_register_thread_exit(
   if handle.isNil:
     return
 
-  if handle.useMultiStream:
-    if not handle.msWriterReady:
-      return
-    discard flushPendingStep(handle)
-    failIfErr handle.msWriter.registerThreadExit(thread_id)
+  if not handle.msWriterReady:
     return
-
-  if not handle.writerReady:
-    return
-  failIfErr handle.writer.writeEvent(TraceLowLevelEvent(
-    kind: tleThreadExit,
-    threadExitId: ThreadId(thread_id),
-  ))
+  discard flushPendingStep(handle)
+  failIfErr handle.msWriter.registerThreadExit(thread_id)
+  return
 
 proc trace_writer_register_raise(
     handle: TraceWriterHandle,
@@ -2685,17 +2336,12 @@ proc trace_writer_register_raise(
 ) {.exportc, cdecl, dynlib, ffiGuard.} =
   ## Register a Raise event: an exception of the interned type
   ## `exception_type_id` is raised, with `message_len` bytes of message
-  ## (`message` may be NULL when the length is 0). The split-stream writer
-  ## only; the legacy writer refuses it by name.
+  ## (`message` may be NULL when the length is 0).
   if handle.isNil:
     return
   if message.isNil and message_len > 0:
     setError("trace_writer_register_raise: NULL message with length " &
       $message_len)
-    return
-  if not handle.useMultiStream:
-    setError("trace_writer_register_raise: the legacy writer records no " &
-      "Raise events; use the split-stream writer")
     return
   if not handle.msWriterReady:
     return
@@ -2712,10 +2358,6 @@ proc trace_writer_register_catch(
   ## Register a Catch event: an exception of the interned type
   ## `exception_type_id` is caught. The split-stream writer only.
   if handle.isNil:
-    return
-  if not handle.useMultiStream:
-    setError("trace_writer_register_catch: the legacy writer records no " &
-      "Catch events; use the split-stream writer")
     return
   if not handle.msWriterReady:
     return
@@ -2737,10 +2379,6 @@ proc trace_writer_register_return_exception(
       "required; a call that returned is registered with " &
       "trace_writer_register_return")
     return
-  if not handle.useMultiStream:
-    setError("trace_writer_register_return_exception: the legacy writer " &
-      "records no call exceptions; use the split-stream writer")
-    return
   var exc = newSeq[byte](int(exception_len))
   copyMem(addr exc[0], exception_cbor, int(exception_len))
   discard flushPendingStep(handle)
@@ -2754,19 +2392,11 @@ proc trace_writer_register_thread_switch(
   if handle.isNil:
     return
 
-  if handle.useMultiStream:
-    if not handle.msWriterReady:
-      return
-    discard flushPendingStep(handle)
-    failIfErr handle.msWriter.registerThreadSwitch(thread_id)
+  if not handle.msWriterReady:
     return
-
-  if not handle.writerReady:
-    return
-  failIfErr handle.writer.writeEvent(TraceLowLevelEvent(
-    kind: tleThreadSwitch,
-    threadSwitchId: ThreadId(thread_id),
-  ))
+  discard flushPendingStep(handle)
+  failIfErr handle.msWriter.registerThreadSwitch(thread_id)
+  return
 
 # ---------------------------------------------------------------------------
 # Column-aware step mode (P6.3 / P6.4)
@@ -2785,10 +2415,7 @@ proc trace_writer_register_thread_switch(
 #   * on close, ``meta.dat`` carries ``FlagHasColumnAwareSteps`` (bit 4)
 #     so column-unaware readers reject the trace cleanly via the
 #     reserved-bits check.
-#
-# Only the multi-stream backend supports column-aware mode; calling
-# ``trace_writer_register_delta_column`` on the legacy single-stream
-# backend is a no-op (the legacy format has no column-only event).
+
 
 proc trace_writer_enable_column_aware_steps(
     handle: TraceWriterHandle,
@@ -2798,10 +2425,9 @@ proc trace_writer_enable_column_aware_steps(
   ## the spec.
   if handle.isNil:
     return
-  if handle.useMultiStream:
-    if not handle.msWriterReady:
-      return
-    failIfErr handle.msWriter.enableColumnAwareSteps()
+  if not handle.msWriterReady:
+    return
+  failIfErr handle.msWriter.enableColumnAwareSteps()
 
 proc trace_writer_enable_column_breakpoints_support(
     handle: TraceWriterHandle,
@@ -2815,15 +2441,11 @@ proc trace_writer_enable_column_breakpoints_support(
   ## already called ``trace_writer_enable_column_aware_steps`` get that
   ## flip for free as a convenience for the common
   ## "fully column-aware recorder" case.
-  ##
-  ## Single-stream writers (legacy line-only backend) ignore the call:
-  ## there is no column-aware mode to gate.
   if handle.isNil:
     return
-  if handle.useMultiStream:
-    if not handle.msWriterReady:
-      return
-    failIfErr handle.msWriter.enableColumnBreakpointsSupport()
+  if not handle.msWriterReady:
+    return
+  failIfErr handle.msWriter.enableColumnBreakpointsSupport()
 
 proc trace_writer_enable_column_motions_support(
     handle: TraceWriterHandle,
@@ -2835,10 +2457,9 @@ proc trace_writer_enable_column_motions_support(
   ## the call implicitly enables column-aware step encoding.
   if handle.isNil:
     return
-  if handle.useMultiStream:
-    if not handle.msWriterReady:
-      return
-    failIfErr handle.msWriter.enableColumnMotionsSupport()
+  if not handle.msWriterReady:
+    return
+  failIfErr handle.msWriter.enableColumnMotionsSupport()
 
 proc trace_writer_register_delta_column(
     handle: TraceWriterHandle,
@@ -2869,10 +2490,6 @@ proc trace_writer_register_delta_column(
   ## running ``global_position_index`` is defined).  Otherwise sets
   ## a thread-local error string and returns silently.
   if handle.isNil:
-    return
-  if not handle.useMultiStream:
-    setError("trace_writer_register_delta_column: only the multi-stream " &
-      "backend supports column-aware events")
     return
   if not handle.msWriterReady:
     return
@@ -2932,11 +2549,7 @@ proc trace_writer_register_path_with_line_lengths(
   ## ``line_lengths`` argument is ignored and the legacy bare-path-bytes
   ## paths.dat record format is preserved byte-for-byte — this matches
   ## the back-compat contract documented in P6.5.
-  ##
-  ## Only the multi-stream backend is supported; calling this on the
-  ## legacy single-stream backend interns the path string via
-  ## ``writePath`` so its index in ``paths`` stays consistent with the
-  ## (legacy) implicit registration done by ``trace_writer_register_step``.
+
   ##
   ## Returns 0 on success, non-zero on failure (with ``last_error`` set).
   if handle.isNil:
@@ -2944,36 +2557,24 @@ proc trace_writer_register_path_with_line_lengths(
     return 1.cint
   let p = toNimStr(path)
 
-  if handle.useMultiStream:
-    if not handle.msWriterReady:
-      setError("trace_writer_register_path_with_line_lengths: writer not " &
-        "ready (call trace_writer_begin_events first)")
-      return 1.cint
-    # Materialise the C buffer into a Nim ``seq[uint32]`` so we can
-    # forward it through ``registerPath``'s ``openArray[uint32]``
-    # parameter.  A NULL pointer with line_count > 0 is treated as
-    # "no per-line data" — defensive parity with the empty-array case.
-    var lengths: seq[uint32] = @[]
-    if line_count > 0 and not line_lengths.isNil:
-      lengths = newSeq[uint32](int(line_count))
-      for i in 0 ..< int(line_count):
-        lengths[i] = line_lengths[i]
-    let pathIdRes = handle.msWriter.registerPath(p, lengths)
-    if pathIdRes.isErr:
-      setError(pathIdRes.error)
-      return 1.cint
-    return 0.cint
-
-  # Legacy single-stream backend: intern the path string so its index
-  # stays consistent with implicit registration done by
-  # trace_writer_register_step; line_lengths are ignored because the
-  # legacy paths.json carries no per-line metadata.
-  if not handle.writerReady:
+  if not handle.msWriterReady:
     setError("trace_writer_register_path_with_line_lengths: writer not " &
       "ready (call trace_writer_begin_events first)")
     return 1.cint
-  failIfErr handle.writer.writePath(p)
-  0.cint
+  # Materialise the C buffer into a Nim ``seq[uint32]`` so we can
+  # forward it through ``registerPath``'s ``openArray[uint32]``
+  # parameter.  A NULL pointer with line_count > 0 is treated as
+  # "no per-line data" — defensive parity with the empty-array case.
+  var lengths: seq[uint32] = @[]
+  if line_count > 0 and not line_lengths.isNil:
+    lengths = newSeq[uint32](int(line_count))
+    for i in 0 ..< int(line_count):
+      lengths[i] = line_lengths[i]
+  let pathIdRes = handle.msWriter.registerPath(p, lengths)
+  if pathIdRes.isErr:
+    setError(pathIdRes.error)
+    return 1.cint
+  return 0.cint
 
 proc trace_writer_enable_line_count_table(
     handle: TraceWriterHandle,
@@ -2995,10 +2596,6 @@ proc trace_writer_enable_line_count_table(
   ## failure (with ``last_error`` set).
   if handle.isNil:
     setError("trace_writer_enable_line_count_table: NULL handle")
-    return 1.cint
-  if not handle.useMultiStream:
-    setError("trace_writer_enable_line_count_table: the legacy " &
-      "single-stream backend has no paths.dat to record line counts in")
     return 1.cint
   if not handle.msWriterReady:
     setError("trace_writer_enable_line_count_table: writer not ready " &
@@ -3032,10 +2629,6 @@ proc trace_writer_register_path_with_line_count(
   ## Returns 0 on success, non-zero on failure (with ``last_error`` set).
   if handle.isNil:
     setError("trace_writer_register_path_with_line_count: NULL handle")
-    return 1.cint
-  if not handle.useMultiStream:
-    setError("trace_writer_register_path_with_line_count: the legacy " &
-      "single-stream backend has no paths.dat to record line counts in")
     return 1.cint
   if not handle.msWriterReady:
     setError("trace_writer_register_path_with_line_count: writer not " &
@@ -3116,10 +2709,6 @@ proc trace_writer_register_path_version(
   if handle.isNil:
     setError("trace_writer_register_path_version: NULL handle")
     return CtTwInvalidPathId
-  if not handle.useMultiStream:
-    setError("trace_writer_register_path_version: the legacy " &
-      "single-stream backend has no paths.dat to version")
-    return CtTwInvalidPathId
   if not handle.msWriterReady:
     setError("trace_writer_register_path_version: writer not ready " &
       "(call trace_writer_begin_events first)")
@@ -3168,10 +2757,6 @@ proc trace_writer_current_path_id(
   if handle.isNil:
     setError("trace_writer_current_path_id: NULL handle")
     return CtTwInvalidPathId
-  if not handle.useMultiStream:
-    setError("trace_writer_current_path_id: the legacy single-stream " &
-      "backend has no paths.dat ids to answer with")
-    return CtTwInvalidPathId
   if not handle.msWriterReady:
     setError("trace_writer_current_path_id: writer not ready " &
       "(call trace_writer_begin_events first)")
@@ -3209,10 +2794,6 @@ proc trace_writer_register_path(
   if handle.isNil:
     setError("trace_writer_register_path: NULL handle")
     return CtTwInvalidPathId
-  if not handle.useMultiStream:
-    setError("trace_writer_register_path: the legacy single-stream " &
-      "backend has no paths.dat to intern into")
-    return CtTwInvalidPathId
   if not handle.msWriterReady:
     setError("trace_writer_register_path: writer not ready " &
       "(call trace_writer_begin_events first)")
@@ -3238,10 +2819,6 @@ proc trace_writer_register_variable_name(
   trace_writer_clear_last_error()
   if handle.isNil:
     setError("trace_writer_register_variable_name: NULL handle")
-    return high(uint64)
-  if not handle.useMultiStream:
-    setError("trace_writer_register_variable_name: the legacy " &
-      "single-stream backend has no varnames.dat to intern into")
     return high(uint64)
   if not handle.msWriterReady:
     setError("trace_writer_register_variable_name: writer not ready " &
@@ -3283,10 +2860,6 @@ proc trace_writer_register_source_view(
   ## distinguish "index 0" from "error".
   if handle.isNil:
     setError("trace_writer_register_source_view: NULL handle")
-    return -1'i64
-  if not handle.useMultiStream:
-    setError("trace_writer_register_source_view: only the multi-stream " &
-      "backend supports alternate source views")
     return -1'i64
   if not handle.msWriterReady:
     setError("trace_writer_register_source_view: writer not ready " &
@@ -3391,10 +2964,6 @@ proc trace_writer_register_source_reload(
   if handle.isNil:
     setError("trace_writer_register_source_reload: NULL handle")
     return CtTwInvalidReloadOrdinal
-  if not handle.useMultiStream:
-    setError("trace_writer_register_source_reload: the legacy " &
-      "single-stream backend has no execution stream to annotate")
-    return CtTwInvalidReloadOrdinal
   if not handle.msWriterReady:
     setError("trace_writer_register_source_reload: writer not ready " &
       "(call trace_writer_begin_events first)")
@@ -3449,10 +3018,6 @@ proc trace_writer_declare_source_reload(
   if handle.isNil:
     setError("NULL handle")
     return 1.cint
-  if not handle.useMultiStream:
-    setError("trace_writer_declare_source_reload: source reloads are " &
-      "recorded by the multi-stream writer only")
-    return 1.cint
   if not handle.msWriterReady:
     setError("trace_writer_declare_source_reload: writer not ready (call " &
       "trace_writer_begin_events first)")
@@ -3471,7 +3036,7 @@ proc trace_writer_source_reload_count(
   ## and so a host that emitted nothing cannot report that it did.
   ## Answers 0 for a NULL / non-multi-stream / not-ready handle, which is
   ## the truthful count in each of those cases.
-  if handle.isNil or not handle.useMultiStream or not handle.msWriterReady:
+  if handle.isNil or not handle.msWriterReady:
     return 0'u64
   handle.msWriter.sourceReloadCount()
 
@@ -3527,10 +3092,6 @@ proc trace_writer_register_span(
   ## success, non-zero on failure with ``trace_writer_last_error`` set.
   if handle.isNil:
     setError("trace_writer_register_span: NULL handle")
-    return 1.cint
-  if not handle.useMultiStream:
-    setError("trace_writer_register_span: only the multi-stream backend " &
-      "supports spans")
     return 1.cint
   if not handle.msWriterReady:
     setError("trace_writer_register_span: writer not ready " &
@@ -3599,10 +3160,6 @@ proc trace_writer_flush_spans(handle: TraceWriterHandle): cint
   if handle.isNil:
     setError("trace_writer_flush_spans: NULL handle")
     return 1.cint
-  if not handle.useMultiStream:
-    setError("trace_writer_flush_spans: only the multi-stream backend " &
-      "supports spans")
-    return 1.cint
   if not handle.msWriterReady:
     return 0.cint
   let res = handle.msWriter.flushSpans()
@@ -3635,10 +3192,6 @@ proc trace_writer_begin_crossing(
   ## `trace_writer_last_error` set.
   if handle.isNil:
     setError("trace_writer_begin_crossing: NULL handle")
-    return 0'u64
-  if not handle.useMultiStream:
-    setError("trace_writer_begin_crossing: only the multi-stream backend " &
-      "supports crossings")
     return 0'u64
   if not handle.msWriterReady:
     setError("trace_writer_begin_crossing: writer not ready " &
@@ -3674,10 +3227,6 @@ proc trace_writer_end_crossing(
   ## is not the innermost open crossing.
   if handle.isNil:
     setError("trace_writer_end_crossing: NULL handle")
-    return 1.cint
-  if not handle.useMultiStream:
-    setError("trace_writer_end_crossing: only the multi-stream backend " &
-      "supports crossings")
     return 1.cint
   if not handle.msWriterReady:
     setError("trace_writer_end_crossing: writer not ready " &
@@ -3717,8 +3266,6 @@ proc trace_writer_next_step_index(handle: TraceWriterHandle): uint64
   ## Returns 0 for a NULL handle, a non-multi-stream backend, or a writer that
   ## is not ready yet — all cases in which no step has been recorded.
   if handle.isNil:
-    return 0'u64
-  if not handle.useMultiStream:
     return 0'u64
   if not handle.msWriterReady:
     return 0'u64
@@ -4233,91 +3780,78 @@ proc closeHandle(handle: TraceWriterHandle): cint =
     setError("NULL handle")
     return 1.cint
 
-  if handle.useMultiStream:
-    if not handle.msWriterReady:
-      return 0.cint
-    # Flush the last pending step
-    let flushRc = flushPendingStep(handle)
-    if flushRc != 0:
-      return flushRc
-    # …and anything carry-forward is still holding, which has no next step now.
-    let trailRc = flushTrailingValues(handle)
-    if trailRc != 0:
-      return trailRc
-    let closeRes = handle.msWriter.close()
-    if closeRes.isErr:
-      setError(closeRes.error)
-      return 1.cint
-    # The profile is chosen on the finished full container (§1e); a compact
-    # one replaces it below, once the full one is finalized.
-    var compactImage: seq[byte]
-    var compactChosen = false
-    if handle.compactThreshold > 0:
-      let sel = selectProfile(handle.msWriter.toBytes(),
-        handle.compactThreshold)
-      if sel.isErr:
-        setError("trace_writer_close: choosing the container profile: " &
-          sel.error)
-        return 1.cint
-      if sel.get()[0] == cpCompact:
-        compactImage = sel.get()[1]
-        compactChosen = true
-    if compactChosen and handle.inMemory:
-      handle.containerData = move compactImage
-      handle.containerReady = true
-    elif handle.inMemory:
-      # A writer with no file to stream into holds the whole container in
-      # RAM, so the finished image has to be lifted out of it here.
-      #
-      # RETAIN BEFORE RELEASING. `closeCtfs` frees the writer's own storage,
-      # so the copy has to be taken while it is still alive; a pointer into
-      # the writer would dangle at the next line.
-      handle.containerData = handle.msWriter.toBytes()
-      handle.containerReady = true
-    # A file-backed writer needs nothing here: the exec/value/call/io/span
-    # chunks + meta.dat were written into the streaming container at
-    # `handle.ctFilePath` as they were produced, and closeCtfs() finalizes the
-    # on-disk image (writes the final root block and closes the file). No
-    # toBytes()/open(fmWrite) dump — that was the buffered mode, which
-    # balloons RAM and loses the trace if a long-running producer is killed
-    # before close.
-    let ctfsRes = handle.msWriter.closeCtfs()
-    if ctfsRes.isErr:
-      # The final write is what publishes block 0's entry-size array; losing
-      # it leaves a container whose members read back empty.  Reporting
-      # success here would hand the recorder a corrupt trace it believes is
-      # complete.
-      setError(ctfsRes.error)
-      return 1.cint
-    if compactChosen and not handle.inMemory:
-      when ctHasFilesystem:
-        # Through a sibling temporary, so the file holds the full container
-        # or the compact one and never a partial write.
-        let tmp = handle.ctFilePath & ".compact.tmp"
-        try:
-          writeFile(tmp, cast[string](compactImage))
-          moveFile(tmp, handle.ctFilePath)
-        except CatchableError:
-          setError("trace_writer_close: replacing " & handle.ctFilePath &
-            " with its compact container: " & getCurrentExceptionMsg())
-          return 1.cint
-        except Exception:
-          setError("trace_writer_close: replacing " & handle.ctFilePath &
-            " with its compact container")
-          return 1.cint
+  if not handle.msWriterReady:
     return 0.cint
-
-  if not handle.writerReady:
-    # Writer was never opened — nothing to close
-    return 0.cint
-  let res = handle.writer.close()
-  if res.isErr:
-    setError(res.error)
+  # Flush the last pending step
+  let flushRc = flushPendingStep(handle)
+  if flushRc != 0:
+    return flushRc
+  # …and anything carry-forward is still holding, which has no next step now.
+  let trailRc = flushTrailingValues(handle)
+  if trailRc != 0:
+    return trailRc
+  let closeRes = handle.msWriter.close()
+  if closeRes.isErr:
+    setError(closeRes.error)
     return 1.cint
-  if handle.inMemory:
-    handle.containerData = handle.writer.containerBytes()
+  # The profile is chosen on the finished full container (§1e); a compact
+  # one replaces it below, once the full one is finalized.
+  var compactImage: seq[byte]
+  var compactChosen = false
+  if handle.compactThreshold > 0:
+    let sel = selectProfile(handle.msWriter.toBytes(),
+      handle.compactThreshold)
+    if sel.isErr:
+      setError("trace_writer_close: choosing the container profile: " &
+        sel.error)
+      return 1.cint
+    if sel.get()[0] == cpCompact:
+      compactImage = sel.get()[1]
+      compactChosen = true
+  if compactChosen and handle.inMemory:
+    handle.containerData = move compactImage
     handle.containerReady = true
-  0.cint
+  elif handle.inMemory:
+    # A writer with no file to stream into holds the whole container in
+    # RAM, so the finished image has to be lifted out of it here.
+    #
+    # RETAIN BEFORE RELEASING. `closeCtfs` frees the writer's own storage,
+    # so the copy has to be taken while it is still alive; a pointer into
+    # the writer would dangle at the next line.
+    handle.containerData = handle.msWriter.toBytes()
+    handle.containerReady = true
+  # A file-backed writer needs nothing here: the exec/value/call/io/span
+  # chunks + meta.dat were written into the streaming container at
+  # `handle.ctFilePath` as they were produced, and closeCtfs() finalizes the
+  # on-disk image (writes the final root block and closes the file). No
+  # toBytes()/open(fmWrite) dump — that was the buffered mode, which
+  # balloons RAM and loses the trace if a long-running producer is killed
+  # before close.
+  let ctfsRes = handle.msWriter.closeCtfs()
+  if ctfsRes.isErr:
+    # The final write is what publishes block 0's entry-size array; losing
+    # it leaves a container whose members read back empty.  Reporting
+    # success here would hand the recorder a corrupt trace it believes is
+    # complete.
+    setError(ctfsRes.error)
+    return 1.cint
+  if compactChosen and not handle.inMemory:
+    when ctHasFilesystem:
+      # Through a sibling temporary, so the file holds the full container
+      # or the compact one and never a partial write.
+      let tmp = handle.ctFilePath & ".compact.tmp"
+      try:
+        writeFile(tmp, cast[string](compactImage))
+        moveFile(tmp, handle.ctFilePath)
+      except CatchableError:
+        setError("trace_writer_close: replacing " & handle.ctFilePath &
+          " with its compact container: " & getCurrentExceptionMsg())
+        return 1.cint
+      except Exception:
+        setError("trace_writer_close: replacing " & handle.ctFilePath &
+          " with its compact container")
+        return 1.cint
+  return 0.cint
 
 
 proc trace_writer_close(handle: TraceWriterHandle): cint {.exportc, cdecl, dynlib, ffiGuard.} =
@@ -4364,9 +3898,6 @@ proc trace_writer_add_filter_provenance(
   if handle.isNil:
     setError("NULL handle")
     return 1.cint
-  if not handle.useMultiStream:
-    setError("filter provenance only supported in CTFS multi-stream mode")
-    return 1.cint
   if not handle.msWriterReady:
     setError("writer not ready (call begin_events first)")
     return 1.cint
@@ -4402,9 +3933,6 @@ proc trace_writer_record_empty_filter_provenance(
   if handle.isNil:
     setError("NULL handle")
     return 1.cint
-  if not handle.useMultiStream:
-    setError("filter provenance only supported in CTFS multi-stream mode")
-    return 1.cint
   if not handle.msWriterReady:
     setError("writer not ready (call begin_events first)")
     return 1.cint
@@ -4419,9 +3947,6 @@ template metaBlockWriter(handle: TraceWriterHandle, what: string) =
   ## returning 1 with the reason in `trace_writer_last_error`.
   if handle.isNil:
     setError("NULL handle")
-    return 1.cint
-  if not handle.useMultiStream:
-    setError(what & " only supported in CTFS multi-stream mode")
     return 1.cint
   if not handle.msWriterReady:
     setError("writer not ready (call begin_events first)")
@@ -4518,28 +4043,11 @@ proc ct_write_meta_dat(
     setError("NULL handle")
     return 1.cint
 
-  if handle.useMultiStream:
-    # The multi-stream writer writes meta.dat at the first record (or close).
-    if not handle.msWriterReady:
-      setError("writer not ready (call begin_events first)")
-      return 1.cint
-    return 0.cint
-
-  if not handle.writerReady:
+  # The multi-stream writer writes meta.dat at the first record (or close).
+  if not handle.msWriterReady:
     setError("writer not ready (call begin_events first)")
     return 1.cint
-
-  var recId = ""
-  if not recorder_id.isNil and recorder_id_len > 0.csize_t:
-    recId = newString(int(recorder_id_len))
-    copyMem(addr recId[0], recorder_id, int(recorder_id_len))
-
-  let wRes = handle.writer.writeMetaDat(recorderId = recId)
-  if wRes.isErr:
-    setError(wRes.error)
-    return 1.cint
-
-  0.cint
+  return 0.cint
 
 # ---------------------------------------------------------------------------
 # meta.dat — standalone buffer write

@@ -569,6 +569,22 @@ proc decodeSourceView(raw: openArray[byte], v: var SourceView,
   field(v.sourcemapV3, "map")
   true
 
+const RetiredMembers* = ["events.log", "events.fmt"]
+  ## Members that are not part of the trace format: a single combined event
+  ## stream and its encoding marker. A container's events live in its split
+  ## streams.
+
+proc refuseRetiredMembers*(containerBytes: openArray[byte],
+    maxEntries: uint32): Result[void, string] =
+  ## `err` naming the first retired member the container carries. A reader
+  ## refuses such a container before reading any stream, so it is never read
+  ## as if the member were not there.
+  for name in RetiredMembers:
+    if hasInternalFile(containerBytes, name, maxEntries):
+      return err("this container carries `" & name & "`, which is not part " &
+        "of the trace format; it is refused")
+  ok()
+
 proc openNewTraceFromImage(image: ContainerImage, blockSize: uint32,
     maxEntries: uint32, assumeColumnAwarePaths: bool):
     Result[NewTraceReader, string]
@@ -629,6 +645,7 @@ proc openNewTraceFromImage(image: ContainerImage, blockSize: uint32,
   reader.blockSize = blockSize
   reader.maxEntries = maxEntries
   reader.assumedColumnAwarePaths = assumeColumnAwarePaths
+  ? refuseRetiredMembers(reader.image.bytes, maxEntries)
 
   # Read meta.dat.  A container that HAS one and cannot parse it is refused,
   # rather than opened with a zeroed `meta`.  Every flag this reader consults

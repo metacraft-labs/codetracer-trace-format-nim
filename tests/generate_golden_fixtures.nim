@@ -7,7 +7,6 @@ import std/os
 import std/json
 import results
 import codetracer_ctfs
-import codetracer_trace_writer
 import ct_pretty_print
 
 const FixtureDir = currentSourcePath().parentDir / "fixtures"
@@ -69,46 +68,6 @@ proc generateSeekableZstd3Frames(): seq[byte] =
   enc.write(data)
   enc.finish()
 
-proc generateTraceComplete(): seq[byte] =
-  let path = getTempDir() / "golden_regen_trace_complete.ct"
-  try:
-    removeFile(path)
-  except OSError:
-    discard
-
-  # M-REC-1: keep this fixture byte-stable by pinning recording_id.
-  const GoldenRecordingId = "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb"
-  var writerRes = newTraceWriter(path, "test_program", @["--flag", "input.txt"],
-                                  workdir = "/home/user/project",
-                                  chunkThreshold = 5,
-                                  recordingId = GoldenRecordingId)
-  doAssert writerRes.isOk, "newTraceWriter failed: " & writerRes.error
-  var w = writerRes.get()
-
-  doAssert w.writePath("/src/main.nim").isOk
-  doAssert w.writePath("/src/lib.nim").isOk
-  doAssert w.writeFunction(0, 1, "main").isOk
-  doAssert w.writeStep(0, 1).isOk
-  doAssert w.writeCall(0).isOk
-  doAssert w.writeStep(0, 5).isOk
-  doAssert w.writeStep(0, 6).isOk
-  doAssert w.writeStep(0, 7).isOk
-  doAssert w.writeStep(1, 10).isOk
-  doAssert w.writeReturn().isOk
-  doAssert w.writeStep(0, 8).isOk
-  doAssert w.writeStep(0, 9).isOk
-
-  doAssert w.close().isOk
-
-  let readRes = readCtfsFromFile(path)
-  doAssert readRes.isOk, "readCtfsFromFile failed: " & readRes.error
-  result = readRes.get()
-
-  try:
-    removeFile(path)
-  except OSError:
-    discard
-
 # ---------------------------------------------------------------------------
 # Main: generate all .expected files
 # ---------------------------------------------------------------------------
@@ -134,13 +93,6 @@ proc main() =
     let data = generateSeekableZstd3Frames()
     let text = prettyPrintSeekableZstd(data)
     let path = FixtureDir / "seekable_zstd_3frames.expected"
-    writeFile(path, text)
-    echo "Generated: ", path
-
-  block:
-    let data = generateTraceComplete()
-    let text = prettyPrintCtFile(data)
-    let path = FixtureDir / "trace_complete.expected"
     writeFile(path, text)
     echo "Generated: ", path
 

@@ -63,7 +63,6 @@ lint-nim:
     set -euo pipefail
     for m in src/codetracer_ctfs.nim \
              src/codetracer_trace_types.nim \
-             src/codetracer_trace_writer.nim \
              src/codetracer_profile_writer.nim \
              src/codetracer_trace_reader.nim \
              src/codetracer_ct_print_lib.nim; do

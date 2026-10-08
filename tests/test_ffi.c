@@ -246,39 +246,18 @@ int main(void) {
     printf("\n=== All meta.dat tests passed! ===\n\n");
 
     /* ================================================================
-     * Old single-stream format test (BINARY_V0)
-     * Ensures backward compat: useMultiStream=false
+     * The formats that selected a combined events.log are refused
      * ================================================================ */
-    printf("=== Old format (BINARY_V0) backward-compat test ===\n\n");
+    printf("=== Retired formats are refused ===\n\n");
     {
         trace_writer_t w = trace_writer_new("old_format_test", FFI_TRACE_FORMAT_BINARY_V0);
-        ASSERT(w != NULL, "trace_writer_new (old format)");
-
-        trace_writer_set_workdir(w, "/tmp/old_workdir");
-        ASSERT(trace_writer_begin_events(w, "/tmp/old_events.bin") == 0,
-            "begin_events (old format)");
-
-        trace_writer_start(w, "/test/old_main.py", 1);
-        trace_writer_register_step(w, "/test/old_main.py", 5);
-
-        size_t fn = trace_writer_ensure_function_id(w, "old_func", "/test/old_main.py", 10);
-        ASSERT(fn != (size_t)-1, "ensure_function_id (old format)");
-
-        size_t tid = trace_writer_ensure_type_id(w, FFI_TYPE_INT, "int");
-        ASSERT(tid != (size_t)-1, "ensure_type_id (old format)");
-
-        trace_writer_register_call(w, fn);
-        trace_writer_register_variable_int(w, "x", 99, FFI_TYPE_INT, "int");
-        trace_writer_register_return_int(w, 0, FFI_TYPE_INT, "int");
-
-        ASSERT(trace_writer_close(w) == 0, "close (old format)");
-        ASSERT(file_exists("/tmp/old_format_test.ct"), "old_format_test.ct should exist");
-        printf("[OK] old format roundtrip\n");
-
-        trace_writer_free(w);
-        remove("/tmp/old_format_test.ct");
+        ASSERT(w == NULL, "trace_writer_new refuses FFI_TRACE_FORMAT_BINARY_V0");
+        ASSERT(strstr(trace_writer_last_error(), "events.log") != NULL,
+            "the refusal names events.log");
+        w = trace_writer_new("old_format_test", FFI_TRACE_FORMAT_JSON);
+        ASSERT(w == NULL, "trace_writer_new refuses FFI_TRACE_FORMAT_JSON");
+        printf("[OK] retired formats refused\n");
     }
-    printf("\n=== Old format test passed! ===\n\n");
 
     /* ================================================================
      * Multi-stream format test (BINARY = 2)

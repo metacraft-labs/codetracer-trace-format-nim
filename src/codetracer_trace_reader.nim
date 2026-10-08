@@ -5,16 +5,14 @@ when defined(nimPreviewSlimSystem):
 
 ## High-level trace reader API for .ct files produced by TraceWriter.
 ##
-## Opens a .ct file, parses the CTFS container, decompresses seekable Zstd
-## chunks from events.log, decodes split-binary events, and provides
-## JSON and text output.
+## Opens a .ct file, parses the CTFS container, assembles the recording's
+## events from its split streams, and provides JSON and text output.
 
 import std/[json, strutils]
 import results
 import codetracer_ctfs/types
 import codetracer_ctfs/base40
 import codetracer_ctfs/container
-import codetracer_ctfs/chunk_index
 import codetracer_ctfs/zstd_bindings
 import codetracer_trace_types
 import codetracer_trace_writer/split_binary
@@ -29,19 +27,6 @@ import codetracer_trace_writer/cbor as v4_cbor
 import codetracer_trace_writer/global_line_index as v4_gli
 
 export results, codetracer_trace_types
-
-const
-  EventsLogHeaderV1* = [
-    # "CodeTracer" in hex leetspeak, then file-format version 1, then two
-    # reserved bytes that are zero in this version.
-    byte 0xC0, 0xDE, 0x72, 0xAC, 0xE2,
-    0x01,
-    0x00, 0x00
-  ]
-    ## The 8-byte CodeTracer file header the Rust `CtfsTraceWriter` writes at
-    ## the start of `events.log`, ahead of the first inline chunk header.  The
-    ## Nim `TraceWriter` does not write it, so `readEvents` treats it as
-    ## optional and skips it when present.
 
 # ---------------------------------------------------------------------------
 # Types
@@ -118,33 +103,15 @@ proc openTrace*(path: string): Result[TraceReader, string] =
   mr4[0] = data[12]; mr4[1] = data[13]; mr4[2] = data[14]; mr4[3] = data[15]
   let maxEntries = fromBytesLE(uint32, mr4)
 
-  # DETECT v4 POSITIVELY, BY `steps.dat`. This used to infer it from the ABSENCE
-  # of `events.log`, which worked only while some writer still emitted that
-  # stream to be absent from. No writer does now, and an inference from absence
-  # over a file that contains NOTHING answers "v4" — so a truncated stub, a
-  # zero-filled file or any other garbage classified as a v4 recording with no
-  # events, and `ct-print` reported an empty program and zero counts with exit
-  # 0. Measured on a 512-byte head of a real container, which this reader used
-  # to refuse.
-  #
-  # A positive test cannot do that: `steps.dat` is the stream the v4 path
-  # actually reads, and a file that does not carry it is not a v4 recording
-  # whatever else is true of it.
-  #
-  # The old comment's point still stands and is kept: the question is whether
-  # the ENTRY is there, not whether it resolves. A v3 trace whose `events.log`
-  # mapping root was lost to a torn write still has the entry, and classifying
-  # that as v4 would answer "no events" instead of reporting the damage — so a
-  # container carrying BOTH entries is read as v3, as before.
-  # A container with NEITHER stream is not refused here, and that is deliberate:
-  # a metadata-only container — `meta.dat` and paths, no events — is a legitimate
-  # thing to open for its metadata, and `test_meta_dat` writes one. Refusing it
-  # here broke that. The refusal belongs where a caller asks to DECODE a
-  # recording, which is `ct-print`'s archetype detector, and it keys on
-  # `meta.dat` rather than on the streams for the reason recorded there.
-  let hasEvents = findInternalFileEntry(data, "events.log", maxEntries).found
-  let hasSteps = findInternalFileEntry(data, "steps.dat", maxEntries).found
-  let isV4 = hasSteps and not hasEvents
+  # A container carrying a member that is not part of the trace format is
+  # refused before anything in it is read.
+  ? refuseRetiredMembers(data, maxEntries)
+
+  # A container with no `steps.dat` is not refused here: a metadata-only
+  # container — `meta.dat` and paths, no events — is a legitimate thing to open
+  # for its metadata. `readEvents` refuses it, because that is where a caller
+  # asks to decode a recording.
+  let isV4 = findInternalFileEntry(data, "steps.dat", maxEntries).found
 
   var reader = TraceReader(
     ctfsData: data,
@@ -543,167 +510,11 @@ proc readEventsV4(reader: var TraceReader): Result[void, string] =
   reader.eventCount = reader.events.len
   ok()
 
-const
-  # A frame that does not pledge its content size has to be inflated into a
-  # buffer this reader guesses.  The first guess is 16x the compressed bytes
-  # (the same heuristic `native_decoder.decompressZstdFrame` uses), then
-  # doubling up to `UnknownSizeMaxFactor`.  The cap is what stops a damaged
-  # frame -- one whose header merely CLAIMS to be unpledged -- from driving an
-  # unbounded allocation: the walk is bounded to six doublings and to a fixed
-  # ceiling, so a hostile chunk costs a bounded amount of memory and then a
-  # named error rather than an OOM.
-  UnknownSizeInitialFactor = 16
-  UnknownSizeMaxFactor = 1024
-  UnknownSizeMinBytes = 4096
-  UnknownSizeCeilingBytes = 512 * 1024 * 1024
-
-proc inflateEventsLogChunk*(compressed: openArray[byte]):
-    Result[seq[byte], string] =
-  ## Inflate one `events.log` chunk, whether or not its Zstd frame header
-  ## pledges the decompressed size.
-  ##
-  ## `ZSTD_getFrameContentSize` answers one of three things, and the two
-  ## sentinels are ORDINARY RETURN VALUES, not errors -- they are compared
-  ## against the `ZSTD_CONTENTSIZE_*` constants in
-  ## `codetracer_ctfs/zstd_bindings.nim`, never against an error STRING.  This
-  ## matters: `ZSTD_getErrorName`'s text is not a stable API and a zstd bump
-  ## can reword it, whereas the two sentinel values are fixed by the format.
-  ## Every other stream module in this repo tests the same two constants
-  ## (`exec_stream`, `value_stream`, `call_stream`, `io_event_stream`,
-  ## `span_stream`, `chunked_compressed_table`, `native_decoder`); this reader
-  ## was the sole exception, testing only `_ERROR`, so `_UNKNOWN`
-  ## (0xFFFFFFFFFFFFFFFF) flowed into `int(...)` and killed the process with a
-  ## RangeDefect instead of being handled or refused.
-  ##
-  ## An unpledged frame is what a streaming encoder produces.  The Rust
-  ## `CtfsTraceWriter` compresses `events.log` chunks that way when it cannot
-  ## reach libzstd -- notably every container written from
-  ## `wasm32-unknown-unknown`, where the pure-Rust encoder emits
-  ## `frame_content_size: None` unconditionally.
-  if compressed.len == 0:
-    var empty: seq[byte] = @[]
-    return ok(empty)
-
-  let contentSize = ZSTD_getFrameContentSize(
-    unsafeAddr compressed[0], csize_t(compressed.len))
-
-  if contentSize == ZSTD_CONTENTSIZE_ERROR:
-    return err("failed to get decompressed size for chunk")
-
-  if contentSize != ZSTD_CONTENTSIZE_UNKNOWN:
-    # The ordinary path: the frame pledges its size, so one exactly-sized
-    # allocation and one call.  Byte-for-byte the behaviour this reader has
-    # always had for pledged frames.
-    let pledged = int(contentSize)
-    var decompressed = newSeq[byte](pledged)
-    if pledged > 0:
-      let actualSize = ZSTD_decompress(
-        addr decompressed[0], csize_t(decompressed.len),
-        unsafeAddr compressed[0], csize_t(compressed.len))
-      if ZSTD_isError(actualSize) != 0:
-        return err("zstd decompression failed")
-      decompressed.setLen(int(actualSize))
-    return ok(decompressed)
-
-  # Unpledged: grow and retry, bounded.
-  #
-  # A failed `ZSTD_decompress` is not distinguished here between "destination
-  # too small" and "corrupt frame", because the binding surface exposes only
-  # `ZSTD_getErrorName` for that and its text is not a contract.  Retrying a
-  # genuinely corrupt frame is harmless -- it costs at most six doublings and
-  # then reports the error -- whereas keying the decision off a string would
-  # silently change behaviour the next time zstd rewords a message.
-  var capacity = compressed.len * UnknownSizeInitialFactor
-  if capacity < UnknownSizeMinBytes:
-    capacity = UnknownSizeMinBytes
-  var limit = compressed.len * UnknownSizeMaxFactor
-  if limit < UnknownSizeMinBytes:
-    limit = UnknownSizeMinBytes
-  if limit > UnknownSizeCeilingBytes:
-    limit = UnknownSizeCeilingBytes
-  if capacity > limit:
-    capacity = limit
-
-  while true:
-    var decompressed = newSeq[byte](capacity)
-    let actualSize = ZSTD_decompress(
-      addr decompressed[0], csize_t(decompressed.len),
-      unsafeAddr compressed[0], csize_t(compressed.len))
-    if ZSTD_isError(actualSize) == 0:
-      decompressed.setLen(int(actualSize))
-      return ok(decompressed)
-    if capacity >= limit:
-      return err(
-        "zstd decompression failed: chunk declares no content size and did " &
-        "not fit in " & $limit & " bytes")
-    capacity = capacity * 2
-    if capacity > limit:
-      capacity = limit
-
 proc readEvents*(reader: var TraceReader): Result[void, string] =
-  ## Decompress and decode all events. Dispatches to v3 (events.log) or
-  ## v4 (multi-stream) based on the file layout detected at openTrace time.
-  if reader.isV4:
-    return readEventsV4(reader)
-
-  let eventsRes = readInternalFile(reader.ctfsData, "events.log",
-                                    reader.blockSize, reader.maxRootEntries)
-  if eventsRes.isErr:
-    return err("failed to read events.log: " & eventsRes.error)
-
-  let eventsData = eventsRes.get()
-  if eventsData.len == 0:
-    reader.events = @[]
-    reader.eventCount = 0
-    return ok()
-
-  # The SECONDARY (Rust) CTFS writer prefixes `events.log` with the 8-byte
-  # CodeTracer stream header (`HEADERV1` in
-  # `codetracer-trace-format/codetracer_trace_format_cbor_zstd`): the 5-byte
-  # magic `C0 DE 72 AC E2`, a format-version byte, and two reserved bytes.
-  # Both Rust readers (`ctfs_reader.rs`, `seekable_reader.rs`) require it and
-  # skip it before walking chunks.  This reader did not, so it read the magic
-  # as a chunk header: the first four bytes little-endian give a
-  # `compressedSize` of 0xAC72DEC0 (~2.9 GB) and the walk aborted with
-  # "chunk compressed data extends beyond events.log" — a Rust-written
-  # container was unreadable here even though it is valid.
-  #
-  # The Nim writer does NOT emit this prefix (see `codetracer_trace_writer.nim`,
-  # which adds `events.log` and writes chunks straight into it), so the skip
-  # is conditional and Nim-written containers are unaffected.
-  var pos = 0
-  if eventsData.len >= HeaderSize and hasCtfsMagic(eventsData):
-    pos = HeaderSize
-
-  # Decode all chunks: [16-byte header][compressed data]...
-  while pos + ChunkIndexEntrySize <= eventsData.len:
-    let chunk = decodeChunkHeader(eventsData, pos)
-    if chunk.compressedSize == 0:
-      break
-    pos += ChunkIndexEntrySize
-
-    if pos + int(chunk.compressedSize) > eventsData.len:
-      return err("chunk compressed data extends beyond events.log")
-
-    # Decompress the chunk.  Handles both a frame that pledges its content
-    # size and one that does not; see `inflateEventsLogChunk`.
-    let compressedSlice = eventsData[pos ..< pos + int(chunk.compressedSize)]
-    let inflated = inflateEventsLogChunk(compressedSlice)
-    if inflated.isErr:
-      return err(inflated.unsafeError)
-    let decompressed = inflated.get()
-
-    # Decode split-binary events
-    let decoded = decodeAllEvents(decompressed)
-    if decoded.isErr:
-      return err("failed to decode events: " & decoded.unsafeError)
-    for event in decoded.get():
-      reader.events.add(event)
-
-    pos += int(chunk.compressedSize)
-
-  reader.eventCount = reader.events.len
-  ok()
+  ## Decode every event of the recording from its split streams.
+  if not reader.isV4:
+    return err("steps.dat missing: this container records no events")
+  readEventsV4(reader)
 
 # ---------------------------------------------------------------------------
 # JSON output

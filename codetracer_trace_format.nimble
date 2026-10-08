@@ -56,7 +56,6 @@ task test, "Run all tests":
   exec "nim c -r tests/test_trace_types.nim"
   exec "nim c -r tests/test_varint.nim"
   exec "nim c -r tests/test_split_binary.nim"
-  exec "nim c -r tests/test_trace_writer.nim"
   exec "nim c -r tests/test_trace_reader.nim"
   # The same §5d bound in the *other* Nim transcription of the §4 walk:
   # `codetracer_trace_reader.nim`'s own `readInternalFile`. It bounded byte
@@ -72,11 +71,6 @@ task test, "Run all tests":
   exec "nim c -r -d:release tests/test_corrmark_builder.nim"
   exec "nim c -r tests/test_correlation_marker_api.nim"
   exec "nim c -r tests/test_close_publishes_entry_sizes.nim"
-  # Reading a combined-stream bundle written by the sibling Rust
-  # `CtfsTraceWriter`: it prefixes `events.log` with the 8-byte CodeTracer
-  # file header the Nim writer omits, and its chunks are streaming-encoder
-  # frames that do not pledge a decompressed size.
-  exec "nim c -r -p:src tests/test_rust_written_events_log.nim"
   exec "nim c -r tests/test_meta_dat.nim"
   # The writer writes the MCR, replay-launch and layout blocks it is given.
   exec "nim c -r tests/test_writer_meta_blocks.nim"
@@ -259,16 +253,10 @@ task test, "Run all tests":
   exec "nim c -r -p:src tests/test_split_trace.nim"
   exec "nim c -r -p:src tests/test_trace_storage_config.nim"
   exec "nim c -r -p:src tests/test_path_filter.nim"
-  exec "nim c -r -d:release -p:src -p:tests tests/test_ct_print_events_log_fallback.nim"
-  # A Rust-written `events.log` carries an 8-byte stream header this repo's
-  # legacy reader used to mistake for a chunk header, making every such
-  # container unreadable by `ct-print`.
-  exec "nim c -r -d:release -p:src tests/test_rust_events_log_header.nim"
-  # An `events.log` chunk compressed by a STREAMING encoder pledges no
-  # content size, so `ZSTD_getFrameContentSize` answers CONTENTSIZE_UNKNOWN.
-  # This reader tested only for CONTENTSIZE_ERROR and converted the UNKNOWN
-  # sentinel to `int`, killing `ct-print` with a RangeDefect.
-  exec "nim c -r -d:release -p:src tests/test_events_log_unpledged_frame.nim"
+  # `events.log` / `events.fmt` are not part of the trace format: every
+  # reader (library, legacy TraceReader, C ABI, ct-print) refuses a container
+  # carrying either, by name, and the C ABI refuses the formats that wrote one.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src -p:tests tests/test_retired_streams_are_refused.nim"
   # ct-print reports a step position it cannot resolve instead of emitting
   # the plausible wrong (path, line) the unchecked inverse produces.
   exec "nim c -r -d:release -p:src tests/test_ct_print_unresolvable_position.nim"

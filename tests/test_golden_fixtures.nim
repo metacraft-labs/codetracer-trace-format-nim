@@ -14,7 +14,6 @@ import std/json
 import results
 import stew/endians2
 import codetracer_ctfs
-import codetracer_trace_writer
 import ct_pretty_print
 
 const FixtureDir = currentSourcePath().parentDir / "fixtures"
@@ -104,52 +103,6 @@ proc generateSeekableZstd3Frames(): seq[byte] =
   enc.write(data)
   enc.finish()
 
-proc generateTraceComplete(): seq[byte] =
-  ## Full trace writer output with known events.
-  ##
-  ## M-REC-1: passes a stable canonical-form recording_id so the
-  ## golden fixture's meta.json content is reproducible across runs.
-  ## The id is fabricated (the embedded ms timestamp does not
-  ## correspond to a real recording time) and only exists here as a
-  ## byte-stable test constant.
-  let path = getTempDir() / "golden_regen_trace_complete.ct"
-  try:
-    removeFile(path)
-  except OSError:
-    discard
-
-  const GoldenRecordingId = "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb"
-  var writerRes = newTraceWriter(path, "test_program", @["--flag", "input.txt"],
-                                  workdir = "/home/user/project",
-                                  chunkThreshold = 5,
-                                  recordingId = GoldenRecordingId)
-  doAssert writerRes.isOk, "newTraceWriter failed: " & writerRes.error
-  var w = writerRes.get()
-
-  doAssert w.writePath("/src/main.nim").isOk
-  doAssert w.writePath("/src/lib.nim").isOk
-  doAssert w.writeFunction(0, 1, "main").isOk
-  doAssert w.writeStep(0, 1).isOk
-  doAssert w.writeCall(0).isOk
-  doAssert w.writeStep(0, 5).isOk
-  doAssert w.writeStep(0, 6).isOk
-  doAssert w.writeStep(0, 7).isOk
-  doAssert w.writeStep(1, 10).isOk
-  doAssert w.writeReturn().isOk
-  doAssert w.writeStep(0, 8).isOk
-  doAssert w.writeStep(0, 9).isOk
-
-  doAssert w.close().isOk
-
-  let readRes = readCtfsFromFile(path)
-  doAssert readRes.isOk, "readCtfsFromFile failed: " & readRes.error
-  result = readRes.get()
-
-  try:
-    removeFile(path)
-  except OSError:
-    discard
-
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -181,15 +134,6 @@ proc test_seekable_zstd() =
     "Seekable Zstd output differs from expected:\n" & diffStrings(actual, expected)
   echo "PASS: test_seekable_zstd"
 
-proc test_trace_complete() =
-  let data = generateTraceComplete()
-  let actual = prettyPrintCtFile(data)
-  let expectedPath = FixtureDir / "trace_complete.expected"
-  let expected = readExpectedText(expectedPath)
-  doAssert actual == expected,
-    "Trace complete output differs from expected:\n" & diffStrings(actual, expected)
-  echo "PASS: test_trace_complete"
-
 # ---------------------------------------------------------------------------
 # Run all tests
 # ---------------------------------------------------------------------------
@@ -197,5 +141,4 @@ proc test_trace_complete() =
 test_split_binary_events()
 test_ctfs_basic()
 test_seekable_zstd()
-test_trace_complete()
 echo "ALL PASS: test_golden_fixtures"

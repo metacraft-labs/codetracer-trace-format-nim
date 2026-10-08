@@ -321,46 +321,7 @@ proc prettyPrintCtFile*(data: openArray[byte]): string =
     let fileData = readInternalFileData(data, entry.mapBlock, entry.size, blockSize)
     lines.add("")
 
-    if entry.name == "events.log":
-      # Decode chunked compressed events
-      lines.add("=== Internal File: events.log ===")
-      let chunks = decodeAllChunkHeaders(fileData)
-      var pos = 0
-      var chunkIdx = 0
-      for chunk in chunks:
-        pos += ChunkIndexEntrySize
-        let compressedData = fileData[pos ..< pos + int(chunk.compressedSize)]
-        # Decompress
-        let decompSize = ZSTD_getFrameContentSize(
-          unsafeAddr compressedData[0], csize_t(compressedData.len))
-        if decompSize == ZSTD_CONTENTSIZE_ERROR:
-          lines.add("[chunk " & $chunkIdx & "] ERROR: bad frame content size")
-          pos += int(chunk.compressedSize)
-          chunkIdx += 1
-          continue
-        var decompressed = newSeq[byte](int(decompSize))
-        let actualSize = ZSTD_decompress(
-          addr decompressed[0], csize_t(decompressed.len),
-          unsafeAddr compressedData[0], csize_t(compressedData.len))
-        if ZSTD_isError(actualSize) != 0:
-          lines.add("[chunk " & $chunkIdx & "] ERROR: decompression failed")
-          pos += int(chunk.compressedSize)
-          chunkIdx += 1
-          continue
-        decompressed.setLen(int(actualSize))
-        let decoded = decodeAllEvents(decompressed)
-        if decoded.isErr:
-          lines.add("[chunk " & $chunkIdx & "] ERROR: decode failed: " & decoded.unsafeError)
-        else:
-          let events = decoded.get()
-          lines.add("[chunk " & $chunkIdx & "] event_count: " &
-                    $chunk.eventCount & " first_geid: " & $chunk.firstGeid)
-          for i, ev in events:
-            lines.add(prettyPrintEvent(ev, i))
-        pos += int(chunk.compressedSize)
-        chunkIdx += 1
-    elif entry.name == "events.fmt" or entry.name == "meta.json" or
-        entry.name == "paths.json":
+    if entry.name == "meta.json" or entry.name == "paths.json":
       lines.add("=== Internal File: " & entry.name & " ===")
       var content = newString(fileData.len)
       for i in 0 ..< fileData.len:

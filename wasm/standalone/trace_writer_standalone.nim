@@ -2,9 +2,9 @@
 ##
 ## `ctfs_standalone.nim` proves the CONTAINER layer builds and reads back with
 ## no WASI and no imports. This module does the same for the layer above it —
-## `codetracer_trace_writer`, i.e. split-binary encoding, chunked seekable Zstd,
-## `meta.dat` and `paths.dat` — which is the layer a recorder actually calls and
-## the one a browser or a Rust `cdylib` host embeds.
+## the split-stream `MultiStreamTraceWriter`, i.e. the step, value, call and
+## I/O event streams, `meta.dat` and `paths.dat` — which is the layer a recorder
+## actually calls and the one a browser or a Rust `cdylib` host embeds.
 ##
 ## Two things in the writer had to change before this shape was reachable, and
 ## both are in the module graph below rather than in this file:
@@ -13,9 +13,9 @@
 ##     alone. `--os:any` has no POSIX `struct tm`, so `times.nim` does not
 ##     compile there. Under `-d:ctHostClock` the host supplies the millisecond
 ##     clock, the way `-d:ctLeanRecord` already lets it supply the entropy.
-##   * `newTraceWriter` opened its container with `createCtfsStreaming(path)`,
-##     so the module would have needed a filesystem it does not have.
-##     `newTraceWriterInMemory` builds in a `seq[byte]` and `containerBytes`
+##   * A writer given a path opens its container with
+##     `createCtfsStreaming(path)`, which needs a filesystem the module does not
+##     have. `initMultiStreamWriter("")` builds in a `seq[byte]` and `toBytes`
 ##     hands it back after `close`.
 ##
 ## `trace_writer_host_stub.c` supplies `ct_host_unix_ms`, `getentropy`, `fclose`
@@ -25,8 +25,7 @@
 ## Build: see `wasm/build-trace-writer-standalone.sh`.
 
 import results
-import codetracer_trace_writer
-import codetracer_trace_types
+import codetracer_trace_writer/multi_stream_writer
 import codetracer_ctfs/container
 import codetracer_ctfs/types
 
@@ -35,29 +34,29 @@ const
     ## A caller-supplied `recordingId`, which is also what keeps the selftest
     ## clear of the deterministic UUIDv7 the host stub would otherwise mint.
   SelftestSteps = 8192
-    ## Above `DefaultChunkThreshold` (4096), so the run seals at least one
-    ## chunk and the seekable-Zstd path is exercised rather than skipped.
+    ## Above the step stream's 4096-record chunk, so the run seals at least
+    ## one chunk and the compressed-chunk path is exercised rather than
+    ## skipped.
 
 var built: seq[byte]
 
 proc buildContainer(): int32 =
   ## Build a trace container in linear memory. Returns 0, or the failing step.
-  let wr = newTraceWriterInMemory("trace_writer_standalone", @[],
-                                  recordingId = SelftestRecordingId)
+  let wr = initMultiStreamWriter("", "trace_writer_standalone",
+                                 recordingId = SelftestRecordingId)
   if wr.isErr: return 1
   var w = wr.get()
 
-  if w.writePath("/ct/standalone.nim").isErr: return 2
+  let pathRes = w.registerPath("/ct/standalone.nim")
+  if pathRes.isErr: return 2
+  let pathId = pathRes.get()
 
   for i in 0 ..< SelftestSteps:
-    if w.writeStep(0'u64, int64(i)).isErr: return 3
-
-  # The column-aware opcode, which is the whole reason this writer is of
-  # interest to a caller that has column information to record.
-  if w.writeStepWithColumn(0'u64, 1'i64, 7'i64).isErr: return 4
+    if w.registerStep(pathId, uint64(i + 1), []).isErr: return 3
 
   if w.close().isErr: return 5
-  built = w.containerBytes()
+  built = w.toBytes()
+  if w.closeCtfs().isErr: return 4
   0
 
 proc ctBuild(): int32 {.exportc: "ct_build", cdecl.} =
@@ -92,16 +91,17 @@ proc ctSelftest(): int32 {.exportc: "ct_selftest", cdecl.} =
      built[2] != CtfsMagic[2] or built[3] != CtfsMagic[3] or
      built[4] != CtfsMagic[4]: return 7
 
-  # The four streams `newTraceWriterInMemory` + `close` are supposed to leave
-  # behind. `events.log` carries the steps; an empty one would still be a
-  # well-formed container, which is why the length is checked and not just the
-  # presence.
-  let ev = readInternalFile(built, "events.log")
-  if ev.isErr: return 8
-  if ev.get().len == 0: return 9
+  # The members a split-stream writer leaves behind. `steps.dat` carries the
+  # steps; an empty one would still be a well-formed container, which is why
+  # its length is checked and not just its presence.
+  let steps = readInternalFile(built, "steps.dat")
+  if steps.isErr: return 8
+  if steps.get().len == 0: return 9
 
-  if readInternalFile(built, "events.fmt").isErr: return 10
+  if readInternalFile(built, "steps.idx").isErr: return 10
   if readInternalFile(built, "meta.dat").isErr: return 11
   if readInternalFile(built, "paths.dat").isErr: return 12
+  # No combined event stream: it is not part of the trace format.
+  if readInternalFile(built, "events.log").isOk: return 13
 
   0
