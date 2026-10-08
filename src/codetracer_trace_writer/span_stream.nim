@@ -154,7 +154,8 @@ when defined(nimPreviewSlimSystem):
 ##
 ## `decodeSpanRecord` NEVER silently drops or repairs a span.  It rejects:
 ## truncated fields, trailing bytes inside a record, unknown `flags` bits,
-## unknown `structural` bits, a `status` outside 0..2, and an open record whose
+## unknown `structural` bits, a `status` outside 0..2, a string that is not
+## UTF-8 (the encoder refuses one too), and an open record whose
 ## `end_wall_ns` / `end_step` are non-zero (the spec requires them to be 0 when
 ## `flags.open` is set).  Any of these fail the whole read with an error rather
 ## than yielding a partial span list.
@@ -194,7 +195,7 @@ when defined(nimPreviewSlimSystem):
 ##    next, not-yet-sealed chunk, and feeding those trailing bytes to
 ##    `ZSTD_decompress` is an error.
 
-import std/[algorithm, sets, tables]
+import std/[algorithm, sets, tables, unicode]
 import results
 import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
@@ -352,6 +353,12 @@ proc hexByte(b: uint8): string =
   result[0] = digits[int(b shr 4)]
   result[1] = digits[int(b and 0x0F)]
 
+proc requireUtf8(s: string, what: string): Result[void, string] =
+  ## Every string a span record or `spantype.ns` carries is UTF-8 text.
+  if validateUtf8(s) >= 0:
+    return err("span record: " & what & " is not UTF-8")
+  ok()
+
 proc appendVarintStr(buf: var seq[byte], s: string) =
   encodeVarint(uint64(s.len), buf)
   for i in 0 ..< s.len:
@@ -367,6 +374,7 @@ proc readVarintStr(data: openArray[byte], pos: var int,
   for i in 0 ..< sLen:
     s[i] = char(data[pos + i])
   pos += sLen
+  ?requireUtf8(s, what)
   ok(s)
 
 proc spanFlagsByte*(s: SpanRecord): uint8 =
@@ -398,6 +406,15 @@ proc encodeSpanRecord*(s: SpanRecord): Result[seq[byte], string] =
       (s.externalRecording.len > 0 or s.externalPath.len > 0):
     return err("span record: span " & $s.spanId & " carries external " &
       "binding fields but flags.external is not set")
+
+  if s.isExternal:
+    ?requireUtf8(s.externalRecording, "external_recording")
+    ?requireUtf8(s.externalPath, "external_path")
+  ?requireUtf8(s.spanType, "span_type")
+  ?requireUtf8(s.label, "label")
+  for (k, v) in s.metadata:
+    ?requireUtf8(k, "metadata key")
+    ?requireUtf8(v, "metadata value")
 
   var buf: seq[byte] = @[]
   encodeVarint(s.spanId, buf)
@@ -819,6 +836,8 @@ proc parseSpanTypeNamespace*(data: openArray[byte]):
     var name = newString(nameLen)
     for j in 0 ..< nameLen:
       name[j] = char(data[nameOff + j])
+    if validateUtf8(name) >= 0:
+      return err("spantype.ns: name of type " & $typeId & " is not UTF-8")
     var ids = newSeq[uint64](spanCount)
     for j in 0 ..< spanCount:
       ids[j] = getU64LE(data, spansOff + j * 8)

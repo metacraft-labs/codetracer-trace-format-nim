@@ -1340,6 +1340,36 @@ proc span_stream_multi_stream_writer_gating() {.raises: [].} =
 
   echo "PASS: span_stream_multi_stream_writer_gating"
 
+proc span_stream_refuses_text_that_is_not_utf8() {.raises: [].} =
+  ## Every string a span record or `spantype.ns` carries is UTF-8 text. A
+  ## writer refuses to encode one that is not, and a reader refuses to decode
+  ## one, so a byte string never reaches a consumer as a label.
+  var notText = SpanRecord(spanId: 1, status: spanStatusOk, endStep: 4,
+    spanType: "t", label: "l\xFF")
+  doAssert encodeSpanRecord(notText).isErr,
+    "a label that is not UTF-8 must be refused by the encoder"
+  notText.label = "l"
+  let enc = encodeSpanRecord(notText)
+  doAssert enc.isOk, enc.error
+  var bad = enc.get()
+  # A metadata-free record ends `[label 1 byte][structural][metadata_count]`.
+  bad[^3] = 0xFF'u8
+  doAssert decodeSpanRecord(bad).isErr,
+    "a label that is not UTF-8 must be refused by the decoder"
+  for field in ["span_type", "metadata"]:
+    var s = notText
+    if field == "span_type": s.spanType = "\xC3"
+    else: s.metadata = @[("k", "\xC3")]
+    doAssert encodeSpanRecord(s).isErr,
+      "a " & field & " that is not UTF-8 must be refused by the encoder"
+
+  var image = encodeSpanTypeNamespace(["ab"], [@[1'u64]])
+  doAssert parseSpanTypeNamespace(image).isOk
+  image[18 + 28] = 0xFF'u8
+  doAssert parseSpanTypeNamespace(image).isErr,
+    "a span-type name that is not UTF-8 must be refused"
+  echo "PASS: span_stream_refuses_text_that_is_not_utf8"
+
 # ---------------------------------------------------------------------------
 
 span_stream_roundtrip_both_bindings()
@@ -1352,3 +1382,4 @@ span_stream_read_span_touches_one_chunk()
 span_stream_fail_closed_decode()
 span_stream_page_by_span_id()
 span_stream_multi_stream_writer_gating()
+span_stream_refuses_text_that_is_not_utf8()
