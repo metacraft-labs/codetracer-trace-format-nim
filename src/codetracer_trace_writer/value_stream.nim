@@ -1027,13 +1027,15 @@ proc readStepValues*(r: var ValueStreamReader,
   if not r.spec.locate(stepIndex, within, why):
     return err(why)
   var skipped: seq[uint8]
-  var values: seq[VariableValue]
   var noEvents: seq[DecodedValueEvent]
-  let decoded = walkRecord(r.spec.record(within), wtValues, noEvents, values,
-    skipped, why)
+  # The values are walked into the result in place: built in a local and
+  # returned, the result was copied out of memory just written field by
+  # field, a load the CPU cannot forward from those stores.
+  result.ok(newSeq[VariableValue]())
+  if not walkRecord(r.spec.record(within), wtValues, noEvents,
+      result.unsafeGet(), skipped, why):
+    result = err(why)
   r.noteSkippedTags(skipped)
-  if decoded: ok(values)
-  else: err(why)
 
 proc readStepDropVariable*(r: var ValueStreamReader,
     stepIndex: uint64): Result[seq[uint64], string] =
