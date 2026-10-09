@@ -180,6 +180,10 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_split_binary.nim", binary: "build/test-bin/test_split_binary"),
   TestSpec(source: "tests/test_trace_writer.nim", binary: "build/test-bin/test_trace_writer"),
   TestSpec(source: "tests/test_trace_reader.nim", binary: "build/test-bin/test_trace_reader"),
+  # The reader's entry points stay callable from `{.gcsafe.}` code. Only the
+  # default memory manager is modelled; the nimble `test` task also compiles
+  # it under refc, which `TestSpec` has no field for.
+  TestSpec(source: "tests/test_reader_is_gcsafe.nim", binary: "build/test-bin/test_reader_is_gcsafe"),
   TestSpec(source: "tests/test_golden_fixtures.nim", binary: "build/test-bin/test_golden_fixtures"),
   TestSpec(source: "tests/test_cross_compat.nim", binary: "build/test-bin/test_cross_compat"),
   TestSpec(source: "tests/test_xxh64.nim", binary: "build/test-bin/test_xxh64"),
