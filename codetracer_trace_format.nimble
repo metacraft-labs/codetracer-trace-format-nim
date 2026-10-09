@@ -57,6 +57,11 @@ task test, "Run all tests":
   exec "nim c -r tests/test_varint.nim"
   exec "nim c -r tests/test_split_binary.nim"
   exec "nim c -r tests/test_trace_reader.nim"
+  # The reader's entry points stay callable from GC-safe code: a forward
+  # declaration with no effects stated makes every caller above it lose its
+  # inferred GC-safety. refc too, because consumers build with it.
+  exec "nim c -r -p:src tests/test_reader_is_gcsafe.nim"
+  exec "nim c -r -p:src --mm:refc tests/test_reader_is_gcsafe.nim"
   # The same §5d bound in the *other* Nim transcription of the §4 walk:
   # `codetracer_trace_reader.nim`'s own `readInternalFile`. It bounded byte
   # offsets only, and read a null mapping root as a walk through block 0 —

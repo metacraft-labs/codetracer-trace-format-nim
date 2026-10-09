@@ -331,7 +331,27 @@ proc totalEvents*(w: ExecStreamWriter): uint64 = w.totalEvents
 # ---------------------------------------------------------------------------
 
 proc countSpecChunkRecords(raw: openArray[byte],
-    allowSourceReload: bool): Result[int, string]
+    allowSourceReload: bool): Result[int, string] =
+  var pos = 0
+  var count = 0
+  while pos < raw.len:
+    let ev = decodeStepEvent(raw, pos, allowSourceReload)
+    if ev.isErr:
+      return err("failed to count records in last step chunk: " & ev.unsafeError)
+    # FALSIFIER (``gdh2FalsifyUncountedMarker``,
+    # gdh2_reload_marker_round_trips): treat the reload marker as "not a
+    # record" while still consuming its bytes.  This is the SHORTER,
+    # PLAUSIBLE step stream the strict-rejection contract exists to
+    # prevent — no error, no diagnostic, just a total that disagrees with
+    # the value stream's.  It is here to prove the gate's count
+    # comparison has teeth: the naive skip arm cascades into a different
+    # tag error and never reaches it.
+    when gdh2Arm(gdh2FalsifyUncountedMarker):
+      if ev.get().kind != sekSourceReload:
+        inc count
+    else:
+      inc count
+  ok(count)
 
 proc decodeSpecChunkRecordCount(compressed: openArray[byte],
     allowSourceReload: bool, stored: bool): Result[int, string] =
@@ -360,29 +380,6 @@ proc decodeSpecChunkRecordCount(compressed: openArray[byte],
       $ZSTD_getErrorName(decompSize))
   raw.setLen(int(decompSize))
   countSpecChunkRecords(raw, allowSourceReload)
-
-proc countSpecChunkRecords(raw: openArray[byte],
-    allowSourceReload: bool): Result[int, string] =
-  var pos = 0
-  var count = 0
-  while pos < raw.len:
-    let ev = decodeStepEvent(raw, pos, allowSourceReload)
-    if ev.isErr:
-      return err("failed to count records in last step chunk: " & ev.unsafeError)
-    # FALSIFIER (``gdh2FalsifyUncountedMarker``,
-    # gdh2_reload_marker_round_trips): treat the reload marker as "not a
-    # record" while still consuming its bytes.  This is the SHORTER,
-    # PLAUSIBLE step stream the strict-rejection contract exists to
-    # prevent — no error, no diagnostic, just a total that disagrees with
-    # the value stream's.  It is here to prove the gate's count
-    # comparison has teeth: the naive skip arm cascades into a different
-    # tag error and never reaches it.
-    when gdh2Arm(gdh2FalsifyUncountedMarker):
-      if ev.get().kind != sekSourceReload:
-        inc count
-    else:
-      inc count
-  ok(count)
 
 proc openExecStream(datData: sink MemberView, idxData: seq[byte],
     stored: bool, cacheBytes: uint64,
@@ -569,7 +566,18 @@ proc advanceCursor(ev: StepEvent, i: int, chunkIdx: int, cursor: var uint64,
   true
 
 proc commitChunk(r: var ExecStreamReader, slot: int,
-    chunkIdx: int): Result[int, string]
+    chunkIdx: int): Result[int, string] =
+  ## Make the chunk just put in ``slot`` resident, nothing of it decoded yet.
+  template m: untyped = r.cache.meta(slot)
+  m.nextPos = 0
+  m.resolvePos = 0
+  m.posRefusedAt = high(int)
+  m.complete = r.cache.data(slot).len == 0
+
+  r.cache.commit(slot, chunkIdx)
+  r.heldChunk = chunkIdx + 1
+  r.heldSlot = slot
+  ok(slot)
 
 proc chunkSlot(r: var ExecStreamReader,
     chunkIdx: int): Result[int, string] =
@@ -626,20 +634,6 @@ proc chunkSlot(r: var ExecStreamReader,
   # each increment is a genuinely new inflation.
   r.chunkDecompressions += 1
   r.commitChunk(slot, chunkIdx)
-
-proc commitChunk(r: var ExecStreamReader, slot: int,
-    chunkIdx: int): Result[int, string] =
-  ## Make the chunk just put in ``slot`` resident, nothing of it decoded yet.
-  template m: untyped = r.cache.meta(slot)
-  m.nextPos = 0
-  m.resolvePos = 0
-  m.posRefusedAt = high(int)
-  m.complete = r.cache.data(slot).len == 0
-
-  r.cache.commit(slot, chunkIdx)
-  r.heldChunk = chunkIdx + 1
-  r.heldSlot = slot
-  ok(slot)
 
 const StartStride = 16
   ## Every how many records a chunk notes where one starts.

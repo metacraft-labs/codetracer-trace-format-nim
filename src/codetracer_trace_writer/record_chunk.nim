@@ -49,7 +49,13 @@ proc reset(c: var RecordChunk) =
   c.framed = 0
   c.framedTo = 0
 
-proc loadStored*(c: var RecordChunk, index: int, content: openArray[byte])
+proc loadStored*(c: var RecordChunk, index: int, content: openArray[byte]) =
+  ## Hold chunk `index` whose records are `content` as stored, uncompressed.
+  c.reset()
+  c.raw.setLenUninit(content.len)
+  if content.len > 0:
+    copyMem(addr c.raw[0], unsafeAddr content[0], content.len)
+  c.index = index
 
 proc load*(c: var RecordChunk, index: int, frame: openArray[byte],
     what: string, stored = false): Result[void, string] =
@@ -77,14 +83,6 @@ proc load*(c: var RecordChunk, index: int, frame: openArray[byte],
       c.raw.setLen(int(got))
   c.index = index
   ok()
-
-proc loadStored*(c: var RecordChunk, index: int, content: openArray[byte]) =
-  ## Hold chunk `index` whose records are `content` as stored, uncompressed.
-  c.reset()
-  c.raw.setLenUninit(content.len)
-  if content.len > 0:
-    copyMem(addr c.raw[0], unsafeAddr content[0], content.len)
-  c.index = index
 
 type
   FrameOutcome* = enum

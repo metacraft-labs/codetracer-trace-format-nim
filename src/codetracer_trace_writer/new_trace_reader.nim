@@ -600,42 +600,6 @@ proc refuseRetiredMembers*(containerBytes: openArray[byte],
         "of the trace format; it is refused")
   ok()
 
-proc openNewTraceFromImage(image: ContainerImage, blockSize: uint32,
-    maxEntries: uint32, assumeColumnAwarePaths: bool):
-    Result[NewTraceReader, string]
-
-proc openNewTraceFromBytes*(data: sink seq[byte],
-    blockSize: uint32 = DefaultBlockSize,
-    maxEntries: uint32 = DefaultMaxRootEntries,
-    assumeColumnAwarePaths: bool = false): Result[NewTraceReader, string] =
-  ## Open a trace from in-memory bytes. The reader keeps ``data``: pass the
-  ## buffer by its last use (or ``move`` it) and it is taken without a copy.
-  ##
-  ## ``assumeColumnAwarePaths`` overrides the ``meta.dat`` bit 4
-  ## declaration for the ``paths.dat`` record layout only.  Pass it when
-  ## you know out of band that the trace was produced by a recorder that
-  ## emitted Layout A path records without setting the flag (see the
-  ## note at the Layout A block below).  It is an assertion by the
-  ## caller, not a guess by the reader: on a trace whose records are not
-  ## Layout A the open fails with a named ``paths.dat[N]: …`` error
-  ## instead of returning misdecoded positions.
-  var bytes = data
-  # Versions 5 and 6 in both profiles are read (`ctfs-container.md` §1a); a
-  # container stored under a whole-file scheme is reconstructed first, as
-  # `header || decompress(rest)`. The reconstructed image keeps its header,
-  # which still declares the scheme it was stored under; in the reader's own
-  # copy that byte is set to `none`, the true statement about the bytes it
-  # holds, so every member read below refuses a stored compressed body and
-  # needs no word that this one has been undone.
-  if bytes.len > V6CompressionOffset and bytes[5] == CtfsVersionV6 and
-      bytes[V6CompressionOffset] != uint8(ord(wfcNone)):
-    var image = ? reconstructImage(bytes)
-    image[V6CompressionOffset] = uint8(ord(wfcNone))
-    bytes = move image
-  ? checkReadableContainer(bytes)
-  openNewTraceFromImage(newContainerImage(move bytes), blockSize, maxEntries,
-    assumeColumnAwarePaths)
-
 proc loadTable(image: ContainerImage, name: string, blockSize: uint32,
     maxEntries: uint32, dest: var InterningTableReader): Result[void, string] =
   ## The interning table `name` into `dest`. A table that is absent is empty;
@@ -783,6 +747,38 @@ proc openNewTraceFromImage(image: ContainerImage, blockSize: uint32,
   reader.posSpace = positionSpace(reader.lineLengths, reader.lineCounts,
     int(reader.pathReader.count()), reader.meta.hasColumnAwareSteps)
   ok(reader)
+
+proc openNewTraceFromBytes*(data: sink seq[byte],
+    blockSize: uint32 = DefaultBlockSize,
+    maxEntries: uint32 = DefaultMaxRootEntries,
+    assumeColumnAwarePaths: bool = false): Result[NewTraceReader, string] =
+  ## Open a trace from in-memory bytes. The reader keeps ``data``: pass the
+  ## buffer by its last use (or ``move`` it) and it is taken without a copy.
+  ##
+  ## ``assumeColumnAwarePaths`` overrides the ``meta.dat`` bit 4
+  ## declaration for the ``paths.dat`` record layout only.  Pass it when
+  ## you know out of band that the trace was produced by a recorder that
+  ## emitted Layout A path records without setting the flag (see the
+  ## note at the Layout A block below).  It is an assertion by the
+  ## caller, not a guess by the reader: on a trace whose records are not
+  ## Layout A the open fails with a named ``paths.dat[N]: …`` error
+  ## instead of returning misdecoded positions.
+  var bytes = data
+  # Versions 5 and 6 in both profiles are read (`ctfs-container.md` §1a); a
+  # container stored under a whole-file scheme is reconstructed first, as
+  # `header || decompress(rest)`. The reconstructed image keeps its header,
+  # which still declares the scheme it was stored under; in the reader's own
+  # copy that byte is set to `none`, the true statement about the bytes it
+  # holds, so every member read below refuses a stored compressed body and
+  # needs no word that this one has been undone.
+  if bytes.len > V6CompressionOffset and bytes[5] == CtfsVersionV6 and
+      bytes[V6CompressionOffset] != uint8(ord(wfcNone)):
+    var image = ? reconstructImage(bytes)
+    image[V6CompressionOffset] = uint8(ord(wfcNone))
+    bytes = move image
+  ? checkReadableContainer(bytes)
+  openNewTraceFromImage(newContainerImage(move bytes), blockSize, maxEntries,
+    assumeColumnAwarePaths)
 
 when ctHasFilesystem:
   # The only two entry points in this module that name a file. Everything
