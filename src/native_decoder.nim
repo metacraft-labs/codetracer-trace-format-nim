@@ -70,6 +70,7 @@ import codetracer_ctfs/container
 import codetracer_ctfs/types
 import codetracer_ctfs/zstd_bindings
 import codetracer_trace_writer/meta_dat
+import codetracer_trace_writer/interning_table
 
 # ---------------------------------------------------------------------------
 # Wire-format constants (must match the native recorder)
@@ -149,8 +150,9 @@ proc detectNativeBundle*(data: openArray[byte]): Result[NativeBundleInfo, string
     return err("file too small to be a CTFS container")
   if not hasCtfsMagic(data):
     return err("invalid CTFS magic")
-  if not hasValidVersion(data):
-    return err("unsupported CTFS version: byte 0x" & toHex(int(data[5]), 2))
+  let versionErr = ctfsVersionError(data)
+  if versionErr.len > 0:
+    return err(versionErr)
 
   let blockSize = readU32LE(data, 8)
   let maxRoot = readU32LE(data, 12)
@@ -600,10 +602,21 @@ proc buildNativeFullDocument*(data: openArray[byte], opts: NativeOpts):
   args = md.args
   workdir = md.workdir
   metaVersion = $md.version
-  metaDatPaths = md.paths
+  # Source paths are `paths.dat`'s records (meta.dat v6 carries no list).
+  if hasInternalFile(data, "paths.dat", info.maxRoot):
+    let prR = initInterningTableReader(data, "paths", info.blockSize,
+      info.maxRoot)
+    if prR.isErr:
+      return err("paths.dat: " & prR.error)
+    let pr = prR.get()
+    for i in 0'u64 ..< pr.count():
+      let pathR = pr.readById(i)
+      if pathR.isErr:
+        return err("paths.dat[" & $i & "]: " & pathR.error)
+      metaDatPaths.add(splitInterningPayload(pathR.get()).name)
   if md.mcrFields.isSome:
     let mcr = md.mcrFields.get()
-    recordingMode = "mcr"
+    recordingMode = md.recorderId
     platform = mcr.platform
     tickSource = mcr.tickSourceStr
     tickDef = mcr.tickGranularity

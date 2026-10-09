@@ -237,7 +237,7 @@ proc test_reader_meta_and_encoder_calls_fail_visibly() =
 proc test_every_exported_proc_is_guarded() =
   const src = staticRead("../src/codetracer_trace_writer_ffi.nim")
   const unguarded = ["trace_writer_last_error", "trace_writer_clear_last_error",
-    "codetracer_trace_writer_init"]
+    "trace_writer_build_config", "codetracer_trace_writer_init"]
   var missing: seq[string] = @[]
   var i = 0
   var seen = 0

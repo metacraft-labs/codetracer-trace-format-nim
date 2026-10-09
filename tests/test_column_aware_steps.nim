@@ -37,14 +37,18 @@ proc test_column_aware_round_trip() {.raises: [].} =
   var w = writerRes.get()
 
   # Opt into column-aware mode *before* any step is written.
-  w.enableColumnAwareSteps()
-
+  doAssert w.enableColumnAwareSteps().isOk
   # WITH per-line lengths. A column-aware trace addresses a position as a
   # byte offset within a file's slot, and a file registered without that table
   # is sized by the line-only fallback instead — one address per line — so a
   # column delta on it would name a later LINE rather than a column. The
   # writer refuses that now; this fixture supplies the table it always needed.
-  let p0 = w.registerPath("/src/main.py", @[20'u32, 20, 20, 20])
+  # Twenty lines of 30 columns: line 10 starts at position 270, past the
+  # one-byte varint range, so the normative rule writes the small moves below
+  # as deltas (each strictly shorter than the position) rather than absolutes.
+  var lens: seq[uint32]
+  for i in 0 ..< 20: lens.add(30'u32)
+  let p0 = w.registerPath("/src/main.py", lens)
   doAssert p0.isOk
 
   # First step must be absolute (registerStep) to define the running
@@ -130,8 +134,7 @@ proc test_column_step_first_is_rejected() {.raises: [].} =
   let writerRes = initMultiStreamWriter("test_first_col.ct", "first_col")
   doAssert writerRes.isOk
   var w = writerRes.get()
-  w.enableColumnAwareSteps()
-
+  doAssert w.enableColumnAwareSteps().isOk
   doAssert w.registerPath("/src/main.py").isOk
   let colRes = w.registerColumnStep(1, @[])
   doAssert colRes.isErr,
@@ -179,8 +182,7 @@ proc test_paths_dat_line_lengths_round_trip() {.raises: [].} =
   let writerRes = initMultiStreamWriter("test_paths_lengths.ct", "ll_test")
   doAssert writerRes.isOk
   var w = writerRes.get()
-  w.enableColumnAwareSteps()
-
+  doAssert w.enableColumnAwareSteps().isOk
   let llA: seq[uint32] = @[20'u32, 25, 30, 27, 22]
   let llB: seq[uint32] = @[10'u32, 12, 14]
 
@@ -267,8 +269,7 @@ proc test_decode_global_position_index() {.raises: [].} =
   let writerRes = initMultiStreamWriter("test_decode_pos.ct", "decode_pos")
   doAssert writerRes.isOk
   var w = writerRes.get()
-  w.enableColumnAwareSteps()
-
+  doAssert w.enableColumnAwareSteps().isOk
   # File A: 4 lines × 10 columns each → file_size = 40.
   let llA: seq[uint32] = @[10'u32, 10, 10, 10]
   # File B: 6 lines × 20 columns each → file_size = 120.  Line 5
@@ -336,7 +337,7 @@ proc test_step_record_column_field() {.raises: [].} =
   let writerRes = initMultiStreamWriter(path, "col_field")
   doAssert writerRes.isOk
   var w = writerRes.get()
-  w.enableColumnAwareSteps()
+  doAssert w.enableColumnAwareSteps().isOk
   # With per-line lengths: a column delta is only addressable in a file whose
   # slot is sized by its own line table (see `test_column_aware_round_trip`).
   doAssert w.registerPath("/src/main.py", @[20'u32, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20]).isOk
@@ -454,6 +455,8 @@ proc handcraftMetaDatWithFlags(flags: uint16): seq[byte] {.raises: [].} =
   # Flags
   buf.add(byte(flags and 0xFF))
   buf.add(byte((flags shr 8) and 0xFF))
+  # flags_ext (always present at version 6)
+  buf.add(0'u8); buf.add(0'u8); buf.add(0'u8); buf.add(0'u8)
   # recording_id
   encodeVarint(uint64(TestRecordingId.len), buf)
   for c in TestRecordingId:
@@ -464,9 +467,7 @@ proc handcraftMetaDatWithFlags(flags: uint16): seq[byte] {.raises: [].} =
   buf.add(0'u8)
   # workdir (empty)
   buf.add(0'u8)
-  # recorder_id (empty)
-  buf.add(0'u8)
-  # paths_count = 0
+  # recorder_id (empty); version 6 carries no path list
   buf.add(0'u8)
   buf
 
@@ -565,8 +566,7 @@ proc test_writer_gli_matches_reader_decode() {.raises: [].} =
   let writerRes = initMultiStreamWriter("test_writer_gli.ct", "writer_gli")
   doAssert writerRes.isOk
   var w = writerRes.get()
-  w.enableColumnAwareSteps()
-
+  doAssert w.enableColumnAwareSteps().isOk
   # Two files with distinct line-length distributions.
   let llA: seq[uint32] = @[10'u32, 10, 10, 10]   # file_size = 40
   let llB: seq[uint32] = @[20'u32, 20, 20, 20]   # file_size = 80
@@ -625,9 +625,8 @@ proc test_capability_flags_round_trip() {.raises: [].} =
   doAssert writerRes.isOk, "init failed: " & writerRes.error
   var w = writerRes.get()
 
-  w.enableColumnBreakpointsSupport()
-  w.enableColumnMotionsSupport()
-
+  doAssert w.enableColumnBreakpointsSupport().isOk
+  doAssert w.enableColumnMotionsSupport().isOk
   doAssert w.registerPath("/src/main.rs").isOk
   doAssert w.registerStep(0, 1, @[]).isOk
   doAssert w.close().isOk
@@ -656,7 +655,7 @@ proc test_capability_flags_independent() {.raises: [].} =
   doAssert writerRes.isOk
   var w = writerRes.get()
 
-  w.enableColumnBreakpointsSupport()
+  doAssert w.enableColumnBreakpointsSupport().isOk
   doAssert w.registerPath("/src/main.rs").isOk
   doAssert w.registerStep(0, 1, @[]).isOk
   doAssert w.close().isOk
@@ -684,7 +683,7 @@ proc test_capability_flags_default_off() {.raises: [].} =
   let writerRes = initMultiStreamWriter("test_caps_off.ct", "caps_off")
   doAssert writerRes.isOk
   var w = writerRes.get()
-  w.enableColumnAwareSteps()
+  doAssert w.enableColumnAwareSteps().isOk
   doAssert w.registerPath("/src/main.rs").isOk
   doAssert w.registerStep(0, 1, @[]).isOk
   doAssert w.close().isOk
@@ -720,7 +719,7 @@ proc test_capability_bits_reject_without_column_aware_buffer() {.raises: [].} =
   var trapped = false
   try:
     discard writeMetaDatToBuffer(
-      meta, paths = [],
+      meta,
       columnAwareSteps = false,
       supportsColumnBreakpoints = true)
   except AssertionDefect:
@@ -755,9 +754,9 @@ proc test_column_aware_after_a_path_is_refused_at_close() {.raises: [].} =
     var w = initMultiStreamWriter(dir / ("late_column_aware_" & label & ".ct"), "late_col").get()
     doAssert w.registerPath("/src/interned_before_the_opt_in.nr").isOk
     case enable
-    of 0: w.enableColumnAwareSteps()
-    of 1: w.enableColumnBreakpointsSupport()
-    else: w.enableColumnMotionsSupport()
+    of 0: doAssert w.enableColumnAwareSteps().isOk
+    of 1: doAssert w.enableColumnBreakpointsSupport().isOk
+    else: doAssert w.enableColumnMotionsSupport().isOk
     let closed = w.close()
     doAssert closed.isErr,
       label & " after a path was interned must fail close(): that path's " &
@@ -768,7 +767,7 @@ proc test_column_aware_after_a_path_is_refused_at_close() {.raises: [].} =
   # The control: the same writer with the opt-in FIRST closes, and its one
   # record decodes as Layout A to exactly the path that was registered.
   var ok = initMultiStreamWriter(dir / "late_column_aware_in_order.ct", "late_col").get()
-  ok.enableColumnAwareSteps()
+  doAssert ok.enableColumnAwareSteps().isOk
   doAssert ok.registerPath("/src/interned_before_the_opt_in.nr").isOk
   doAssert ok.registerStep(0, 1, @[]).isOk
   let closed = ok.close()

@@ -95,6 +95,60 @@ const DefaultLinesPerFile*: uint64 = 100_000
   ## kept readable, and the reason the constant still lives here next to
   ## the prefix-sum arithmetic it parameterises.
 
+const ConventionalLineLength*: uint32 = 1024
+  ## The per-line position count of the conventional column-aware table
+  ## (``internal-files.md`` §"`paths.dat` Layout A"): a column-aware file
+  ## first mentioned with no table is recorded as ``DefaultLinesPerFile``
+  ## lines of this many positions. A column above it is recorded at this
+  ## column of its line; a line above ``DefaultLinesPerFile`` is refused.
+  ##
+  ## The table is written as ``line_count = 0`` with no line lengths, its
+  ## only encoding, and is held as this rule rather than as an array: an
+  ## EMPTY column-aware table means the conventional one, in the writer, in
+  ## ``paths.dat`` and in the reader.
+
+const ConventionalFileSize*: uint64 =
+  DefaultLinesPerFile * uint64(ConventionalLineLength)
+  ## The positions a file with the conventional table occupies.
+
+proc conventionalLineLengths*(): seq[uint32] =
+  ## The conventional column-aware table spelled out — for a recorder or a
+  ## test that builds it; the writer and the reader never hold it.
+  result = newSeq[uint32](int(DefaultLinesPerFile))
+  for L in result.mitems:
+    L = ConventionalLineLength
+
+proc isConventionalTable*(lineLengths: openArray[uint32]): bool =
+  ## Whether ``lineLengths`` is the conventional table. Decided by content,
+  ## so a file is treated alike whether the writer chose the table or the
+  ## recorder built it: the two are the same record on the wire.
+  if uint64(lineLengths.len) != DefaultLinesPerFile:
+    return false
+  for L in lineLengths:
+    if L != ConventionalLineLength:
+      return false
+  true
+
+proc columnTableAtFirstMention*(lineLengths: openArray[uint32]): seq[uint32] =
+  ## The table a column-aware writer records for a file first mentioned with
+  ## ``lineLengths`` (``internal-files.md`` §"`paths.dat` Layout A"):
+  ##
+  ## * empty — no table given — is the conventional table;
+  ## * a table whose lines hold nothing gives its first line one position,
+  ##   keeping its line count (``[0]`` → ``[1]``, ``[0, 0]`` → ``[1, 0]``),
+  ##   so the file's size is not 0;
+  ## * anything else is recorded as given.
+  ##
+  ## The conventional table is returned in its held form, EMPTY — whether
+  ## none was given or the 100000 × 1024 table itself was.
+  if lineLengths.len == 0 or isConventionalTable(lineLengths):
+    return @[]
+  result = @lineLengths
+  for L in lineLengths:
+    if L != 0:
+      return
+  result[0] = 1
+
 proc fileAddressCount*(lineLengths: openArray[uint32],
     lineCount: uint64 = 0): uint64 =
   ## Addresses the global position space allocates to one file: **the
@@ -137,6 +191,25 @@ proc fileAddressCount*(lineLengths: openArray[uint32],
     return lineCount
   DefaultLinesPerFile
 
+proc positionSpaceCount*(lineLengths: openArray[seq[uint32]],
+    lineCounts: openArray[uint64], fileId: int, columnAware: bool): uint64 =
+  ## The address count of the one file `fileId`, by the rule
+  ## `positionSpaceCounts` applies to every file. A writer that extends its
+  ## space one registration at a time sizes the new file through this, so the
+  ## incremental and the one-pass layouts cannot disagree.
+  let count =
+    if fileId < lineCounts.len: lineCounts[fileId]
+    else: 0'u64
+  if columnAware:
+    # Every column-aware file has a table; an empty one is the
+    # conventional table, held as its rule.
+    if fileId < lineLengths.len and lineLengths[fileId].len > 0:
+      fileAddressCount(lineLengths[fileId])
+    else:
+      ConventionalFileSize
+  else:
+    fileAddressCount([], count)
+
 proc positionSpaceCounts*(lineLengths: openArray[seq[uint32]],
     lineCounts: openArray[uint64],
     fileCount: int, columnAware: bool): seq[uint64] =
@@ -146,18 +219,14 @@ proc positionSpaceCounts*(lineLengths: openArray[seq[uint32]],
   ## `lineLengths` carries the column-aware per-line tables and
   ## `lineCounts` the line-only per-file line counts; a trace supplies
   ## whichever its mode addresses in, and either may be short of
-  ## `fileCount` (or empty) for the files it says nothing about. Those
-  ## fall back to `DefaultLinesPerFile`, which is what a container
-  ## without a size table has always meant.
+  ## `fileCount` (or empty) for the files it says nothing about. In a
+  ## line-only trace those fall back to `DefaultLinesPerFile`, which is
+  ## what a container without a size table has always meant; in a
+  ## column-aware one an empty table is the conventional table
+  ## (`ConventionalFileSize`).
   result = newSeq[uint64](fileCount)
   for i in 0 ..< fileCount:
-    let lls =
-      if columnAware and i < lineLengths.len: lineLengths[i]
-      else: @[]
-    let count =
-      if i < lineCounts.len: lineCounts[i]
-      else: 0'u64
-    result[i] = fileAddressCount(lls, count)
+    result[i] = positionSpaceCount(lineLengths, lineCounts, i, columnAware)
 
 type
   GlobalLineIndex* = object
@@ -174,6 +243,18 @@ proc buildGlobalLineIndex*(lineCounts: openArray[uint64]): GlobalLineIndex =
     prefixSum: prefix,
     totalLines: prefix[^1]
   )
+
+proc appendFile*(gli: var GlobalLineIndex, count: uint64) =
+  ## Extend the space by one file of `count` addresses, placed after every
+  ## file already in it. No existing base moves, so this is O(1) and leaves
+  ## the index equal to `buildGlobalLineIndex` over the extended counts.
+  ##
+  ## `gli` must already be an index (at least `buildGlobalLineIndex([])`):
+  ## the default-initialised object has no base for file 0.
+  doAssert gli.prefixSum.len > 0,
+    "appendFile on an index that was never built"
+  gli.totalLines += count
+  gli.prefixSum.add(gli.totalLines)
 
 proc globalIndex*(gli: GlobalLineIndex, fileId: int, line: uint64): uint64 =
   ## Convert a 1-based `(file_id, line)` to a global line index:

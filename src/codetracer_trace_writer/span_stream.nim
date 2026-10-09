@@ -572,12 +572,11 @@ proc flushChunk(ctfs: var Ctfs, w: var SpanStreamWriter): Result[void, string] =
 
   let chunkStart = w.dataOffset
 
-  # 1. Chunk body first, then publish its size to concurrent readers.
+  # 1. Chunk body; it is published with the index entry below.
   let datRes = ctfs.writeToFile(w.dataFile,
       compressed.toOpenArray(0, int(compressedSize) - 1))
   if datRes.isErr:
     return err("failed to write span chunk: " & datRes.error)
-  ctfs.syncEntry(w.dataFile)
 
   # 2. Only now does the index entry appear — it means "chunk complete".
   #    The entry publishes WHERE the chunk starts and HOW MANY records the

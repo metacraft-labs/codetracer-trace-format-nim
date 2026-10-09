@@ -121,7 +121,7 @@ proc buildBundle(path: string, withHeaderPrefix: bool): seq[TraceLowLevelEvent] 
   # would shadow the `meta_dat` module and turn the qualified call below into
   # a method call on the local.
   var metaDatFile = c.addFile("meta.dat").get()
-  doAssert writeMetaDat(c, metaDatFile, meta, ["/wd/main.rs"]).isOk
+  doAssert writeMetaDat(c, metaDatFile, meta).isOk
 
   doAssert c.writeCtfsToFile(path).isOk
   events

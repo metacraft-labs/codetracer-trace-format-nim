@@ -27,7 +27,7 @@
 ## ``FullOpts.stripPaths`` substitutes ``<workdir>`` and ``<tmp>`` placeholders
 ## for cross-machine snapshots.
 
-import std/[json, strutils, base64, algorithm]
+import std/[json, strutils, base64, algorithm, options]
 import results
 import ./new_trace_reader
 import ./meta_dat
@@ -451,6 +451,11 @@ proc buildFullDocument*(reader: var NewTraceReader,
     traceFilterObj["filters"] = filtersArr
     meta["trace_filter"] = traceFilterObj
 
+  let entry = reader.recordedEntryIdentity()
+  if entry.isSome:
+    let identity = entry.get()
+    meta["entry"] = %* {"call_key": identity.callKey,
+      "function_id": identity.functionId, "entry_step": identity.entryStep}
   root["metadata"] = meta
 
   # ----- paths -----
@@ -753,7 +758,7 @@ proc buildFullDocument*(reader: var NewTraceReader,
         if sid == stepIdx:
           var ioObj = newJObject()
           ioObj["kind"] = newJString("io")
-          ioObj["io_kind"] = newJString($ev.kind)
+          ioObj["io_kind"] = newJString(eventLogKindName(ev.kind))
           ioObj["io_index"] = newJInt(int64(idx))
           ioObj["step_id"] = newJInt(int64(ev.stepId))
           # Surface both UTF-8 (best-effort) and base64 (exact bytes) so
@@ -847,4 +852,3 @@ proc buildFullDocument*(reader: var NewTraceReader,
 
   root["events"] = eventsArr
   return root
-

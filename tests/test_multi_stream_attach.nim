@@ -169,8 +169,10 @@ proc test_attach_shares_container() {.raises: [].} =
   doAssert ev0.get().kind == sekAbsoluteStep, "step 0 should be absolute"
   let ev1 = execR.readEvent(1)
   doAssert ev1.isOk, "readEvent 1: " & ev1.error
-  doAssert ev1.get().kind == sekDeltaStep and ev1.get().lineDelta == 1,
-    "step 1 should be delta +1"
+  # Position 1 is one varint byte, as long as the delta, so the normative
+  # rule writes it absolute (`trace-events.md` §"Encoding Rules").
+  doAssert ev1.get().kind == sekAbsoluteStep and ev1.get().globalLineIndex == 1,
+    "step 1 should be absolute at position 1"
   let ev11 = execR.readEvent(11)
   doAssert ev11.isOk, "readEvent 11: " & ev11.error
 

@@ -23,6 +23,14 @@ int main(void) {
 
     printf("=== C FFI Test for codetracer_trace_writer ===\n\n");
 
+    /* The archive this test links is the one build_ffi.nims produces, and it
+     * must say so: a host library built any other way (--threads:on, no
+     * process lock) is not safe to call from several host threads. */
+    ASSERT(strcmp(trace_writer_build_config(),
+                  "app:staticlib;threads:off;mm:arc;release:on;processLock:on") == 0,
+            "the shipped archive must report the build_ffi.nims configuration");
+    printf("[OK] trace_writer_build_config: %s\n", trace_writer_build_config());
+
     /* Create a trace writer */
     trace_writer_t writer = trace_writer_new("test_program", FFI_TRACE_FORMAT_BINARY);
     ASSERT(writer != NULL, "trace_writer_new should return non-NULL");
@@ -133,13 +141,6 @@ int main(void) {
         };
         size_t arg_lens[] = { strlen(arg_strs[0]), strlen(arg_strs[1]), strlen(arg_strs[2]) };
 
-        const char* path_strs[] = { "/src/main.c", "/src/util.c" };
-        const uint8_t* path_ptrs[] = {
-            (const uint8_t*)path_strs[0],
-            (const uint8_t*)path_strs[1]
-        };
-        size_t path_lens[] = { strlen(path_strs[0]), strlen(path_strs[1]) };
-
         const char* rec_id = "test-recorder-v1";
         /* M-REC-1: canonical UUIDv7.  Hard-coded so the test
          * exercises caller-supplied id rather than the mint path. */
@@ -152,7 +153,6 @@ int main(void) {
             (const uint8_t*)prog, strlen(prog),
             (const uint8_t*)wd, strlen(wd),
             arg_ptrs, arg_lens, 3,
-            path_ptrs, path_lens, 2,
             (const uint8_t*)rec_id, strlen(rec_id),
             (const uint8_t*)recording_id, strlen(recording_id),
             &buf, &buf_len);
@@ -161,9 +161,11 @@ int main(void) {
         ASSERT(buf_len > 8, "output buffer should have at least header bytes");
         printf("[OK] ct_write_meta_dat_to_buffer (len=%zu)\n", buf_len);
 
-        /* Check magic bytes */
+        /* Check magic bytes, and version 6 (meta.dat carries no path list:
+         * a trace's source paths are paths.dat's records). */
         ASSERT(buf[0] == 'C' && buf[1] == 'T' && buf[2] == 'M' && buf[3] == 'D',
             "magic bytes should be CTMD");
+        ASSERT(buf[4] == 6 && buf[5] == 0, "meta.dat version should be 6");
         printf("[OK] magic bytes\n");
 
         /* Read back */
@@ -193,24 +195,14 @@ int main(void) {
             printf("[OK] arg[%zu] = \"%.*s\"\n", i, (int)len, (const char*)p);
         }
 
-        /* Verify paths */
-        ASSERT(ct_meta_dat_paths_count(reader) == 2, "paths count should be 2");
-        for (size_t i = 0; i < 2; i++) {
-            p = ct_meta_dat_path(reader, i, &len);
-            ASSERT(p != NULL && len == strlen(path_strs[i]), "path length mismatch");
-            ASSERT(memcmp(p, path_strs[i], len) == 0, "path content mismatch");
-            printf("[OK] path[%zu] = \"%.*s\"\n", i, (int)len, (const char*)p);
-        }
-
         /* Verify recorder_id */
         p = ct_meta_dat_recorder_id(reader, &len);
         ASSERT(p != NULL && len == strlen(rec_id), "recorder_id length mismatch");
         ASSERT(memcmp(p, rec_id, len) == 0, "recorder_id content mismatch");
         printf("[OK] recorder_id = \"%.*s\"\n", (int)len, (const char*)p);
 
-        /* Out of bounds arg/path should return NULL */
+        /* Out of bounds arg should return NULL */
         ASSERT(ct_meta_dat_arg(reader, 99, &len) == NULL, "out-of-bounds arg should be NULL");
-        ASSERT(ct_meta_dat_path(reader, 99, &len) == NULL, "out-of-bounds path should be NULL");
         printf("[OK] out-of-bounds safety\n");
 
         /* Free reader and buffer */
@@ -331,55 +323,55 @@ int main(void) {
          * SAME span_id (last-record-wins), and an external-bound span. */
         {
             const char* keys[] = { "http.method", "http.url",
-                                   "http.status_code", "http.duration_ms" };
+                                    "http.status_code", "http.duration_ms" };
             const char* vals[] = { "GET", "/api/users/42", "200", "12" };
 
             /* open record: no end fields, status unknown */
             ASSERT(trace_writer_register_span(w,
-                       1, 0, SPAN_FLAG_OPEN, SPAN_STATUS_UNKNOWN,
-                       1700000000000000000ULL, 0,
-                       0, 7, 100, 0,
-                       NULL, NULL, "web-request", "GET /api/users/42",
-                       SPAN_STRUCTURAL_CONTIGUOUS |
-                           SPAN_STRUCTURAL_SHARES_TIMELINE,
-                       keys, vals, 2) == 0,
-                   "register_span (open)");
+                        1, 0, SPAN_FLAG_OPEN, SPAN_STATUS_UNKNOWN,
+                        1700000000000000000ULL, 0,
+                        0, 7, 100, 0,
+                        NULL, NULL, "web-request", "GET /api/users/42",
+                        SPAN_STRUCTURAL_CONTIGUOUS |
+                            SPAN_STRUCTURAL_SHARES_TIMELINE,
+                        keys, vals, 2) == 0,
+                    "register_span (open)");
 
             /* a live recorder can publish it before closing */
             ASSERT(trace_writer_flush_spans(w) == 0, "flush_spans");
 
             /* completion record for the same span_id */
             ASSERT(trace_writer_register_span(w,
-                       1, 0, 0, SPAN_STATUS_OK,
-                       1700000000000000000ULL, 1700000000012000000ULL,
-                       0, 7, 100, 350,
-                       NULL, NULL, "web-request", "GET /api/users/42",
-                       SPAN_STRUCTURAL_CONTIGUOUS |
-                           SPAN_STRUCTURAL_SHARES_TIMELINE,
-                       keys, vals, 4) == 0,
-                   "register_span (completion)");
+                        1, 0, 0, SPAN_STATUS_OK,
+                        1700000000000000000ULL, 1700000000012000000ULL,
+                        0, 7, 100, 350,
+                        NULL, NULL, "web-request", "GET /api/users/42",
+                        SPAN_STRUCTURAL_CONTIGUOUS |
+                            SPAN_STRUCTURAL_SHARES_TIMELINE,
+                        keys, vals, 4) == 0,
+                    "register_span (completion)");
 
             /* external-bound span: execution lives in another container */
             ASSERT(trace_writer_register_span(w,
-                       2, 0, SPAN_FLAG_EXTERNAL, SPAN_STATUS_ERROR,
-                       1700000000000000000ULL, 1700000000500000000ULL,
-                       0, 0, 0, 0,
-                       "01949fcc-7d92-7e9c-cccc-dddddddddddd",
-                       "requests/req-0002.ct",
-                       "web-request", "POST /api/orders",
-                       SPAN_STRUCTURAL_SHARES_TIMELINE,
-                       keys, vals, 4) == 0,
-                   "register_span (external)");
+                        2, 0, SPAN_FLAG_EXTERNAL, SPAN_STATUS_ERROR,
+                        1700000000000000000ULL, 1700000000500000000ULL,
+                        0, 0, 0, 0,
+                        "01949fcc-7d92-7e9c-cccc-dddddddddddd",
+                        "requests/req-0002.ct",
+                        "web-request", "POST /api/orders",
+                        SPAN_STRUCTURAL_SHARES_TIMELINE,
+                        keys, vals, 4) == 0,
+                    "register_span (external)");
 
             /* an open record carrying end fields must be REJECTED, not
              * silently normalised — the fail-closed contract at the ABI. */
             ASSERT(trace_writer_register_span(w,
-                       3, 0, SPAN_FLAG_OPEN, SPAN_STATUS_UNKNOWN,
-                       1700000000000000000ULL, 1700000000000000001ULL,
-                       0, 0, 0, 99,
-                       NULL, NULL, "web-request", "bad",
-                       0, NULL, NULL, 0) != 0,
-                   "register_span must reject an open record with end fields");
+                        3, 0, SPAN_FLAG_OPEN, SPAN_STATUS_UNKNOWN,
+                        1700000000000000000ULL, 1700000000000000001ULL,
+                        0, 0, 0, 99,
+                        NULL, NULL, "web-request", "bad",
+                        0, NULL, NULL, 0) != 0,
+                    "register_span must reject an open record with end fields");
 
             printf("[OK] ms: spans (open + completion + external + reject)\n");
         }
@@ -483,12 +475,12 @@ int main(void) {
                 body_a[i] = (unsigned char)((i * 7 + i / 4096) % 251);
             }
             ASSERT(ct_container_append_files(path, names, contents, lengths, 3) == 0,
-                   "ct_container_append_files");
+                    "ct_container_append_files");
             ASSERT(stat(path, &st) == 0, "stat the appended container");
             ASSERT(st.st_size % 4096 == 0,
-                   "an appended container must stay a whole number of blocks");
+                    "an appended container must stay a whole number of blocks");
             ASSERT((size_t)st.st_size > sizeof(body_a),
-                   "the container should have grown by at least the payload");
+                    "the container should have grown by at least the payload");
             printf("[OK] container: append (%ld bytes)\n", (long)st.st_size);
 
             /* Append-only: a name that already exists must be refused, and
@@ -498,10 +490,10 @@ int main(void) {
                 const unsigned char* dup_contents[1] = { body_b };
                 size_t dup_lengths[1] = { sizeof(body_b) };
                 ASSERT(ct_container_append_files(path, dup_names, dup_contents,
-                                                 dup_lengths, 1) != 0,
-                       "appending an existing name must fail");
+                                                  dup_lengths, 1) != 0,
+                        "appending an existing name must fail");
                 ASSERT(trace_writer_last_error()[0] != '\0',
-                       "a refused append must set an error message");
+                        "a refused append must set an error message");
                 printf("[OK] container: append refuses an existing name\n");
             }
 
@@ -512,15 +504,15 @@ int main(void) {
                 const unsigned char* bad_contents[1] = { body_b };
                 size_t bad_lengths[1] = { sizeof(body_b) };
                 ASSERT(ct_container_append_files(path, bad_names, bad_contents,
-                                                 bad_lengths, 1) != 0,
-                       "appending an unencodable name must fail");
+                                                  bad_lengths, 1) != 0,
+                        "appending an unencodable name must fail");
                 printf("[OK] container: append refuses an unencodable name\n");
             }
 
             /* A container that is not a container. */
             ASSERT(ct_container_append_files("/tmp/ct_container_append_test.missing",
-                                             names, contents, lengths, 1) != 0,
-                   "appending to a nonexistent container must fail");
+                                              names, contents, lengths, 1) != 0,
+                    "appending to a nonexistent container must fail");
             printf("[OK] container: append refuses a nonexistent container\n");
         }
         remove(path);

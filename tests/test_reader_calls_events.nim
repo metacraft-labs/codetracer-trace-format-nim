@@ -54,7 +54,7 @@ proc writeCallsAndEventsTrace(numCalls: int, numEvents: int): seq[byte] {.raises
   doAssert metaFileRes.isOk
   var metaFile = metaFileRes.get()
   let meta = TraceMetadata(recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb", program: "call_event_test", args: @[], workdir: "/tmp")
-  let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/main.py"],
+  let metaWr = ctfs.writeMetaDat(metaFile, meta,
     hasStepStream = true, hasValueStream = true, hasIoEventStream = true)
   doAssert metaWr.isOk
 
@@ -122,7 +122,7 @@ proc writeCallsAndEventsTrace(numCalls: int, numEvents: int): seq[byte] {.raises
   var ioW = ioRes.get()
 
   for i in 0 ..< numEvents:
-    let kind = if i mod 2 == 0: ioStdout else: ioStderr
+    let kind = if i mod 2 == 0: elkWrite else: elkWriteOther
     let ioWr = ctfs.writeEvent(ioW, IOEvent(
       kind: kind,
       stepId: uint64(i * 3),
@@ -236,7 +236,7 @@ proc test_reader_event_page() {.raises: [].} =
     doAssert page[j].stepId == expectedStepId,
       "event " & intToStr(idx) & " stepId: " & $page[j].stepId & " != " & $expectedStepId
 
-    let expectedKind = if idx mod 2 == 0: ioStdout else: ioStderr
+    let expectedKind = if idx mod 2 == 0: elkWrite else: elkWriteOther
     doAssert page[j].kind == expectedKind,
       "event " & intToStr(idx) & " kind mismatch"
 
@@ -256,7 +256,7 @@ proc test_reader_event_page() {.raises: [].} =
   # Single event access
   let ev0 = reader.ioEvent(0)
   doAssert ev0.isOk, "ioEvent 0 failed: " & ev0.error
-  doAssert ev0.get().kind == ioStdout, "event 0 kind"
+  doAssert ev0.get().kind == elkWrite, "event 0 kind"
   doAssert ev0.get().stepId == 0, "event 0 stepId"
   doAssert ev0.get().data == "output_0".toBytes, "event 0 data"
 

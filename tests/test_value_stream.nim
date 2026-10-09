@@ -617,25 +617,25 @@ proc test_value_stream_drop_variable_events() {.raises: [].} =
   echo "PASS: test_value_stream_drop_variable_events"
 
 # ---------------------------------------------------------------------------
-# test_value_stream_unknown_tag_is_refused_by_name — the forward-compat rule
+# test_value_stream_unknown_tag_is_refused_by_name — a tag < 10 that does not
+# walk is refused, naming the tag
 # ---------------------------------------------------------------------------
 
 proc test_value_stream_unknown_tag_is_refused_by_name() {.raises: [].} =
   ## Value-stream event tags < 10 are NOT self-delimiting, so a reader that
-  ## meets an unhandled tag < 10 cannot walk past it and must refuse the whole
-  ## record rather than guess a length and mis-frame everything after it.
-  ##
-  ## That refusal is a forward-compatibility hazard with a specific symptom —
-  ## a binary older than a tag reports a step as having no variables — so the
-  ## message has to NAME the remedy.
+  ## cannot walk one must refuse the whole record rather than guess a length
+  ## and mis-frame everything after it. Every tag 0-9 is part of the format
+  ## (`trace-events.md` §"Value Stream"), so the refusal a reader can still
+  ## meet below 10 is a malformed event — here a tag-5 `CompoundValue` whose
+  ## value is cut off — and the message has to name the tag it could not walk.
   var ctfs = createCtfs()
   let writerRes = initValueStreamWriter(ctfs, chunkSize = 4)
   doAssert writerRes.isOk, "initValueStreamWriter failed: " & writerRes.error
   var writer = writerRes.get()
 
-  # A record carrying an unhandled tag < 10 (e.g. tag 5).
-  let unknown: seq[byte] = @[0x05'u8, 0x01'u8]
-  let w = writeStepValues(ctfs, writer, [], unknown)
+  # Tag 5, place 1, and no value length or bytes.
+  let truncated: seq[byte] = @[0x05'u8, 0x02'u8]
+  let w = writeStepValues(ctfs, writer, [], truncated)
   doAssert w.isOk, "write failed: " & w.error
   let fr = value_stream.flush(ctfs, writer)
   doAssert fr.isOk, "flush failed: " & fr.error
@@ -645,11 +645,9 @@ proc test_value_stream_unknown_tag_is_refused_by_name() {.raises: [].} =
   var reader = readerRes.get()
 
   let got = readStepValues(reader, 0'u64)
-  doAssert got.isErr, "an unknown value-stream tag < 10 must be REFUSED, not skipped"
-  doAssert got.error.contains("5"),
+  doAssert got.isErr, "a value-stream event that does not walk must be REFUSED"
+  doAssert got.error.contains("tag 5"),
     "the refusal must name the tag it could not walk: " & got.error
-  doAssert got.error.contains("rebuild ct-print"),
-    "the refusal must name the remedy (rebuilding a stale reader): " & got.error
 
   echo "PASS: test_value_stream_unknown_tag_is_refused_by_name"
 
@@ -734,4 +732,3 @@ test_value_stream_drop_variable_events()
 test_value_stream_unknown_tag_is_refused_by_name()
 test_value_stream_forward_compat_tag_skipped()
 test_value_stream_forward_compat_truncated_payload_refused()
-

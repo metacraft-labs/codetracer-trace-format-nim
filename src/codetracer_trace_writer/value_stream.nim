@@ -120,6 +120,26 @@ const
     ## ``codetracer-trace-format/codetracer_trace_writer/src/value_stream.rs``,
     ## which is what lets each writer's output be read by the other's decoder.
 
+  TagBindVariable* = 1'u8
+    ## ``BindVariable {variable_id: varint, place: signed varint}``.
+  TagCellValue* = 4'u8
+    ## ``CellValue {place: signed varint, value: varint len + CBOR}``.
+  TagCompoundValue* = 5'u8
+    ## ``CompoundValue {place: signed varint, value: varint len + CBOR}``.
+  TagAssignCell* = 6'u8
+    ## ``AssignCell {place: signed varint, new_value: varint len + CBOR}``.
+  TagAssignCompoundItem* = 7'u8
+    ## ``AssignCompoundItem {place: signed varint, index: varint,
+    ## item_place: signed varint}``.
+  TagVariableCell* = 8'u8
+    ## ``VariableCell {variable_id: varint, place: signed varint}``.
+    ##
+    ## Tags 1 and 4-8 carry the place model (`trace-events.md` §"Value
+    ## Stream"): every tag 0-9 is part of the format, a writer writes every
+    ## tag its API exposes and a reader decodes all of them. Places are
+    ## zigzag-signed varints and every CBOR value is length-prefixed, byte
+    ## for byte as the Rust ``ValueStreamEvent`` encodes them.
+
   TagAssignment* = 9'u8
     ## Value-stream event tag 9 (``trace-events.md`` §"Value Stream Events"):
     ## ``Assignment {to: varint, pass_by: u8, from: length-prefixed CBOR RValue}``.
@@ -153,18 +173,29 @@ type
     recordCount: int           ## records in the current chunk buffer
     totalRecords: uint64
     dataOffset: uint64         ## running byte offset in values.dat
-    lastRecordStart: int
-      ## Offset in ``buffer`` of the most recently written record, or -1 when
-      ## no record has been written into the current chunk.
+    held: seq[seq[byte]]
+      ## Full chunks, oldest first, that are not written yet because the last
+      ## STEP's record is in one of them or in ``buffer`` after them. Only
+      ## records that are not steps (thread, raise/catch, reload records)
+      ## follow that step's record, so this is bounded by how many of those a
+      ## recording emits between two steps.
+    chunksWritten: int         ## chunks compressed into values.dat so far
+    lastStepChunk: int
+      ## Ordinal of the chunk holding the most recent step's record (the
+      ## chunk it is in counts ``chunksWritten`` + position in ``held``, and
+      ## ``buffer`` comes after ``held``), or -1 when no step has been written.
+    lastStepRecordStart: int
+      ## Offset of that record within its chunk's bytes.
       ##
-      ## The most recent record stays amendable, which is what lets a writer
-      ## attach values staged after it to the step it belongs to instead of
-      ## emitting a second step to carry them (spec §"Where the recording ends
-      ## with values still staged": the terminus must not change the step
-      ## count, because a recording has exactly N + 1 steps). Keeping it
-      ## amendable is why the chunk is flushed BEFORE the next record is
-      ## appended rather than after the current one — same chunk contents,
-      ## but the record just written is always still here.
+      ## The most recent STEP's record stays amendable, which is what lets a
+      ## writer attach values staged after it to the step they belong to
+      ## instead of emitting a second step to carry them (spec §"Where the
+      ## recording ends with values still staged": the terminus must not
+      ## change the step count, because a recording has exactly N + 1 steps).
+      ## Records that are not steps can follow it — a thread switch, say — and
+      ## the values do not belong to those, whose records no step reads; so
+      ## the step's chunk, and every chunk after it, is held back from
+      ## compression until a later step makes it final.
 
   ValueStreamReader* = object
     data: seq[byte]            ## raw values.dat content (SPEC mode)
@@ -268,6 +299,54 @@ proc encodeDropVariablesEvent*(variableIds: openArray[uint64],
   for id in variableIds:
     encodeVarint(id, outBuf)
 
+proc encodeBlob(data: openArray[byte], outBuf: var seq[byte]) =
+  encodeVarint(uint64(data.len), outBuf)
+  for b in data:
+    outBuf.add(b)
+
+proc encodeBindVariableEvent*(variableId: uint64, place: int64,
+    outBuf: var seq[byte]) =
+  ## Tag 1 ``BindVariable``.
+  outBuf.add(TagBindVariable)
+  encodeVarint(variableId, outBuf)
+  encodeSignedVarint(place, outBuf)
+
+proc encodeCellValueEvent*(place: int64, valueCbor: openArray[byte],
+    outBuf: var seq[byte]) =
+  ## Tag 4 ``CellValue``.
+  outBuf.add(TagCellValue)
+  encodeSignedVarint(place, outBuf)
+  encodeBlob(valueCbor, outBuf)
+
+proc encodeCompoundValueEvent*(place: int64, valueCbor: openArray[byte],
+    outBuf: var seq[byte]) =
+  ## Tag 5 ``CompoundValue``.
+  outBuf.add(TagCompoundValue)
+  encodeSignedVarint(place, outBuf)
+  encodeBlob(valueCbor, outBuf)
+
+proc encodeAssignCellEvent*(place: int64, newValueCbor: openArray[byte],
+    outBuf: var seq[byte]) =
+  ## Tag 6 ``AssignCell``.
+  outBuf.add(TagAssignCell)
+  encodeSignedVarint(place, outBuf)
+  encodeBlob(newValueCbor, outBuf)
+
+proc encodeAssignCompoundItemEvent*(place: int64, index: uint64,
+    itemPlace: int64, outBuf: var seq[byte]) =
+  ## Tag 7 ``AssignCompoundItem``.
+  outBuf.add(TagAssignCompoundItem)
+  encodeSignedVarint(place, outBuf)
+  encodeVarint(index, outBuf)
+  encodeSignedVarint(itemPlace, outBuf)
+
+proc encodeVariableCellEvent*(variableId: uint64, place: int64,
+    outBuf: var seq[byte]) =
+  ## Tag 8 ``VariableCell``.
+  outBuf.add(TagVariableCell)
+  encodeVarint(variableId, outBuf)
+  encodeSignedVarint(place, outBuf)
+
 proc encodeLengthPrefixedEvent*(tag: uint8, payload: openArray[byte],
     outBuf: var seq[byte]) =
   ## Encode one forward-compatible self-delimiting value-stream event (tag >= 10):
@@ -308,8 +387,14 @@ type
   ValueEventKind* = enum
     ## Which tagged value-stream event a decoded record entry is.
     veStepValues
+    veBindVariable
     veDropVariable
     veDropVariables
+    veCellValue
+    veCompoundValue
+    veAssignCell
+    veAssignCompoundItem
+    veVariableCell
     veAssignment
 
   DecodedValueEvent* = object
@@ -326,6 +411,114 @@ type
       droppedIds*: seq[uint64]
     of veAssignment:
       assignment*: AssignmentEventEntry
+    of veBindVariable, veVariableCell:
+      variableId*: uint64
+      variablePlace*: int64
+    of veCellValue, veCompoundValue, veAssignCell:
+      place*: int64
+      valueCbor*: seq[byte]
+    of veAssignCompoundItem:
+      compoundPlace*: int64
+      itemIndex*: uint64
+      itemPlace*: int64
+
+proc decodeOneValueEvent(data: openArray[byte], pos: var int, tag: uint8,
+    events: var seq[DecodedValueEvent],
+    skippedTags: var seq[uint8]): Result[void, string] =
+  ## Decode the fields of one tagged value-stream event, its tag already read.
+  case tag
+  of TagStepValues:
+    let count = int(?decodeVarint(data, pos))
+    var values = newSeq[VariableValue](count)
+    for i in 0 ..< count:
+      let vnId = ?decodeVarint(data, pos)
+      let dLen = int(?decodeVarint(data, pos))
+      if pos + dLen > data.len:
+        return err("truncated value data in StepValues record")
+      var d = newSeq[byte](dLen)
+      for j in 0 ..< dLen:
+        d[j] = data[pos + j]
+      pos += dLen
+      values[i] = VariableValue(
+        varnameId: vnId,
+        typeId: decodeCborTopLevelTypeId(d),
+        data: d)
+    events.add(DecodedValueEvent(kind: veStepValues, values: values))
+  of TagBindVariable, TagVariableCell:
+    let vid = ?decodeVarint(data, pos)
+    let place = ?decodeSignedVarint(data, pos)
+    if tag == TagBindVariable:
+      events.add(DecodedValueEvent(kind: veBindVariable,
+        variableId: vid, variablePlace: place))
+    else:
+      events.add(DecodedValueEvent(kind: veVariableCell,
+        variableId: vid, variablePlace: place))
+  of TagCellValue, TagCompoundValue, TagAssignCell:
+    let place = ?decodeSignedVarint(data, pos)
+    let vLen = ?decodeVarint(data, pos)
+    if vLen > uint64(data.len - pos):
+      return err("truncated CBOR value in value-stream event tag " & $tag)
+    let blob = @(data.toOpenArray(pos, pos + int(vLen) - 1))
+    pos += int(vLen)
+    case tag
+    of TagCellValue:
+      events.add(DecodedValueEvent(kind: veCellValue, place: place,
+        valueCbor: blob))
+    of TagCompoundValue:
+      events.add(DecodedValueEvent(kind: veCompoundValue, place: place,
+        valueCbor: blob))
+    else:
+      events.add(DecodedValueEvent(kind: veAssignCell, place: place,
+        valueCbor: blob))
+  of TagAssignCompoundItem:
+    let place = ?decodeSignedVarint(data, pos)
+    let index = ?decodeVarint(data, pos)
+    let itemPlace = ?decodeSignedVarint(data, pos)
+    events.add(DecodedValueEvent(kind: veAssignCompoundItem,
+      compoundPlace: place, itemIndex: index, itemPlace: itemPlace))
+  of TagDropVariable:
+    let id = ?decodeVarint(data, pos)
+    events.add(DecodedValueEvent(kind: veDropVariable, droppedId: id))
+  of TagDropVariables:
+    let count = int(?decodeVarint(data, pos))
+    var ids = newSeq[uint64](count)
+    for i in 0 ..< count:
+      ids[i] = ?decodeVarint(data, pos)
+    events.add(DecodedValueEvent(kind: veDropVariables, droppedIds: ids))
+  of TagAssignment:
+    let vnId = ?decodeVarint(data, pos)
+    if pos >= data.len:
+      return err("truncated pass_by in Assignment value-stream event")
+    let passBy = data[pos]
+    inc pos
+    let fromLen = int(?decodeVarint(data, pos))
+    if pos + fromLen > data.len:
+      return err("truncated RValue payload in Assignment value-stream event")
+    var blob = newSeq[byte](fromLen)
+    for j in 0 ..< fromLen:
+      blob[j] = data[pos + j]
+    pos += fromLen
+    events.add(DecodedValueEvent(kind: veAssignment,
+      assignment: AssignmentEventEntry(
+        varnameId: vnId, passBy: passBy, rvalueCbor: blob)))
+  else:
+    when defined(oldReaderPreForwardCompat):
+      return err("unsupported value-stream event tag " & $tag &
+        " in Nim value record (this reader predates the tag; rebuild ct-print " &
+        "from codetracer-trace-format-nim)")
+    else:
+      if tag >= 10:
+        let payloadLen = int(?decodeVarint(data, pos))
+        if pos + payloadLen > data.len:
+          return err("truncated payload in value-stream event tag " & $tag &
+            " (expected " & $payloadLen & " bytes, only " & $(data.len - pos) & " remain)")
+        pos += payloadLen
+        skippedTags.add(tag)
+      else:
+        return err("unsupported value-stream event tag " & $tag &
+          " in Nim value record (this reader predates the tag; rebuild ct-print " &
+          "from codetracer-trace-format-nim)")
+  ok()
 
 proc decodeRecordEvents*(data: openArray[byte],
     skippedTags: var seq[uint8]): Result[seq[DecodedValueEvent], string] =
@@ -349,66 +542,11 @@ proc decodeRecordEvents*(data: openArray[byte],
   while pos < data.len:
     let tag = data[pos]
     inc pos
-    case tag
-    of TagStepValues:
-      let count = int(?decodeVarint(data, pos))
-      var values = newSeq[VariableValue](count)
-      for i in 0 ..< count:
-        let vnId = ?decodeVarint(data, pos)
-        let dLen = int(?decodeVarint(data, pos))
-        if pos + dLen > data.len:
-          return err("truncated value data in StepValues record")
-        var d = newSeq[byte](dLen)
-        for j in 0 ..< dLen:
-          d[j] = data[pos + j]
-        pos += dLen
-        values[i] = VariableValue(
-          varnameId: vnId,
-          typeId: decodeCborTopLevelTypeId(d),
-          data: d)
-      events.add(DecodedValueEvent(kind: veStepValues, values: values))
-    of TagDropVariable:
-      let id = ?decodeVarint(data, pos)
-      events.add(DecodedValueEvent(kind: veDropVariable, droppedId: id))
-    of TagDropVariables:
-      let count = int(?decodeVarint(data, pos))
-      var ids = newSeq[uint64](count)
-      for i in 0 ..< count:
-        ids[i] = ?decodeVarint(data, pos)
-      events.add(DecodedValueEvent(kind: veDropVariables, droppedIds: ids))
-    of TagAssignment:
-      let vnId = ?decodeVarint(data, pos)
-      if pos >= data.len:
-        return err("truncated pass_by in Assignment value-stream event")
-      let passBy = data[pos]
-      inc pos
-      let fromLen = int(?decodeVarint(data, pos))
-      if pos + fromLen > data.len:
-        return err("truncated RValue payload in Assignment value-stream event")
-      var blob = newSeq[byte](fromLen)
-      for j in 0 ..< fromLen:
-        blob[j] = data[pos + j]
-      pos += fromLen
-      events.add(DecodedValueEvent(kind: veAssignment,
-        assignment: AssignmentEventEntry(
-          varnameId: vnId, passBy: passBy, rvalueCbor: blob)))
-    else:
-      when defined(oldReaderPreForwardCompat):
-        return err("unsupported value-stream event tag " & $tag &
-          " in Nim value record (this reader predates the tag; rebuild ct-print " &
-          "from codetracer-trace-format-nim)")
-      else:
-        if tag >= 10:
-          let payloadLen = int(?decodeVarint(data, pos))
-          if pos + payloadLen > data.len:
-            return err("truncated payload in value-stream event tag " & $tag &
-              " (expected " & $payloadLen & " bytes, only " & $(data.len - pos) & " remain)")
-          pos += payloadLen
-          skippedTags.add(tag)
-        else:
-          return err("unsupported value-stream event tag " & $tag &
-            " in Nim value record (this reader predates the tag; rebuild ct-print " &
-            "from codetracer-trace-format-nim)")
+    let tagStart = pos - 1
+    let r = decodeOneValueEvent(data, pos, tag, events, skippedTags)
+    if r.isErr:
+      return err("value-stream event tag " & $tag & " at byte " & $tagStart &
+        ": " & r.error)
   ok(events)
 
 proc decodeRecordEvents*(data: openArray[byte]):
@@ -511,7 +649,10 @@ proc initValueStreamWriter*(ctfs: var Ctfs,
     recordCount: 0,
     totalRecords: 0,
     dataOffset: 0,
-    lastRecordStart: -1,
+    held: @[],
+    chunksWritten: 0,
+    lastStepChunk: -1,
+    lastStepRecordStart: -1,
   )
 
   # Index header: just the u32 chunk_size (SPEC layout — no total_events).
@@ -526,17 +667,15 @@ proc initValueStreamWriter*(ctfs: var Ctfs,
 
   ok(writer)
 
-proc flushChunk(ctfs: var Ctfs, w: var ValueStreamWriter): Result[void, string] =
-  ## Compress the buffered records into one chunk, append to values.dat, and
-  ## record the chunk's byte offset in values.idx.
-  if w.recordCount == 0:
-    return ok()
-
-  let bound = ZSTD_compressBound(csize_t(w.buffer.len))
+proc writeChunk(ctfs: var Ctfs, w: var ValueStreamWriter,
+    chunk: openArray[byte]): Result[void, string] =
+  ## Compress one chunk's records, append it to values.dat, and record its
+  ## byte offset in values.idx.
+  let bound = ZSTD_compressBound(csize_t(chunk.len))
   var compressed = newSeq[byte](int(bound))
   let compressedSize = ZSTD_compress(
     addr compressed[0], csize_t(bound),
-    addr w.buffer[0], csize_t(w.buffer.len),
+    unsafeAddr chunk[0], csize_t(chunk.len),
     cint(ValuesCompressionLevel))
   if ZSTD_isError(compressedSize) != 0:
     return err("zstd compress failed for value chunk: " &
@@ -544,17 +683,15 @@ proc flushChunk(ctfs: var Ctfs, w: var ValueStreamWriter): Result[void, string] 
 
   let chunkStart = w.dataOffset
 
-  # DATA-FIRST-THEN-INDEX ordering (matches span_stream.flushChunk): append the
-  # compressed chunk body to values.dat and sync its size FIRST, then append the
-  # chunk's byte offset to values.idx and sync.  A concurrent follow reader that
-  # observes N index entries can then always assume chunks 0..N-1 are fully on
-  # disk; the reverse order could publish an offset for bytes not yet written,
-  # yielding a transient short/zero decode.
+  # The chunk's bytes, then its offset in the companion index, then ONE
+  # publish: every block written since the last seal (the chunk, its mapping,
+  # the index, interning records), then the root entries that publish their
+  # sizes (`ctfs-container.md` §6, "Durability", rule 2). A follow reader that
+  # sees N index entries can assume chunks 0..N-1 are on disk.
   let datRes = ctfs.writeToFile(w.dataFile,
       compressed.toOpenArray(0, int(compressedSize) - 1))
   if datRes.isErr:
     return err("failed to write value chunk: " & datRes.error)
-  ctfs.syncEntry(w.dataFile)
 
   var offBytes: array[8, byte]
   let offLE = toBytesLE(chunkStart)
@@ -566,34 +703,70 @@ proc flushChunk(ctfs: var Ctfs, w: var ValueStreamWriter): Result[void, string] 
   ctfs.syncEntry(w.indexFile)
 
   w.dataOffset += uint64(compressedSize)
+  inc w.chunksWritten
+  ok()
+
+proc writeHeld(ctfs: var Ctfs, w: var ValueStreamWriter): Result[void, string] =
+  ## Write every held chunk, oldest first.
+  for chunk in w.held:
+    ? writeChunk(ctfs, w, chunk)
+  w.held.setLen(0)
+  ok()
+
+proc rotateChunk(ctfs: var Ctfs, w: var ValueStreamWriter): Result[void, string] =
+  ## The current chunk is full: start a new one. It is written now unless the
+  ## last step's record is in it (or in a held chunk before it), in which case
+  ## it is held until a later step makes that record final.
+  let currentChunk = w.chunksWritten + w.held.len
+  if w.lastStepChunk >= w.chunksWritten and w.lastStepChunk <= currentChunk:
+    w.held.add(w.buffer)
+  else:
+    ? writeChunk(ctfs, w, w.buffer)
+  w.buffer = @[]
+  w.recordCount = 0
+  ok()
+
+proc flushChunk(ctfs: var Ctfs, w: var ValueStreamWriter): Result[void, string] =
+  ## Write every held chunk and the current one. Called when the stream ends:
+  ## nothing after this can amend a record.
+  ? writeHeld(ctfs, w)
+  if w.recordCount > 0:
+    ? writeChunk(ctfs, w, w.buffer)
   w.buffer.setLen(0)
   w.recordCount = 0
-  # The amendable record went out with the chunk. A later amend refuses by
-  # name rather than rewriting whatever byte range happens to be at offset 0.
-  w.lastRecordStart = -1
+  w.lastStepChunk = -1
+  w.lastStepRecordStart = -1
   ok()
 
 proc writeStepValues*(ctfs: var Ctfs, w: var ValueStreamWriter,
     values: openArray[VariableValue],
-    extraEvents: openArray[byte] = []): Result[void, string] =
-  ## Write all variable values for one step.  Call exactly once per step event,
-  ## in step order — this preserves the parallel-index invariant (record N ↔
-  ## step N).  For steps with no values pass an empty array (an empty record).
+    extraEvents: openArray[byte] = [],
+    isStep = true): Result[void, string] =
+  ## Write the value record of one exec record.  Call exactly once per exec
+  ## record, in order — this preserves the parallel-index invariant (record N
+  ## ↔ exec record N).  For a record with no values pass an empty array.
+  ##
+  ## ``isStep`` is false for an exec record that is not a step (a thread
+  ## record, raise/catch, a reload marker): its record is always empty, and it
+  ## does not become the record ``rewriteLastStepValues`` amends.
   ##
   ## ``extraEvents`` carries already-encoded tagged value-stream events (today
   ## only tag-9 ``Assignment``, built by ``encodeAssignmentEvent``) that belong
   ## to the same step; they are appended after the tag-0 StepValues event.
-  # Flush the full chunk BEFORE appending, so the record written below is
-  # still in ``buffer`` when this returns. See ``lastRecordStart``.
+  # Start a new chunk BEFORE appending, so a full chunk that holds the last
+  # step's record is still amendable when this returns.
   if w.recordCount >= w.chunkSize:
-    let flushed = flushChunk(ctfs, w)
-    if flushed.isErr:
-      return flushed
+    ? rotateChunk(ctfs, w)
+
+  if isStep:
+    # A new step: every earlier record is final, so the held chunks can go.
+    ? writeHeld(ctfs, w)
+    w.lastStepChunk = w.chunksWritten
+    w.lastStepRecordStart = w.buffer.len
 
   var rec: seq[byte] = @[]
   encodeRecord(values, extraEvents, rec)
   # Length-prefix the record within the chunk so the reader can index it.
-  w.lastRecordStart = w.buffer.len
   encodeVarint(uint64(rec.len), w.buffer)
   w.buffer.add(rec)
   inc w.recordCount
@@ -603,8 +776,9 @@ proc writeStepValues*(ctfs: var Ctfs, w: var ValueStreamWriter,
 proc rewriteLastStepValues*(w: var ValueStreamWriter,
     values: openArray[VariableValue],
     extraEvents: openArray[byte] = []): Result[void, string] =
-  ## Replace the most recently written record with one encoding ``values`` and
-  ## ``extraEvents``.
+  ## Replace the most recent STEP's record with one encoding ``values`` and
+  ## ``extraEvents``; records written after it (thread and other non-step
+  ## records) are kept as they are.
   ##
   ## This is how values staged after the last step reach the trace: they are
   ## merged with that step's own values by the caller (which is the party that
@@ -614,17 +788,35 @@ proc rewriteLastStepValues*(w: var ValueStreamWriter,
   ## long whenever a value happened to be staged at the end.
   ##
   ## Refuses rather than guesses when there is no record to amend.
-  if w.lastRecordStart < 0:
-    return err("rewriteLastStepValues: no value record has been written into " &
-      "the current chunk, so there is nothing to amend")
-  if w.lastRecordStart > w.buffer.len:
-    return err("rewriteLastStepValues: recorded record offset " &
-      $w.lastRecordStart & " is past the buffer end " & $w.buffer.len)
-  var rec: seq[byte] = @[]
-  encodeRecord(values, extraEvents, rec)
-  w.buffer.setLen(w.lastRecordStart)
-  encodeVarint(uint64(rec.len), w.buffer)
-  w.buffer.add(rec)
+  if w.lastStepChunk < w.chunksWritten:
+    return err("rewriteLastStepValues: no step's value record is still " &
+      "amendable, so there is nothing to amend")
+  let pos = w.lastStepChunk - w.chunksWritten
+  template splice(chunk: var seq[byte]) =
+    let start = w.lastStepRecordStart
+    if start < 0 or start >= chunk.len:
+      return err("rewriteLastStepValues: recorded record offset " & $start &
+        " is outside its chunk of " & $chunk.len & " bytes")
+    var p = start
+    var oldLen = 0'u64
+    var shift = 0
+    while true:
+      let b = chunk[p]
+      oldLen = oldLen or (uint64(b and 0x7F) shl shift)
+      inc p
+      if (b and 0x80) == 0: break
+      shift += 7
+    let oldEnd = p + int(oldLen)
+    var rec: seq[byte] = @[]
+    encodeRecord(values, extraEvents, rec)
+    var replacement: seq[byte] = @[]
+    encodeVarint(uint64(rec.len), replacement)
+    replacement.add(rec)
+    chunk = chunk[0 ..< start] & replacement & chunk[oldEnd ..< chunk.len]
+  if pos < w.held.len:
+    splice(w.held[pos])
+  else:
+    splice(w.buffer)
   ok()
 
 proc flush*(ctfs: var Ctfs, w: var ValueStreamWriter): Result[void, string] =
@@ -893,6 +1085,23 @@ proc readStepAssignments*(r: var ValueStreamReader,
   r.noteSkippedTags(skipped)
   res
 
+proc readStepEvents*(r: var ValueStreamReader,
+    stepIndex: uint64): Result[seq[DecodedValueEvent], string] =
+  ## Every value-stream event of a step's record, tags 0-9, in wire order.
+  r.lastSkippedTags.setLen(0)
+  if r.legacy:
+    let vals = ? r.readStepValues(stepIndex)
+    if vals.len == 0:
+      return ok(newSeq[DecodedValueEvent]())
+    return ok(@[DecodedValueEvent(kind: veStepValues, values: vals)])
+  let within = ?r.cacheRecordFor(stepIndex)
+  var skipped: seq[uint8] = @[]
+  let res = decodeRecordEvents(r.cachedRecords[within], skipped)
+  r.noteSkippedTags(skipped)
+  if res.isErr:
+    return err("values.dat record " & $stepIndex & ": " & res.error)
+  res
+
 proc lastSkippedTags*(r: ValueStreamReader): seq[uint8] =
   r.lastSkippedTags
 
@@ -901,4 +1110,3 @@ proc skippedTags*(r: ValueStreamReader): seq[uint8] =
 
 proc skippedTagCounts*(r: ValueStreamReader): seq[(uint8, int)] =
   r.skippedTagCounts
-

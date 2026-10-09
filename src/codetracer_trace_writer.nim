@@ -9,10 +9,13 @@ when defined(nimPreviewSlimSystem):
 ## Produces .ct files with:
 ##   events.log  — split-binary events compressed with seekable Zstd
 ##   events.fmt  — the string "split-binary"
-##   meta.dat    — binary metadata (program / args / workdir / paths /
-##                 recording_id).  The legacy `meta.json` + `paths.json`
-##                 JSON sidecars this writer used to emit alongside it are
-##                 retired; `meta.dat` is the format.
+##   meta.dat    — binary metadata (program / args / workdir /
+##                 recording_id), version 6, written once at the first event
+##                 (or at close for a trace with none).
+##   paths.dat   — every `Path` event's path, in id order (+ `paths.off`):
+##                 `meta.dat` carries no path list, and a writer that knows a
+##                 source path interns it in `paths.dat`
+##                 (`internal-files.md` §"Metadata (meta.dat)").
 
 import std/json
 import std/options
@@ -26,6 +29,7 @@ import codetracer_ctfs/zstd_bindings
 import codetracer_trace_types
 import codetracer_trace_writer/split_binary
 import codetracer_trace_writer/meta_dat
+import codetracer_trace_writer/interning_table
 import codetracer_trace_writer/uuid_v7
 
 export results, codetracer_trace_types, uuid_v7
@@ -47,14 +51,16 @@ type
     ctfs: Ctfs                       ## CTFS container
     eventsFile: CtfsInternalFile     ## Handle for events.log
     encoder: SplitBinaryEncoder      ## Event serializer
-    paths*: seq[string]              ## Registered paths (written into meta.dat)
+    paths*: seq[string]              ## Registered paths (also in paths.dat)
+    pathsTable: InterningTableWriter ## `paths.dat` + `paths.off`, made lazily
+    hasPathsTable: bool
     metadata*: TraceMetadata         ## Program name, args, workdir
     eventCount: uint64               ## Total events written
     chunkEventCount: int             ## Events in current chunk
     chunkThreshold: int              ## Events per chunk
     closed*: bool
     filePath: string                 ## Path to .ct file
-    metaDatWritten: bool             ## `writeMetaDat` already ran for this writer
+    metaDatWritten: bool             ## `meta.dat` has been written (once)
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -119,6 +125,22 @@ proc flushChunk(w: var TraceWriter): Result[void, string] =
 # Public API
 # ---------------------------------------------------------------------------
 
+proc writeEventsFmt(w: var TraceWriter): Result[void, string] =
+  ## `events.fmt` names the encoding of `events.log`. It is known at open, so
+  ## it is written there, with `meta.dat`, rather than at close.
+  let fmtRes = w.ctfs.addFile("events.fmt")
+  if fmtRes.isErr:
+    return err("failed to add events.fmt: " & fmtRes.error)
+  var fmtFile = fmtRes.get()
+  let fmtContent = "split-binary"
+  var fmtBytes = newSeq[byte](fmtContent.len)
+  for i in 0 ..< fmtContent.len:
+    fmtBytes[i] = byte(fmtContent[i])
+  let writeRes = w.ctfs.writeToFile(fmtFile, fmtBytes)
+  if writeRes.isErr:
+    return err("failed to write events.fmt: " & writeRes.error)
+  ok()
+
 proc newTraceWriter*(path: string, program: string, args: seq[string],
     workdir: string = "",
     chunkThreshold: int = DefaultChunkThreshold,
@@ -167,6 +189,7 @@ proc newTraceWriter*(path: string, program: string, args: seq[string],
   if eventsRes.isErr:
     return err("failed to add events.log: " & eventsRes.error)
   w.eventsFile = eventsRes.get()
+  ? w.writeEventsFmt()
 
   ok(w)
 
@@ -201,19 +224,36 @@ proc newTraceWriterInMemory*(program: string, args: seq[string],
   if eventsRes.isErr:
     return err("failed to add events.log: " & eventsRes.error)
   w.eventsFile = eventsRes.get()
+  ? w.writeEventsFmt()
   ok(w)
 
 proc containerBytes*(w: TraceWriter): lent seq[byte] =
   ## The finished container. Only meaningful for an in-memory writer.
   w.ctfs.data
 
+proc writeMetaDat*(w: var TraceWriter, recorderId: string = "",
+    mcrFields: Option[McrMetaFields] = none(McrMetaFields)
+): Result[void, string]
+
 proc writeEvent*(w: var TraceWriter, event: TraceLowLevelEvent): Result[void, string] =
   ## Write a single event. Events are buffered and compressed in chunks.
   if w.closed:
     return err("TraceWriter is already closed")
 
-  # Track paths
+  # meta.dat is written once, before the first event reaches the container.
+  if not w.metaDatWritten:
+    ? w.writeMetaDat()
+
+  # Track paths: each `Path` event's id is its position among them, and
+  # paths.dat holds the same list in the same order.
   if event.kind == tlePath:
+    if not w.hasPathsTable:
+      w.pathsTable = ? initInterningTableWriter(w.ctfs, "paths")
+      w.hasPathsTable = true
+    var rec = newSeq[byte](event.path.len)
+    for i, c in event.path:
+      rec[i] = byte(c)
+    discard ? w.ctfs.appendRecord(w.pathsTable, rec)
     w.paths.add(event.path)
 
   w.encoder.encodeEvent(event)
@@ -324,21 +364,27 @@ proc writeMetaDat*(w: var TraceWriter, recorderId: string = "",
     mcrFields: Option[McrMetaFields] = none(McrMetaFields)
 ): Result[void, string] =
   ## Write binary meta.dat into the CTFS container using the writer's
-  ## current metadata and paths.
+  ## current metadata. `meta.dat` is written once: a caller that wants a
+  ## recorder id or MCR fields in it calls this before the first event, and
+  ## the first event (or `close`) writes it otherwise.
   if w.closed:
     return err("TraceWriter is already closed")
+  if w.metaDatWritten:
+    return err("meta.dat has already been written for this trace; it is " &
+      "written once, before the first event, and never rewritten")
 
   let fileRes = w.ctfs.addFile("meta.dat")
   if fileRes.isErr:
     return err("failed to add meta.dat: " & fileRes.error)
   var metaFile = fileRes.get()
 
-  let wRes = meta_dat.writeMetaDat(w.ctfs, metaFile, w.metadata, w.paths,
+  let wRes = meta_dat.writeMetaDat(w.ctfs, metaFile, w.metadata,
       recorderId = recorderId,
       mcrFields = mcrFields)
   if wRes.isErr:
     return err("failed to write meta.dat: " & wRes.error)
   w.metaDatWritten = true
+  w.ctfs.syncAllEntries()
   ok()
 
 # ---------------------------------------------------------------------------
@@ -354,20 +400,6 @@ proc close*(w: var TraceWriter): Result[void, string] =
   let flushRes = w.flushChunk()
   if flushRes.isErr:
     return err("failed to flush final chunk: " & flushRes.error)
-
-  # Write events.fmt
-  block:
-    let fmtRes = w.ctfs.addFile("events.fmt")
-    if fmtRes.isErr:
-      return err("failed to add events.fmt: " & fmtRes.error)
-    var fmtFile = fmtRes.get()
-    let fmtContent = "split-binary"
-    var fmtBytes = newSeq[byte](fmtContent.len)
-    for i in 0 ..< fmtContent.len:
-      fmtBytes[i] = byte(fmtContent[i])
-    let writeRes = w.ctfs.writeToFile(fmtFile, fmtBytes)
-    if writeRes.isErr:
-      return err("failed to write events.fmt: " & writeRes.error)
 
   # Write the metadata document if the caller did not already.
   #

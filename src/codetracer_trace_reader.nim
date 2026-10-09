@@ -74,158 +74,11 @@ type
 
 proc findInternalFileEntry(data: openArray[byte], name: string,
     maxEntries: uint32): tuple[found: bool, size: uint64, mapBlock: uint64] =
-  ## Search file entries in block 0 for the given name.
-  ##
-  ## `found` is reported separately from the two values, because `(0, 0)` is a
-  ## legitimate entry — an empty stream — as well as the shape of "no such
-  ## name", and conflating them is how a **damaged** entry used to slip
-  ## through: a stream with `Size > 0` and a null mapping root is neither
-  ## absent nor intact, and the caller has to be able to say so.
-  let encoded = base40Encode(name)
-  for i in 0 ..< int(maxEntries):
-    let off = HeaderSize + ExtHeaderSize + i * FileEntrySize
-    if off + FileEntrySize > data.len:
-      break
-    let entrySize = readU64LE(data, off)
-    let entryMap = readU64LE(data, off + 8)
-    let entryName = readU64LE(data, off + 16)
-    if entryName == encoded:
-      return (true, entrySize, entryMap)
-  (false, 0'u64, 0'u64)
-
-proc readInternalFile(data: openArray[byte], name: string,
-                      blockSize: uint32,
-                      maxEntries: uint32): Result[seq[byte], string] =
-  ## Read the complete content of an internal CTFS file by following the block mapping.
-  ##
-  ## Every block number this walk resolves is bounded against
-  ## `floor(len / blockSize)` before it is turned into a byte offset —
-  ## `CTFS-Binary-Format.md` §5d, the same three paths `container.nim`'s
-  ## `readInternalFile` bounds: the entry's mapping root, every mapping block
-  ## walked, and the data block. Checking byte offsets against `data.len` is
-  ## **not** this bound: the last data block's copy is clamped to what is left
-  ## of the entry, so a short read out of a truncated container's partial
-  ## region succeeds and is returned as content.
-  ##
-  ## A `0` is refused separately from an out-of-range number, because it means
-  ## something different — "unallocated", §4 — and because block 0 is the root
-  ## directory, so an unrefused null resolves *into* the container's own
-  ## header and entry array and reads it back as the stream.
-  let (found, fileSize, mapBlock) = findInternalFileEntry(data, name, maxEntries)
-  if not found:
-    return err("internal file not found: " & name)
-  if fileSize == 0:
-    return ok(newSeq[byte](0))
-
-  # Floor, never round up: the incomplete final block of a container whose tail
-  # write was interrupted must stay unaddressable.
-  let wholeBlocks = uint64(data.len) div uint64(blockSize)
-  let truncatedNote =
-    " — the container carries " & $wholeBlocks & " whole " & $blockSize &
-    "-byte blocks in " & $data.len & " bytes, so it is truncated or its tail " &
-    "write was interrupted"
-
-  if mapBlock == 0:
-    return err("mapping root block of internal file " & name & " is null, so " &
-      "the stream's mapping was never allocated or has been overwritten; " &
-      "block 0 is the container's root directory and no stream may name it")
-  if mapBlock >= wholeBlocks:
-    return err("mapping root block of internal file " & name & " names block " &
-      $mapBlock & ", which is out of bounds" & truncatedNote)
-
-  var fileBytes = newSeq[byte](int(fileSize))
-  let usable = uint64(blockSize) div 8 - 1
-
-  var remaining = int(fileSize)
-  var destPos = 0
-  var blockIdx: uint64 = 0
-
-  # Walk through data blocks using the mapping. Supports multi-level mapping
-  # by using the same chain-walking logic as the writer.
-  while remaining > 0:
-    # Use lookupDataBlock logic inline for the reader (no Ctfs object available)
-    var idx = blockIdx
-    var currentLevelBlock = mapBlock
-    var level: uint32 = 1
-
-    # Walk up through levels
-    block findLevel:
-      while true:
-        var cap: uint64 = 1
-        for l in 0'u32 ..< level:
-          cap = cap * usable
-        if idx < cap:
-          break findLevel
-        idx -= cap
-        level += 1
-        if level > MaxChainLevels:
-          return err("block index too large for mapping")
-        # Follow chain pointer (last entry in current level block)
-        let chainOff = int(currentLevelBlock) * int(blockSize) + int(usable) * 8
-        if chainOff + 8 > data.len:
-          return err("chain pointer out of bounds")
-        let chainPtr = readU64LE(data, chainOff)
-        if chainPtr == 0:
-          return err("missing chain pointer at level " & $level)
-        # Path 2a of 3: a mapping block reached through the chain.
-        if chainPtr >= wholeBlocks:
-          return err("chain pointer at level " & $level & " of internal file " &
-            name & " names block " & $chainPtr & ", which is out of bounds" &
-            truncatedNote)
-        currentLevelBlock = chainPtr
-
-    # Navigate down from level to find the data block
-    var navBlock = currentLevelBlock
-    var navLevel = level
-    var navIdx = idx
-    while navLevel > 1:
-      var subCap: uint64 = 1
-      for l in 0'u32 ..< (navLevel - 1):
-        subCap = subCap * usable
-      let entryIdx = navIdx div subCap
-      let subIdx = navIdx mod subCap
-      let childOff = int(navBlock) * int(blockSize) + int(entryIdx) * 8
-      if childOff + 8 > data.len:
-        return err("child pointer out of bounds")
-      let childBlock = readU64LE(data, childOff)
-      if childBlock == 0:
-        return err("missing child block at level " & $navLevel)
-      # Path 2b of 3: a mapping block reached by descending the hierarchy.
-      if childBlock >= wholeBlocks:
-        return err("child block pointer at level " & $navLevel &
-          " of internal file " & name & " names block " & $childBlock &
-          ", which is out of bounds" & truncatedNote)
-      navBlock = childBlock
-      navIdx = subIdx
-      navLevel -= 1
-
-    # Level 1: read direct pointer
-    let ptrOff = int(navBlock) * int(blockSize) + int(navIdx) * 8
-    if ptrOff + 8 > data.len:
-      return err("data block pointer out of bounds")
-    let dataBlock = readU64LE(data, ptrOff)
-    if dataBlock == 0:
-      return err("null data block at index " & $blockIdx)
-    # Path 3 of 3, and the one §5d calls the easy one to miss. It must be
-    # checked here rather than after the multiply below: `dataBlock` is read
-    # out of the container, so on a damaged one it can be large enough that
-    # `int(dataBlock) * int(blockSize)` overflows and kills the process
-    # instead of returning an error.
-    if dataBlock >= wholeBlocks:
-      return err("data block " & $blockIdx & " of internal file " & name &
-        " names block " & $dataBlock & ", which is out of bounds" & truncatedNote)
-
-    let blockOff = int(dataBlock) * int(blockSize)
-    let toCopy = min(remaining, int(blockSize))
-    if blockOff + toCopy > data.len:
-      return err("data block content out of bounds")
-    for i in 0 ..< toCopy:
-      fileBytes[destPos + i] = data[blockOff + i]
-    destPos += toCopy
-    remaining -= toCopy
-    blockIdx += 1
-
-  ok(fileBytes)
+  ## Search the root directory for the given name. `found` is reported
+  ## separately because `(0, 0)` is a legitimately empty member as well as the
+  ## shape of "no such name".
+  let e = findFileEntry(data, name, maxEntries)
+  (e.found, e.size, e.mapBlock)
 
 proc bytesToString(data: seq[byte]): string =
   result = newString(data.len)
@@ -237,7 +90,9 @@ proc bytesToString(data: seq[byte]): string =
 # ---------------------------------------------------------------------------
 
 proc openTrace*(path: string): Result[TraceReader, string] =
-  ## Open a .ct file and parse its contents (metadata and paths).
+  ## Open a .ct file and parse its contents (metadata and paths). Source
+  ## paths come from `paths.dat` only (`internal-files.md` §"Metadata
+  ## (meta.dat)": version 6 carries no path list).
   let readRes = readCtfsFromFile(path)
   if readRes.isErr:
     return err("failed to read file: " & readRes.error)
@@ -247,8 +102,9 @@ proc openTrace*(path: string): Result[TraceReader, string] =
   # Validate CTFS magic
   if not hasCtfsMagic(data):
     return err("not a valid CTFS file (bad magic)")
-  if not hasValidVersion(data):
-    return err("unsupported CTFS version")
+  let versionErr = ctfsVersionError(data)
+  if versionErr.len > 0:
+    return err(versionErr)
 
   # Read block size and max entries from extended header
   if data.len < 16:
@@ -325,7 +181,13 @@ proc openTrace*(path: string): Result[TraceReader, string] =
   reader.metadata.program = contents.program
   reader.metadata.workdir = contents.workdir
   reader.metadata.args = contents.args
-  reader.paths = contents.paths
+  if findInternalFileEntry(data, "paths.dat", maxEntries).found:
+    let nrRes = openNewTraceFromBytes(data, blockSize, maxEntries)
+    if nrRes.isErr:
+      return err("paths.dat: " & nrRes.error)
+    let nr = nrRes.get()
+    for i in 0'u64 ..< nr.pathCount():
+      reader.paths.add(? nr.path(i))
 
   ok(reader)
 
@@ -369,8 +231,8 @@ proc readEventsV4(reader: var TraceReader): Result[void, string] =
   ##        d. If n is the exitStep of any pending call records,
   ##           emit tleReturn (innermost-first / LIFO — deeper exits first).
   ##   4. tleEvent for each IO event (in stream order).
-  let trRes = openNewTraceFromBytes(reader.ctfsData, reader.blockSize,
-                                    reader.maxRootEntries)
+  let trRes = openNewTraceFromBytes(
+    reader.ctfsData, reader.blockSize, reader.maxRootEntries)
   if trRes.isErr:
     return err("failed to open v4 trace: " & trRes.error)
   var nr = trRes.get()
@@ -664,22 +526,19 @@ proc readEventsV4(reader: var TraceReader): Result[void, string] =
   if ioCountRes.isOk:
     let total = ioCountRes.get()
     for i in 0 ..< int(total):
-      let evRes = nr.ioEvent(uint64(i))
-      if evRes.isOk:
-        let io = evRes.get()
-        let kind =
-          case io.kind
-          of ioStdout, ioStderr, ioFileOp: elkWrite
-          of ioError: elkError
-        var content = newString(io.data.len)
-        for j in 0 ..< io.data.len:
-          content[j] = char(io.data[j])
-        reader.events.add(TraceLowLevelEvent(
-          kind: tleEvent,
-          recordEvent: RecordEvent(
-            kind: kind,
-            metadata: "",
-            content: content)))
+      let io = ? nr.ioEvent(uint64(i))
+      var content = newString(io.data.len)
+      for j in 0 ..< io.data.len:
+        content[j] = char(io.data[j])
+      var metadata = newString(io.metadata.len)
+      for j in 0 ..< io.metadata.len:
+        metadata[j] = char(io.metadata[j])
+      reader.events.add(TraceLowLevelEvent(
+        kind: tleEvent,
+        recordEvent: RecordEvent(
+          kind: io.kind,
+          metadata: metadata,
+          content: content)))
 
   reader.eventCount = reader.events.len
   ok()

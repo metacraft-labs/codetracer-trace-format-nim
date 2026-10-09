@@ -128,7 +128,7 @@ for spec in "${ARMS[@]}"; do
   fi
   if ! grep -q "GDH1-FAIL\[$wantgate\]" "$bin.out"; then
     echo "ARM-FAIL: $armdef exited $rc but not with GDH1-FAIL[$wantgate];" \
-         "it went red for some other reason:" >&2
+          "it went red for some other reason:" >&2
     tail -20 "$bin.out" >&2
     failures=$((failures + 1))
     continue
@@ -145,7 +145,7 @@ done
 echo "== ct-print instrument =="
 CTP="$WORK/ct-print"
 if ! nim c "${NIMFLAGS[@]}" --mm:arc --nimcache:"$WORK/nc-ctprint" \
-     -o:"$CTP" src/codetracer_ct_print.nim >"$WORK/ctprint.build.log" 2>&1; then
+      -o:"$CTP" src/codetracer_ct_print.nim >"$WORK/ctprint.build.log" 2>&1; then
   tail -30 "$WORK/ctprint.build.log" >&2
   echo "INSTRUMENT-FAIL: ct-print did not build" >&2
   failures=$((failures + 1))

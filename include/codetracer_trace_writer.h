@@ -103,6 +103,20 @@ const char* trace_writer_last_error(void);
  */
 void trace_writer_clear_last_error(void);
 
+/*
+ * How this library was compiled: `key:value` pairs joined by ';'.  A host
+ * library built by the repository's build_ffi.nims answers
+ * "app:staticlib;threads:off;mm:arc;release:on;processLock:on".
+ *
+ * The C ABI is safe to call from several host threads only when the library
+ * was built --threads:off with its process lock (one Nim heap, entered by one
+ * thread at a time); the same source built --threads:on crashes when a writer
+ * is freed after the thread that used it exited.  A host that did not build
+ * the archive itself can check this instead of trusting the build.  The
+ * string is static, never NULL, and never fails.
+ */
+const char* trace_writer_build_config(void);
+
 /* --------------------------------------------------------------------------
  * Lifecycle
  * -------------------------------------------------------------------------- */
@@ -191,6 +205,13 @@ int trace_writer_set_recording_id(trace_writer_t handle,
                                   const char* recording_id);
 
 void trace_writer_start(trace_writer_t handle, const char* path, int64_t line);
+/*
+ * meta.dat is written once, at the trace's first record (trace_writer_start
+ * included), and never rewritten: the working directory, the arguments and
+ * every capability (enable_*, declare_source_reload, filter provenance) must
+ * be set before it.  A later call is refused (trace_writer_last_error) and
+ * the recording's close fails.
+ */
 void trace_writer_set_workdir(trace_writer_t handle, const char* workdir);
 /* IC-M2: stamp a fully-qualified-key origin namespace (the VM language, e.g.
  * "gdscript") on every interned string when this materialized writer shares a
@@ -241,8 +262,8 @@ int trace_writer_enable_line_count_table(trace_writer_t handle);
  * Returns 0 on success, non-zero on failure (see trace_writer_last_error).
  */
 int trace_writer_register_path_with_line_count(trace_writer_t handle,
-                                               const char* path,
-                                               uint64_t line_count);
+                                                const char* path,
+                                                uint64_t line_count);
 
 /*
  * The failure return of the two uint64_t-returning path entry points below.
@@ -303,6 +324,34 @@ uint64_t trace_writer_register_path_version(trace_writer_t handle,
  */
 uint64_t trace_writer_current_path_id(trace_writer_t handle,
                                       const char* path);
+
+/*
+ * Intern `path` in paths.dat NOW and return its id: the id a step at `path`
+ * registered afterwards is attributed to.  A path is interned when it is
+ * registered, whether or not a step ever refers to it, so ids follow the
+ * caller's registrations rather than the order in which steps first reach
+ * each file.  Registering a path twice returns the id it already has.
+ *
+ * Under the line-count table an unseen path registered here has no count to
+ * record and is refused by name, like the implicit registration
+ * trace_writer_register_step performs; use
+ * trace_writer_register_path_with_line_count there.
+ *
+ * Returns CT_TW_INVALID_PATH_ID on failure, with trace_writer_last_error set.
+ * The error buffer is cleared on entry.
+ */
+uint64_t trace_writer_register_path(trace_writer_t handle, const char* path);
+
+/*
+ * Intern `name` in varnames.dat NOW and return its id: the id a value
+ * registered under `name` afterwards carries.  Registering a name twice
+ * returns the id it already has.
+ *
+ * Returns UINT64_MAX on failure, with trace_writer_last_error set.  The error
+ * buffer is cleared on entry.
+ */
+uint64_t trace_writer_register_variable_name(trace_writer_t handle,
+                                              const char* name);
 
 /* --------------------------------------------------------------------------
  * Source-reload markers (GDH-M6 — design §6.3)
@@ -376,6 +425,16 @@ typedef struct {
  * buffer is CLEARED on entry, so a non-empty buffer afterwards is always this
  * call's message and never a stale one.
  */
+/*
+ * Declare, before the first record, that this trace MAY carry source reload
+ * markers (meta.dat flags_ext bit 0).  meta.dat is written once, at the first
+ * record, so the declaration is refused after it; and
+ * trace_writer_register_source_reload is refused in a trace that did not
+ * declare.  A declared trace that records no reload is well-formed.
+ * Returns 0 on success, 1 on refusal (trace_writer_last_error).
+ */
+int trace_writer_declare_source_reload(trace_writer_t handle);
+
 uint64_t trace_writer_register_source_reload(
     trace_writer_t handle,
     const ct_tw_source_reload_change* changed,
@@ -396,6 +455,11 @@ size_t trace_writer_ensure_type_id(trace_writer_t handle,
     int kind, const char* lang_type);
 
 void trace_writer_register_call(trace_writer_t handle, size_t function_id);
+
+/* Mark the actual current active call as entry. No ids are supplied.
+ * Returns 0 on success, nonzero on named/latching failure. Optional entry.dat
+ * is appended last at close; unchanged callers emit no new member. */
+int trace_writer_mark_current_call_as_entry(trace_writer_t handle);
 void trace_writer_register_return(trace_writer_t handle);
 
 void trace_writer_register_return_int(trace_writer_t handle,
@@ -436,18 +500,18 @@ void trace_writer_register_variable_raw(trace_writer_t handle,
  * registration indistinguishable from a successful one.
  */
 void trace_writer_register_return_int_by_type_id(trace_writer_t handle,
-                                                 int64_t value,
-                                                 size_t type_id);
+                                                  int64_t value,
+                                                  size_t type_id);
 
 void trace_writer_register_variable_int_by_type_id(trace_writer_t handle,
-                                                   const char* name,
-                                                   int64_t value,
-                                                   size_t type_id);
+                                                    const char* name,
+                                                    int64_t value,
+                                                    size_t type_id);
 
 void trace_writer_register_variable_raw_by_type_id(trace_writer_t handle,
-                                                   const char* name,
-                                                   const char* value_repr,
-                                                   size_t type_id);
+                                                    const char* name,
+                                                    const char* value_repr,
+                                                    size_t type_id);
 
 void trace_writer_register_variable_cbor(trace_writer_t handle,
     const char* name,
@@ -506,10 +570,35 @@ int trace_writer_register_drop_variables(trace_writer_t handle,
 int trace_writer_register_drop_variable(trace_writer_t handle,
     const char* name);
 
+/*
+ * The place model: value-stream tags 1 and 4-8 (trace-events.md §"Value
+ * Stream").  Each attaches to the step being buffered and reaches the trace in
+ * that step's value record.  Values are pre-encoded CBOR ValueRecords (the
+ * ct_value_* encoder), stored verbatim; places are signed.  Variable names are
+ * interned in varnames.dat.  Each returns 0 on success, 1 on failure.
+ */
+int trace_writer_bind_variable(trace_writer_t handle,
+    const char* variable_name, int64_t place);                  /* tag 1 */
+int trace_writer_register_cell_value(trace_writer_t handle, int64_t place,
+    const uint8_t* value_cbor, size_t value_cbor_len);          /* tag 4 */
+int trace_writer_register_compound_value(trace_writer_t handle, int64_t place,
+    const uint8_t* value_cbor, size_t value_cbor_len);          /* tag 5 */
+int trace_writer_assign_cell(trace_writer_t handle, int64_t place,
+    const uint8_t* new_value_cbor, size_t new_value_cbor_len);  /* tag 6 */
+int trace_writer_assign_compound_item(trace_writer_t handle, int64_t place,
+    uint64_t index, int64_t item_place);                        /* tag 7 */
+int trace_writer_register_variable_cell(trace_writer_t handle,
+    const char* variable_name, int64_t place);                  /* tag 8 */
+
 void trace_writer_register_return_cbor(trace_writer_t handle,
     const uint8_t* cbor_data,
     size_t cbor_len);
 
+/*
+ * `kind` is the event's exact EventLogKind ordinal (0-13, trace-events.md
+ * §"EventLogKind (u8 enum)"): it is stored as given and read back as given.
+ * An unassigned value is refused (trace_writer_last_error; close fails).
+ */
 void trace_writer_register_special_event(trace_writer_t handle,
     int kind, const char* metadata, const char* content);
 
@@ -812,7 +901,6 @@ int ct_write_meta_dat_to_buffer(
     const uint8_t* program, size_t program_len,
     const uint8_t* workdir, size_t workdir_len,
     const uint8_t* const* args, const size_t* arg_lens, size_t args_count,
-    const uint8_t* const* paths, const size_t* path_lens, size_t paths_count,
     const uint8_t* recorder_id, size_t recorder_id_len,
     const uint8_t* recording_id, size_t recording_id_len,
     uint8_t** out_buf, size_t* out_len);
@@ -878,8 +966,6 @@ const uint8_t* ct_meta_dat_program(meta_dat_reader_t h, size_t* out_len);
 const uint8_t* ct_meta_dat_workdir(meta_dat_reader_t h, size_t* out_len);
 size_t ct_meta_dat_args_count(meta_dat_reader_t h);
 const uint8_t* ct_meta_dat_arg(meta_dat_reader_t h, size_t idx, size_t* out_len);
-size_t ct_meta_dat_paths_count(meta_dat_reader_t h);
-const uint8_t* ct_meta_dat_path(meta_dat_reader_t h, size_t idx, size_t* out_len);
 const uint8_t* ct_meta_dat_recorder_id(meta_dat_reader_t h, size_t* out_len);
 void ct_meta_dat_free(meta_dat_reader_t h);
 
@@ -914,6 +1000,15 @@ int ct_value_write_char(value_encoder_t h, uint32_t codepoint, uint64_t type_id)
 int ct_value_write_bigint(value_encoder_t h, const uint8_t* data, size_t len, int negative, uint64_t type_id);
 
 const uint8_t* ct_value_get_bytes(value_encoder_t h, size_t* out_len);
+
+/* Checked optional entry identity from an existing owned reader image.
+ * 1=present, 0=absent, -1=error; output pointers must be non-NULL. */
+/* Owned image lifecycle; NULL/nonzero and overlarge sizes refuse. NULL/0 is
+ * an empty image and is refused before parsing. Input bytes are copied. */
+void* ct_reader_open_bytes(const void* data, size_t length);
+int ct_reader_refresh_bytes(void* handle, const void* data, size_t length);
+int ct_reader_recorded_entry(void* reader, uint64_t* call_key,
+                            uint64_t* function_id, uint64_t* entry_step);
 
 #ifdef __cplusplus
 }

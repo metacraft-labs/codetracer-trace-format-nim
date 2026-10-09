@@ -9,6 +9,7 @@
 ## This module is the new replacement for the old TraceWriter that produced
 ## single-stream events.log + meta.json + paths.json.
 
+import std/algorithm
 import std/options
 import std/tables
 import results
@@ -18,6 +19,7 @@ import ../codetracer_ctfs/streaming
 import ../codetracer_ctfs/variable_record_table
 import ../codetracer_ctfs/crossing_state
 import ./meta_dat
+import ./entry_identity
 import ./corrmark_builder
 import ./interning_table
 import ./gdh2_arms
@@ -34,7 +36,7 @@ import ./step_map_builder
 import ./uuid_v7
 import ../codetracer_trace_types
 
-export results, value_stream.VariableValue, io_event_stream.IOEventKind,
+export results, value_stream.VariableValue, io_event_stream.EventLogKind,
        codetracer_trace_types.FilterProvenance, uuid_v7
 
 # The line-only address-space stride, re-exported for the consumers that
@@ -43,6 +45,8 @@ export results, value_stream.VariableValue, io_event_stream.IOEventKind,
 # inverting with another produces plausible wrong positions that no
 # container check can catch.
 export global_line_index.DefaultLinesPerFile
+export global_line_index.ConventionalLineLength
+export global_line_index.conventionalLineLengths
 
 type
   SourceViewRecord* = object
@@ -205,9 +209,10 @@ type
       ## P6 follow-up — per-path line-length tables, used in column-aware
       ## mode to compute byte-offset-based ``global_position_index`` values
       ## that match the reader's ``decodeGlobalPositionIndex`` expectation
-      ## per spec §"Source Location Addressing".  Parallel to ``paths``;
-      ## empty seq for files whose line_lengths the caller didn't
-      ## supply.  Ignored when ``columnAwareSteps`` is false.
+      ## per spec §"Source Location Addressing".  Parallel to ``paths``.
+      ## In column-aware mode an EMPTY seq is the conventional table
+      ## (100000 lines of 1024), held as its rule rather than spelled out;
+      ## on a line-only writer every entry is empty and unused.
     pathLineCounts: seq[uint64]
     pendingFuncs: seq[tuple[path: string, line: uint64, name: string]]
       ## `funcs.dat` records, held until `close`.
@@ -314,6 +319,8 @@ type
     lastPathId: uint64
     lastLine: uint64
     callStack: seq[PendingCall]
+    recordedEntry: Option[RecordedEntryIdentity]
+    recordedEntryValidated: bool
     completedCalls: seq[(uint64, call_stream.CallRecord)]
       ## CTFS-M-CallKeyOrder: finished CallRecords waiting to be written
       ## to the call stream. Filled in registerReturn (in exit order) and
@@ -403,6 +410,16 @@ type
       ## becomes the on-disk record index.  Empty until a recorder
       ## opts in via ``registerSourceView``.
 
+    metaCommitted: bool
+      ## True once ``meta.dat`` has been written — at the trace's first
+      ## record, or at ``close`` for a trace with none. ``meta.dat`` is written
+      ## once and never rewritten (``ctfs-container.md`` §6, "Durability", rule
+      ## 1), so every field and flag is fixed from then on and a call that
+      ## would change one is refused (``internal-files.md`` §"Extended flags").
+    sourceReloadDeclared: bool
+      ## The recorder declared, before the first record, that the trace may
+      ## carry ``SourceReload`` records (``flags_ext`` bit 0).
+
     lastStepValues: seq[VariableValue]
     lastStepExtraValueEvents: seq[byte]
       ## What the most recently written value record holds.
@@ -479,6 +496,48 @@ proc rebuildGli(w: var MultiStreamTraceWriter) =
       w.paths.len, w.columnAwareSteps))
   w.gliDirty = false
 
+proc extendGli(w: var MultiStreamTraceWriter) =
+  ## Add the path just appended to ``w.paths`` to the global line index.
+  ##
+  ## A new path goes after every existing one, so only its own base is new:
+  ## one prefix sum appended, sized by the same rule ``rebuildGli`` applies.
+  ## Rebuilding instead costs O(paths) per registration — O(paths^2) over a
+  ## trace that meets a new file every few steps. An index already awaiting
+  ## a rebuild is left to it, which will include this path.
+  if w.gliDirty:
+    return
+  w.gli.appendFile(positionSpaceCount(w.pathLineLengths, w.pathLineCounts,
+    w.paths.len - 1, w.columnAwareSteps))
+
+proc columnTableLineCount(table: seq[uint32]): int =
+  ## The line count of a held column-aware table; the empty one is the
+  ## conventional table.
+  if table.len == 0: int(DefaultLinesPerFile) else: table.len
+
+proc isConventionalPath(w: MultiStreamTraceWriter, pathId: uint64): bool =
+  ## Whether ``pathId``'s table is the conventional one.
+  ## The table is held as its rule: an empty column-aware table.
+  w.columnAwareSteps and pathId < uint64(w.pathLineLengths.len) and
+    w.pathLineLengths[int(pathId)].len == 0
+
+proc checkConventionalLine(w: MultiStreamTraceWriter,
+    pathId: uint64, line: uint64): Result[void, string] =
+  ## Refuse a step past the last line of a file with the conventional
+  ## table: its position would fall inside the next file's range.
+  if w.isConventionalPath(pathId) and line > DefaultLinesPerFile:
+    return err(conventionalLineDiagnostic(w.paths[int(pathId)], line))
+  ok()
+
+proc clampConventionalColumn(w: MultiStreamTraceWriter, pathId: uint64,
+    columnDelta: int64): int64 =
+  ## A column above ``ConventionalLineLength`` on a file with the
+  ## conventional table is recorded at that column of its line, as a line 0
+  ## is recorded as line 1. ``columnDelta`` is the offset from column 1.
+  if w.isConventionalPath(pathId):
+    min(columnDelta, int64(ConventionalLineLength) - 1)
+  else:
+    columnDelta
+
 proc toGlobalLineIndex(w: var MultiStreamTraceWriter,
     pathId: uint64, line: uint64): uint64 =
   ## In column-aware mode, returns the byte-offset-based
@@ -493,14 +552,18 @@ proc toGlobalLineIndex(w: var MultiStreamTraceWriter,
   ## base. See ``global_line_index.globalIndex``.
   if w.gliDirty:
     w.rebuildGli()
-  if w.columnAwareSteps and pathId < uint64(w.pathLineLengths.len) and
-     w.pathLineLengths[int(pathId)].len > 0:
+  if w.columnAwareSteps and pathId < uint64(w.pathLineLengths.len):
     # Cumulative byte offset of column 1 on ``line``: sum of the lengths
     # of preceding lines.  ``line`` is 1-based per the cursor convention;
     # line 1 sits at offset 0 within the file.  When ``line`` exceeds the
     # known line count we clamp to the file's total capacity (the reader's
     # ``decodeGlobalPositionIndex`` handles past-end addresses the same
     # way).
+    if w.isConventionalPath(pathId):
+      # Every line has the same length, so the sum is a product.
+      let upTo = max(min(int64(line) - 1, int64(DefaultLinesPerFile)), 0'i64)
+      return w.gli.prefixSum[int(pathId)] +
+        uint64(upTo) * uint64(ConventionalLineLength)
     let lls = w.pathLineLengths[int(pathId)]
     var lineOffset: uint64 = 0
     let upTo = min(int(line) - 1, lls.len)
@@ -539,6 +602,86 @@ proc checkLineWithinFile(w: var MultiStreamTraceWriter,
       "space, so its address would be inside the NEXT file's range and " &
       "read back as a location that was never recorded. Register the " &
       "path with the file's real line count")
+  ok()
+
+proc isMetaCommitted*(w: MultiStreamTraceWriter): bool =
+  ## True once ``meta.dat`` has been written (see ``metaCommitted``).
+  w.metaCommitted
+
+proc refuseAfterCommit(w: MultiStreamTraceWriter,
+    what: string): Result[void, string] =
+  if w.metaCommitted:
+    return err(what & ": meta.dat was written at this trace's first record " &
+      "and is never rewritten, so every field and capability is fixed from " &
+      "then on (ctfs-container.md §6, \"Durability\", rule 1). Make this " &
+      "call before the first record")
+  ok()
+
+proc commitMeta(w: var MultiStreamTraceWriter): Result[void, string] =
+  ## Write ``meta.dat``, complete, once: at the first record or at close.
+  ##
+  ## Stream-presence bits 8-12 are set because those members are created when
+  ## the writer opens. Bits 5 (``srcviews``), 13 (spans) and 15 (correlation
+  ## index) are never set: those members are created during recording, which
+  ## ``meta.dat`` — written before it — cannot know; a reader finds them by
+  ## their presence in the root directory (``internal-files.md`` §"Stream-
+  ## presence flags are a hint, not a gate").
+  ##
+  ## An ATTACHED writer does not own ``meta.dat`` (the container's owner
+  ## writes it), so it only records that its configuration is now fixed.
+  if w.metaCommitted:
+    return ok()
+  if w.attached:
+    w.metaCommitted = true
+    return ok()
+  let metaFileRes = w.container.addFile("meta.dat")
+  if metaFileRes.isErr:
+    return err("failed to add meta.dat: " & metaFileRes.error)
+  var metaFile = metaFileRes.get()
+  let metaRes = w.container.writeMetaDat(
+    metaFile, w.metadata,
+    filterProvenance = w.filterProvenance,
+    emitFilterProvenance = w.recordEmptyFilterProvenance,
+    columnAwareSteps = w.columnAwareSteps,
+    supportsColumnBreakpoints = w.supportsColumnBreakpoints,
+    supportsColumnMotions = w.supportsColumnMotions,
+    hasCallStream = true,
+    hasStepStream = true,
+    hasValueStream = true,
+    hasIoEventStream = true,
+    hasInterningTables = true,
+    hasLineCountTable = w.lineCountTable,
+    hasSourceReload = w.sourceReloadDeclared)
+  if metaRes.isErr:
+    return err("failed to write meta.dat: " & metaRes.error)
+  # Durability rule 1: meta.dat and the entry publishing it reach the file
+  # before any chunk of any stream does.
+  w.container.syncRootBlock()
+  w.metaCommitted = true
+  ok()
+
+proc setWorkdir*(w: var MultiStreamTraceWriter,
+    workdir: string): Result[void, string] =
+  ## Set ``meta.dat``'s working directory. Refused once ``meta.dat`` is written.
+  ? w.refuseAfterCommit("setWorkdir")
+  w.metadata.workdir = workdir
+  ok()
+
+proc setArgs*(w: var MultiStreamTraceWriter,
+    args: openArray[string]): Result[void, string] =
+  ## Set ``meta.dat``'s program arguments. Refused once ``meta.dat`` is written.
+  ? w.refuseAfterCommit("setArgs")
+  w.metadata.args = @args
+  ok()
+
+proc declareSourceReload*(w: var MultiStreamTraceWriter): Result[void, string] =
+  ## Declare that this trace MAY carry ``SourceReload`` records
+  ## (``flags_ext`` bit 0, ``internal-files.md`` §"Extended flags"). A
+  ## recorder attached to a reload agent calls this before the first record;
+  ## ``registerSourceReload`` is refused in a trace that did not. A declared
+  ## trace that records no reload is well-formed.
+  ? w.refuseAfterCommit("declareSourceReload")
+  w.sourceReloadDeclared = true
   ok()
 
 # ---------------------------------------------------------------------------
@@ -745,7 +888,7 @@ proc optIntoColumnAware(w: var MultiStreamTraceWriter) =
     w.columnAwareOptInAfterPaths = w.paths.len
   w.columnAwareSteps = true
 
-proc enableColumnAwareSteps*(w: var MultiStreamTraceWriter) =
+proc enableColumnAwareSteps*(w: var MultiStreamTraceWriter): Result[void, string] =
   ## Opt this writer into column-aware step encoding.  After calling
   ## this, ``writeColumnStep`` is permitted, and ``close()`` will set
   ## ``FlagHasColumnAwareSteps`` (bit 4) on ``meta.dat`` so
@@ -758,7 +901,8 @@ proc enableColumnAwareSteps*(w: var MultiStreamTraceWriter) =
   ## trace, and every ``paths.dat`` record of a column-aware trace is
   ## Layout A.  A path interned earlier was written as bare bytes and
   ## cannot be re-framed, so an opt-in after one fails ``close()`` by
-  ## name; there is no Result here to refuse it through.
+  ## name. Refused once ``meta.dat`` is written: the flag is fixed then.
+  ? w.refuseAfterCommit("enableColumnAwareSteps")
   w.optIntoColumnAware()
   # M26b — the column-aware exec stream stores a byte-offset
   # `global_position_index`, which the db-backend decodes via the
@@ -766,8 +910,10 @@ proc enableColumnAwareSteps*(w: var MultiStreamTraceWriter) =
   # gli-derived `step-map.ns` would not match that decode, so suppress
   # emission for column-aware traces (line-only traces keep it on).
   w.emitStepMap = false
+  ok()
 
-proc enableColumnBreakpointsSupport*(w: var MultiStreamTraceWriter) =
+proc enableColumnBreakpointsSupport*(w: var MultiStreamTraceWriter):
+    Result[void, string] =
   ## Capability opt-in: declare that this trace's recorder emits
   ## columns precise enough for the GUI to set per-column breakpoints.
   ## Sets ``FlagSupportsColumnBreakpoints`` (bit 6) on the meta.dat
@@ -781,20 +927,25 @@ proc enableColumnBreakpointsSupport*(w: var MultiStreamTraceWriter) =
   ##
   ## See ``codetracer-trace-format-spec/internal-files.md`` §
   ## "Column-Aware Capability Flags".
+  ? w.refuseAfterCommit("enableColumnBreakpointsSupport")
   w.optIntoColumnAware()
   w.supportsColumnBreakpoints = true
   w.emitStepMap = false  # M26b — see enableColumnAwareSteps.
+  ok()
 
-proc enableColumnMotionsSupport*(w: var MultiStreamTraceWriter) =
+proc enableColumnMotionsSupport*(w: var MultiStreamTraceWriter):
+    Result[void, string] =
   ## Capability opt-in: declare that this trace's recorder supports
   ## per-column step-over / step-in / step-out.  Sets
   ## ``FlagSupportsColumnMotions`` (bit 7) on the meta.dat header at
   ## ``close()`` time and — like ``enableColumnBreakpointsSupport`` —
   ## auto-enables ``columnAwareSteps`` because capability bits without
   ## wire-format column data is undefined behaviour per spec.
+  ? w.refuseAfterCommit("enableColumnMotionsSupport")
   w.optIntoColumnAware()
   w.supportsColumnMotions = true
   w.emitStepMap = false  # M26b — see enableColumnAwareSteps.
+  ok()
 
 proc enableLineCountTable*(w: var MultiStreamTraceWriter): Result[void, string] =
   ## Opt this writer into recording a per-file line count.
@@ -821,6 +972,7 @@ proc enableLineCountTable*(w: var MultiStreamTraceWriter): Result[void, string] 
   ## that mode sizes a file in addressable columns rather than lines, so
   ## the two tables are not additive — they are two spellings of the same
   ## field under two different units.
+  ? w.refuseAfterCommit("enableLineCountTable")
   if w.columnAwareSteps:
     return err("enableLineCountTable: this writer is column-aware, whose " &
       "paths.dat records already carry the file's line_count and whose " &
@@ -838,7 +990,8 @@ proc enableLineCountTable*(w: var MultiStreamTraceWriter): Result[void, string] 
 
 proc setFilterProvenance*(w: var MultiStreamTraceWriter,
                           entries: openArray[FilterProvenance];
-                          recordEvenIfEmpty: bool = false) =
+                          recordEvenIfEmpty: bool = false):
+    Result[void, string] =
   ## Record the active trace-filter chain in composition order.
   ##
   ## When the resulting sequence is non-empty, OR when
@@ -852,11 +1005,28 @@ proc setFilterProvenance*(w: var MultiStreamTraceWriter,
   ## Calling this proc replaces any previously set provenance — there
   ## is no append API by design: the caller composes the full
   ## composition chain (builtin default → auto-discovered → env →
-  ## CLI) once before close().
+  ## CLI) once, before the first record: ``meta.dat`` is written then.
+  ? w.refuseAfterCommit("setFilterProvenance")
   w.filterProvenance = @[]
   for e in entries:
     w.filterProvenance.add(e)
   w.recordEmptyFilterProvenance = recordEvenIfEmpty
+  ok()
+
+proc addFilterProvenance*(w: var MultiStreamTraceWriter,
+    entry: FilterProvenance): Result[void, string] =
+  ## Append one trace-filter chain entry. Refused once ``meta.dat`` is written.
+  ? w.refuseAfterCommit("addFilterProvenance")
+  w.filterProvenance.add(entry)
+  ok()
+
+proc recordEmptyFilterProvenanceBlock*(w: var MultiStreamTraceWriter):
+    Result[void, string] =
+  ## Emit a present-but-empty provenance block. Refused once ``meta.dat`` is
+  ## written.
+  ? w.refuseAfterCommit("recordEmptyFilterProvenance")
+  w.recordEmptyFilterProvenance = true
+  ok()
 
 proc linehits*(w: var MultiStreamTraceWriter): var LinehitsBuilder =
   ## Access the linehits builder. Raises if not enabled.
@@ -890,19 +1060,37 @@ proc registerPath*(w: var MultiStreamTraceWriter,
   ## trace is line-only, ``lineLengths`` is ignored and the legacy
   ## bare-path-bytes record format is preserved byte-for-byte.
   ##
-  ## Recorders that don't yet surface per-line column counts can leave
-  ## ``lineLengths`` at its default empty value.  Column-aware traces
-  ## still write the ``path_len`` and ``line_count = 0`` framing so
-  ## the reader can decode the record uniformly — empty
-  ## ``lineLengths`` just signals "no per-line data available yet"
-  ## and column resolution falls back to surfacing ``None``.
+  ## On a column-aware writer the file's table is decided when the path is
+  ## first mentioned — here, or by a step, a function or an id request that
+  ## names it — by ``columnTableAtFirstMention`` (``internal-files.md``
+  ## §"`paths.dat` Layout A"): a given table as given, except that one
+  ## whose lines hold nothing gives its first line a position; an empty
+  ## table or none, the conventional table. A recorder that can read a
+  ## file's source registers its real table before the file's first
+  ## mention. For a path already interned, a non-empty ``lineLengths`` that
+  ## is not the recorded table (after the same normalisation) is refused,
+  ## naming the path: positions already written depend on the file's size.
+  ## The same table again, or none, returns the existing id.
+  var table: seq[uint32]
   let idRes =
     if w.columnAwareSteps:
       # Column-aware paths key their dedup on the bare path (the on-disk record
       # is the self-describing Layout A form); IC-M2's qualifier applies to the
       # line-only producers (MCR, the GDScript VM), so column-aware attach keeps
       # the bare record.
-      w.container.ensurePathIdColumnAware(w.interningPtr[], path, lineLengths)
+      let existing = w.interningPtr[].paths.lookupId(path)
+      if existing.isSome:
+        let id = existing.get()
+        if lineLengths.len > 0 and id < uint64(w.pathLineLengths.len):
+          let offered = columnTableAtFirstMention(lineLengths)
+          let recorded = w.pathLineLengths[int(id)]
+          if offered != recorded:
+            return err(lateColumnTableDiagnostic(path,
+              columnTableLineCount(recorded), columnTableLineCount(offered)))
+        Result[uint64, string].ok(id)
+      else:
+        table = columnTableAtFirstMention(lineLengths)
+        w.container.ensurePathIdColumnAware(w.interningPtr[], path, table)
     elif w.lineCountTable:
       w.container.ensureQualifiedPathIdWithLineCount(
         w.interningPtr[], w.qualifier, path, lineCount)
@@ -915,22 +1103,17 @@ proc registerPath*(w: var MultiStreamTraceWriter,
   if id == uint64(w.paths.len):
     w.paths.add(path)
     # Mirror the per-file line-lengths so ``toGlobalLineIndex`` can
-    # compute byte-offset positions in column-aware mode.  When line
-    # lengths weren't supplied, store an empty seq so ``rebuildGli``
-    # falls back to the legacy ``DefaultLinesPerFile`` allocation for
-    # that path.
+    # compute byte-offset positions in column-aware mode.  A line-only
+    # writer stores an empty seq: its slots are sized by line count.
     if w.columnAwareSteps:
-      var lls = newSeq[uint32](lineLengths.len)
-      for i in 0 ..< lineLengths.len:
-        lls[i] = lineLengths[i]
-      w.pathLineLengths.add(lls)
+      w.pathLineLengths.add(move(table))
     else:
       w.pathLineLengths.add(@[])
-    # Mirror the line count so ``rebuildGli`` sizes the file's slot to it.
+    # Mirror the line count so the global line index sizes the file's slot to it.
     # Zero outside the line-count table: no count was recorded, and
     # ``positionSpaceCounts`` reads that as the pre-table convention.
     w.pathLineCounts.add(if w.lineCountTable: lineCount else: 0'u64)
-    w.gliDirty = true
+    w.extendGli()
   ok(id)
 
 # ---------------------------------------------------------------------------
@@ -1098,7 +1281,10 @@ proc registerPathVersion*(w: var MultiStreamTraceWriter,
         discard
       else:
         w.pathLineCounts.add(recordedCount)
-    w.gliDirty = true
+    when gdh1Arm(gdh1FalsifyPrepend):
+      w.gliDirty = true
+    else:
+      w.extendGli()
 
   w.currentPathVersions[gdh1VersionKey(path)] = id
   ok(id)
@@ -1271,10 +1457,11 @@ proc registerStep*(w: var MultiStreamTraceWriter, pathId: uint64,
   ## ``extraValueEvents`` carries already-encoded non-``StepValues``
   ## value-stream events (today only tag-9 ``Assignment``) belonging to this
   ## step; they are appended to the step's value record.
-  ## Automatically uses DeltaStep encoding when the new global line index
-  ## is within a small delta of the previous one.
+  ## The record is an AbsoluteStep or a DeltaStep by the normative rule
+  ## the exec stream applies (`trace-events.md` §"Encoding Rules").
   if w.closed:
     return err("writer is closed")
+  ? w.commitMeta()
   when gdh1Arm(gdh1FalsifyNoBoundsCheck):
     # FALSIFIER (GDH-M1's fourth gate): drop the per-file bound. The step
     # is then accepted, encodes into the NEXT file's range, and reads back
@@ -1282,20 +1469,13 @@ proc registerStep*(w: var MultiStreamTraceWriter, pathId: uint64,
     discard
   else:
     ? w.checkLineWithinFile(pathId, line)
+  ? w.checkConventionalLine(pathId, line)
 
   let gli = w.toGlobalLineIndex(pathId, line)
 
-  var ev: StepEvent
-  if w.stepCount == 0:
-    # First step must be absolute
-    ev = StepEvent(kind: sekAbsoluteStep, globalLineIndex: gli)
-  else:
-    let delta = int64(gli) - int64(w.lastGlobalLineIndex)
-    # Use delta encoding for small deltas (fits in 1-2 varint bytes)
-    if delta >= -64 and delta <= 63:
-      ev = StepEvent(kind: sekDeltaStep, lineDelta: delta)
-    else:
-      ev = StepEvent(kind: sekAbsoluteStep, globalLineIndex: gli)
+  # The position is handed over absolute; the exec stream chooses its
+  # encoding by the normative rule (`trace-events.md` §"Encoding Rules").
+  let ev = StepEvent(kind: sekAbsoluteStep, globalLineIndex: gli)
 
   let evRes = w.container.writeEvent(w.execWriter, ev)
   if evRes.isErr:
@@ -1399,11 +1579,13 @@ proc registerStepWithColumn*(w: var MultiStreamTraceWriter,
   ## doesn't carry per-event column information either way.
   if w.closed:
     return err("writer is closed")
+  ? w.commitMeta()
   if not w.columnAwareSteps and columnDelta != 0:
     return err("registerStepWithColumn(columnDelta != 0) called on a " &
       "writer that has not opted into column-aware mode " &
       "(call enableColumnAwareSteps first)")
   ? w.checkLineWithinFile(pathId, line)
+  ? w.checkConventionalLine(pathId, line)
 
   # A file with no per-line table has no column axis. Its slot in the position
   # space is sized by the line-only fallback, so one address IS one line, and a
@@ -1422,26 +1604,16 @@ proc registerStepWithColumn*(w: var MultiStreamTraceWriter,
   # the column onto a pending step and flushes both through here as one event —
   # so a guard present only on ``registerColumnStep`` left the defect live on
   # the path every recorder actually takes.
-  var effectiveDelta = columnDelta
-  if columnDelta != 0 and
-     (int(pathId) >= w.pathLineLengths.len or
-      w.pathLineLengths[int(pathId)].len == 0):
+  var effectiveDelta = w.clampConventionalColumn(pathId, columnDelta)
+  if columnDelta != 0 and int(pathId) >= w.pathLineLengths.len:
     w.noteColumnWithoutAxis(pathId)
     effectiveDelta = 0
 
   let baseGli = w.toGlobalLineIndex(pathId, line)
   let combinedGli = uint64(int64(baseGli) + effectiveDelta)
 
-  var ev: StepEvent
-  if w.stepCount == 0:
-    # First step must be absolute.
-    ev = StepEvent(kind: sekAbsoluteStep, globalLineIndex: combinedGli)
-  else:
-    let delta = int64(combinedGli) - int64(w.lastGlobalLineIndex)
-    if delta >= -64 and delta <= 63:
-      ev = StepEvent(kind: sekDeltaStep, lineDelta: delta)
-    else:
-      ev = StepEvent(kind: sekAbsoluteStep, globalLineIndex: combinedGli)
+  # Handed over absolute; the exec stream chooses the encoding.
+  let ev = StepEvent(kind: sekAbsoluteStep, globalLineIndex: combinedGli)
 
   let evRes = w.container.writeEvent(w.execWriter, ev)
   if evRes.isErr:
@@ -1487,6 +1659,7 @@ proc registerColumnStep*(w: var MultiStreamTraceWriter,
   ## applied.
   if w.closed:
     return err("writer is closed")
+  ? w.commitMeta()
   if not w.columnAwareSteps:
     return err("registerColumnStep called on a writer that has not " &
       "opted into column-aware mode (call enableColumnAwareSteps first)")
@@ -1503,12 +1676,20 @@ proc registerColumnStep*(w: var MultiStreamTraceWriter,
   # from a real step at that later line. Measured in the Solana recorder, whose
   # DWARF source paths do not resolve on the recording machine, so every file
   # went untabled and every step after the first reported the wrong line.
-  if int(w.lastPathId) >= w.pathLineLengths.len or
-     w.pathLineLengths[int(w.lastPathId)].len == 0:
+  if int(w.lastPathId) >= w.pathLineLengths.len:
     return err("registerColumnStep: file " & $w.lastPathId & " has no " &
       "per-line length table, so its positions are line-only and a column " &
       "delta would decode as a different line. Register the path with its " &
       "per-line counts, or emit line-only steps for it.")
+
+  # On a file with the conventional table, a move past column
+  # ``ConventionalLineLength`` stops at that column of the current line.
+  var columnDelta = columnDelta
+  if w.isConventionalPath(w.lastPathId):
+    let column = int64(w.lastGlobalLineIndex) -
+      int64(w.toGlobalLineIndex(w.lastPathId, w.lastLine)) + 1
+    columnDelta = min(column + columnDelta, int64(ConventionalLineLength)) -
+      column
 
   # In column-aware mode `global_position_index` is one-dimensional, so
   # a column delta is also a position delta.  The exec-stream writer
@@ -1549,20 +1730,65 @@ proc flushCompletedCalls(w: var MultiStreamTraceWriter): Result[void, string] =
   ## were assigned at entry time so a child key > parent key. Sorting by
   ## call_key and appending in that order makes the on-disk record index
   ## equal to the entry-order call_key.
+  ##
+  ## A recursion returns innermost first, so the buffer can hold its keys in
+  ## strictly descending order. The order is restored by sorting a permutation
+  ## of (key, index) pairs — O(n log n) integer moves, no record ever moved — so a
+  ## 100k-deep recursion flushes in about the time its records take to encode.
   if w.completedCalls.len == 0:
     return ok()
-  # Insertion-sort by callKey: typical fan-out is small (1..few siblings
-  # per parent), so this is effectively linear and avoids pulling in a
-  # generic sort over a tuple type.
-  for i in 1 ..< w.completedCalls.len:
-    var j = i
-    while j > 0 and w.completedCalls[j - 1][0] > w.completedCalls[j][0]:
-      let tmp = w.completedCalls[j - 1]
-      w.completedCalls[j - 1] = w.completedCalls[j]
-      w.completedCalls[j] = tmp
-      dec j
-  for entry in w.completedCalls:
-    let res = w.container.writeCall(w.callWriter, entry[1])
+  var order = newSeq[(uint64, int)](w.completedCalls.len)
+  for i in 0 ..< order.len:
+    order[i] = (w.completedCalls[i][0], i)
+  order.sort()
+  if w.recordedEntry.isSome and w.recordedEntryValidated:
+    let entry = w.recordedEntry.get()
+    for (key, rec) in w.completedCalls:
+      if key > entry.callKey and rec.entryStep <= entry.entryStep and
+          rec.exitStep >= entry.entryStep:
+        return err("entry.dat: later finalized call owns the marked entry step")
+  if w.recordedEntry.isSome and not w.recordedEntryValidated:
+    let entry = w.recordedEntry.get()
+    var records = initTable[uint64, int]()
+    for i, pair in w.completedCalls:
+      if records.hasKey(pair[0]):
+        return err("entry.dat: duplicate completed call key")
+      records[pair[0]] = i
+    if records.hasKey(entry.callKey):
+      let marked = w.completedCalls[records.getOrDefault(entry.callKey)][1]
+      if marked.functionId != entry.functionId or marked.entryStep != entry.entryStep:
+        return err("entry.dat: marked identity differs from completed call")
+      if entry.entryStep >= w.stepCount or marked.exitStep < entry.entryStep:
+        return err("entry.dat: marked call has no actual entry step")
+      for (otherKey, other) in w.completedCalls:
+        if otherKey > entry.callKey and other.entryStep <= entry.entryStep and
+            other.exitStep >= entry.entryStep:
+          return err("entry.dat: entry step belongs to another call")
+      var childKey = entry.callKey
+      var child = marked
+      while child.parentCallKey >= 0:
+        let parentKey = uint64(child.parentCallKey)
+        if parentKey >= childKey or not records.hasKey(parentKey):
+          return err("entry.dat: missing or cyclic finalized parent")
+        let parent = w.completedCalls[records.getOrDefault(parentKey)][1]
+        if child.depth == 0 or parent.depth != child.depth - 1 or
+            parent.entryStep > child.entryStep or parent.exitStep < child.exitStep:
+          return err("entry.dat: invalid finalized parent range or depth")
+        var links = 0
+        for key in parent.children:
+          if key == childKey: inc links
+        if links != 1:
+          return err("entry.dat: invalid finalized parent child link")
+        childKey = parentKey
+        child = parent
+      if child.parentCallKey != -1 or child.depth != 0:
+        return err("entry.dat: invalid finalized root")
+      if w.funcIds.hasKey("<toplevel>") and w.funcIds.getOrDefault("<toplevel>", high(uint64)) == 0 and
+          (childKey != 0 or child.functionId != 0):
+        return err("entry.dat: marked chain does not reach the synthetic root")
+      w.recordedEntryValidated = true
+  for (_, i) in order:
+    let res = w.container.writeCall(w.callWriter, w.completedCalls[i][1])
     if res.isErr:
       return err("failed to write call record: " & res.error)
     w.callCount += 1
@@ -1584,6 +1810,7 @@ proc registerCall*(w: var MultiStreamTraceWriter, functionId: uint64,
   ## frontend can render the call's argument names alongside their values.
   if w.closed:
     return err("writer is closed")
+  ? w.commitMeta()
 
   let parentKey =
     if w.callStack.len > 0:
@@ -1633,6 +1860,23 @@ proc registerCall*(w: var MultiStreamTraceWriter, functionId: uint64,
   w.currentDepth += 1
   ok()
 
+proc markCurrentCallAsEntry*(w: var MultiStreamTraceWriter): Result[void, string] =
+  ## Capture actual active-call identity; no caller-provided names or ids.
+  if w.closed: return err("entry.dat: writer is closed")
+  if w.callStack.len == 0: return err("entry.dat: no active call to mark")
+  let pending = w.callStack[^1]
+  if pending.functionId >= uint64(w.funcIds.len):
+    return err("entry.dat: active call has no registered function")
+  let entry = RecordedEntryIdentity(callKey: pending.callKey,
+      functionId: pending.functionId, entryStep: pending.entryStep)
+  discard ? encodeEntryIdentity(entry)
+  if w.recordedEntry.isSome:
+    if w.recordedEntry.get() != entry:
+      return err("entry.dat: a different entry is already marked")
+    return ok()
+  w.recordedEntry = some(entry)
+  ok()
+
 proc registerReturn*(w: var MultiStreamTraceWriter,
     returnValue: seq[byte] = @[]): Result[void, string] =
   ## Register a function return. Pops the call stack and buffers the
@@ -1641,6 +1885,7 @@ proc registerReturn*(w: var MultiStreamTraceWriter,
   ## record position in the call stream equals its entry-order call_key.
   if w.closed:
     return err("writer is closed")
+  ? w.commitMeta()
   if w.callStack.len == 0:
     return err("call stack underflow: return without matching call")
 
@@ -1720,6 +1965,7 @@ proc registerSpan*(w: var MultiStreamTraceWriter,
   ## rewritten.
   if w.closed:
     return err("writer is closed")
+  ? w.commitMeta()
 
   if not w.hasSpans:
     let initRes = initSpanStreamWriter(w.container)
@@ -1808,6 +2054,8 @@ proc beginCrossing*(w: var MultiStreamTraceWriter, spanType: string): uint64 =
   ## committed, so a failed begin leaves no dangling pending entry.
   if w.closed:
     return 0'u64
+  if w.commitMeta().isErr:
+    return 0'u64
   if w.nextSpanId == 0'u64:
     w.nextSpanId = 1'u64
   let spanId = w.nextSpanId
@@ -1870,6 +2118,7 @@ proc endCrossing*(w: var MultiStreamTraceWriter,
   ## no-op: it catches genuine misuse (mismatched begin/end nesting).
   if w.closed:
     return err("writer is closed")
+  ? w.commitMeta()
   if w.pendingCrossings.len == 0:
     return err("endCrossing: span_id " & $spanId &
       " is not the innermost open crossing (no open crossings)")
@@ -1907,7 +2156,7 @@ proc endCrossing*(w: var MultiStreamTraceWriter,
   ?w.flushSpans()
   ok()
 
-proc registerIOEvent*(w: var MultiStreamTraceWriter, kind: IOEventKind,
+proc registerIOEvent*(w: var MultiStreamTraceWriter, kind: EventLogKind,
     data: openArray[byte],
     metadata: openArray[byte] = [],
     stepId: Option[uint64] = none(uint64)): Result[void, string] =
@@ -1929,6 +2178,7 @@ proc registerIOEvent*(w: var MultiStreamTraceWriter, kind: IOEventKind,
   ## would render the output one line too high (issue #601).
   if w.closed:
     return err("writer is closed")
+  ? w.commitMeta()
 
   var dataSeq = newSeq[byte](data.len)
   for i in 0 ..< data.len:
@@ -2063,6 +2313,7 @@ proc registerCorrelationMarkerById*(w: var MultiStreamTraceWriter,
   ## past Rust destructors and strands the guard.
   if w.closed:
     return err("writer is closed")
+  ? w.commitMeta()
 
   let dir = if direction == "recv" or direction == "receive": "recv" else: "send"
     ## An unrecognised direction becomes "send" rather than an error, matching
@@ -2091,7 +2342,7 @@ proc registerCorrelationMarkerById*(w: var MultiStreamTraceWriter,
     elif w.stepCount > 0: w.stepCount - 1
     else: 0'u64
 
-  ?w.registerIOEvent(ioStdout, [], metaBytes, stepId = some(enclosingStep))
+  ?w.registerIOEvent(elkWrite, [], metaBytes, stepId = some(enclosingStep))
 
   w.correlationMarkers.add(initBoundaryMarker(
     markerId, keyValue, isRecv = dir == "recv", geid = enclosingStep))
@@ -2143,6 +2394,7 @@ proc registerSpanCoverage*(w: var MultiStreamTraceWriter,
   ## §11a.6.
   if w.closed:
     return err("writer is closed")
+  ? w.commitMeta()
   let enclosingStep =
     if stepId.isSome: stepId.get()
     elif w.stepCount > 0: w.stepCount - 1
@@ -2172,6 +2424,7 @@ proc registerRaise*(w: var MultiStreamTraceWriter, exceptionTypeId: uint64,
   ## Also writes an empty value record to keep the value stream in sync.
   if w.closed:
     return err("writer is closed")
+  ? w.commitMeta()
 
   var msgSeq = newSeq[byte](message.len)
   for i in 0 ..< message.len:
@@ -2184,9 +2437,9 @@ proc registerRaise*(w: var MultiStreamTraceWriter, exceptionTypeId: uint64,
     return err("failed to write raise event: " & res.error)
 
   # Write empty values to keep streams in sync
-  w.lastStepValues = @[]
-  w.lastStepExtraValueEvents = @[]
-  let valRes = w.container.writeStepValues(w.valueWriter, @[])
+  # Not a step: its record stays empty, and the last step's record stays
+  # the one values staged at the end are amended into.
+  let valRes = w.container.writeStepValues(w.valueWriter, @[], isStep = false)
   if valRes.isErr:
     return err("failed to write raise values: " & valRes.error)
 
@@ -2199,6 +2452,7 @@ proc registerCatch*(w: var MultiStreamTraceWriter,
   ## Also writes an empty value record to keep the value stream in sync.
   if w.closed:
     return err("writer is closed")
+  ? w.commitMeta()
 
   let ev = StepEvent(kind: sekCatch, catchExceptionTypeId: exceptionTypeId)
   let res = w.container.writeEvent(w.execWriter, ev)
@@ -2206,9 +2460,9 @@ proc registerCatch*(w: var MultiStreamTraceWriter,
     return err("failed to write catch event: " & res.error)
 
   # Write empty values to keep streams in sync
-  w.lastStepValues = @[]
-  w.lastStepExtraValueEvents = @[]
-  let valRes = w.container.writeStepValues(w.valueWriter, @[])
+  # Not a step: its record stays empty, and the last step's record stays
+  # the one values staged at the end are amended into.
+  let valRes = w.container.writeStepValues(w.valueWriter, @[], isStep = false)
   if valRes.isErr:
     return err("failed to write catch values: " & valRes.error)
 
@@ -2272,6 +2526,12 @@ proc registerSourceReload*(w: var MultiStreamTraceWriter,
   ## so a second reload cannot repeat the first's.
   if w.closed:
     return err("writer is closed")
+  if not w.sourceReloadDeclared:
+    return err("registerSourceReload: this trace did not declare source " &
+      "reloads before its first record (declareSourceReload), so its " &
+      "meta.dat does not admit SourceReload records and a reader would " &
+      "refuse the stream (internal-files.md \"Extended flags\", bit 0)")
+  ? w.commitMeta()
   # FALSIFIER (``gdh2FalsifyZeroedMarker``, gdh2_reload_marker_round_trips):
   # drop every validation and emit a marker whose payload is all zeros.
   # This is the cheapest way to make "the reload is discoverable" pass —
@@ -2289,9 +2549,9 @@ proc registerSourceReload*(w: var MultiStreamTraceWriter,
     let zeroRes = w.container.writeEvent(w.execWriter, zeroEv)
     if zeroRes.isErr:
       return err("failed to write source_reload event: " & zeroRes.error)
-    w.lastStepValues = @[]
-    w.lastStepExtraValueEvents = @[]
-    let zeroVal = w.container.writeStepValues(w.valueWriter, @[])
+    # Not a step: its record stays empty, and the last step's record stays
+    # the one values staged at the end are amended into.
+    let zeroVal = w.container.writeStepValues(w.valueWriter, @[], isStep = false)
     if zeroVal.isErr:
       return err("failed to write source_reload values: " & zeroVal.error)
     w.sourceReloads = zeroOrdinal
@@ -2336,9 +2596,9 @@ proc registerSourceReload*(w: var MultiStreamTraceWriter,
 
   # Keep the value stream in lock-step, exactly as raise / catch / the
   # thread events do.
-  w.lastStepValues = @[]
-  w.lastStepExtraValueEvents = @[]
-  let valRes = w.container.writeStepValues(w.valueWriter, @[])
+  # Not a step: its record stays empty, and the last step's record stays
+  # the one values staged at the end are amended into.
+  let valRes = w.container.writeStepValues(w.valueWriter, @[], isStep = false)
   if valRes.isErr:
     return err("failed to write source_reload values: " & valRes.error)
 
@@ -2357,15 +2617,16 @@ proc registerThreadSwitch*(w: var MultiStreamTraceWriter,
   ## Also writes an empty value record to keep the value stream in sync.
   if w.closed:
     return err("writer is closed")
+  ? w.commitMeta()
 
   let ev = StepEvent(kind: sekThreadSwitch, threadId: threadId)
   let res = w.container.writeEvent(w.execWriter, ev)
   if res.isErr:
     return err("failed to write thread_switch event: " & res.error)
 
-  w.lastStepValues = @[]
-  w.lastStepExtraValueEvents = @[]
-  let valRes = w.container.writeStepValues(w.valueWriter, @[])
+  # Not a step: its record stays empty, and the last step's record stays
+  # the one values staged at the end are amended into.
+  let valRes = w.container.writeStepValues(w.valueWriter, @[], isStep = false)
   if valRes.isErr:
     return err("failed to write thread_switch values: " & valRes.error)
 
@@ -2378,15 +2639,16 @@ proc registerThreadStart*(w: var MultiStreamTraceWriter,
   ## Also writes an empty value record to keep the value stream in sync.
   if w.closed:
     return err("writer is closed")
+  ? w.commitMeta()
 
   let ev = StepEvent(kind: sekThreadStart, startThreadId: threadId)
   let res = w.container.writeEvent(w.execWriter, ev)
   if res.isErr:
     return err("failed to write thread_start event: " & res.error)
 
-  w.lastStepValues = @[]
-  w.lastStepExtraValueEvents = @[]
-  let valRes = w.container.writeStepValues(w.valueWriter, @[])
+  # Not a step: its record stays empty, and the last step's record stays
+  # the one values staged at the end are amended into.
+  let valRes = w.container.writeStepValues(w.valueWriter, @[], isStep = false)
   if valRes.isErr:
     return err("failed to write thread_start values: " & valRes.error)
 
@@ -2399,15 +2661,16 @@ proc registerThreadExit*(w: var MultiStreamTraceWriter,
   ## Also writes an empty value record to keep the value stream in sync.
   if w.closed:
     return err("writer is closed")
+  ? w.commitMeta()
 
   let ev = StepEvent(kind: sekThreadExit, exitThreadId: threadId)
   let res = w.container.writeEvent(w.execWriter, ev)
   if res.isErr:
     return err("failed to write thread_exit event: " & res.error)
 
-  w.lastStepValues = @[]
-  w.lastStepExtraValueEvents = @[]
-  let valRes = w.container.writeStepValues(w.valueWriter, @[])
+  # Not a step: its record stays empty, and the last step's record stays
+  # the one values staged at the end are amended into.
+  let valRes = w.container.writeStepValues(w.valueWriter, @[], isStep = false)
   if valRes.isErr:
     return err("failed to write thread_exit values: " & valRes.error)
 
@@ -2441,6 +2704,10 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
       "bare, and a column-aware trace declares every paths.dat record " &
       "Layout A, so the container would misframe them. Enable column-aware " &
       "steps before the first path is registered")
+
+  # A trace with no record writes its meta.dat here; every other trace wrote
+  # it at its first record.
+  ? w.commitMeta()
 
   # FLUSH THE DEFERRED `funcs.dat` FIRST, while the container is still open and
   # every path this trace will ever register is already interned. That is the
@@ -2696,82 +2963,14 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
     if writeRes.isErr:
       return err("failed to write corrmark.ns: " & writeRes.error)
 
-  # Write meta.dat
-  let metaFileRes = w.container.addFile("meta.dat")
-  if metaFileRes.isErr:
-    return err("failed to add meta.dat: " & metaFileRes.error)
-  var metaFile = metaFileRes.get()
-
-  let metaRes = w.container.writeMetaDat(
-    metaFile, w.metadata, w.paths,
-    filterProvenance = w.filterProvenance,
-    emitFilterProvenance = w.recordEmptyFilterProvenance,
-    columnAwareSteps = w.columnAwareSteps,
-    alternateSourceViews = hasSourceViews,
-    supportsColumnBreakpoints = w.supportsColumnBreakpoints,
-    supportsColumnMotions = w.supportsColumnMotions,
-    # M17a: the multi-stream writer ALWAYS emits a dedicated calls.dat call
-    # stream (initCallStreamWriter above), so stamp the has_call_stream
-    # capability flag.  Readers may then load the call tree from calls.dat
-    # directly; the flag is the M17a gate for that on-demand path.
-    hasCallStream = true,
-    # M24a-1: the writer ALWAYS emits a dedicated steps.dat/steps.idx execution
-    # stream (initExecStreamWriter above) in the SPEC-canonical layout, so stamp
-    # the has_step_stream capability flag (bit 9).  The flag both gates the
-    # Rust/db-backend seekable step path AND, for the Nim FFI reader, marks the
-    # bundle as SPEC-framed (vs the legacy Nim-v4 framing that never set it).
-    hasStepStream = true,
-    # M24a-2: the writer ALWAYS emits a dedicated values.dat/values.idx value
-    # stream (initValueStreamWriter above) in the SPEC-canonical chunked layout,
-    # so stamp the has_value_stream capability flag (bit 10).  The flag both
-    # gates the Rust/db-backend seekable value path AND, for the Nim FFI reader,
-    # marks the bundle as SPEC-framed (vs the legacy Nim-v4 .off VRT framing
-    # that never set it).
-    hasValueStream = true,
-    # M24a-3: the writer ALWAYS emits a dedicated events.dat/events.idx I/O event
-    # stream (initIOEventStreamWriter above) in the SPEC-canonical chunked
-    # layout, so stamp the has_io_event_stream capability flag (bit 11).  The
-    # flag both gates the Rust/db-backend event-log path AND, for the Nim FFI
-    # reader, marks the bundle as SPEC-framed (vs the legacy Nim-v4 .off VRT
-    # framing that never set it).
-    hasIoEventStream = true,
-    # M23d: the writer ALWAYS creates the four interning tables —
-    # `initTraceInterningTables` builds paths/funcs/types/varnames eagerly for
-    # every trace — so bit 12 is additive and unconditional like the four stream
-    # bits above.
-    #
-    # It was simply never passed, so every container this writer has produced
-    # emitted all four tables and then declared it had none. That is worse than
-    # a missing capability: a reader honouring the flag skips tables that are
-    # right there, and the two writers' `meta.flags` differed on this one bit
-    # while agreeing on the other eleven.
-    hasInterningTables = true,
-    # RS-M1: unlike the four stream bits above, bit 13 is stamped ONLY when a
-    # span was actually registered.  See `hasSpans` for why this one is
-    # conditional: bit 13 is rejecting, not additive, at the reader.
-    hasSpanStream = w.hasSpans,
-    # Bit 14 is stamped only when the writer opted into recording per-file
-    # line counts.  Like bit 13 it is rejecting, not additive, at the
-    # reader, so a writer that did not opt in must leave it clear — see
-    # `enableLineCountTable`.
-    hasLineCountTable = w.lineCountTable,
-    # WTCI (bit 15): stamped only when the recording actually declared a
-    # marker, i.e. exactly when `corrmark.ns` was written above.  The bit is
-    # a hint and the file entry is the authority, so the two must never be
-    # able to disagree: a bit set over a container with no index would
-    # reintroduce the exact ambiguity the contract's §9 removes.
-    hasCorrelationIndex = w.correlationMarkers.len > 0,
-    # GDH-M2: the EXTENDED flag (schema version 5's flags_ext bit 0) is
-    # stamped only when a `TagSourceReload` marker was actually emitted.
-    # Conditional for the same reason bits 13-15 are, and with one extra
-    # consequence: setting it also moves the container to schema version
-    # 5, which every reader that predates GDH-M2 refuses by name.  A
-    # writer that stamped it unconditionally would make every existing
-    # reader refuse every new recording — the rollout hazard bit 13's
-    # documentation warns about, one field over.
-    hasSourceReload = w.sourceReloads > 0)
-  if metaRes.isErr:
-    return err("failed to write meta.dat: " & metaRes.error)
+  # Optional recorded entry is the last close-time append (format 4fc5486).
+  # Existing unmarked traces retain every original append and byte.
+  if w.recordedEntry.isSome:
+    if not w.recordedEntryValidated:
+      return err("entry.dat: marked identity was not validated by a completed call")
+    let data = ? encodeEntryIdentity(w.recordedEntry.get())
+    var entryFile = ? w.container.addFile("entry.dat")
+    ? w.container.writeToFile(entryFile, data)
 
   # Publish block 0 — the root entry array, which carries every internal
   # file's size.  `writeToFile` maintains those sizes in the in-memory image

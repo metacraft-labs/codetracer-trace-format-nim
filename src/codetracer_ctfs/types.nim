@@ -10,9 +10,40 @@ export endians2
 
 const
   CtfsMagic*: array[5, byte] = [0xC0'u8, 0xDE, 0x72, 0xAC, 0xE2]
-  CtfsVersion*: uint8 = 4
-  CtfsVersionV3*: uint8 = 3  ## Previous version, accepted by v4 readers
-  CtfsVersionV2*: uint8 = 2  ## Legacy version, accepted by v4 readers
+  CtfsVersion*: uint8 = 5
+    ## `ctfs-container.md` §1: writers write 5 and readers refuse every other
+    ## version, naming it (§2, "Older versions are refused").
+  CtfsVersionV6*: uint8 = 6
+    ## The 24-byte header that carries `Profile` and whole-file `Compression`
+    ## (`ctfs-container.md` §1, §1a, §1b). Version 6 is version 5's body plus
+    ## those eight bytes, so everything §2 says about `MapBlock`'s three forms
+    ## holds in a version-6 full-profile container unchanged.
+    ##
+    ## **This library does NOT read version 6, and that is deliberate.**
+    ## `CtfsVersion` is 5 and `ctfsVersionError` refuses everything else by
+    ## name, version 6 included. A version-6 container's `FileEntry` array
+    ## starts at `24 + R` rather than `16 + R`, so a reader that accepted the
+    ## version without implementing the body would resolve every entry out of
+    ## the reserved bytes — the same shape of defect as reading a
+    ## pre-correction container because its version stamp was trusted
+    ## (`meta_dat.nim`'s `LastShiftedGlobalIndexVersion`). The compact body is
+    ## the next milestone's work; the constant exists so the refusal, the
+    ## header offsets below and the parsers in `container.nim` all name one
+    ## number from one place.
+  V6HeaderSize* = 24
+    ## Size of the version-6 container header, in bytes: the 16 bytes every
+    ## earlier version has, plus `profile`, `compression` and six reserved
+    ## bytes. The six exist so that, in an unsharded container, the
+    ## `FileEntry` array still starts 8-byte aligned (`ctfs-container.md` §1).
+  V6ProfileOffset* = 16
+  V6CompressionOffset* = 17
+  V6ReservedOffset* = 18
+  V6ReservedLen* = 6
+  CtfsDirect*: uint64 = 1'u64 shl 63
+    ## `ctfs-container.md` §2, "`MapBlock` has three forms": a `MapBlock` with
+    ## this bit set names the member's only data block (`MapBlock and not
+    ## CtfsDirect`); the member owns no mapping block. `0` is an empty member,
+    ## any other value a level-1 mapping block.
   DefaultMaxShards*: uint8 = 0
     ## `ctfs-container.md`: a container that is not sharded writes `0`, and `1`
     ## is not a synonym for it. This wrote `1` while the Rust writer wrote `0`
@@ -35,6 +66,31 @@ type
   CtfsEncryptionMethod* = enum
     emNone = 0        ## No encryption
     emAes256Gcm = 1   ## AES-256-GCM encryption (reserved, not yet implemented)
+
+  CtfsProfile* = enum
+    ## `ctfs-container.md` §1a. Byte 16 of a version-6 header. CLOSED SET:
+    ## these are the only two defined values and anything else is a refusal,
+    ## so the parser is `parseCtfsProfile`, which returns a `Result`, and not
+    ## a cast from the byte.
+    cpFull = 0        ## Block 0, FileEntry array, block map
+    cpCompact = 1     ## Directory + concatenated raw members, no block map
+
+  CtfsWholeFileCompression* = enum
+    ## `ctfs-container.md` §1b. Byte 17 of a version-6 header: the scheme
+    ## applied to the container image from offset 24 to the end of the stored
+    ## object.
+    ##
+    ## **This is a different field from `CtfsCompressionMethod`**, which is
+    ## per-member and lives inside the region a whole-file scheme covers. The
+    ## set is two members because a member of it is a promise that every
+    ## reader of the format implements the scheme, and zstd is the only one
+    ## both this package and the Rust db-backend already decode (`ruzstd` on
+    ## `wasm32-unknown-unknown`). It deliberately does NOT carry the
+    ## `reserved, not yet implemented` member that `CtfsCompressionMethod`
+    ## carries for LZ4 — an enumerated scheme with no implementation is a
+    ## capability a consumer can read and cannot rely on.
+    wfcNone = 0       ## Stored as-is. What a BlockTracer archive declares
+    wfcZstd = 1       ## One zstd frame over the body
 
   ## Inline chunk header for chunked compressed streams.
   ## Written before each compressed chunk in the stream:
@@ -65,6 +121,16 @@ type
     streaming*: bool        ## True if streaming writes to disk
     streamPath*: string     ## File path when streaming (empty if not)
     streamFile*: File       ## Open file handle when streaming
+    deferWrites*: bool
+      ## Streaming writes are recorded as dirty blocks and handed to the
+      ## operating system by `publish` — at every sealed chunk, at
+      ## `meta.dat`, at close — instead of written through on every append.
+      ## `ctfs-container.md` §6, "Durability", allows buffering between seals
+      ## and requires everything up to the last seal to be written.
+    dirtyBlocks*: seq[uint64]
+      ## Blocks written since the last `publish` (deferred mode).
+    dirtyMark*: seq[bool]
+      ## Indexed by block number: already in `dirtyBlocks`.
 
 proc entriesPerBlock*(c: Ctfs): uint64 =
   uint64(c.blockSize) div 8
@@ -73,12 +139,23 @@ proc usableEntries*(c: Ctfs): uint64 =
   ## Usable entries per mapping block (last entry reserved for chain pointer).
   c.entriesPerBlock() - 1
 
+proc rootEntryStart*(maxShards: uint8): int =
+  ## Version-5 full-profile header plus seven six-byte free-list roots per shard.
+  HeaderSize + ExtHeaderSize + 7 * int(maxShards) * 6
+
+proc effectiveRootEntryCount*(blockSize, declared: uint32, maxShards: uint8): uint32 =
+  ## A zero header count auto-fills the remainder of block 0 after the roots.
+  if declared != 0: return declared
+  let prefix = uint64(rootEntryStart(maxShards))
+  if uint64(blockSize) < prefix: return 0
+  uint32((uint64(blockSize) - prefix) div uint64(FileEntrySize))
+
 proc fileEntryOffset*(c: Ctfs, index: int): int =
   ## Byte offset of a file entry from the start of the container.  The entry
   ## array starts in block 0 and, when it is larger than block 0, continues
   ## into the blocks after it (`rootBlockCount`), so this is a plain byte
   ## offset and may lie past the end of block 0.
-  HeaderSize + ExtHeaderSize + index * FileEntrySize
+  rootEntryStart(c.maxShards) + index * FileEntrySize
 
 proc rootBlockCount*(blockSize: uint32, maxRootEntries: uint32,
                      maxShards: uint8): uint64 =
@@ -95,8 +172,7 @@ proc rootBlockCount*(blockSize: uint32, maxRootEntries: uint32,
   ## 0 for a zero block size, which no reader accepts.
   if blockSize == 0'u32:
     return 0
-  let rootBytes = uint64(HeaderSize + ExtHeaderSize) +
-    7'u64 * uint64(maxShards) * 6'u64 +
+  let rootBytes = uint64(rootEntryStart(maxShards)) +
     uint64(maxRootEntries) * uint64(FileEntrySize)
   max(1'u64, (rootBytes + uint64(blockSize) - 1) div uint64(blockSize))
 
@@ -128,3 +204,42 @@ proc writeU32LE*(data: var openArray[byte], offset: int, val: uint32) =
 proc blockOffset*(c: Ctfs, blockNum: uint64): int =
   ## Byte offset of a given block number.
   int(blockNum) * int(c.blockSize)
+
+proc isDirectMapBlock*(mapBlock: uint64): bool {.inline.} =
+  ## True when a file entry's `MapBlock` names the member's only data block
+  ## (`ctfs-container.md` §2) rather than a mapping block.
+  (mapBlock and CtfsDirect) != 0
+
+proc directDataBlock*(mapBlock: uint64): uint64 {.inline.} =
+  ## The data block a tagged `MapBlock` names.
+  mapBlock and not CtfsDirect
+
+proc ctfsVersionError*(data: openArray[byte]): string =
+  ## Empty when `data` carries the CTFS version this library reads (5);
+  ## otherwise the refusal, naming the version found and the one read
+  ## (`ctfs-container.md` §2, "Older versions are refused").
+  if data.len < 6:
+    return "CTFS container too short for a header (" & $data.len & " bytes)"
+  if data[5] != CtfsVersion:
+    return "CTFS container version " & $data[5] & " is not supported: this " &
+      "reader reads version " & $CtfsVersion & " only (older containers are " &
+      "re-recorded; ctfs-container.md §2, \"Older versions are refused\")"
+  ""
+
+proc rootDirectoryLayout*(data: openArray[byte]): tuple[entryStart: int, entryCount: uint32, error: string] =
+  ## Validate the version-5 header-derived directory before any entry traversal.
+  if data.len < HeaderSize + ExtHeaderSize:
+    return (0, 0'u32, "CTFS container too short for root layout")
+  for i in 0 ..< CtfsMagic.len:
+    if data[i] != CtfsMagic[i]: return (0, 0'u32, "invalid CTFS magic")
+  let versionErr = ctfsVersionError(data)
+  if versionErr.len > 0: return (0, 0'u32, versionErr)
+  let blockSize = readU32LE(data, 8)
+  let declared = readU32LE(data, 12)
+  let prefix = rootEntryStart(data[7])
+  if blockSize == 0 or (declared == 0 and uint64(blockSize) < uint64(prefix)):
+    return (0, 0'u32, "unusable CTFS auto-fill root layout")
+  let count = effectiveRootEntryCount(blockSize, declared, data[7])
+  if uint64(prefix) + uint64(count) * uint64(FileEntrySize) > uint64(data.len):
+    return (0, 0'u32, "truncated CTFS reserved root directory")
+  (prefix, count, "")
