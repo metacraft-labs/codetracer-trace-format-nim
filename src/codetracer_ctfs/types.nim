@@ -8,6 +8,17 @@ when defined(nimPreviewSlimSystem):
 import stew/endians2
 export endians2
 
+when not defined(gcDestructors):
+  # `setLenUninit` is a destructor-GC (arc/orc) seq routine; it is undeclared
+  # under refc AND under `--mm:none` — the mode the injected recorder shim
+  # (`libct_interpose[_lean].dylib`) builds with.  Provide an equivalent
+  # fallback so the CTFS reader modules compile for every consumer regardless of
+  # mm.  Every call site immediately overwrites the bytes it grew (via copyMem
+  # or a read loop), so `setLen`'s zero-init is discarded — same observable
+  # result, just without the uninitialized-grow optimization under a GC that
+  # does not support it.
+  template setLenUninit*[T](s: var seq[T]; newLen: int) = s.setLen(newLen)
+
 const
   CtfsMagic*: array[5, byte] = [0xC0'u8, 0xDE, 0x72, 0xAC, 0xE2]
   CtfsVersion*: uint8 = 5

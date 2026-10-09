@@ -19,6 +19,7 @@ import results
 import ../codetracer_ctfs/zstd_bindings
 import ./varint
 import ../codetracer_ctfs/member_view
+import ../codetracer_ctfs/types  # setLenUninit fallback for refc/--mm:none builds
 
 export results, member_view
 

@@ -65,13 +65,27 @@ when fileImages:
     except IOError:
       discard
 
-proc `=destroy`(x: ContainerImageObj) =
+# The destroy body is shared across both `=destroy` signatures below.  nim
+# requires the by-value `proc =destroy(x: T)` under the destructor GCs
+# (arc/orc, `defined(gcDestructors)`), but the legacy `proc =destroy(x: var T)`
+# under refc AND under `--mm:none` — the mode the injected recorder shim
+# (`libct_interpose[_lean].dylib`) builds with.  Provide both so this container
+# compiles for every consumer regardless of mm, without losing the by-value
+# (move/sink-friendly) form where it is accepted.
+template destroyContainerImageObj(x: untyped) =
   when fileImages:
     if x.file != nil:
       closeRead(x.file)
     `=destroy`(x.path)
   `=destroy`(x.bytes)
   `=destroy`(x.loaded)
+
+when defined(gcDestructors):
+  proc `=destroy`(x: ContainerImageObj) =
+    destroyContainerImageObj(x)
+else:
+  proc `=destroy`(x: var ContainerImageObj) =
+    destroyContainerImageObj(x)
 
 proc `=copy`(a: var ContainerImageObj, b: ContainerImageObj) {.error.}
 
@@ -326,7 +340,8 @@ proc span*(v: MemberView, first, n: int,
   if into + n <= v.runs[k].len:
     mustBeLoaded(v.runs[k].at + into, n)
     return cast[ptr UncheckedArray[byte]](addr v.image.bytes[v.runs[k].at + into])
-  scratch.setLenUninit(n)  # every byte copied below
+  scratch.setLenUninit(n)  # every byte copied below (see types.setLenUninit
+                           # fallback for refc/--mm:none builds)
   var done = 0
   var off = into
   while done < n:
