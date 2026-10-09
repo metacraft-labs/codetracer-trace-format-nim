@@ -13,6 +13,8 @@ import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
 import ../codetracer_ctfs/variable_record_table
 import ./meta_dat
+import ./entry_identity
+import ../codetracer_ctfs/base40
 import ./interning_table
 import ./exec_stream
 import ./value_stream
@@ -69,6 +71,7 @@ type
 
     # Metadata
     meta*: MetaDatContents
+    entryIdentity: Option[RecordedEntryIdentity]
 
     # Interning tables (loaded at startup)
     pathReader: InterningTableReader
@@ -527,6 +530,13 @@ proc computePathVersionOrdinals(r: var NewTraceReader): Result[void, string] =
 # Opening
 # ---------------------------------------------------------------------------
 
+proc validateRecordedEntry*(r: var NewTraceReader,
+    entry: RecordedEntryIdentity): Result[void, string]
+
+proc recordedEntryIdentity*(r: NewTraceReader): Option[RecordedEntryIdentity] =
+  ## Only open's checked same-image identity is exposed.
+  r.entryIdentity
+
 proc openNewTraceFromBytes*(data: seq[byte],
     blockSize: uint32 = DefaultBlockSize,
     maxEntries: uint32 = DefaultMaxRootEntries,
@@ -551,6 +561,14 @@ proc openNewTraceFromBytes*(data: seq[byte],
   let rootLayout = rootDirectoryLayout(data)
   if rootLayout.error.len > 0:
     return err(rootLayout.error)
+
+  # Structural presence is independent of caller lookup caps and table decoding.
+  var entryMembers = 0
+  let entryName = base40Encode("entry.dat")
+  for i in 0 ..< int(rootLayout.entryCount):
+    let off = rootLayout.entryStart + i * FileEntrySize
+    if readU64LE(data, off + 16) == entryName: inc entryMembers
+  if entryMembers > 1: return err("entry.dat: duplicate member")
 
   var reader: NewTraceReader
   reader.data = data
@@ -741,6 +759,12 @@ proc openNewTraceFromBytes*(data: seq[byte],
   reader.posSpace = buildGlobalLineIndex(positionSpaceCounts(
     reader.lineLengths, reader.lineCounts, int(reader.pathReader.count()),
     reader.meta.hasColumnAwareSteps))
+  # Optional finalized metadata is read from these same owned bytes.
+  if entryMembers == 1:
+    let raw = ? readInternalFile(data, "entry.dat", blockSize, rootLayout.entryCount)
+    let entry = ? decodeEntryIdentity(raw)
+    ? reader.validateRecordedEntry(entry)
+    reader.entryIdentity = some(entry)
   ok(reader)
 
 when ctHasFilesystem:
@@ -1644,6 +1668,52 @@ proc callForStep*(r: var NewTraceReader, stepId: uint64): Result[CallRecord, str
       break
     i -= 1
   err("step " & $stepId & " not found in any call")
+
+proc validateRecordedEntry*(r: var NewTraceReader,
+    entry: RecordedEntryIdentity): Result[void, string] =
+  let calls = ? r.callCount()
+  let steps = ? r.stepCount()
+  if entry.callKey >= calls: return err("entry.dat: call key out of range")
+  if entry.functionId >= r.functionCount(): return err("entry.dat: function id out of range")
+  if entry.entryStep >= steps: return err("entry.dat: entry step out of range")
+  discard ? r.functionRecord(entry.functionId)
+  let target = ? r.call(entry.callKey)
+  if target.functionId != entry.functionId: return err("entry.dat: function binding mismatch")
+  if target.entryStep != entry.entryStep: return err("entry.dat: entry step binding mismatch")
+  let event = ? r.step(entry.entryStep)
+  if event.kind notin {sekAbsoluteStep, sekDeltaStep, sekDeltaColumn}:
+    return err("entry.dat: entry is not a source step")
+  # Resolve the actual latest entered enclosing frame, retaining its key.
+  var owner = none(uint64)
+  for key in 0'u64 ..< calls:
+    let c = ? r.call(key)
+    if c.entryStep <= entry.entryStep and c.exitStep >= entry.entryStep:
+      owner = some(key)
+  if owner.isNone or owner.get() != entry.callKey:
+    return err("entry.dat: source step belongs to another call")
+  var key = entry.callKey
+  var child = target
+  while child.parentCallKey >= 0:
+    let parentKey = uint64(child.parentCallKey)
+    if parentKey >= key or parentKey >= calls:
+      return err("entry.dat: invalid or cyclic parent chain")
+    let parent = ? r.call(parentKey)
+    if parent.depth == high(uint32) or parent.depth + 1 != child.depth:
+      return err("entry.dat: parent depth mismatch")
+    if parent.entryStep > child.entryStep or parent.exitStep < child.exitStep:
+      return err("entry.dat: child range outside parent")
+    var memberships = 0
+    for childKey in parent.children:
+      if childKey == key: inc memberships
+    if memberships != 1: return err("entry.dat: parent child-link mismatch")
+    child = parent
+    key = parentKey
+  if child.parentCallKey != -1 or child.depth != 0:
+    return err("entry.dat: invalid outermost frame")
+  if r.functionCount() > 0 and (? r.function(0)) == "<toplevel>":
+    if key != 0 or child.functionId != 0:
+      return err("entry.dat: parent chain does not terminate at literal root")
+  ok()
 
 iterator callRange*(r: var NewTraceReader, start, count: uint64): CallRecord =
   ## Yields call records in [start, start+count).

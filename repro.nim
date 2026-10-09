@@ -143,6 +143,9 @@ const
 # Teaching ``TestSpec`` about the two flags so reprobuild covers them as
 # well is worth doing and is tracked separately.
 const testSpecs: seq[TestSpec] = @[
+  TestSpec(source: "tests/test_recorded_entry_identity.nim", binary: "build/test-bin/test_recorded_entry_identity"),
+  TestSpec(source: "tests/test_recorded_entry_sealed.nim", binary: "build/test-bin/test_recorded_entry_sealed"),
+  TestSpec(source: "tests/test_recorded_entry_hierarchy.nim", binary: "build/test-bin/test_recorded_entry_hierarchy"),
   TestSpec(source: "tests/test_base40.nim", binary: "build/test-bin/test_base40"),
   TestSpec(source: "tests/test_container.nim", binary: "build/test-bin/test_container"),
   TestSpec(source: "tests/test_ctfs_v5_member_forms.nim", binary: "build/test-bin/test_ctfs_v5_member_forms"),

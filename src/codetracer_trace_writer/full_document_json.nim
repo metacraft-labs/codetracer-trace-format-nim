@@ -27,7 +27,7 @@
 ## ``FullOpts.stripPaths`` substitutes ``<workdir>`` and ``<tmp>`` placeholders
 ## for cross-machine snapshots.
 
-import std/[json, strutils, base64, algorithm]
+import std/[json, strutils, base64, algorithm, options]
 import results
 import ./new_trace_reader
 import ./meta_dat
@@ -451,6 +451,11 @@ proc buildFullDocument*(reader: var NewTraceReader,
     traceFilterObj["filters"] = filtersArr
     meta["trace_filter"] = traceFilterObj
 
+  let entry = reader.recordedEntryIdentity()
+  if entry.isSome:
+    let identity = entry.get()
+    meta["entry"] = %* {"call_key": identity.callKey,
+      "function_id": identity.functionId, "entry_step": identity.entryStep}
   root["metadata"] = meta
 
   # ----- paths -----

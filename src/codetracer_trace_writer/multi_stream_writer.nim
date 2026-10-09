@@ -19,6 +19,7 @@ import ../codetracer_ctfs/streaming
 import ../codetracer_ctfs/variable_record_table
 import ../codetracer_ctfs/crossing_state
 import ./meta_dat
+import ./entry_identity
 import ./corrmark_builder
 import ./interning_table
 import ./gdh2_arms
@@ -318,6 +319,8 @@ type
     lastPathId: uint64
     lastLine: uint64
     callStack: seq[PendingCall]
+    recordedEntry: Option[RecordedEntryIdentity]
+    recordedEntryValidated: bool
     completedCalls: seq[(uint64, call_stream.CallRecord)]
       ## CTFS-M-CallKeyOrder: finished CallRecords waiting to be written
       ## to the call stream. Filled in registerReturn (in exit order) and
@@ -1738,6 +1741,52 @@ proc flushCompletedCalls(w: var MultiStreamTraceWriter): Result[void, string] =
   for i in 0 ..< order.len:
     order[i] = (w.completedCalls[i][0], i)
   order.sort()
+  if w.recordedEntry.isSome and w.recordedEntryValidated:
+    let entry = w.recordedEntry.get()
+    for (key, rec) in w.completedCalls:
+      if key > entry.callKey and rec.entryStep <= entry.entryStep and
+          rec.exitStep >= entry.entryStep:
+        return err("entry.dat: later finalized call owns the marked entry step")
+  if w.recordedEntry.isSome and not w.recordedEntryValidated:
+    let entry = w.recordedEntry.get()
+    var records = initTable[uint64, int]()
+    for i, pair in w.completedCalls:
+      if records.hasKey(pair[0]):
+        return err("entry.dat: duplicate completed call key")
+      records[pair[0]] = i
+    if records.hasKey(entry.callKey):
+      let marked = w.completedCalls[records.getOrDefault(entry.callKey)][1]
+      if marked.functionId != entry.functionId or marked.entryStep != entry.entryStep:
+        return err("entry.dat: marked identity differs from completed call")
+      if entry.entryStep >= w.stepCount or marked.exitStep < entry.entryStep:
+        return err("entry.dat: marked call has no actual entry step")
+      for (otherKey, other) in w.completedCalls:
+        if otherKey > entry.callKey and other.entryStep <= entry.entryStep and
+            other.exitStep >= entry.entryStep:
+          return err("entry.dat: entry step belongs to another call")
+      var childKey = entry.callKey
+      var child = marked
+      while child.parentCallKey >= 0:
+        let parentKey = uint64(child.parentCallKey)
+        if parentKey >= childKey or not records.hasKey(parentKey):
+          return err("entry.dat: missing or cyclic finalized parent")
+        let parent = w.completedCalls[records.getOrDefault(parentKey)][1]
+        if child.depth == 0 or parent.depth != child.depth - 1 or
+            parent.entryStep > child.entryStep or parent.exitStep < child.exitStep:
+          return err("entry.dat: invalid finalized parent range or depth")
+        var links = 0
+        for key in parent.children:
+          if key == childKey: inc links
+        if links != 1:
+          return err("entry.dat: invalid finalized parent child link")
+        childKey = parentKey
+        child = parent
+      if child.parentCallKey != -1 or child.depth != 0:
+        return err("entry.dat: invalid finalized root")
+      if w.funcIds.hasKey("<toplevel>") and w.funcIds.getOrDefault("<toplevel>", high(uint64)) == 0 and
+          (childKey != 0 or child.functionId != 0):
+        return err("entry.dat: marked chain does not reach the synthetic root")
+      w.recordedEntryValidated = true
   for (_, i) in order:
     let res = w.container.writeCall(w.callWriter, w.completedCalls[i][1])
     if res.isErr:
@@ -1809,6 +1858,23 @@ proc registerCall*(w: var MultiStreamTraceWriter, functionId: uint64,
     children: @[],
   ))
   w.currentDepth += 1
+  ok()
+
+proc markCurrentCallAsEntry*(w: var MultiStreamTraceWriter): Result[void, string] =
+  ## Capture actual active-call identity; no caller-provided names or ids.
+  if w.closed: return err("entry.dat: writer is closed")
+  if w.callStack.len == 0: return err("entry.dat: no active call to mark")
+  let pending = w.callStack[^1]
+  if pending.functionId >= uint64(w.funcIds.len):
+    return err("entry.dat: active call has no registered function")
+  let entry = RecordedEntryIdentity(callKey: pending.callKey,
+      functionId: pending.functionId, entryStep: pending.entryStep)
+  discard ? encodeEntryIdentity(entry)
+  if w.recordedEntry.isSome:
+    if w.recordedEntry.get() != entry:
+      return err("entry.dat: a different entry is already marked")
+    return ok()
+  w.recordedEntry = some(entry)
   ok()
 
 proc registerReturn*(w: var MultiStreamTraceWriter,
@@ -2896,6 +2962,15 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
     let writeRes = w.container.writeToFile(nsFile, image)
     if writeRes.isErr:
       return err("failed to write corrmark.ns: " & writeRes.error)
+
+  # Optional recorded entry is the last close-time append (format 4fc5486).
+  # Existing unmarked traces retain every original append and byte.
+  if w.recordedEntry.isSome:
+    if not w.recordedEntryValidated:
+      return err("entry.dat: marked identity was not validated by a completed call")
+    let data = ? encodeEntryIdentity(w.recordedEntry.get())
+    var entryFile = ? w.container.addFile("entry.dat")
+    ? w.container.writeToFile(entryFile, data)
 
   # Publish block 0 — the root entry array, which carries every internal
   # file's size.  `writeToFile` maintains those sizes in the in-memory image

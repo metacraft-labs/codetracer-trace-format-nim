@@ -44,6 +44,8 @@ import codetracer_trace_types
 # `ct_container_append_files`) at the bottom of this file.
 import codetracer_ctfs/types
 import codetracer_ctfs/container
+import codetracer_ctfs/compact
+import codetracer_ctfs/base40
 import codetracer_ctfs/container_append
 import codetracer_trace_writer/meta_dat
 import codetracer_trace_writer/multi_stream_writer
@@ -1495,6 +1497,22 @@ proc trace_writer_register_call(
   # Legacy single-stream path doesn't support call args yet.
   handle.pendingCallArgs.setLen(0)
   failIfErr handle.writer.writeCall(uint64(function_id))
+
+proc trace_writer_mark_current_call_as_entry(handle: TraceWriterHandle): cint
+    {.exportc, cdecl, dynlib, ffiGuard.} =
+  ## Checked actual active-call capture, never caller-provided identity.
+  trace_writer_clear_last_error()
+  if handle.isNil:
+    setError("entry.dat: NULL writer handle")
+    return 1.cint
+  if not handle.useMultiStream or not handle.msWriterReady:
+    setError("entry.dat: active multi-stream writer required")
+    return 1.cint
+  let res = handle.msWriter.markCurrentCallAsEntry()
+  if res.isErr:
+    setError(res.error)
+    return 1.cint
+  0.cint
 
 proc trace_writer_register_return(handle: TraceWriterHandle) {.exportc, cdecl, dynlib, ffiGuard.} =
   ## Register a function return with no explicit return value.
@@ -4696,6 +4714,105 @@ proc allocStringResult(s: string, outLen: ptr csize_t): ptr uint8 =
 # Reader lifecycle
 # ---------------------------------------------------------------------------
 
+proc validateOwnedV5Image(data: seq[byte]): Result[tuple[blockSize, maxEntries: uint32], string] =
+  ## Canonical existing v5 member decoder; failed lookups are never absence.
+  if not hasCtfsMagic(data): return err("CTFS image has invalid magic")
+  let versionError = ctfsVersionError(data)
+  if versionError.len > 0: return err(versionError)
+  if data.len < HeaderSize + ExtHeaderSize:
+    return err("CTFS image truncated before complete header")
+  let blockSize = readU32LE(data, 8)
+  let declaredEntries = readU32LE(data, 12)
+  let shards = readMaxShards(data)
+  if blockSize == 0 or blockSize mod 8 != 0 or
+     uint64(blockSize) < uint64(HeaderSize + ExtHeaderSize + FileEntrySize):
+    return err("CTFS image has unusable canonical block size")
+  # Reader §5d admits an unreferenced partial tail; readMemberBytes floors
+  # every referenced block. Only the complete declared root region is required.
+  let roots = rootBlockCount(blockSize, declaredEntries, shards)
+  if roots > uint64(data.len) div uint64(blockSize):
+    return err("CTFS image truncated before complete root directory")
+  let rootArea = 7'u64 * uint64(shards) * 6'u64
+  let start = uint64(HeaderSize + ExtHeaderSize) + rootArea
+  var entries = uint64(declaredEntries)
+  if entries == 0:
+    if start > uint64(blockSize): return err("CTFS root geometry exceeds block size")
+    entries = (uint64(blockSize) - start) div uint64(FileEntrySize)
+  if entries > uint64(high(uint32)) or entries > uint64(high(int)) or start + entries * uint64(FileEntrySize) > uint64(data.len):
+    return err("CTFS root directory exceeds held image/index domain")
+  var names = initTable[uint64, bool]()
+  for index in 0 ..< int(entries):
+    let offset = int(start) + index * FileEntrySize
+    let size = readU64LE(data, offset)
+    let mapping = readU64LE(data, offset + 8)
+    let encoded = readU64LE(data, offset + 16)
+    if size == 0 and mapping == 0 and encoded == 0: continue
+    if not nameIsWellFormed(encoded): return err("CTFS root directory has malformed member name")
+    if names.hasKey(encoded): return err("CTFS root directory has duplicate member")
+    names[encoded] = true
+    if size > uint64(high(int)): return err("CTFS member exceeds native index domain")
+    let member = readMemberBytes(data, base40Decode(encoded), size, mapping, blockSize)
+    if member.isErr: return err(member.error)
+  # The semantic NewTraceReader's root lookup is unsharded. CT's existing
+  # local member path handles other valid geometry without changing its floor.
+  if shards != 0: return err("Nim owned-image semantic reader does not support sharded roots")
+  ok((blockSize, uint32(entries)))
+
+proc ct_reader_open_bytes(data: pointer, length: csize_t): pointer {.exportc, cdecl, dynlib, ffiGuard.} =
+  ## Copy an actual held CTFS image into the existing owned parser.
+  ## Zero length is refused before parsing, including NULL/0.
+  if length == 0:
+    setError("Empty CTFS image")
+    return nil
+  if length > csize_t(high(int)):
+    setError("CTFS image length exceeds native index domain")
+    return nil
+  if data.isNil and length != 0:
+    setError("NULL CTFS image with nonzero length")
+    return nil
+  var owned = newSeq[byte](int(length))
+  if owned.len > 0: copyMem(addr owned[0], data, owned.len)
+  let validated = validateOwnedV5Image(owned)
+  if validated.isErr:
+    setError(validated.error)
+    return nil
+  let geometry = validated.get()
+  let parsed = openNewTraceFromBytes(owned, geometry.blockSize, geometry.maxEntries)
+  if parsed.isErr:
+    setError(parsed.error)
+    return nil
+  let handle = cast[TraceReaderHandle](alloc0(sizeof(NewTraceReader)))
+  handle[] = parsed.get()
+  return cast[pointer](handle)
+
+proc ct_reader_refresh_bytes(h, data: pointer, length: csize_t): cint {.exportc, cdecl, dynlib, ffiGuard.} =
+  ## Parse a complete owned candidate before changing the existing handle.
+  if h.isNil:
+    setError("NULL reader handle")
+    return 1
+  if length == 0:
+    setError("Empty CTFS image")
+    return 1
+  if length > csize_t(high(int)):
+    setError("CTFS image length exceeds native index domain")
+    return 1
+  if data.isNil and length != 0:
+    setError("NULL CTFS image with nonzero length")
+    return 1
+  var owned = newSeq[byte](int(length))
+  if owned.len > 0: copyMem(addr owned[0], data, owned.len)
+  let validated = validateOwnedV5Image(owned)
+  if validated.isErr:
+    setError(validated.error)
+    return 1
+  let geometry = validated.get()
+  let parsed = openNewTraceFromBytes(owned, geometry.blockSize, geometry.maxEntries)
+  if parsed.isErr:
+    setError(parsed.error)
+    return 1
+  cast[TraceReaderHandle](h)[] = parsed.get()
+  return 0
+
 when ctHasFilesystem:
   # The reader entry points that name a file, and the only ones in this
   # family that do. The handle-based accessors below are byte readers and
@@ -4776,6 +4893,21 @@ proc ct_reader_close(h: pointer) {.exportc, cdecl, dynlib, ffiGuard.} =
 # ---------------------------------------------------------------------------
 # Counts
 # ---------------------------------------------------------------------------
+
+proc ct_reader_recorded_entry(h: pointer, callKey, functionId,
+    entryStep: ptr uint64): cint {.exportc, cdecl, dynlib, ffiGuardFail(-1.cint).} =
+  trace_writer_clear_last_error()
+  if h.isNil or callKey.isNil or functionId.isNil or entryStep.isNil:
+    setError("entry.dat: NULL reader or output pointer")
+    return -1
+  let rh = cast[TraceReaderHandle](h)
+  let entry = rh[].recordedEntryIdentity()
+  if entry.isNone:
+    return 0
+  callKey[] = entry.get().callKey
+  functionId[] = entry.get().functionId
+  entryStep[] = entry.get().entryStep
+  return 1
 
 proc ct_reader_step_count(h: pointer): uint64 {.exportc, cdecl, dynlib, ffiGuard.} =
   if h.isNil: return 0

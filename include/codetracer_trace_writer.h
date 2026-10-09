@@ -455,6 +455,11 @@ size_t trace_writer_ensure_type_id(trace_writer_t handle,
     int kind, const char* lang_type);
 
 void trace_writer_register_call(trace_writer_t handle, size_t function_id);
+
+/* Mark the actual current active call as entry. No ids are supplied.
+ * Returns 0 on success, nonzero on named/latching failure. Optional entry.dat
+ * is appended last at close; unchanged callers emit no new member. */
+int trace_writer_mark_current_call_as_entry(trace_writer_t handle);
 void trace_writer_register_return(trace_writer_t handle);
 
 void trace_writer_register_return_int(trace_writer_t handle,
@@ -995,6 +1000,15 @@ int ct_value_write_char(value_encoder_t h, uint32_t codepoint, uint64_t type_id)
 int ct_value_write_bigint(value_encoder_t h, const uint8_t* data, size_t len, int negative, uint64_t type_id);
 
 const uint8_t* ct_value_get_bytes(value_encoder_t h, size_t* out_len);
+
+/* Checked optional entry identity from an existing owned reader image.
+ * 1=present, 0=absent, -1=error; output pointers must be non-NULL. */
+/* Owned image lifecycle; NULL/nonzero and overlarge sizes refuse. NULL/0 is
+ * an empty image and is refused before parsing. Input bytes are copied. */
+void* ct_reader_open_bytes(const void* data, size_t length);
+int ct_reader_refresh_bytes(void* handle, const void* data, size_t length);
+int ct_reader_recorded_entry(void* reader, uint64_t* call_key,
+                            uint64_t* function_id, uint64_t* entry_step);
 
 #ifdef __cplusplus
 }

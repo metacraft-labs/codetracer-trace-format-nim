@@ -529,6 +529,15 @@ proc readMemberBytes*(data: openArray[byte], name: string,
   # floor, never `+ blockSize - 1`: rounding up would make the incomplete
   # final block addressable, which is the one arithmetic §5d forbids.
   let wholeBlocks = uint64(data.len div int(blockSize))
+  let rootLayout = rootDirectoryLayout(data)
+  if rootLayout.error.len > 0:
+    return err(rootLayout.error)
+  let headerBlockSize = readU32LE(data, 8)
+  if headerBlockSize != blockSize:
+    return err("member block size differs from CTFS header")
+  let rootBytes = uint64(rootLayout.entryStart) +
+    uint64(rootLayout.entryCount) * uint64(FileEntrySize)
+  let reservedBlocks = (rootBytes + uint64(blockSize) - 1) div uint64(blockSize)
   let truncatedNote = " — the container carries " & $wholeBlocks &
     " whole " & $blockSize & "-byte blocks in " & $data.len &
     " bytes, so it is truncated or its tail write was interrupted"
@@ -546,6 +555,8 @@ proc readMemberBytes*(data: openArray[byte], name: string,
     if b == 0'u64:
       return err("internal file " & name & " names data block 0 directly; " &
         "block 0 is the container's root directory and no member may name it")
+    if b < reservedBlocks:
+      return err("internal file " & name & " overlaps reserved root directory blocks")
     if b >= wholeBlocks:
       return err("direct data block " & $b & " of internal file " & name &
         " is out of bounds" & truncatedNote)
@@ -560,6 +571,8 @@ proc readMemberBytes*(data: openArray[byte], name: string,
     return ok(direct)
 
   # Path 1 of 3: the entry's mapping root.
+  if mapBlock < reservedBlocks:
+    return err("internal file " & name & " overlaps reserved root directory blocks")
   if mapBlock >= wholeBlocks:
     return err("mapping root block " & $mapBlock & " of internal file " & name &
       " is out of bounds" & truncatedNote)
@@ -597,6 +610,8 @@ proc readMemberBytes*(data: openArray[byte], name: string,
           return err("missing chain pointer at level " & $level &
             " of internal file " & name)
         # Path 2a of 3: a mapping block reached through the chain.
+        if chainPtr < reservedBlocks:
+          return err("internal file " & name & " overlaps reserved root directory blocks")
         if chainPtr >= wholeBlocks:
           return err("chain pointer at level " & $level & " of internal file " &
             name & " names block " & $chainPtr & ", which is out of bounds" &
@@ -620,6 +635,8 @@ proc readMemberBytes*(data: openArray[byte], name: string,
         return err("missing child block at level " & $navLevel &
           " of internal file " & name)
       # Path 2b of 3: a mapping block reached by descending the hierarchy.
+      if childBlock < reservedBlocks:
+        return err("internal file " & name & " overlaps reserved root directory blocks")
       if childBlock >= wholeBlocks:
         return err("child block pointer at level " & $navLevel &
           " of internal file " & name & " names block " & $childBlock &
@@ -643,6 +660,8 @@ proc readMemberBytes*(data: openArray[byte], name: string,
     # not own. Check the block NUMBER, before its bytes are touched — and
     # before it is multiplied by the block size, which on a damaged container
     # can overflow.
+    if dataBlock < reservedBlocks:
+      return err("internal file " & name & " overlaps reserved root directory blocks")
     if dataBlock >= wholeBlocks:
       return err("data block " & $blockIdx & " of internal file " & name &
         " is block " & $dataBlock & ", which is out of bounds" & truncatedNote)

@@ -13,6 +13,9 @@ requires "stew >= 0.1.0"
 requires "results"
 
 task test, "Run all tests":
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_recorded_entry_identity.nim"
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_recorded_entry_hierarchy.nim"
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_recorded_entry_sealed.nim"
   exec "nim c -r tests/test_nimcache_is_worktree_local.nim"
   exec "nim c -r tests/test_base40.nim"
   exec "nim c -r tests/test_container.nim"
