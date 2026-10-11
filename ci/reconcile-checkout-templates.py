@@ -65,9 +65,20 @@ def run(executable, *argv):
     return subprocess.check_output([str(executable), *map(str, argv)], cwd=root)
 
 for variable in ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_TEMPLATE_DIR',
-                  'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT']:
+                  'GIT_CONFIG_PARAMETERS']:
     if os.environ.get(variable):
         raise RuntimeError('Inherited Git authority refused')
+# Setup installs exactly one owner-scoped authentication entry. Keep its value
+# only in task memory; path selectors and additional configuration stay refused.
+auth_keys = {name: value for name, value in os.environ.items()
+            if name == 'GIT_CONFIG_COUNT' or name.startswith('GIT_CONFIG_KEY_')
+            or name.startswith('GIT_CONFIG_VALUE_')}
+if auth_keys:
+    if (set(auth_keys) != {'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'}
+            or auth_keys['GIT_CONFIG_COUNT'] != '1'
+            or auth_keys['GIT_CONFIG_KEY_0'] != 'http.https://github.com/metacraft-labs/.extraHeader'
+            or not auth_keys['GIT_CONFIG_VALUE_0']):
+        raise RuntimeError('Inherited Git authentication shape refused')
 for key in ['core.hooksPath', 'init.templateDir']:
     result = subprocess.run([str(git), 'config', '--get', key], cwd=root,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -228,6 +239,7 @@ finally:
         'worktreeUnchanged': lambda: worktree_inventory() == worktree_before,
         'indexUnchanged': lambda: regular(common / 'index') == index,
         'headUnchanged': lambda: run(git, 'rev-parse', 'HEAD').decode().strip() == head,
+        'authenticationEnvironmentUnchanged': lambda: {name: value for name, value in os.environ.items() if name == 'GIT_CONFIG_COUNT' or name.startswith('GIT_CONFIG_KEY_') or name.startswith('GIT_CONFIG_VALUE_')} == auth_keys,
         'configUnchanged': lambda: run(git, 'config', '--null', '--show-origin', '--show-scope', '--list') == config,
         'hookDirectoryUnchanged': hooks_unchanged,
         'owningDirectoriesUnchanged': parents_unchanged,
