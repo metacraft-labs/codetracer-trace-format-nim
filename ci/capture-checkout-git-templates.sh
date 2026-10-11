@@ -63,7 +63,7 @@ test -d "$hooks" && test ! -L "$hooks"
 test -z "$(git --no-optional-locks status --porcelain=v1 --untracked-files=no)"
 source_before=$(record_source | sha256sum)
 index_before=$(sha256sum "$common/index")
-config_before=$(sha256sum "$common/config")
+config_before=$(git config --null --show-origin --show-scope --list | base64 -w0)
 record_inventory() {
   local root=$1 member name mode body
   local members=("$root"/*)
@@ -92,7 +92,8 @@ record_inventory "$hooks" > "$receipt/initialized-after.tsv"
 test "$(sha256sum < "$receipt/initialized-before.tsv")" = "$(sha256sum < "$receipt/initialized-after.tsv")"
 test "$source_before" = "$(record_source | sha256sum)"
 test "$index_before" = "$(sha256sum "$common/index")"
-test "$config_before" = "$(sha256sum "$common/config")"
+test "$config_before" = "$(git config --null --show-origin --show-scope --list | base64 -w0)"
+unset config_before
 test "$common" = "$(realpath "$(git rev-parse --path-format=absolute --git-common-dir)")"
 test -d "$own_root/.git" && test ! -L "$own_root/.git"
 refuse_hooks_path

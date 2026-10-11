@@ -88,6 +88,23 @@ jobs:
           GH_TOKEN: ${{ steps.ci_token.outputs.token }}
         run: bash .github/scripts/bind-unix-constructor.sh
 
+      - name: Reconcile authenticated inactive checkout templates
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          captured_head="$(cat "$RUNNER_TEMP/trace-checkout-git-templates/source-head.txt")"
+          test "$captured_head" = "$GITHUB_SHA"
+          initialized_git="$(cat "$RUNNER_TEMP/trace-checkout-git-templates/git-image.txt")"
+          sha256sum --check "$RUNNER_TEMP/trace-checkout-git-templates/git-image.sha256"
+          selected_git_package="$(nix build --no-link --no-write-lock-file --print-out-paths .#ci-checkout-git)"
+          selected_python_package="$(nix build --no-link --no-write-lock-file --print-out-paths .#ci-checkout-python)"
+          "$selected_python_package/bin/python3" ci/reconcile-checkout-templates.py \
+            --root "$GITHUB_WORKSPACE" --initialized-git "$initialized_git" \
+            --selected-git "$selected_git_package/bin/git" \
+            --expected-head "$captured_head" \
+            --receipt "$RUNNER_TEMP/trace-checkout-template-reconciliation.json"
+
       - name: Expose the declared non-SIP shell
         if: runner.os != 'Windows'
         run: |
@@ -236,5 +253,6 @@ jobs:
             ${{ runner.temp }}/trace-checkout-git-templates/templates-source.txt
             ${{ runner.temp }}/trace-checkout-git-templates/source-head.txt
             ${{ runner.temp }}/trace-checkout-git-templates/result.txt
+            ${{ runner.temp }}/trace-checkout-template-reconciliation.json
           if-no-files-found: warn
           retention-days: 7

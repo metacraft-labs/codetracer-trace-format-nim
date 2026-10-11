@@ -301,6 +301,10 @@
           # writer, for one) links to emit `.ct` containers.  `lib/` and
           # `include/` mirror the source-tree locations the sibling-checkout
           # builds read.  Consumers also link libzstd.
+          # Same selected constructors used by the guarded owning shell.
+          packages.ci-checkout-git = pkgs.git;
+          packages.ci-checkout-python = pkgs.python3;
+
           packages.trace-writer-ffi = pkgs.stdenv.mkDerivation {
             pname = "codetracer-trace-writer-ffi";
             version = "0.1.0";
