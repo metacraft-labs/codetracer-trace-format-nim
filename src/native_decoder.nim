@@ -21,7 +21,8 @@
 ##                               frames (seekable-zstd; companion index
 ##                               `iNNNNNNNNNNN`).  Uncompressed streams are
 ##                               accepted too (auto-detected).
-##   - `eventlog.dat` + `.idx` (`event_log.*` before the recorder's rename) —
+##   - `eventlog.dat` + `.idx` (a bundle carrying the retired `event_log.*`
+##     words is refused by name) —
 ##     chunk-indexed OS-event log with structured
 ##                               (geid, tick, tid, kind, fd, returnValue,
 ##                               metadata, content) entries.
@@ -81,11 +82,14 @@ const
   EventLogDat* = "eventlog.dat"
   EventLogIdx* = "eventlog.idx"
     ## The OS event log's members, as the native recorder names them.
-  LegacyEventLogDatKey* = base40Encode("event_log.dat")
-  LegacyEventLogIdxKey* = base40Encode("event_log.idx")
-    ## The name words the recorder stored before its rename for
-    ## `event_log.dat` / `.idx`, which base40 cannot pack (13 characters, and
-    ## an underscore): what a recording made then carries, found by the word.
+  RetiredEventLogNames* = ["event_log.dat", "event_log.idx"]
+    ## The names the recorder used before its rename, which base40 cannot
+    ## pack (13 characters, and an underscore).  A recording made then
+    ## carries the lossy words a writer stored for them; such a bundle is
+    ## refused by name, never read.
+  EventLogMaxKind* = 14'u8
+    ## The last kind of the event log's own table
+    ## (`MCR-Event-Log-Stream.md` §2.3: 0 `elkWrite` .. 14 `elkGetrandom`).
 
 const
   HeaderSize = 8
@@ -183,7 +187,7 @@ proc detectNativeBundle*(data: openArray[byte]): Result[NativeBundleInfo, string
     return err("meta.dat missing: " & metaDatR.error)
   info.metaDat = metaDatR.get()
 
-  # Enumerate root-block entries to find tNNNN streams and event_log files.
+  # Enumerate root-block entries to find tNNNN streams and eventlog files.
   for i in 0 ..< int(maxRoot):
     let off = HeaderSize + ExtHeaderSize + i * FileEntrySize
     if off + FileEntrySize > data.len:
@@ -195,9 +199,17 @@ proc detectNativeBundle*(data: openArray[byte]): Result[NativeBundleInfo, string
     if isThreadStreamName(name):
       info.threadStreams.add((parseTidFromName(name), name))
     elif nameVal == base40Encode(EventLogDat) or
-        nameVal == base40Encode(EventLogIdx) or
-        nameVal == LegacyEventLogDatKey or nameVal == LegacyEventLogIdxKey:
+        nameVal == base40Encode(EventLogIdx):
       info.hasEventLog = true
+    elif nameVal == base40Encode(RetiredEventLogNames[0]) or
+        nameVal == base40Encode(RetiredEventLogNames[1]):
+      let retired =
+        if nameVal == base40Encode(RetiredEventLogNames[0]): RetiredEventLogNames[0]
+        else: RetiredEventLogNames[1]
+      return err("this recording stores its event log as `" & retired &
+        "`, a name CTFS cannot address (more than 12 characters, and `_`); " &
+        "the event log is read as `" & EventLogDat & "` / `" & EventLogIdx &
+        "` only: re-record the trace")
     elif nameVal == base40Encode("cpidx.idx"):
       info.hasCheckpointIndex = true
 
@@ -431,7 +443,7 @@ proc nativeEventTypeName*(et: uint16): string =
   else: "ev_unknown_" & $et
 
 # ---------------------------------------------------------------------------
-# event_log.dat / .idx decoding
+# eventlog.dat / .idx decoding
 # ---------------------------------------------------------------------------
 
 type
@@ -464,72 +476,72 @@ proc osEventKindName*(k: uint8): string =
   of 14: "elkGetrandom"
   else: "elk_unknown_" & $k
 
-proc eventLogMember(data: openArray[byte], name: string, legacyKey: uint64,
-    blockSize, maxRoot: uint32): Result[seq[byte], string] =
-  ## An event-log member under its name, or under the name word a recording
-  ## made before the rename carries.
-  if hasInternalFile(data, name, maxRoot):
-    return readInternalFile(data, name, blockSize, maxRoot)
-  let e = findFileEntryKey(data, legacyKey, maxRoot)
-  if not e.found:
-    return err("internal file not found: " & name)
-  readMemberBytes(data, name, e.size, e.mapBlock, blockSize)
-
 proc decodeOsEventLog(data: openArray[byte], blockSize, maxRoot: uint32):
     Result[seq[OsEventLogEntry], string] =
-  ## Decode `event_log.dat` (chunk-prefixed records) using `event_log.idx`
+  ## Decode `eventlog.dat` (chunk-prefixed records) using `eventlog.idx`
   ## for the chunk count and offsets. Returns entries in stored order.
-  let datR = eventLogMember(data, EventLogDat, LegacyEventLogDatKey,
-    blockSize, maxRoot)
-  if datR.isErr:
+  let hasDat = hasInternalFile(data, EventLogDat, maxRoot)
+  let hasIdx = hasInternalFile(data, EventLogIdx, maxRoot)
+  if not hasDat and not hasIdx:
     var empty: seq[OsEventLogEntry] = @[]
-    return ok(empty)  # event log file is optional (older bundles)
-  let idxR = eventLogMember(data, EventLogIdx, LegacyEventLogIdxKey,
-    blockSize, maxRoot)
+    return ok(empty)  # a bundle without an event log
+  if not hasIdx:
+    return err(EventLogDat & " present but " & EventLogIdx & " missing")
+  if not hasDat:
+    return err(EventLogIdx & " present but " & EventLogDat & " missing")
+  let datR = readInternalFile(data, EventLogDat, blockSize, maxRoot)
+  if datR.isErr:
+    return err(EventLogDat & ": " & datR.error)
+  let idxR = readInternalFile(data, EventLogIdx, blockSize, maxRoot)
   if idxR.isErr:
-    return err("event_log.dat present but event_log.idx missing: " & idxR.error)
+    return err(EventLogIdx & ": " & idxR.error)
   let dat = datR.get()
   let idx = idxR.get()
   if idx.len < 4 + 2 + 4 + 4 + 4:
-    return err("event_log.idx truncated (len=" & $idx.len & ")")
+    return err("eventlog.idx truncated (len=" & $idx.len & ")")
   for i in 0 ..< 4:
     if idx[i] != EventLogMagic[i]:
-      return err("event_log.idx: bad magic at byte " & $i)
+      return err("eventlog.idx: bad magic at byte " & $i)
   let entryCount = readU32LE(idx, 4 + 2)
   let chunkCount = readU32LE(idx, 4 + 2 + 4 + 4)
   let chunkOffsetsStart = 4 + 2 + 4 + 4 + 4
   if idx.len < chunkOffsetsStart + int(chunkCount) * 8:
-    return err("event_log.idx: truncated chunk-offsets table")
+    return err("eventlog.idx: truncated chunk-offsets table")
 
   var entries: seq[OsEventLogEntry] = @[]
   for c in 0 ..< int(chunkCount):
     let chunkOff = readU64LE(idx, chunkOffsetsStart + c * 8)
     if int(chunkOff) + 4 > dat.len:
-      return err("event_log.dat: chunk " & $c & " offset out of bounds")
+      return err("eventlog.dat: chunk " & $c & " offset out of bounds")
     let chunkRawSize = readU32LE(dat, int(chunkOff))
     let bodyStart = int(chunkOff) + 4
     if bodyStart + int(chunkRawSize) > dat.len:
-      return err("event_log.dat: chunk " & $c & " size overruns end")
+      return err("eventlog.dat: chunk " & $c & " size overruns end")
     if chunkRawSize < 4:
-      return err("event_log.dat: chunk " & $c & " too small for entry count")
+      return err("eventlog.dat: chunk " & $c & " too small for entry count")
     let nEntries = readU32LE(dat, bodyStart)
     var pos = bodyStart + 4
     let bodyEnd = bodyStart + int(chunkRawSize)
     for e in 0 ..< int(nEntries):
       if pos + 8 + 8 + 4 + 1 + 4 + 8 + 2 > bodyEnd:
         return err(
-          "event_log.dat: chunk " & $c & " entry " & $e &
+          "eventlog.dat: chunk " & $c & " entry " & $e &
           " truncated header")
       let geid = readU64LE(dat, pos); pos += 8
       let tick = readU64LE(dat, pos); pos += 8
       let tid = readU32LE(dat, pos); pos += 4
       let kind = dat[pos]; pos += 1
+      if kind > EventLogMaxKind:
+        return err(
+          "eventlog.dat: chunk " & $c & " entry " & $e &
+          " carries unassigned event log kind " & $kind &
+          " (assigned: 0-" & $EventLogMaxKind & ")")
       let fdRaw = readU32LE(dat, pos); pos += 4
       let rvRaw = readU64LE(dat, pos); pos += 8
       let mdLen = int(readU16LE(dat, pos)); pos += 2
       if pos + mdLen + 4 > bodyEnd:
         return err(
-          "event_log.dat: chunk " & $c & " entry " & $e &
+          "eventlog.dat: chunk " & $c & " entry " & $e &
           " truncated metadata")
       var md = newString(mdLen)
       for i in 0 ..< mdLen:
@@ -538,7 +550,7 @@ proc decodeOsEventLog(data: openArray[byte], blockSize, maxRoot: uint32):
       let ctLen = int(readU32LE(dat, pos)); pos += 4
       if pos + ctLen > bodyEnd:
         return err(
-          "event_log.dat: chunk " & $c & " entry " & $e &
+          "eventlog.dat: chunk " & $c & " entry " & $e &
           " truncated content (len=" & $ctLen & ")")
       var content = newSeq[byte](ctLen)
       for i in 0 ..< ctLen:
@@ -553,7 +565,7 @@ proc decodeOsEventLog(data: openArray[byte], blockSize, maxRoot: uint32):
       ))
   if uint32(entries.len) != entryCount:
     return err(
-      "event_log: index says " & $entryCount &
+      "eventlog: index says " & $entryCount &
       " entries, decoded " & $entries.len)
   ok(entries)
 

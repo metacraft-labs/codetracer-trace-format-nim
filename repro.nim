@@ -254,6 +254,7 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_name_only_funcs_refusal.nim", binary: "build/test-bin/test_name_only_funcs_refusal"),
   TestSpec(source: "tests/test_ct_print_full.nim", binary: "build/test-bin/test_ct_print_full"),
   TestSpec(source: "tests/test_ct_print_native.nim", binary: "build/test-bin/test_ct_print_native"),
+  TestSpec(source: "tests/test_ct_print_native_event_log.nim", binary: "build/test-bin/test_ct_print_native_event_log"),
   TestSpec(source: "tests/test_managed_sender.nim", binary: "build/test-bin/test_managed_sender"),
   TestSpec(source: "tests/test_reader_v4.nim", binary: "build/test-bin/test_reader_v4"),
   TestSpec(source: "tests/test_source_views.nim", binary: "build/test-bin/test_source_views"),

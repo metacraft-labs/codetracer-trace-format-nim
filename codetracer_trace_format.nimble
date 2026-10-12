@@ -271,6 +271,9 @@ task test, "Run all tests":
   # ct-print reports a step position it cannot resolve instead of emitting
   # the plausible wrong (path, line) the unchecked inverse produces.
   exec "nim c -r -d:release -p:src tests/test_ct_print_unresolvable_position.nim"
+  # ct-print reads a native event log only under `eventlog.dat` / `.idx`:
+  # the retired `event_log.*` words and unassigned kinds are refused by name.
+  exec "nim c -r -d:release -p:src tests/test_ct_print_native_event_log.nim"
   # Line-only orphan pending-value carry-forward (92fce3a regression).
   # `include`s codetracer_trace_writer_ffi, so it needs --mm:arc and the
   # --nimMainPrefix the FFI's NimMain importc expects (see buildStaticLib).
