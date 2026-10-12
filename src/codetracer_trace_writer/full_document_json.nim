@@ -386,6 +386,37 @@ type FullOpts* = object
   ## Only consulted by `--markers`; the other modes are JSON already.
   jsonOut*: bool
 
+proc nonStepRecordJson*(ev: StepEvent, stepIndex: uint64): JsonNode =
+  ## One ``--full`` / ``--events`` entry for a raise, catch or thread record.
+  ## ``step_index`` is the exec-record index it occupies, which places it
+  ## among the steps around it; it is not a step a consumer may navigate to.
+  result = newJObject()
+  case ev.kind
+  of sekRaise:
+    result["kind"] = newJString("raise")
+    result["step_index"] = newJInt(int64(stepIndex))
+    result["exception_type_id"] = newJInt(int64(ev.exceptionTypeId))
+    result["exception_message"] = newJString(bytesToUtf8(ev.message))
+  of sekCatch:
+    result["kind"] = newJString("catch")
+    result["step_index"] = newJInt(int64(stepIndex))
+    result["exception_type_id"] = newJInt(int64(ev.catchExceptionTypeId))
+  of sekThreadStart:
+    result["kind"] = newJString("thread_start")
+    result["step_index"] = newJInt(int64(stepIndex))
+    result["thread_id"] = newJInt(int64(ev.startThreadId))
+  of sekThreadExit:
+    result["kind"] = newJString("thread_exit")
+    result["step_index"] = newJInt(int64(stepIndex))
+    result["thread_id"] = newJInt(int64(ev.exitThreadId))
+  of sekThreadSwitch:
+    result["kind"] = newJString("thread_switch")
+    result["step_index"] = newJInt(int64(stepIndex))
+    result["thread_id"] = newJInt(int64(ev.threadId))
+  else:
+    doAssert false, "nonStepRecordJson: " & $ev.kind & " is not a raise, " &
+      "catch or thread record"
+
 proc buildFullDocument*(reader: var NewTraceReader,
     opts: FullOpts): JsonNode =
   ## Build the deterministic JSON document for `--full` and `--events` modes.
@@ -651,6 +682,14 @@ proc buildFullDocument*(reader: var NewTraceReader,
       let isSourceReload = stepEv.isOk and stepEv.get().kind == sekSourceReload
       if isSourceReload:
         eventsArr.add(sourceReloadEventJson(stepEv.get(), stepIdx))
+      # A raise, a catch and the thread records occupy an exec record but
+      # are not steps (`trace-events.md` §"Which exec records are steps"), so
+      # each gets its own kind and carries no position: `counts.steps` and
+      # the `kind="step"` entries count the same records.
+      let isOtherRecord = stepEv.isOk and stepEv.get().kind in
+        {sekRaise, sekCatch, sekThreadSwitch, sekThreadStart, sekThreadExit}
+      if isOtherRecord:
+        eventsArr.add(nonStepRecordJson(stepEv.get(), stepIdx))
       # A record that could not be DECODED gets its own kind, and never
       # falls through into the `kind="step"` branch below.  Both booleans
       # above are `isOk and ...`, so without this arm a failed decode
@@ -669,7 +708,8 @@ proc buildFullDocument*(reader: var NewTraceReader,
         errObj["step_index"] = newJInt(int64(stepIdx))
         errObj["error"] = newJString(stepEv.error)
         eventsArr.add(errObj)
-      if not isDeltaColumnNudge and not isSourceReload and not isUnreadable:
+      if not isDeltaColumnNudge and not isSourceReload and not isOtherRecord and
+          not isUnreadable:
         var stepObj = newJObject()
         stepObj["kind"] = newJString("step")
         stepObj["step_index"] = newJInt(int64(stepIdx))
@@ -707,20 +747,6 @@ proc buildFullDocument*(reader: var NewTraceReader,
         if stepEv.isOk:
           let se = stepEv.get()
           stepObj["step_kind"] = newJString($se.kind)
-          case se.kind
-          of sekRaise:
-            stepObj["exception_type_id"] = newJInt(int64(se.exceptionTypeId))
-            stepObj["exception_message"] = newJString(bytesToUtf8(se.message))
-          of sekCatch:
-            stepObj["catch_exception_type_id"] = newJInt(int64(se.catchExceptionTypeId))
-          of sekThreadStart:
-            stepObj["thread_id"] = newJInt(int64(se.startThreadId))
-          of sekThreadExit:
-            stepObj["thread_id"] = newJInt(int64(se.exitThreadId))
-          of sekThreadSwitch:
-            stepObj["thread_id"] = newJInt(int64(se.threadId))
-          else:
-            discard
         let callForStep = reader.callForStep(stepIdx)
         if callForStep.isOk:
           let cs = callForStep.get()

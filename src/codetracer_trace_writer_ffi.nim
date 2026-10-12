@@ -4937,6 +4937,19 @@ proc ct_reader_step_count(h: pointer): uint64 {.exportc, cdecl, dynlib, ffiGuard
     return 0
   res.get()
 
+proc ct_reader_logical_step_count(h: pointer): uint64 {.exportc, cdecl, dynlib, ffiGuard.} =
+  ## The number of step records (``AbsoluteStep``, ``DeltaStep``): the
+  ## trace's step count.  ``ct_reader_step_count`` is the exec-record count,
+  ## which the other streams are indexed by and which also counts raise,
+  ## catch, thread, column-only and reload records.
+  if h.isNil: return 0
+  let rh = cast[TraceReaderHandle](h)
+  let res = rh[].logicalStepCount()
+  if res.isErr:
+    setError(res.error)
+    return 0
+  res.get()
+
 proc ct_reader_call_count(h: pointer): uint64 {.exportc, cdecl, dynlib, ffiGuard.} =
   if h.isNil: return 0
   let rh = cast[TraceReaderHandle](h)

@@ -88,7 +88,9 @@ proc printSummaryV4(reader: var NewTraceReader) =
   if reader.meta.recorderId.len > 0:
     lines.add("recorder: " & reader.meta.recorderId)
 
-  let sc = reader.stepCount()
+  # The step count is the number of step records; raise, catch, thread,
+  # column-only and reload records occupy exec records but are not steps.
+  let sc = reader.logicalStepCount()
   let cc = reader.callCount()
   let vc = reader.valueCount()
   let ic = reader.ioEventCount()
@@ -907,8 +909,42 @@ proc printTextV4(reader: var NewTraceReader) =
     echo "(no steps)"
     return
   let totalSteps = uint64(allGlis.len)
+  # Only step records are printed as `Step N`; the other exec records are
+  # printed as what they are (trace-events.md §"Which exec records are
+  # steps"), each still followed by the I/O events anchored to it.
+  let records = reader.execRecords()
 
   for stepIdx in 0'u64 ..< totalSteps:
+    if records.isOk and int(stepIdx) < records.get().len and
+        not records.get()[int(stepIdx)].isStepRecord:
+      let ev = records.get()[int(stepIdx)]
+      case ev.kind
+      of sekRaise:
+        var tn = $ev.exceptionTypeId
+        let t = reader.typeName(ev.exceptionTypeId)
+        if t.isOk: tn = t.get()
+        echo "Raise (exec " & $stepIdx & "): " & tn & ": " & bytesToUtf8(ev.message)
+      of sekCatch:
+        var tn = $ev.catchExceptionTypeId
+        let t = reader.typeName(ev.catchExceptionTypeId)
+        if t.isOk: tn = t.get()
+        echo "Catch (exec " & $stepIdx & "): " & tn
+      of sekThreadSwitch:
+        echo "ThreadSwitch (exec " & $stepIdx & "): thread " & $ev.threadId
+      of sekThreadStart:
+        echo "ThreadStart (exec " & $stepIdx & "): thread " & $ev.startThreadId
+      of sekThreadExit:
+        echo "ThreadExit (exec " & $stepIdx & "): thread " & $ev.exitThreadId
+      of sekDeltaColumn:
+        echo "Column move (exec " & $stepIdx & ")"
+      of sekSourceReload:
+        echo "SourceReload (exec " & $stepIdx & "): reload " & $ev.reloadOrdinal
+      else:
+        discard
+      for (sid, io) in ioByStep:
+        if sid == stepIdx:
+          echo "  [" & eventLogKindName(io.kind) & "] " & bytesToUtf8(io.data)
+      continue
     var pathStr = "?"
     var lineNum: uint64 = 0
     var posError = ""

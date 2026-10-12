@@ -293,6 +293,10 @@ task test, "Run all tests":
   # only shape where the ordering is decided by the assembler rather than by
   # the step index.
   exec "nim c -r -d:release -p:src -p:tests tests/test_ct_print_agreement.nim"
+  # A step count is the number of step records: raise, catch and thread
+  # records are exec records but not steps, in the reader, the C ABI and
+  # every ct-print view.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src -p:tests tests/test_logical_step_count.nim"
   # The reader C FFI exports. Like the two tests above it `include`s the FFI
   # module, so it needs --mm:arc and the --nimMainPrefix. It had never been
   # listed here either: its fixture declared a container it had not written,

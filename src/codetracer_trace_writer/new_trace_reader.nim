@@ -1383,29 +1383,25 @@ proc stepCount*(r: var NewTraceReader): Result[uint64, string] =
   r.ensureExecReader()
   ok(r.execReader.totalEvents)
 
+proc isStepRecord*(ev: StepEvent): bool =
+  ## Whether an exec record is a step (``trace-events.md`` §"Which exec
+  ## records are steps"): only ``AbsoluteStep`` and ``DeltaStep`` are.
+  ev.kind in {sekAbsoluteStep, sekDeltaStep}
+
 proc logicalStepCount*(r: var NewTraceReader): Result[uint64, string] =
-  ## Return the user-facing "step count" — every exec event except
-  ## column-only nudges (``sekDeltaColumn``).  Matches the pre-P6
-  ## semantics of ``stepCount`` (totalEvents) on line-only traces
-  ## byte-for-byte, and continues to match it for column-aware
-  ## traces because DeltaColumn events are subtracted out.  Used by
-  ## ct-print for ``counts.steps`` so golden anchors stay stable
-  ## across the writer's column-aware-mode opt-in.
+  ## The trace's step count: the number of step records (``sekAbsoluteStep``,
+  ## ``sekDeltaStep``), and no other exec record (``trace-events.md``
+  ## §"Which exec records are steps").  A raise, a catch, the thread records,
+  ## a column-only nudge (``sekDeltaColumn``) and a source-reload marker each
+  ## occupy an exec record but are not steps.
   ##
-  ## Why this isn't named "stepCount": ``stepCount`` still returns
-  ## the raw exec event count because the FFI and chunked-storage
-  ## internals correlate calls / IO events back to events-stream
-  ## position via that index — including DeltaColumn nudges.
+  ## ``stepCount`` stays the exec-record count, because the value, call and
+  ## I/O event streams are indexed by exec record.
   ##
-  ## Fast path: when the trace is not column-aware, the count is
-  ## exactly ``stepCount`` and we skip the event walk entirely.
-  ## Column-aware traces walk the event stream via ``readChunkEvents``
-  ## (O(N) total decode cost — chunks are decompressed once each,
-  ## events read in bulk).  Looping ``readEvent`` is O(N²) because
-  ## each call re-scans from the chunk start.
+  ## The stream is walked chunk by chunk via ``readChunkEvents`` (O(N) total:
+  ## each chunk is decompressed once); looping ``readEvent`` would re-scan
+  ## from the chunk start on every call.
   r.ensureExecReader()
-  if not r.meta.hasColumnAwareSteps and not r.meta.hasSourceReload:
-    return ok(r.execReader.totalEvents)
   var n: uint64 = 0
   var chunkBuf: seq[StepEvent]
   let total = int(r.execReader.totalEvents)
@@ -1414,19 +1410,24 @@ proc logicalStepCount*(r: var NewTraceReader): Result[uint64, string] =
   for chunkIdx in 0 ..< chunkCount:
     discard ?r.execReader.readChunkEvents(chunkIdx, chunkBuf)
     for ev in chunkBuf:
-      case ev.kind
-      of sekDeltaColumn:
-        discard
-      of sekSourceReload:
-        # GDH-M2 / design §7.3: the reload marker is a timeline
-        # ANNOTATION, not a step.  It has no source location, so a
-        # consumer must not be able to step to it, and counting it as a
-        # step would put a position-less entry in the middle of a
-        # position-indexed sequence.
-        discard
-      else:
+      if ev.isStepRecord:
         n += 1
   ok(n)
+
+proc execRecords*(r: var NewTraceReader): Result[seq[StepEvent], string] =
+  ## Every exec record, in stream order (index = exec-record index), decoded
+  ## chunk by chunk.  A view that walks the whole stream uses this instead of
+  ## ``step(n)`` per record, which re-scans its chunk on every call.
+  r.ensureExecReader()
+  var records: seq[StepEvent]
+  var chunkBuf: seq[StepEvent]
+  let total = int(r.execReader.totalEvents)
+  let chunkSize = int(r.execReader.chunkSize)
+  let chunkCount = (total + chunkSize - 1) div chunkSize
+  for chunkIdx in 0 ..< chunkCount:
+    discard ?r.execReader.readChunkEvents(chunkIdx, chunkBuf)
+    records.add(chunkBuf)
+  ok(records)
 
 proc sourceReloadCount*(r: var NewTraceReader): Result[uint64, string] =
   ## GDH-M2 — how many ``TagSourceReload`` markers the execution stream

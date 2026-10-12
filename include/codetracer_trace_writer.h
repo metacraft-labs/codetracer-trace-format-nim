@@ -1157,6 +1157,11 @@ void ct_reader_close(ct_reader_t h);
 
 /* Counts.  0 on failure. */
 uint64_t ct_reader_step_count(ct_reader_t h);
+/* The number of step records (AbsoluteStep, DeltaStep): the trace's step
+ * count.  ct_reader_step_count is the exec-record count, which the other
+ * streams are indexed by and which also counts raise, catch, thread,
+ * column-only and source-reload records. */
+uint64_t ct_reader_logical_step_count(ct_reader_t h);
 uint64_t ct_reader_call_count(ct_reader_t h);
 uint64_t ct_reader_event_count(ct_reader_t h);
 uint64_t ct_reader_path_count(ct_reader_t h);
