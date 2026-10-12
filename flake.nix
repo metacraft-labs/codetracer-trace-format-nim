@@ -153,9 +153,8 @@
 
             # EVERYTHING THIS HOOK WRITES IS ANCHORED TO THIS REPOSITORY, never
             # to the directory the shell happens to be entered from.
-            # git-hooks.nix's `shellHook` installs `.pre-commit-config.yaml`
-            # and a pre-commit hook into whatever git repository encloses
-            # `$PWD`: entered from a sibling checkout (`nix develop
+            # A git-hooks installer writes its pre-commit hook into whatever
+            # git repository encloses `$PWD`: entered from a sibling checkout (`nix develop
             # ../codetracer-trace-format-nim`, or a captured `print-dev-env`
             # sourced elsewhere) it planted this repo's `just lint` hook in
             # that sibling and blocked its commits. So it runs only when the
@@ -167,19 +166,24 @@
               if [ -n "$ct_tfn_root" ] \
                 && [ -f "$ct_tfn_root/codetracer_trace_format.nimble" ] \
                 && [ -f "$ct_tfn_root/src/codetracer_trace_writer_ffi.nim" ]; then
-                ( cd "$ct_tfn_root" && ${preCommit.shellHook} )
-                # git-hooks.nix's installer leaves core.hooksPath as the RELATIVE
-                # `.git/hooks`, in the config every worktree shares. A linked worktree
-                # cannot resolve it (there `.git` is a file), so git silently runs no
-                # hooks there. Point it at the common hooks directory instead.
+                # The committed `.pre-commit-config.yaml` is the hook, run by the
+                # flake's pre-commit: the flake provides the tools, the committed
+                # config provides the rules. git-hooks.nix's own installer refuses
+                # to replace a committed config and then installs nothing.
+                ( cd "$ct_tfn_root" && bash ${./scripts/install-git-hooks.sh} ${pkgs.lib.getExe preCommit.config.package} ) || exit $?
+                # A clone where git-hooks.nix's own installer once ran keeps its RELATIVE
+                # core.hooksPath `.git/hooks`, in the config every worktree shares. A linked
+                # worktree cannot resolve it (there `.git` is a file), so git silently runs
+                # no hooks there. Point it at the common hooks directory instead.
                 if [ "$(git -C "$ct_tfn_root" config --local --get core.hooksPath 2>/dev/null)" = .git/hooks ]; then
                   git -C "$ct_tfn_root" config --local core.hooksPath "$(git -C "$ct_tfn_root" rev-parse --path-format=absolute --git-common-dir)/hooks"
                 fi
-                # The installer moves each Reprobuild hook dispatcher aside to
-                # `<hook>.legacy` and puts pre-commit's shim in its slot, so the managed
-                # hook (for pre-push, the publication gate) runs only by accident. Put the
-                # dispatcher back and chain the shim as `<hook>.repro-local`, which the
-                # dispatcher runs: the layout `repro hooks ensure --vcs` produces.
+                # `pre-commit install` (and git-hooks.nix's installer, where it once ran)
+                # moves each Reprobuild hook dispatcher aside to `<hook>.legacy` and puts
+                # its shim in the slot, so the managed hook (for pre-push, the publication
+                # gate) runs only by accident. Put the dispatcher back and chain the shim as
+                # `<hook>.repro-local`, which the dispatcher runs: the layout
+                # `repro hooks ensure --vcs` produces.
                 _hooks="$(git -C "$ct_tfn_root" rev-parse --path-format=absolute --git-path hooks 2>/dev/null || true)"
                 for _legacy in "$_hooks"/*.legacy; do
                   [ -f "$_legacy" ] && grep -q 'reprobuild hook dispatcher' "$_legacy" || continue

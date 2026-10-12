@@ -20,7 +20,8 @@
 # defect: before this file there was neither a `.pre-commit-config.yaml` nor a
 # `.git/hooks/pre-commit` here, so §4.3 was satisfied on paper by nothing at all.
 #
-# Install:  prek install        (or: pre-commit install)
+# Install:  automatic on dev-shell entry (scripts/install-git-hooks.sh);
+#           elsewhere `prek install` (or: pre-commit install)
 # Run:      prek run --all-files
 #
 # ON NixOS, `uv` MUST BE ON PATH BEFORE EITHER OF THOSE. prek otherwise
@@ -58,13 +59,14 @@
 # file would have silently dropped the only gate the repo had, so the entry is
 # reproduced verbatim below rather than lost.
 #
-# From this commit the generated set is not installed: upstream git-hooks.nix's
-# installationScript -- which is its shellHook, modules/pre-commit.nix:471 --
-# refuses when a non-symlink exists at this path ("WARNING: Refusing to install
-# because of an existing config at .pre-commit-config.yaml"). Measured in
-# codetracer-wasm-recorder: the devShell exits 0, prints the refusal once, and
-# leaves the committed file byte-identical. The flake keeps providing the tools;
-# this file provides the rules, which is the agent-harbor pattern.
+# Entering the dev shell (`nix develop`, direnv) installs THIS file as the
+# pre-commit hook: scripts/install-git-hooks.sh, called from the shellHook in
+# flake.nix, points `.git/hooks/pre-commit` (or its `.repro-local` chain under a
+# Reprobuild dispatcher) at this committed config, run by the flake's
+# pre-commit. git-hooks.nix's own installer is not used: it refuses when a
+# non-symlink exists at this path and then installs nothing. The flake provides
+# the tools; this file provides the rules, which is the agent-harbor pattern.
+# The flake's generated set still runs under `nix flake check`.
 #
 # `core.hooksPath` was also set here, to an absolute path naming exactly this
 # repo's own `.git/hooks` -- i.e. the directory git uses anyway -- and both prek

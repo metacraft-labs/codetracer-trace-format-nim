@@ -16,7 +16,8 @@
 #     `core.hooksPath` change -- `git status --ignored` stays empty;
 # and, as the positive control, entered from inside this repository (its
 # `tests/` directory) NIMBLE_DIR is this repository's `.nimble/` and the hook
-# installs: `.pre-commit-config.yaml` is the git-hooks.nix symlink.
+# installs: a pre-commit hook runs the committed `.pre-commit-config.yaml`,
+# which it leaves byte-identical.
 #
 #   bash tests/test_dev_shell_writes_nothing_elsewhere.sh
 set -euo pipefail
@@ -42,9 +43,15 @@ for dir in "$SCRATCH" "$SCRATCH/sub"; do
   [ -z "$(git -C "$SCRATCH" status --porcelain --ignored)" ] || fail "entered from $dir: the other repository is dirty: $(git -C "$SCRATCH" status --porcelain --ignored)"
 done
 
+config_before="$(git -C "$REPO" hash-object .pre-commit-config.yaml)"
+hooks_dir="$(git -C "$REPO" rev-parse --path-format=absolute --git-path hooks)"
 nimble_dir="$( cd "$REPO/tests" && env -u NIMBLE_DIR nix develop "$REPO" --no-write-lock-file \
   -c sh -c 'printf %s "$NIMBLE_DIR"' 2>/dev/null )" || fail "the dev shell did not start from this repository"
 [ "$nimble_dir" = "$REPO/.nimble" ] || fail "control: entered from inside this repository, NIMBLE_DIR is '$nimble_dir', not '$REPO/.nimble'"
-[ -L "$REPO/.pre-commit-config.yaml" ] || fail "control: entered from this repository, the hook did not install .pre-commit-config.yaml"
+[ -f "$REPO/.pre-commit-config.yaml" ] && [ ! -L "$REPO/.pre-commit-config.yaml" ] \
+  && [ "$(git -C "$REPO" hash-object .pre-commit-config.yaml)" = "$config_before" ] \
+  || fail "control: the committed .pre-commit-config.yaml was replaced or changed"
+grep -qs -- '--config .pre-commit-config.yaml' "$hooks_dir/pre-commit" "$hooks_dir/pre-commit.repro-local" \
+  || fail "control: entered from this repository, no pre-commit hook runs the committed config"
 
 echo "PASS: entered from another repository the dev shell writes nothing there; from this one it installs its hooks"
