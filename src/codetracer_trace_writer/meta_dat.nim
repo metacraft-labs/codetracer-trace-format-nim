@@ -5,7 +5,7 @@ when defined(nimPreviewSlimSystem):
 
 ## Binary meta.dat writer for CTFS trace metadata.
 ##
-## Layout (version 6, `internal-files.md` §"Metadata (meta.dat)"):
+## Layout (version 7, `internal-files.md` §"Metadata (meta.dat)"):
 ##   [4] magic "CTMD"
 ##   [2] version u16 LE (6)
 ##   [2] flags u16 LE (bit 0: has_mcr_fields,
@@ -127,6 +127,10 @@ when defined(nimPreviewSlimSystem):
 ##        ``meta.dat`` is written once, complete, at open; every flag is
 ##        fixed then, so ``FlagExtHasSourceReload`` is a capability the
 ##        recorder declares up front rather than a record of what happened.
+##   v7 — (2026-10-12): the header and body are v6's; ``events.dat`` may
+##        carry the ten ``EventLogKind`` values 14-23 (``trace-events.md``
+##        §"EventLogKind (u8 enum)").  The version moves so that a v6 reader
+##        refuses a v7 trace at open rather than at its first new-kind event.
 
 import std/options
 import std/strutils
@@ -140,13 +144,13 @@ import ./uuid_v7
 
 const
   MetaDatMagic*: array[4, byte] = [0x43'u8, 0x54, 0x4D, 0x44]  # "CTMD"
-  MetaDatVersion*: uint16 = 6
+  MetaDatVersion*: uint16 = 7
     ## The only schema version this library writes or reads
-    ## (`internal-files.md` §"Metadata (meta.dat)", "Version History": v6).
+    ## (`internal-files.md` §"Metadata (meta.dat)", "Version History": v7).
     ## Every other version is refused by name; pre-1.0 there is no
     ## compatibility path, and older containers are re-recorded.
   MetaDatHeaderSize* = 12
-    ## magic (4) + version (2) + flags (2) + flags_ext (4). Version 6 always
+    ## magic (4) + version (2) + flags (2) + flags_ext (4). Version 6 on always
     ## carries `flags_ext`, so this is the one header length.
   FlagHasMcrFields*: uint16 = 1                  # bit 0
   FlagHasReplayLaunchFields*: uint16 = 2         # bit 1 — M-RLP-1 (spec §6A.5)
@@ -598,7 +602,7 @@ template refuseNonUtf8(s: string, what: string) =
 
 proc encodeMetaDat*(meta: TraceMetadata,
     input: MetaDatFlagsInput): Result[seq[byte], string] =
-  ## Serialize a version 6 `meta.dat`.
+  ## Serialize a version 7 `meta.dat`.
   ##
   ## `filterProvenance` records the active trace-filter chain (TF-M7,
   ## spec § 7).  The flag bit is set whenever `emitFilterProvenance` is
@@ -768,7 +772,7 @@ proc writeMetaDat*(
     hasCorrelationIndex: bool = false,
     hasSourceReload: bool = false,
 ): Result[void, string] =
-  ## Write a version 6 `meta.dat` to a CTFS internal file, in one append.
+  ## Write a version 7 `meta.dat` to a CTFS internal file, in one append.
   let buf = ? encodeMetaDat(meta, MetaDatFlagsInput(
     recorderId: recorderId, mcrFields: mcrFields,
     replayLaunchFields: replayLaunchFields,
@@ -917,10 +921,11 @@ proc readBody(data: openArray[byte], flags: uint16, pos: var int,
   true
 
 proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
-  ## Parse a version 6 `meta.dat`.
+  ## Parse a version 7 `meta.dat`.
   ##
   ## Every other version is refused, naming it (`internal-files.md`
-  ## §"Version History", v6): the bytes after `recorder_id` mean something
+  ## §"Version History", v7): a version 6 trace was written against the
+  ## fourteen-kind `EventLogKind` table; the bytes after `recorder_id` mean something
   ## different in version 5 and below — a path list — and a reader that
   ## guessed would read a path count as an MCR field. Versions 3 and below
   ## also packed line-only step positions one line higher than version 4 on.

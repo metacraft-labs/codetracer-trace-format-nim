@@ -161,11 +161,11 @@ int main(void) {
         ASSERT(buf_len > 8, "output buffer should have at least header bytes");
         printf("[OK] ct_write_meta_dat_to_buffer (len=%zu)\n", buf_len);
 
-        /* Check magic bytes, and version 6 (meta.dat carries no path list:
+        /* Check magic bytes, and version 7 (meta.dat carries no path list:
          * a trace's source paths are paths.dat's records). */
         ASSERT(buf[0] == 'C' && buf[1] == 'T' && buf[2] == 'M' && buf[3] == 'D',
             "magic bytes should be CTMD");
-        ASSERT(buf[4] == 6 && buf[5] == 0, "meta.dat version should be 6");
+        ASSERT(buf[4] == 7 && buf[5] == 0, "meta.dat version should be 7");
         printf("[OK] magic bytes\n");
 
         /* Read back */

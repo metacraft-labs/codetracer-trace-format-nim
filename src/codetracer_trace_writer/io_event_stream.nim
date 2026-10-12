@@ -47,7 +47,7 @@
 ## The on-disk ``kind`` byte is the recorder's exact ``EventLogKind`` ordinal
 ## (``trace-events.md`` §"EventLogKind (u8 enum)"), and it round-trips exactly:
 ## the writer stores the ordinal its caller gave and the reader reports it as
-## that kind. Values 14-255 are unassigned and refused on both sides, by value.
+## that kind. Values 24-255 are unassigned and refused on both sides, by value.
 ## ``metadata`` is carried verbatim; ``data`` is the record's ``content``.
 ##
 import results
@@ -59,7 +59,7 @@ import ./varint
 import ./record_chunk
 import ../codetracer_trace_types
 
-export codetracer_trace_types.EventLogKind
+export codetracer_trace_types.EventLogKind, codetracer_trace_types.eventLogKindName
 
 const
   DefaultEventsChunkSize* = 64
@@ -91,27 +91,9 @@ type
   IOEventStreamReader* = object
     spec: ChunkedRecords       ## events.dat + events.idx (SPEC mode)
 
-proc eventLogKindName*(k: EventLogKind): string =
-  ## The kind's name as `trace-events.md` §"EventLogKind (u8 enum)" spells it.
-  case k
-  of elkWrite: "Write"
-  of elkWriteFile: "WriteFile"
-  of elkWriteOther: "WriteOther"
-  of elkRead: "Read"
-  of elkReadFile: "ReadFile"
-  of elkReadOther: "ReadOther"
-  of elkReadDir: "ReadDir"
-  of elkOpenDir: "OpenDir"
-  of elkCloseDir: "CloseDir"
-  of elkSocket: "Socket"
-  of elkOpen: "Open"
-  of elkError: "Error"
-  of elkTraceLogEvent: "TraceLogEvent"
-  of elkEvmEvent: "EvmEvent"
-
 proc eventLogKindFromOrdinal*(ord: uint64): Result[EventLogKind, string] =
   ## The ``EventLogKind`` an on-disk or caller-supplied ordinal names; an
-  ## unassigned value (14 and up) is refused by value, never mapped onto a
+  ## unassigned value (24 and up) is refused by value, never mapped onto a
   ## kind (``trace-events.md`` §"EventLogKind (u8 enum)").
   if ord > uint64(high(EventLogKind)):
     return err("event kind " & $ord & " is not an assigned EventLogKind " &

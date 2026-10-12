@@ -101,7 +101,7 @@ proc test_meta_dat_write_layout() {.raises: [].} =
   # Flags
   doAssert readU16LEAt(raw, pos) == 0, "flags should be 0 (no MCR)"
   pos += 2
-  # flags_ext: always present at version 6
+  # flags_ext: always present from version 6 on
   doAssert readU16LEAt(raw, pos) == 0 and readU16LEAt(raw, pos + 2) == 0
   pos += 4
 
@@ -183,7 +183,7 @@ proc test_meta_dat_with_mcr_fields() {.raises: [].} =
   doAssert (flags and 1) == 1, "flags bit 0 should be set for MCR fields"
   pos += 6
 
-  # recording_id, program, args, workdir, recorder_id (version 6: no paths)
+  # recording_id, program, args, workdir, recorder_id (no paths from version 6 on)
   let recId = decodeString(raw, pos)
   doAssert recId.isOk and recId.get() == TestRecordingId,
     "recording_id mismatch"
@@ -310,7 +310,7 @@ proc test_meta_dat_empty_fields() {.raises: [].} =
   doAssert rid.isOk and rid.get() == ""
 
   # 12 fixed bytes + 1 varint (=36) + 36 recording_id bytes + 4 varint
-  # zeros (each 1 byte) = 53 bytes total; no path list at version 6.
+  # zeros (each 1 byte) = 53 bytes total; no path list from version 6 on.
   doAssert pos == raw.len, "trailing bytes: consumed " & $pos & " of " & $raw.len
   doAssert raw.len == 53,
     "expected 53 bytes for a minimal meta.dat, got " & $raw.len
@@ -831,7 +831,7 @@ proc test_meta_dat_strict_unknown_flag_rejection() {.raises: [].} =
     buf.add(byte((MetaDatVersion shr 8) and 0xFF))
     buf.add(byte(flags and 0xFF))
     buf.add(byte((flags shr 8) and 0xFF))
-    # flags_ext — always present at version 6
+    # flags_ext — always present from version 6 on
     buf.add(0'u8); buf.add(0'u8); buf.add(0'u8); buf.add(0'u8)
     # recording_id (canonical UUIDv7)
     encodeVarint(uint64(TestRecordingId.len), buf)
@@ -1043,12 +1043,14 @@ proc test_meta_dat_strict_unknown_flag_rejection() {.raises: [].} =
     # the other half of the same contract.
     let res = readMetaDat(craftVersion(99'u16))
     doAssert res.isErr, "an unknown meta.dat version must be refused"
-    # Version 6 is the only one read; every other is refused by name
-    # (`internal-files.md` §"Version History", v6).
-    for v in [3'u16, 4, 5, 7]:
+    # Version 7 is the only one read; every other is refused by name
+    # (`internal-files.md` §"Version History", v7). Version 6 included: it
+    # was written against the fourteen-kind `EventLogKind` table.
+    doAssert MetaDatVersion == 7'u16
+    for v in [3'u16, 4, 5, 6, 8]:
       let old = readMetaDat(craftVersion(v))
       doAssert old.isErr and ("version " & $v) in old.error and
-        "version 6" in old.error, "version " & $v & ": " & $old
+        "version 7" in old.error, "version " & $v & ": " & $old
 
   echo "PASS: test_meta_dat_strict_unknown_flag_rejection"
 

@@ -556,6 +556,16 @@ type
     ffiElkError = 11
     ffiElkTraceLogEvent = 12
     ffiElkEvmEvent = 13
+    ffiElkWriteStderr = 14
+    ffiElkExec = 15
+    ffiElkReadEnv = 16
+    ffiElkWriteEnv = 17
+    ffiElkStat = 18
+    ffiElkCreateDir = 19
+    ffiElkRemoveDir = 20
+    ffiElkRemoveFile = 21
+    ffiElkRename = 22
+    ffiElkChangeDir = 23
 
 proc toTypeKind(k: FfiTypeKind): TypeKind =
   TypeKind(ord(k))
@@ -5723,7 +5733,7 @@ proc ct_reader_event_fields(
 ): cint {.exportc, cdecl, dynlib, ffiGuard.} =
   ## Returns the fields of IO event at `index`.
   ## The data pointer is heap-allocated; caller must free with ct_free_buffer.
-  ## `outKind` is the event's exact `EventLogKind` ordinal (0-13,
+  ## `outKind` is the event's exact `EventLogKind` ordinal (0-23,
   ## `trace-events.md` §"EventLogKind (u8 enum)").
   ## Returns 0 on success, non-zero on failure.
   if h.isNil or outKind.isNil or outStepId.isNil or

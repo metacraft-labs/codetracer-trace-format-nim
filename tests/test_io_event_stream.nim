@@ -156,7 +156,7 @@ proc test_io_event_kind_roundtrip() {.raises: [].} =
     doAssert back.isOk and back.get().kind == k,
       "kind round-trip broken for " & $k
   # An unassigned value is refused by value, not mapped onto a kind.
-  for v in [14'u8, 15, 200, 255]:
+  for v in [24'u8, 25, 200, 255]:
     var rec = encodeIOEvent(IOEvent(kind: elkWrite, stepId: 1))
     rec[0] = v
     let back = decodeIOEvent(rec)

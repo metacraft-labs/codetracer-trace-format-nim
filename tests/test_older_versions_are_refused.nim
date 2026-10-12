@@ -1,10 +1,12 @@
 ## Every reader door refuses a container from before the 2026-10 revision,
 ## naming the version it found and the one it reads:
 ##
-## * `meta.dat` at any schema version but 6 (`internal-files.md` §"Version
-##   History", v6: "Readers refuse every other version, naming it") — the
-##   bytes after `recorder_id` were a path list up to version 5, and versions
-##   3 and below also packed line-only positions one line higher;
+## * `meta.dat` at any schema version but 7 (`internal-files.md` §"Version
+##   History", v7: "Readers refuse every other version, naming it, v6
+##   included") — version 6 was written against the fourteen-kind
+##   `EventLogKind` table, the bytes after `recorder_id` were a path list up
+##   to version 5, and versions 3 and below also packed line-only positions
+##   one line higher;
 ## * the CTFS container at any version but 5 and 6 (`ctfs-container.md` §2,
 ##   "Older versions are refused"); version 6 is read by `NewTraceReader` and
 ##   the C ABI, and refused by the legacy reader, which reads 5 only.
@@ -73,16 +75,16 @@ proc refusalsOf(file: string): seq[string] =
     ct_reader_close(h)
     result.add("")
 
-proc test_meta_dat_versions_other_than_6_are_refused_by_name() =
-  for v in [3, 4, 5, 7]:
+proc test_meta_dat_versions_other_than_7_are_refused_by_name() =
+  for v in [3, 4, 5, 6, 8]:
     let f = TmpDir / ("meta_v" & $v & ".ct")
     writeCurrent(f)
     stamp(f, metaVersion = v)
     for i, e in refusalsOf(f):
       doAssert e.len > 0, "reader door " & $i & " opened a meta.dat v" & $v
-      doAssert ("version " & $v) in e and "version 6" in e,
-        "door " & $i & " must name version " & $v & " and version 6: " & e
-  echo "PASS: test_meta_dat_versions_other_than_6_are_refused_by_name"
+      doAssert ("version " & $v) in e and "version 7" in e,
+        "door " & $i & " must name version " & $v & " and version 7: " & e
+  echo "PASS: test_meta_dat_versions_other_than_7_are_refused_by_name"
 
 proc test_container_versions_other_than_5_are_refused_by_name() =
   for v in [2, 3, 4, 7]:
@@ -179,7 +181,7 @@ proc test_the_container_version_and_the_meta_dat_schema_are_two_gates() =
 
 when isMainModule:
   createDir(TmpDir)
-  test_meta_dat_versions_other_than_6_are_refused_by_name()
+  test_meta_dat_versions_other_than_7_are_refused_by_name()
   test_container_versions_other_than_5_are_refused_by_name()
   test_the_current_versions_open_at_the_recorded_lines()
   test_the_container_version_and_the_meta_dat_schema_are_two_gates()

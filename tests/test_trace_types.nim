@@ -43,6 +43,17 @@ proc test_event_log_kind_enum() {.raises: [].} =
   doAssert ord(elkWrite) == 0
   doAssert ord(elkError) == 11
   doAssert ord(elkEvmEvent) == 13
+  # The kinds `meta.dat` version 7 allocates (trace-events.md
+  # §"EventLogKind (u8 enum)"), by ordinal and by name.
+  const v7 = [(elkWriteStderr, 14, "WriteStderr"), (elkExec, 15, "Exec"),
+    (elkReadEnv, 16, "ReadEnv"), (elkWriteEnv, 17, "WriteEnv"),
+    (elkStat, 18, "Stat"), (elkCreateDir, 19, "CreateDir"),
+    (elkRemoveDir, 20, "RemoveDir"), (elkRemoveFile, 21, "RemoveFile"),
+    (elkRename, 22, "Rename"), (elkChangeDir, 23, "ChangeDir")]
+  for (k, o, name) in v7:
+    doAssert ord(k) == o, name & " is " & $ord(k)
+    doAssert eventLogKindName(k) == name
+  doAssert ord(high(EventLogKind)) == 23
   echo "PASS: test_event_log_kind_enum"
 
 proc test_value_record_construction() {.raises: [].} =

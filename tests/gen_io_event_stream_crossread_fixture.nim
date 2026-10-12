@@ -71,11 +71,13 @@ proc main() {.raises: [].} =
 
   # Emit a generous interleaving of steps and I/O events so the I/O event stream
   # (default chunk size 64) crosses several chunk boundaries.  Cycle through all
-  # fourteen EventLogKinds and vary metadata (incl. empty) + content (incl.
+  # twenty-four EventLogKinds and vary metadata (incl. empty) + content (incl.
   # binary), so the Rust reader sees every kind byte the format assigns.
   const kinds = [elkWrite, elkWriteFile, elkWriteOther, elkRead, elkReadFile,
     elkReadOther, elkReadDir, elkOpenDir, elkCloseDir, elkSocket, elkOpen,
-    elkError, elkTraceLogEvent, elkEvmEvent]
+    elkError, elkTraceLogEvent, elkEvmEvent, elkWriteStderr, elkExec,
+    elkReadEnv, elkWriteEnv, elkStat, elkCreateDir, elkRemoveDir,
+    elkRemoveFile, elkRename, elkChangeDir]
   var ioCount = 0
   for ln in 1'u64 .. 250'u64:
     step(ln)
