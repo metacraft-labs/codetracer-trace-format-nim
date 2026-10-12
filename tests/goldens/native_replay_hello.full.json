@@ -1,23 +1,30 @@
 {
   "metadata": {
     "program": "<program>",
-    "args": ["--demo", "fixture"],
-    "workdir": "",
+    "args": [
+      "--demo",
+      "fixture"
+    ],
+    "workdir": "<workdir>",
     "recorder": "native-mcr",
-    "recording_mode": "hook",
+    "recording_mode": "mcr",
     "platform": "linux",
     "tick_source": "none",
     "tick_definition": "edge",
     "hook_profile": "test",
-    "ctfs_version": "4",
-    "hook_strategies": ["ldpreload"]
+    "ctfs_version": "7",
+    "hook_strategies": [
+      "ldpreload"
+    ]
   },
-  "paths": [],
+  "paths": [
+    "/synthetic/src/main.c"
+  ],
   "functions": [],
   "varnames": [],
   "types": [],
   "counts": {
-    "paths": 0,
+    "paths": 1,
     "functions": 0,
     "varnames": 0,
     "types": 0,

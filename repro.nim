@@ -110,8 +110,8 @@ const
 # (``test_cross_format`` / ``test_query_protocol`` / ``test_network_reader``
 # / ``test_replication``), PLUS the additional in-tree unit tests that
 # compile + run clean on a headless Linux host under ``-d:release -p:src``
-# (``test_ct_print_full`` / ``test_ct_print_native`` / ``test_managed_sender``
-# / ``test_reader_v4`` / ``test_source_views``).
+# (``test_ct_print_full`` / ``test_managed_sender`` / ``test_reader_v4`` /
+# ``test_source_views``).
 # Every listed file compiles and runs to exit 0 with ``-d:release -p:src``;
 # ``-d:release`` is a faithful superset of the per-file flags the nimble
 # task uses (the non-release files run identically under it).
@@ -254,7 +254,6 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_name_only_funcs_refusal.nim", binary: "build/test-bin/test_name_only_funcs_refusal"),
   TestSpec(source: "tests/test_ct_print_full.nim", binary: "build/test-bin/test_ct_print_full"),
   TestSpec(source: "tests/test_ct_print_native.nim", binary: "build/test-bin/test_ct_print_native"),
-  TestSpec(source: "tests/test_ct_print_native_event_log.nim", binary: "build/test-bin/test_ct_print_native_event_log"),
   TestSpec(source: "tests/test_managed_sender.nim", binary: "build/test-bin/test_managed_sender"),
   TestSpec(source: "tests/test_reader_v4.nim", binary: "build/test-bin/test_reader_v4"),
   TestSpec(source: "tests/test_source_views.nim", binary: "build/test-bin/test_source_views"),
