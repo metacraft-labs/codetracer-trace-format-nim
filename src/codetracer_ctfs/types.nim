@@ -238,6 +238,33 @@ proc ctfsReadableVersionError*(data: openArray[byte]): string =
       "versions are refused\")"
   ""
 
+# TODO(ctfs-legacy-corpus): retire this note once the legacy published corpus is
+# re-produced.
+#
+# The refusal below is correct and stays. Worth recording beside it: for one
+# already-published corpus the version stamp is measurably misleading. Those
+# containers carry `meta.dat` 3 written with the CORRECTED packing under an
+# uncorrected stamp — measured two ways. Flipping only the version byte makes
+# every decoded position match the positions published alongside the containers,
+# with zero disagreements; and all 21 distinct (path, line) pairs land on the
+# one-line body of the function they name, never the signature above it.
+#
+# A per-read vouch for that case is UNBUILDABLE, noted so it is not re-proposed.
+# A caller-supplied "trust this stamp" flag is only half of what one needs,
+# because version 6 moved the LAYOUT and not just the gate: the header went 8 to
+# 12 bytes and the path list after `recorder_id` was removed. A version-3 header
+# therefore cannot be parsed under this layout at all. Forcing such a container
+# to container 5 / schema 6 and re-reading fails at every entry point with
+# "flags_ext carries bits this reader does not implement: 0x65303224", which
+# decodes as the recording-id string read as a flags word (varint length
+# 0x24 = 36, then ASCII "20e"). The parse never reaches the body, so no gate at
+# the version check rescues it.
+#
+# The way out is re-recording rather than a reader change, and it is already
+# proven for the larger half of that corpus (`aztec-avm-runtime` `c87b9cc`).
+# The consumer side carries the matching rule in
+# `blocktracer/client/hydrate/engine-pin.txt`: the engine pin and the published
+# data move together, and the pin is never bumped on its own.
 proc ctfsVersionError*(data: openArray[byte]): string =
   ## Empty when `data` carries the CTFS version this library reads (5);
   ## otherwise the refusal, naming the version found and the one read
