@@ -164,6 +164,12 @@ def census():
         mode = stat.S_IMODE(info.st_mode)
         if path.name.endswith('.sample'):
             if SAMPLES.get(path.name) != [mode, digest]:
+                # Public constructor identities only; never print hook bodies or environment.
+                print('Git sample refusal witness: ' + __import__('json').dumps({
+                    'name': path.name, 'observed': [mode, digest],
+                    'expected': SAMPLES.get(path.name), 'git': str(SELECTED_GIT),
+                    'gitSHA256': GIT_SHA, 'templates': str(TEMPLATES),
+                }, sort_keys=True), file=sys.stderr)
                 raise RuntimeError('Unknown selected Git sample body or mode: ' + path.name)
         else:
             known = set()

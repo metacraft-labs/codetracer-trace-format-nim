@@ -59,7 +59,36 @@
           toolchainsPkgs = inputs.codetracer-toolchains.packages.${system};
 
           nim = toolchainsPkgs.nim-2_2;
-          nimble = toolchainsPkgs.nimble;
+          nimbleSource = pkgs.applyPatches {
+            name = "trace-nim-nimble-supported-github-auth-source";
+            src = toolchainsPkgs.nimble.src;
+            patches = [ ./nix/nimble-github-api-auth.patch ];
+          };
+          nimble = toolchainsPkgs.nimble.overrideAttrs (_: {
+            src = nimbleSource;
+          });
+
+          nimbleRuntimeMetadata = nimble.overrideAttrs (old: {
+            pname = "trace-nim-runtime-metadata";
+            buildPhase = ''
+              runHook preBuild
+              cp ${./nix/construct-runtime-metadata.nim} construct_runtime_metadata.nim
+              nim c -d:ssl -d:zippyNoSimd -d:nimcore \
+                --define:git_revision_override=v0.20.1 \
+                --path:src --path:vendor/zippy/src --path:vendor/sat/src \
+                --path:vendor/checksums/src --out:construct-runtime-metadata \
+                construct_runtime_metadata.nim
+              runHook postBuild
+            '';
+            installPhase = ''
+              runHook preInstall
+              install -Dm755 construct-runtime-metadata $out/bin/construct-runtime-metadata
+              runHook postInstall
+            '';
+            postInstall = ''
+              wrapProgram $out/bin/construct-runtime-metadata --suffix PATH : ${nim}/bin
+            '';
+          });
 
           # `--path:` arguments that make the .nimble's `requires` importable
           # from a bare `nim c` (the package build below, and the FFI static
@@ -302,6 +331,9 @@
           # `include/` mirror the source-tree locations the sibling-checkout
           # builds read.  Consumers also link libzstd.
           # Same selected constructors used by the guarded owning shell.
+          packages.ci-nimble = nimble;
+          packages.ci-nimble-source = nimbleSource;
+          packages.ci-nimble-runtime-metadata = nimbleRuntimeMetadata;
           packages.ci-checkout-git = pkgs.git;
           packages.ci-checkout-python = pkgs.python3;
 
