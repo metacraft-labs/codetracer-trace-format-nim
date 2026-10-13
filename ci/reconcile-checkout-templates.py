@@ -191,14 +191,14 @@ try:
         with tempfile.TemporaryDirectory(prefix='trace-git-template-probe-') as directory:
             probe = Path(directory) / 'probe'
             subprocess.run([str(executable), 'init', str(probe)], cwd=root, check=True,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, umask=0o022)
             probe_payload = payload(samples(probe / '.git/hooks'))
             template_payload = payload(samples(Path(constructors[str(executable)]['templates']) / 'hooks'))
             # Genuine Git init copies immutable templates to owner-writable samples.
             # Keep exact source modes in constructors; compare the observed copy mode.
             template_payload = {name: [mode | stat.S_IWUSR, sha] for name, (mode, sha) in template_payload.items()}
             if probe_payload != template_payload:
-                raise RuntimeError('Actual init differs from selected template supplier')
+                raise RuntimeError('Actual init differs from selected template supplier: ' + json.dumps({'git': str(executable), 'probeUmask': '0022', 'observed': probe_payload, 'expected': template_payload}, sort_keys=True))
             initialized.append(probe_payload)
     if payload(before) != initialized[0]:
         raise RuntimeError('Initialized samples differ from their actual constructor')
@@ -229,7 +229,7 @@ try:
     if samples(retained) != before:
         raise RuntimeError('Retained sample identity/body changed')
     subprocess.run([str(git), 'init', str(root)], cwd=root, check=True,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, umask=0o022)
     if not hooks_unchanged() or payload(samples(hooks)) != initialized[1]:
         raise RuntimeError('Selected constructor did not initialize its genuine templates')
     receipt['success'] = True
