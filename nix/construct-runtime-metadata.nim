@@ -1,5 +1,5 @@
 # Call the selected Nimble writers, preserving their installed-package and cache semantics.
-import std/[os,json,sets]
+import std/[os,json,sets,options]
 import nimblepkg/[options,nimbledatafile,downloadnim,packageinfo,version,sha1hashes,cli,packageparser,reversedeps,packageinfotypes]
 if paramCount() notin [1,3]: quit(64)
 let root=paramStr(1)
@@ -8,6 +8,7 @@ if paramCount()==3:
   setSuppressMessages(true)
   var opts=initOptions()
   opts.nimbleDir=root
+  opts.nimBin=some makeNimBin(opts,"nim")
   let installed=getInstalledPkgs(root/"pkgs2",opts)
   var project=getPkgInfo(paramStr(3),opts)
   project.isLink=true
