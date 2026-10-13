@@ -101,6 +101,7 @@ jobs:
           selected_python_package="$(nix build --no-link --no-write-lock-file --print-out-paths .#ci-checkout-python)"
           "$selected_python_package/bin/python3" ci/reconcile-checkout-templates.py \
             --root "$GITHUB_WORKSPACE" --initialized-git "$initialized_git" \
+            --initialized-umask "$(cat "$RUNNER_TEMP/trace-checkout-git-templates/initialized-umask.txt")" \
             --selected-git "$selected_git_package/bin/git" \
             --expected-head "$captured_head" \
             --receipt "$RUNNER_TEMP/trace-checkout-template-reconciliation.json"

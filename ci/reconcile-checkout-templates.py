@@ -11,10 +11,13 @@ import argparse, hashlib, json, os, stat, subprocess, tempfile
 parser = argparse.ArgumentParser()
 parser.add_argument('--root', required=True, type=Path)
 parser.add_argument('--initialized-git', required=True, type=Path)
+parser.add_argument('--initialized-umask', required=True, type=lambda value: int(value, 8))
 parser.add_argument('--selected-git', required=True, type=Path)
 parser.add_argument('--receipt', required=True, type=Path)
 parser.add_argument('--expected-head', required=True)
 args = parser.parse_args()
+if not 0 <= args.initialized_umask <= 0o777:
+    parser.error('initialized constructor umask is outside permission bits')
 
 def digest(path):
     with path.open('rb') as stream:
@@ -187,18 +190,18 @@ def save():
 save()
 try:
     initialized = []
-    for executable in [old_git, git]:
+    for executable, constructor_umask in [(old_git, args.initialized_umask), (git, 0o022)]:
         with tempfile.TemporaryDirectory(prefix='trace-git-template-probe-') as directory:
             probe = Path(directory) / 'probe'
             subprocess.run([str(executable), 'init', str(probe)], cwd=root, check=True,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, umask=0o022)
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, umask=constructor_umask)
             probe_payload = payload(samples(probe / '.git/hooks'))
             template_payload = payload(samples(Path(constructors[str(executable)]['templates']) / 'hooks'))
             # Genuine Git init copies immutable templates to owner-writable samples.
             # Keep exact source modes in constructors; compare the observed copy mode.
-            template_payload = {name: [mode | stat.S_IWUSR, sha] for name, (mode, sha) in template_payload.items()}
+            template_payload = {name: [(mode | stat.S_IWUSR) & ~constructor_umask, sha] for name, (mode, sha) in template_payload.items()}
             if probe_payload != template_payload:
-                raise RuntimeError('Actual init differs from selected template supplier: ' + json.dumps({'git': str(executable), 'probeUmask': '0022', 'observed': probe_payload, 'expected': template_payload}, sort_keys=True))
+                raise RuntimeError('Actual init differs from selected template supplier: ' + json.dumps({'git': str(executable), 'probeUmask': format(constructor_umask, '04o'), 'observed': probe_payload, 'expected': template_payload}, sort_keys=True))
             initialized.append(probe_payload)
     if payload(before) != initialized[0]:
         raise RuntimeError('Initialized samples differ from their actual constructor')

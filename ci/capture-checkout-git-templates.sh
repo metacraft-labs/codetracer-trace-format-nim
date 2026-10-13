@@ -78,6 +78,7 @@ record_inventory() {
   done | LC_ALL=C sort
 }
 record_inventory "$templates/hooks" > "$receipt/template-source-before.tsv"
+initialized_umask=$(umask)
 git init --template="$templates" "$receipt/probe" > "$receipt/probe.stdout" 2> "$receipt/probe.stderr"
 record_inventory "$hooks" > "$receipt/initialized-before.tsv"
 record_inventory "$receipt/probe/.git/hooks" > "$receipt/actual-template-initialized.tsv"
@@ -97,6 +98,7 @@ unset config_before
 test "$common" = "$(realpath "$(git rev-parse --path-format=absolute --git-common-dir)")"
 test -d "$own_root/.git" && test ! -L "$own_root/.git"
 refuse_hooks_path
+printf '%s\n' "$initialized_umask" > "$receipt/initialized-umask.txt"
 printf '%s\n' "$git_real" > "$receipt/git-image.txt"
 sha256sum "$git_real" > "$receipt/git-image.sha256"
 printf '%s\n' "$templates" > "$receipt/templates-source.txt"
