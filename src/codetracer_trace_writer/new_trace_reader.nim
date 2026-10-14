@@ -531,7 +531,7 @@ proc computePathVersionOrdinals(r: var NewTraceReader): Result[void, string] =
 # ---------------------------------------------------------------------------
 
 proc validateRecordedEntry*(r: var NewTraceReader,
-    entry: RecordedEntryIdentity): Result[void, string]
+    entry: RecordedEntryIdentity): Result[void, string] {.gcsafe.}
 
 proc recordedEntryIdentity*(r: NewTraceReader): Option[RecordedEntryIdentity] =
   ## Only open's checked same-image identity is exposed.
