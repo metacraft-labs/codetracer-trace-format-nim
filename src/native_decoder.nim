@@ -170,7 +170,9 @@ proc detectNativeBundle*(data: openArray[byte]): Result[NativeBundleInfo, string
     return err(versionErr)
 
   let blockSize = readU32LE(data, 8)
-  let maxRoot = readU32LE(data, 12)
+  # A declared `0` is the auto-filled root (`ctfs-container.md` §1,
+  # "Auto-fill"), not a nonsensical header.
+  let maxRoot = headerRootEntryCount(data)
   if blockSize == 0 or maxRoot == 0 or int(maxRoot) > 4096:
     return err(
       "nonsensical CTFS root header (blockSize=" & $blockSize &

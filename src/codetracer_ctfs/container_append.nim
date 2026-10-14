@@ -123,36 +123,18 @@ proc openClosedCtfs*(path: string): Result[Ctfs, string] =
   if maxRootEntries == 0'u32:
     # A zero means "fill block 0" — `ctfs-container.md` §1's normative reading
     # of `MaxRootEntries`, which yields 170 entries at the default 4096-byte
-    # block ((4096 - 16) / 24).
-    #
-    # **The readers in this tree do not agree on that, so do not read the
-    # fallback below as the house convention.** Three readings coexist:
-    #
-    #   - auto-fill to 170, as here: the wasm recorder's independent Go reader
-    #     (`internal/ctfs/container.go`'s `locateEntryArray`) and the
-    #     cross-read checker `tests/check_ctfs_container.nim`;
-    #   - **no fallback at all** — `container.nim`'s `readInternalFile` and
-    #     `hasInternalFile` default `maxEntries` to `DefaultMaxRootEntries`
-    #     (31) and scan exactly that many slots, and
-    #     `codetracer_trace_reader.nim` passes the header's value straight
-    #     through, so a declared 0 makes it scan *nothing* and report every
-    #     internal file absent;
-    #   - outright refusal: `native_decoder.nim` errors on `maxRoot == 0`.
-    #
-    # The divergence is harmless *today* only because nothing ever writes a
-    # zero: `createCtfs`'s `maxRootEntries` parameter defaults to
-    # `DefaultMaxRootEntries` = 31 and every caller takes that default
-    # (`multi_stream_writer.nim`, `split_trace.nim`, `createCtfsStreaming`,
-    # and the FFI's `ct_container_create`), while the Rust writer's one
-    # production call site passes a literal 31. Every `.ct` in the workspace
-    # carries 31 in header bytes 12-15, so the branch below is unreachable for
-    # any container these writers produce — and 31 entries are read the same
-    # way by all three readings.
-    #
-    # It is reachable from a *foreign* producer, and the spec's own defaults
-    # table recommends exactly the 0 that half of this tree cannot read. That
-    # makes the split a latent interop hazard rather than a style difference,
-    # which is why it is written down here instead of quietly relied upon.
+    # block ((4096 - 16) / 24). Every reader in this library applies the same
+    # rule (`types.rootEntryCount`): `findFileEntry`, and through it
+    # `readInternalFile` and `hasInternalFile`, reads a declared `0` passed
+    # through from the header as the auto-filled root, and
+    # `codetracer_trace_reader`, `native_decoder`, ct-print and the space
+    # analyzer read the header through `headerRootEntryCount`. Until
+    # 2026-10-14 they did not: the first group scanned no slot and the
+    # `native_decoder` / ct-print pair refused the header, so a container
+    # from a producer that declares the spec's recommended `0` read as empty
+    # (`tests/test_root_auto_fill.nim`). No writer in this library declares
+    # `0` (`createCtfs` defaults to `DefaultMaxRootEntries`, 31), so no
+    # container written here was ever read differently.
     maxRootEntries = uint32(
       (int(blockSize) - HeaderSize - ExtHeaderSize) div FileEntrySize)
   if uint64(data.len) < rootBlockCount(blockSize, maxRootEntries, readMaxShards(data)) *

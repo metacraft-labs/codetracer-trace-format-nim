@@ -99,9 +99,9 @@ proc openTrace*(path: string): Result[TraceReader, string] =
   bs4[0] = data[8]; bs4[1] = data[9]; bs4[2] = data[10]; bs4[3] = data[11]
   let blockSize = fromBytesLE(uint32, bs4)
 
-  var mr4: array[4, byte]
-  mr4[0] = data[12]; mr4[1] = data[13]; mr4[2] = data[14]; mr4[3] = data[15]
-  let maxEntries = fromBytesLE(uint32, mr4)
+  # The header's `MaxRootEntries`, a declared `0` read as the auto-filled
+  # root (`ctfs-container.md` §1, "Auto-fill") rather than as no entries.
+  let maxEntries = headerRootEntryCount(data)
 
   # A container carrying a member that is not part of the trace format is
   # refused before anything in it is read.

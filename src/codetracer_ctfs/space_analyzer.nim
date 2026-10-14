@@ -137,13 +137,11 @@ proc analyzeCtfs*(data: openArray[byte],
   if versionErr.len > 0:
     return err(versionErr)
 
-  # Read max root entries from extended header.
+  # Read max root entries from extended header, a declared `0` as the
+  # auto-filled root (`ctfs-container.md` §1, "Auto-fill").
   var maxEntries = int(DefaultMaxRootEntries)
   if data.len >= HeaderSize + ExtHeaderSize:
-    var arr: array[4, byte]
-    for i in 0 ..< 4:
-      arr[i] = data[HeaderSize + 4 + i]
-    maxEntries = int(fromBytesLE(uint32, arr))
+    maxEntries = int(headerRootEntryCount(data))
 
   var report: SpaceReport
   report.totalBytes = uint64(data.len)

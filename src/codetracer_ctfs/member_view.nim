@@ -167,10 +167,10 @@ proc isLoaded(image: ContainerImage, at: int): bool {.inline.} =
 proc rootEnd(d: openArray[byte], maxEntries: uint32): int =
   ## Where the root directory of the container image `d` ends: the entry
   ## array after the header, as many entries as the header or the reader
-  ## allows, whichever is more, and no further than the image.
+  ## allows, whichever is more, and no further than the image. A declared `0`
+  ## is the auto-filled root (`ctfs-container.md` §1, "Auto-fill").
   let base = if d[5] == CtfsVersionV6: V6HeaderSize else: HeaderSize + ExtHeaderSize
-  let declared = uint32(d[12]) or (uint32(d[13]) shl 8) or
-    (uint32(d[14]) shl 16) or (uint32(d[15]) shl 24)
+  let declared = headerRootEntryCount(d)
   int(min(uint64(base) + uint64(max(declared, maxEntries)) *
     uint64(FileEntrySize), uint64(d.len)))
 

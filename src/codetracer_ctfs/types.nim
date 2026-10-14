@@ -210,6 +210,30 @@ proc writeU32LE*(data: var openArray[byte], offset: int, val: uint32) =
   for i in 0 ..< 4:
     data[offset + i] = le[i]
 
+proc rootEntryCount*(blockSize, declared: uint32, headerSize: int): uint32 =
+  ## The number of root-directory slots a reader scans in a full-profile
+  ## container whose header is `headerSize` bytes (16 through version 5, 24
+  ## at version 6): `declared`, or for a declared `0` the auto-filled
+  ## remainder of block 0, `(BlockSize - headerSize) div 24` -- 170 at
+  ## version 5 and 169 at version 6 for a 4096-byte block
+  ## (`ctfs-container.md` §1, "Auto-fill", and §1a). A reader that read the
+  ## `0` as "no entries" would read an empty container and report success.
+  if declared != 0'u32:
+    return declared
+  if blockSize <= uint32(headerSize):
+    return 0
+  (blockSize - uint32(headerSize)) div uint32(FileEntrySize)
+
+proc headerRootEntryCount*(data: openArray[byte]): uint32 =
+  ## `rootEntryCount` for the header of the container image `data`: its
+  ## `BlockSize` and `MaxRootEntries`, and its version's header size. 0 for
+  ## an image too short to carry them.
+  if data.len < HeaderSize + ExtHeaderSize:
+    return 0
+  let headerSize =
+    if data[5] == CtfsVersionV6: V6HeaderSize else: HeaderSize + ExtHeaderSize
+  rootEntryCount(readU32LE(data, 8), readU32LE(data, 12), headerSize)
+
 proc blockOffset*(c: Ctfs, blockNum: uint64): int =
   ## Byte offset of a given block number.
   int(blockNum) * int(c.blockSize)

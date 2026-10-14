@@ -610,10 +610,18 @@ proc findFileEntryKey*(data: openArray[byte], encoded: uint64,
   ## version 6 (`ctfs-container.md` §1a). A compact container has no entry
   ## array; `readInternalFile` and `hasInternalFile` look its members up in
   ## its directory.
+  ##
+  ## `maxEntries` is a `MaxRootEntries` declaration, and the callers that read
+  ## it from the header pass it through as stored, so a `0` is the auto-filled
+  ## root of `ctfs-container.md` §1 ("Auto-fill"): the slots that fill the
+  ## rest of block 0 after this image's own header, never none.
   let base =
     if data.len > 5 and data[5] == CtfsVersionV6: V6HeaderSize
     else: HeaderSize + ExtHeaderSize
-  for i in 0 ..< int(maxEntries):
+  let slots =
+    if maxEntries != 0'u32 or data.len < base: maxEntries
+    else: rootEntryCount(readU32LE(data, 8), 0'u32, base)
+  for i in 0 ..< int(slots):
     let off = base + i * FileEntrySize
     if off + FileEntrySize > data.len:
       break

@@ -667,7 +667,8 @@ proc printCorrelationIndexV4(filePath: string, opts: FullOpts) =
     for i in 0 ..< 4:
       result = result or (uint32(buf[off + i]) shl (i * 8))
   let blockSize = u32le(data, 8)
-  let maxEntries = u32le(data, 12)
+  # A declared `0` is the auto-filled root (`ctfs-container.md` §1).
+  let maxEntries = headerRootEntryCount(data)
   # The program name is a nicety; a container whose meta.dat this build cannot
   # parse must still report its index rather than refusing.
   var program = filePath
@@ -786,7 +787,9 @@ proc printSpans(filePath: string, jsonOut: bool) =
   if bytes.len < HeaderSize + ExtHeaderSize:
     quit("ct-print: file too small to be a CTFS container: " & filePath)
   let blockSize = readU32LE(bytes, 8)
-  let maxRoot = readU32LE(bytes, 12)
+  # A declared `0` is the auto-filled root (`ctfs-container.md` §1,
+  # "Auto-fill"), not a nonsensical header.
+  let maxRoot = headerRootEntryCount(bytes)
   if blockSize == 0'u32 or maxRoot == 0'u32 or int(maxRoot) > 4096:
     quit("ct-print: nonsensical CTFS root header (blockSize=" & $blockSize &
       " maxRootEntries=" & $maxRoot & ") in " & filePath)
