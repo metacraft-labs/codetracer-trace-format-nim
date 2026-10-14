@@ -255,6 +255,9 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_ct_print_full.nim", binary: "build/test-bin/test_ct_print_full"),
   TestSpec(source: "tests/test_ct_print_native.nim", binary: "build/test-bin/test_ct_print_native"),
   TestSpec(source: "tests/test_managed_sender.nim", binary: "build/test-bin/test_managed_sender"),
+  # Starts a MinIO and a Python stand-in of codetracer-ci's upload routes,
+  # both from the dev shell (``flake.nix``).
+  TestSpec(source: "tests/test_managed_sender_ci_routes.nim", binary: "build/test-bin/test_managed_sender_ci_routes"),
   TestSpec(source: "tests/test_reader_v4.nim", binary: "build/test-bin/test_reader_v4"),
   TestSpec(source: "tests/test_source_views.nim", binary: "build/test-bin/test_source_views"),
   # GDH-M1 — versioned paths: a path may be registered more than once and

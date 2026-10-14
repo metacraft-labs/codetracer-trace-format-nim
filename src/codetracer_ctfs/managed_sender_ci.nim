@@ -18,6 +18,19 @@ type
     storagePoolId: string
     storageServerId: string
     storageEndpointUri: string
+    sliceUploadMethod: string
+
+const
+  ## The upload session's `sliceUploadMethod` (codetracer-ci
+  ## rewrite-docs/04-apis-events/http-api.md §4.4.1, "POST
+  ## /api/v1/tenants/{tenantId}/traces/upload-session"): how codetracer-ci
+  ## wants this session's objects written.  Its deployment's object store
+  ## decides it.  An S3 or MinIO store issues a presigned URL per object
+  ## (`POST /api/v1/traces/{sessionId}/slice-upload-url`), which needs no
+  ## stored recorder credential; the local file system store takes the bytes
+  ## through its local-storage `PUT` route.
+  SliceUploadPresignedUrl* = "presigned-url"
+  SliceUploadLocalStorage* = "local-storage"
 
 proc codetracerCiSenderConfigFromEnv*(): CodetracerCiSenderConfig =
   result = CodetracerCiSenderConfig(
@@ -70,6 +83,10 @@ proc ensureSession(backend: CodetracerCiSenderBackend): bool =
     backend.storagePoolId = parsed{"storagePoolId"}.getStr()
     backend.storageServerId = parsed{"storageServerId"}.getStr()
     backend.storageEndpointUri = parsed{"storageEndpointUri"}.getStr()
+    # A codetracer-ci from before the field names no method; it took every
+    # object through the local-storage route, so that is what an absent
+    # field means.
+    backend.sliceUploadMethod = parsed{"sliceUploadMethod"}.getStr(SliceUploadLocalStorage)
     backend.sessionId.len > 0 and backend.s3KeyPrefix.len > 0
   except CatchableError:
     false
@@ -84,18 +101,21 @@ proc sessionObjectKey(backend: CodetracerCiSenderBackend, item: ManagedUploadObj
     else: splitFile(item.localPath).name & splitFile(item.localPath).ext
   backend.s3KeyPrefix.strip(leading = false, trailing = true, chars = {'/'}) & "/" & name
 
-proc uploadObject(backend: CodetracerCiSenderBackend, item: ManagedUploadObject,
+proc retryableStatus(code: HttpCode): bool =
+  code.int >= 500 or code in {Http408, Http429}
+
+proc receiptFor(backend: CodetracerCiSenderBackend, objectKey: string): ManagedUploadReceipt =
+  ManagedUploadReceipt(
+    objectKey: objectKey,
+    storagePoolId: backend.storagePoolId,
+    storageServerId: backend.storageServerId,
+    storageEndpointUri: backend.storageEndpointUri)
+
+proc putLocalStorage(backend: CodetracerCiSenderBackend, objectKey, data,
     contentType: string): tuple[ok: bool, receipt: ManagedUploadReceipt, err: ManagedSenderError] =
-  if not backend.ensureSession():
-    return (false, ManagedUploadReceipt(), ManagedSenderError(retryable: true, message: "failed to create codetracer-ci upload session"))
-  var data: string
-  try:
-    data = readFile(item.localPath)
-  except CatchableError as e:
-    return (false, ManagedUploadReceipt(), ManagedSenderError(retryable: true, message: "failed to read upload object: " & e.msg))
-  if uint64(data.len) != item.contentLength:
-    return (false, ManagedUploadReceipt(), ManagedSenderError(retryable: false, message: "upload object content length changed"))
-  let objectKey = backend.sessionObjectKey(item)
+  ## The local file system store: the bytes go to codetracer-ci itself,
+  ## `PUT /api/v1/observability/storage-policy/tenants/{tenantId}/local-storage/objects/{objectKey}`
+  ## (http-api.md §4.4.1), which writes them into its store.
   let url = baseUrl(backend.config) & "/api/v1/observability/storage-policy/tenants/" &
     backend.config.tenantId & "/local-storage/objects/" & encodeUrl(objectKey)
   let client = authedClient(backend.config)
@@ -107,18 +127,94 @@ proc uploadObject(backend: CodetracerCiSenderBackend, item: ManagedUploadObject,
         "Content-Length": $data.len,
       }))
     if response.code.int >= 200 and response.code.int < 300:
-      return (true, ManagedUploadReceipt(
-        objectKey: objectKey,
-        storagePoolId: backend.storagePoolId,
-        storageServerId: backend.storageServerId,
-        storageEndpointUri: backend.storageEndpointUri), ManagedSenderError())
-    let retryable = response.code.int >= 500 or response.code in {Http408, Http429}
-    (false, ManagedUploadReceipt(), ManagedSenderError(retryable: retryable,
+      return (true, backend.receiptFor(objectKey), ManagedSenderError())
+    (false, ManagedUploadReceipt(), ManagedSenderError(retryable: response.code.retryableStatus,
       message: "codetracer-ci upload failed: HTTP " & $response.code.int))
   except CatchableError as e:
     (false, ManagedUploadReceipt(), ManagedSenderError(retryable: true, message: e.msg))
   finally:
     client.close()
+
+proc putPresigned(backend: CodetracerCiSenderBackend, item: ManagedUploadObject,
+    objectKey, data, contentType: string): tuple[ok: bool, receipt: ManagedUploadReceipt, err: ManagedSenderError] =
+  ## An S3 or MinIO store: codetracer-ci presigns a PUT of the object
+  ## (`POST /api/v1/traces/{sessionId}/slice-upload-url`, http-api.md
+  ## §4.4.1), and the bytes go straight to the store.  The route takes the
+  ## file name and builds the key `{s3KeyPrefix}{fileName}` itself, so the
+  ## key it answers must be the one this sender derived: the finalize's
+  ## manifest names the objects by that key.
+  let fileName = objectKey.rsplit('/', maxsplit = 1)[^1]
+  let url = baseUrl(backend.config) & "/api/v1/traces/" & backend.sessionId & "/slice-upload-url"
+  let body = %*{
+    "sliceIndex": max(item.sliceIndex, 0),
+    "fileName": fileName,
+    "contentLength": data.len,
+  }
+  var uploadUrl, issuedKey: string
+  let client = authedClient(backend.config)
+  try:
+    let response = client.request(url, httpMethod = HttpPost, body = $body,
+      headers = newHttpHeaders({
+        "Authorization": "Bearer " & backend.config.bearerToken,
+        "Content-Type": "application/json",
+      }))
+    if response.code.int < 200 or response.code.int >= 300:
+      return (false, ManagedUploadReceipt(), ManagedSenderError(retryable: response.code.retryableStatus,
+        message: "codetracer-ci slice upload URL refused: HTTP " & $response.code.int))
+    let parsed = parseJson(response.body)
+    uploadUrl = parsed{"uploadUrl"}.getStr()
+    issuedKey = parsed{"s3Key"}.getStr()
+  except CatchableError as e:
+    return (false, ManagedUploadReceipt(), ManagedSenderError(retryable: true, message: e.msg))
+  finally:
+    client.close()
+  if issuedKey != objectKey:
+    return (false, ManagedUploadReceipt(), ManagedSenderError(retryable: false,
+      message: "codetracer-ci issued an upload URL for " & issuedKey & ", not " & objectKey))
+  if not (uploadUrl.startsWith("http://") or uploadUrl.startsWith("https://")):
+    return (false, ManagedUploadReceipt(), ManagedSenderError(retryable: false,
+      message: "codetracer-ci issued no HTTP upload URL for " & objectKey))
+  # The presigned URL is the whole authorization: the store refuses a second
+  # one, so the request carries no Authorization header (and the CI token is
+  # not sent to the object store).
+  let store = newHttpClient(timeout = 10_000)
+  try:
+    let response = store.request(uploadUrl, httpMethod = HttpPut, body = data,
+      headers = newHttpHeaders({
+        "Content-Type": contentType,
+        "Content-Length": $data.len,
+      }))
+    if response.code.int >= 200 and response.code.int < 300:
+      return (true, backend.receiptFor(objectKey), ManagedSenderError())
+    (false, ManagedUploadReceipt(), ManagedSenderError(retryable: response.code.retryableStatus,
+      message: "object store refused the presigned upload of " & objectKey & ": HTTP " & $response.code.int))
+  except CatchableError as e:
+    (false, ManagedUploadReceipt(), ManagedSenderError(retryable: true, message: e.msg))
+  finally:
+    store.close()
+
+proc uploadObject(backend: CodetracerCiSenderBackend, item: ManagedUploadObject,
+    contentType: string): tuple[ok: bool, receipt: ManagedUploadReceipt, err: ManagedSenderError] =
+  ## Writes one object of the session by the route the session named
+  ## (`sliceUploadMethod`).
+  if not backend.ensureSession():
+    return (false, ManagedUploadReceipt(), ManagedSenderError(retryable: true, message: "failed to create codetracer-ci upload session"))
+  var data: string
+  try:
+    data = readFile(item.localPath)
+  except CatchableError as e:
+    return (false, ManagedUploadReceipt(), ManagedSenderError(retryable: true, message: "failed to read upload object: " & e.msg))
+  if uint64(data.len) != item.contentLength:
+    return (false, ManagedUploadReceipt(), ManagedSenderError(retryable: false, message: "upload object content length changed"))
+  let objectKey = backend.sessionObjectKey(item)
+  case backend.sliceUploadMethod
+  of SliceUploadPresignedUrl:
+    backend.putPresigned(item, objectKey, data, contentType)
+  of SliceUploadLocalStorage:
+    backend.putLocalStorage(objectKey, data, contentType)
+  else:
+    (false, ManagedUploadReceipt(), ManagedSenderError(retryable: false,
+      message: "codetracer-ci named an unknown sliceUploadMethod: " & backend.sliceUploadMethod))
 
 method uploadSlice*(backend: CodetracerCiSenderBackend,
     item: ManagedUploadObject): tuple[ok: bool, receipt: ManagedUploadReceipt, err: ManagedSenderError] =

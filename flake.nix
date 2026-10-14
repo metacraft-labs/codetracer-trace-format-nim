@@ -137,6 +137,14 @@
               toolchainsPkgs.rust-stable
               pkgs.capnproto
 
+              # `tests/test_managed_sender_ci_routes.nim` uploads through the
+              # codetracer-ci sender into a real MinIO, with codetracer-ci's
+              # upload routes played by a Python stand-in
+              # (`tests/support/ci_upload_standin.py`, standard library only).
+              # Without them the test fails; it has no SKIP arm.
+              pkgs.minio
+              pkgs.python3
+
               # Build automation, formatters and hook runner.
               pkgs.just
               pkgs.nixfmt-rfc-style
