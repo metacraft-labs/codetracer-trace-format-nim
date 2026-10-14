@@ -109,6 +109,8 @@ jobs:
       - name: Expose the declared non-SIP shell
         if: runner.os != 'Windows'
         run: |
+          # Variables expand in the declared child shell rather than this runner shell.
+          # shellcheck disable=SC2016
           nix develop --command bash -c '
             shell_path="$(command -v bash)"
             case "$shell_path" in
@@ -139,6 +141,11 @@ jobs:
         run: |
           ./ci/acquire-windows-nim-sources.ps1 -Destination "$env:RUNNER_TEMP/trace-nim-sources" -Manifest (Join-Path $env:GITHUB_WORKSPACE "ci/windows-complete-source-manifest.json") -Lock (Join-Path $env:GITHUB_WORKSPACE "flake.lock") -Receipt "$env:RUNNER_TEMP/trace-nim-source-receipt.json"
 
+      - name: Acquire declared Windows AMD64 C compiler
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./ci/ensure-declared-gcc.ps1 -Destination "$env:RUNNER_TEMP/trace-nim-gcc"
+
       - name: Setup dev env (reprobuild flavor)
         # setup-dev-env clones the siblings listed in .github/sibling-repos
         # (codetracer-trace-format, codetracer-trace-format-nim) at the
@@ -166,6 +173,17 @@ jobs:
           printf 'daemon helper: %s\n' "$REPROBUILD_NIX_DAEMON_BIN"
           command -v repro
           repro --version
+
+      - name: Verify declared compiler through the original Windows environment
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          dev-exec pwsh -NoProfile -Command '
+            $actual = (Get-Command gcc -CommandType Application).Source
+            if ($actual -ne $env:TRACE_NIM_GCC_IMAGE -or (Get-FileHash -LiteralPath $actual -Algorithm SHA256).Hash -ne $env:TRACE_NIM_GCC_SHA256) { throw "Declared GCC image differs" }
+          '
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dev-exec pwsh -NoProfile -File ./ci/inspect-gcc-header-boundary.ps1 -NimInclude C:/dev-deps/nim/lib -ProjectInclude (Join-Path $env:GITHUB_WORKSPACE "include") -ProjectHeader codetracer_crossing_state.h
 
       - name: repro build
         # Builds the conventional `build` collection declared in
