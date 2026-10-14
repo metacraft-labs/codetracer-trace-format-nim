@@ -28,7 +28,28 @@ $results = @()
 foreach ($probe in @(@{name='project-and-string';include=$ProjectInclude;header=$ProjectHeader},@{name='nimbase';include=$NimInclude;header='nimbase.h'})) {
   $inputFile = Join-Path $work ($probe.name + '.c')
   $outputFile = Join-Path $work ($probe.name + '.o')
-  [IO.File]::WriteAllText($inputFile, '#include <string.h>' + "`n" + '#include "' + $probe.header + '"' + "`n" + 'int main(void) { return 0; }' + "`n", [Text.UTF8Encoding]::new($false))
+  if ($probe.name -eq 'nimbase') {
+    # Nim supplies NIM_INTBITS and the other generated-C header contracts.
+    # A standalone hand-written include is not a genuine Nim translation unit.
+    $nimInput = Join-Path $work 'nimbase_probe.nim'
+    $nimCache = Join-Path $work 'nimbase-cache'
+    New-Item -ItemType Directory -Path $nimCache -ErrorAction Stop | Out-Null
+    [IO.File]::WriteAllText($nimInput, "discard`n", [Text.UTF8Encoding]::new($false))
+    & $nim c --compileOnly ("--lib:" + $NimInclude) ("--nimcache:" + $nimCache) ("--out:" + (Join-Path $work 'nimbase_probe.exe')) $nimInput
+    if ($LASTEXITCODE -ne 0) { throw 'selected Nim header-context generation failed' }
+    $mainPath = Join-Path $nimCache '@mnimbase_probe.nim.c'
+    $mainFiles = @(Get-ChildItem -LiteralPath $nimCache -Filter '@mnimbase_probe.nim.c' -File)
+    $compileInventory = Get-Content -LiteralPath (Join-Path $nimCache 'nimbase_probe.json') -Raw | ConvertFrom-Json
+    $mainRows = @($compileInventory.compile | Where-Object {
+      $_.Count -eq 2 -and $_[0] -is [string] -and $_[0] -eq $mainPath
+    })
+    if ($mainFiles.Count -ne 1 -or $mainRows.Count -ne 1 -or ($mainFiles[0].Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+      throw 'selected Nim generated main translation unit differs'
+    }
+    $inputFile = $mainFiles[0].FullName
+  } else {
+    [IO.File]::WriteAllText($inputFile, '#include <string.h>' + "`n" + '#include "' + $probe.header + '"' + "`n" + 'int main(void) { return 0; }' + "`n", [Text.UTF8Encoding]::new($false))
+  }
   $arguments = @('-c',('-I'+$probe.include),'-o',$outputFile,$inputFile)
   [ordered]@{scope='actual declared SDK command selected inside original dev-exec wrapper; typed action profile identity remains separate';probe=$probe.name;compiler=$gcc;argv=$arguments} | ConvertTo-Json -Compress
   & $gcc @arguments

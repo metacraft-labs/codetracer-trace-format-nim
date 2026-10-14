@@ -179,7 +179,7 @@ jobs:
         shell: pwsh
         run: |
           dev-exec pwsh -NoProfile -Command '
-            $actual = (Get-Command gcc -CommandType Application).Source
+            $actual = @(Get-Command gcc -CommandType Application)[0].Source
             if ($actual -ne $env:TRACE_NIM_GCC_IMAGE -or (Get-FileHash -LiteralPath $actual -Algorithm SHA256).Hash -ne $env:TRACE_NIM_GCC_SHA256) { throw "Declared GCC image differs" }
           '
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
