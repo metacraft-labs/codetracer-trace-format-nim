@@ -3844,6 +3844,8 @@ proc closeHandle(handle: TraceWriterHandle): cint =
   var compactImage: seq[byte]
   var compactChosen = false
   if handle.compactThreshold > 0:
+    # `selectProfile` refuses a container whose interning tables are not
+    # whole, as `finish` and `closeCtfs` do.
     let sel = selectProfile(handle.msWriter.toBytes(),
       handle.compactThreshold)
     if sel.isErr:
@@ -3863,7 +3865,14 @@ proc closeHandle(handle: TraceWriterHandle): cint =
     # RETAIN BEFORE RELEASING. `closeCtfs` frees the writer's own storage,
     # so the copy has to be taken while it is still alive; a pointer into
     # the writer would dangle at the next line.
-    handle.containerData = handle.msWriter.toBytes()
+    #
+    # `finish` refuses a container whose interning tables are not whole, so
+    # such a container is never handed to the host as finished.
+    let finished = handle.msWriter.finish()
+    if finished.isErr:
+      setError("trace_writer_close: " & finished.error)
+      return 1.cint
+    handle.containerData = finished.get()
     handle.containerReady = true
   # A file-backed writer needs nothing here: the exec/value/call/io/span
   # chunks + meta.dat were written into the streaming container at

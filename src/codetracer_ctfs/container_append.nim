@@ -281,6 +281,9 @@ proc appendInternalFiles*(path: string, names: openArray[string],
   ## once. There is deliberately no singular version of this call — attaching
   ## a related set of streams one at a time would make a half-attached
   ## container reachable, and every consumer would have to cope with it.
+  ##
+  ## A batch that would leave the container carrying some but not all of the
+  ## interning tables is refused, and the file is not touched.
   if names.len != contents.len:
     return err("ctfs append: " & $names.len & " name(s) for " &
       $contents.len & " content buffer(s)")
@@ -315,5 +318,12 @@ proc appendInternalFiles*(path: string, names: openArray[string],
     let written = c.writeToFile(f, contents[i])
     if written.isErr:
       return err(appendError(path, "cannot write " & names[i] & ": " & written.error))
+
+  # The appended container is a finished one, so it carries the interning
+  # tables all four or none (`interningSetRefusal`). Refused before anything
+  # reaches the file, which keeps the container on disk as it was.
+  let partialSet = interningSetRefusal(c)
+  if partialSet.len > 0:
+    return err(appendError(path, partialSet))
 
   writeAppendedBlocks(c, path, firstNewBlock, oldRootBlocks)

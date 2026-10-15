@@ -74,6 +74,16 @@ proc compactContainerSize*(members: openArray[CompactMember]): uint64 =
     total += uint64(m.payload.len)
   total
 
+proc interningSetRefusal*(members: openArray[CompactMember]): string =
+  ## The refusal of a member list that carries a strict subset of the
+  ## interning-table members (`interning_set.nim`); "" when it carries all
+  ## eight or none.
+  var present: array[InterningTableMembers.len, bool]
+  for m in members:
+    for i, name in InterningTableMembers:
+      if m.name == name: present[i] = true
+  interningSetRefusal(present)
+
 # ---------------------------------------------------------------------------
 # The encoder
 # ---------------------------------------------------------------------------
@@ -92,7 +102,13 @@ proc encodeCompactContainer*(members: openArray[CompactMember],
   ## reconstructed image a reader holds. Declaring `wfcZstd` here without the
   ## caller compressing would be a header that lies, so the caller owns both
   ## halves.
+  ##
+  ## A member list that carries some but not all of the interning tables is
+  ## refused (`interning_set.nim`), as the full profile's writer refuses it.
   var seen: seq[uint64]
+  let partialSet = interningSetRefusal(members)
+  if partialSet.len > 0:
+    return err(partialSet)
   for m in members:
     if not base40Encodable(m.name):
       return err("member name '" & m.name & "' is not representable in the " &

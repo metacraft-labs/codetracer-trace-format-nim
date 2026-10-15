@@ -2973,8 +2973,14 @@ proc isClosed*(w: MultiStreamTraceWriter): bool =
   w.closed
 
 proc toBytes*(w: var MultiStreamTraceWriter): seq[byte] =
-  ## Get the serialized CTFS bytes. Must call close() first.
+  ## The container image as it stands. Must call close() first. A caller that
+  ## hands the bytes on as a recording takes them through `finish` instead.
   w.container.toBytes()
+
+proc finish*(w: var MultiStreamTraceWriter): Result[seq[byte], string] =
+  ## The finished container's bytes, after close(): `finishCtfs`, which
+  ## refuses a container carrying some but not all of the interning tables.
+  finishCtfs(w.container)
 
 proc closeCtfs*(w: var MultiStreamTraceWriter): Result[void, string]
     {.discardable.} =

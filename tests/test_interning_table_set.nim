@@ -15,7 +15,13 @@
 ##   * the writer refuses to finish such a container — `closeCtfs`,
 ##     `writeCtfsToFile` and `finishCtfs` all return the refusal — while a
 ##     container with all four tables, with none, or with `markers` alone
-##     (an interning table outside the set) finishes.
+##     (an interning table outside the set) finishes;
+##   * so do the writers that lay a container out other than through
+##     `finishCtfs`: the compact-profile encoder (`encodeCompactContainer`),
+##     the profile choice that hands a converting writer its container
+##     (`selectProfile`), and the append to a sealed container
+##     (`appendInternalFiles`, behind `ct_container_append_files`), which
+##     leaves the container on disk as it was.
 ##
 ## No mocks: real containers from the real writer, read by the real readers.
 
@@ -25,8 +31,10 @@ when defined(nimPreviewSlimSystem):
 import std/[options, os, strutils]
 import results
 import codetracer_trace_types
-import codetracer_ctfs/[types, container, streaming, interning_set]
-import codetracer_trace_writer/[interning_table, meta_dat, new_trace_reader]
+import codetracer_ctfs/[types, container, streaming, interning_set, compact,
+  container_append]
+import codetracer_trace_writer/[interning_table, meta_dat, new_trace_reader,
+  compact_profile]
 import native_decoder
 
 const PathsOnly =
@@ -174,5 +182,71 @@ block the_writer_finishes_all_four_none_and_markers_alone:
   discard initTraceInterningTables(s).get()
   doAssert closeCtfs(s).isOk
   echo "PASS the_writer_finishes_all_four_none_and_markers_alone"
+
+proc subset(mask: int): tuple[members: seq[string], present: array[8, bool]] =
+  for i, name in InterningTableMembers:
+    if (mask and (1 shl i)) != 0:
+      result.members.add name
+      result.present[i] = true
+
+proc compactMembers(members: openArray[string]): seq[CompactMember] =
+  ## `members` as compact-container members, each an empty table half.
+  for m in members:
+    result.add CompactMember(name: m, payload:
+      if m.endsWith(".off"): @[0'u8, 0, 0, 0, 0, 0, 0, 0] else: @[])
+
+block the_compact_encoder_refuses_every_strict_subset:
+  var refused = 0
+  for mask in 1 ..< 255:
+    let (members, present) = subset(mask)
+    let enc = encodeCompactContainer(compactMembers(members))
+    doAssert enc.isErr and enc.error == interningSetRefusal(present),
+      "subset " & members.join(",") & ": " &
+      (if enc.isOk: "encoded" else: enc.error)
+    inc refused
+  doAssert refused == 254
+  doAssert encodeCompactContainer(compactMembers(InterningTableMembers)).isOk
+  doAssert encodeCompactContainer(compactMembers([])).isOk
+  doAssert encodeCompactContainer(
+    compactMembers(["markers.dat", "markers.off"])).isOk
+  echo "PASS the_compact_encoder_refuses_every_strict_subset (", refused, ")"
+
+block the_profile_choice_refuses_a_partial_set_either_way:
+  # Below the threshold the choice is the compact container, above it the
+  # full one; neither is handed out for a partial set.
+  let full = pathsOnlyFromTheWriter().toBytes()
+  for threshold in [high(uint64), 1'u64]:
+    let sel = selectProfile(full, threshold)
+    doAssert sel.isErr and sel.error == PathsOnly,
+      "threshold " & $threshold & ": " &
+      (if sel.isOk: "chose " & $sel.get()[0] else: sel.error)
+  var all = createCtfs()
+  discard initTraceInterningTables(all).get()
+  for threshold in [high(uint64), 1'u64]:
+    let sel = selectProfile(all.toBytes(), threshold)
+    doAssert sel.isOk, sel.error
+  echo "PASS the_profile_choice_refuses_a_partial_set_either_way"
+
+block the_append_refuses_to_leave_a_partial_set:
+  let sealed = dir / "sealed-none.ct"
+  doAssert writeCtfsToFile(createCtfs(), sealed).isOk
+  let before = readFile(sealed)
+  let half = appendInternalFiles(sealed, ["paths.dat", "paths.off"],
+    [@[byte('x')], @[0'u8, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]])
+  doAssert half.isErr and half.error.endsWith(PathsOnly),
+    (if half.isOk: "appended" else: half.error)
+  doAssert readFile(sealed) == before,
+    "a refused append must leave the container as it was"
+  var contents: seq[seq[byte]]
+  for m in InterningTableMembers:
+    contents.add(if m.endsWith(".off"): @[0'u8, 0, 0, 0, 0, 0, 0, 0] else: @[])
+  let whole = appendInternalFiles(sealed, InterningTableMembers, contents)
+  doAssert whole.isOk, whole.error
+  doAssert interningSetRefusal(readFile(sealed).toOpenArrayByte(0,
+    readFile(sealed).high)) == ""
+  # A container already carrying all four takes a member outside the set.
+  let more = appendInternalFiles(sealed, ["snap.ns"], [@[1'u8]])
+  doAssert more.isOk, more.error
+  echo "PASS the_append_refuses_to_leave_a_partial_set"
 
 removeDir(dir)

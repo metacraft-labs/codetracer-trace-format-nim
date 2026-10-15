@@ -130,7 +130,13 @@ proc selectProfile*(full: openArray[byte], threshold: uint64):
   ## the compact container when the compact members total less than
   ## `threshold` raw bytes, the full container otherwise (`ctfs-container.md`
   ## §1e). Returns the profile, the container's bytes and the raw total.
+  ##
+  ## A container that carries some but not all of the interning tables is
+  ## refused in either profile (`interning_set.nim`).
   let members = ? compactMembersOf(full)
+  let partialSet = interningSetRefusal(members)
+  if partialSet.len > 0:
+    return err(partialSet)
   let raw = rawMemberBytes(members)
   if raw < threshold:
     ok((cpCompact, ? encodeCompactContainer(members), raw))
