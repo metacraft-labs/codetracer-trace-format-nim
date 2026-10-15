@@ -11,6 +11,7 @@ if (Test-Path -LiteralPath $root) { throw 'occupied native control directory' }
 [void][IO.Directory]::CreateDirectory($root)
 $junctions = [Collections.Generic.List[string]]::new()
 $results = [Collections.Generic.List[object]]::new()
+$primaryError = $null
 function New-ControlJunction([string]$Path, [string]$Target) {
   if (Test-Path -LiteralPath $Path) { throw 'occupied control junction' }
   New-Item -ItemType Junction -Path $Path -Target $Target -ErrorAction Stop | Out-Null
@@ -77,8 +78,13 @@ try {
   try {
     $binding.Verify()
     $results.Add([ordered]@{control='genuine-root-junction';passed=$true})
+    # Track the known destination before attempting mutation, so an unexpected
+    # successful rename cannot leave an untracked junction during cleanup.
+    $renamedAlias = $alias + '-replaced'
+    if (Test-Path -LiteralPath $renamedAlias) { throw 'occupied mutation destination' }
+    $junctions.Add($renamedAlias)
     Assert-SharingRefusal 'held-root-junction-replacement' {
-      [IO.Directory]::Move($alias,($alias + '-replaced'))
+      [IO.Directory]::Move($alias,$renamedAlias)
     }
     Assert-SharingRefusal 'held-short-farm-replacement' {
       [IO.Directory]::Move((Join-Path $store 'p'),(Join-Path $store 'p-replaced'))
@@ -126,18 +132,31 @@ try {
   [void]$junctions.Remove($lib)
   [IO.Directory]::Move($saved,$lib)
   $results | ConvertTo-Json -Compress
+} catch {
+  $primaryError = $_
+  throw
 } finally {
-  # Delete only created junction objects before recursive cleanup of this own
-  # exclusive fixture. Never recurse through a reparse point or foreign target.
-  foreach ($junction in @($junctions | Select-Object -Unique)) {
-    if (Test-Path -LiteralPath $junction) {
-      $item = Get-Item -Force -LiteralPath $junction
+  try {
+    # Unlink only our recorded junction objects, including any unexpectedly
+    # moved root. Get-Item also observes a dangling junction, unlike Test-Path.
+    foreach ($junction in @($junctions | Select-Object -Unique)) {
+      try { $item = Get-Item -Force -LiteralPath $junction -ErrorAction Stop }
+      catch [System.Management.Automation.ItemNotFoundException] { continue }
       if (!($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
           !$item.ResolveLinkTarget($false).FullName.StartsWith($root + [IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)) {
         throw 'native fixture cleanup identity differs'
       }
       [IO.Directory]::Delete($junction)
     }
+    # Refuse unknown reparses instead of recursively traversing them.
+    if (@(Get-ChildItem -LiteralPath $root -Recurse -Force -Attributes ReparsePoint).Count -ne 0) {
+      throw 'untracked native fixture reparse remains'
+    }
+    [IO.Directory]::Delete($root,$true)
+  } catch {
+    if ($null -eq $primaryError) { throw }
+    # Both failures remain visible/nonzero; cleanup must never replace the
+    # actual sharing-control exception that caused the run to fail.
+    [Console]::Error.WriteLine('Native fixture cleanup also failed: ' + $_.Exception.Message)
   }
-  [IO.Directory]::Delete($root,$true)
 }

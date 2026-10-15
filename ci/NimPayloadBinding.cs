@@ -65,7 +65,11 @@ public sealed class NimPayloadBinding : IDisposable {
     SafeFileHandle Open(string path, bool directory, bool reparse) {
         // OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT; directories additionally
         // need BACKUP_SEMANTICS. FILE_SHARE_READ alone denies mutation/replacement.
-        var handle = CreateFileW(path, directory ? 0x80u : 0x80000000u, 1,
+        // Attributes-only opens do not participate in MS-FSA share checks.
+        // GENERIC_READ includes FILE_LIST_DIRECTORY/FILE_READ_DATA, so the
+        // held directories actually deny later write/delete opens as well.
+        // https://learn.microsoft.com/openspecs/windows_protocols/ms-fsa/8c0e3f4f-0729-49f4-a14d-7f7add593819
+        var handle = CreateFileW(path, 0x80000000u, 1,
             IntPtr.Zero, 3, 0x00200000u | (directory ? 0x02000000u : 0), IntPtr.Zero);
         if (handle.IsInvalid) {
             int error = Marshal.GetLastWin32Error(); handle.Dispose();

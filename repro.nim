@@ -362,6 +362,12 @@ package codetracer_trace_format_nim:
     let executeInputs = (when defined(windows): newSeq[string]()
                         else: @[zstdPkgConfigDir / "libzstd.pc"])
 
+    # Shared producer data is provisioned at the explicit published revision in
+    # .github/sibling-repos. Declare the runtime tree as an action input too:
+    # fixturePath walks the real workspace sibling; assertions stay unchanged.
+    let traceStorageFixtures =
+      "../codetracer-trace-format/codetracer_ctfs/tests/fixtures/trace_storage"
+
     var testBuildActions: seq[BuildActionDef] = @[]
     var testExecuteActions: seq[BuildActionDef] = @[]
 
@@ -410,19 +416,22 @@ package codetracer_trace_format_nim:
         appendRegisteredActionToolIdentityRefs(edge.action.id, ["gcc"])
       testBuildActions.add(edge.action)
 
+      let testExecuteInputs = executeInputs &
+        (if stem == "test_trace_storage_config": @[traceStorageFixtures]
+         else: newSeq[string]())
       let executeEdge =
         if spec.pooled:
           edge.testBinary.run(
             actionId = "codetracer-trace-format-nim.test_execute." & stem,
             pool = CrossReadPool,
             extraEnv = executeEnvironment,
-            extraInputs = executeInputs,
+            extraInputs = testExecuteInputs,
             registerImplicitName = false)
         else:
           edge.testBinary.run(
             actionId = "codetracer-trace-format-nim.test_execute." & stem,
             extraEnv = executeEnvironment,
-            extraInputs = executeInputs,
+            extraInputs = testExecuteInputs,
             registerImplicitName = false)
       when not defined(windows):
         appendRegisteredActionToolIdentityRefs(executeEdge.id, ["pkg-config", "nim"])
