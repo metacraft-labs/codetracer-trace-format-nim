@@ -10,6 +10,9 @@ import results
 import ./types
 import ./base40
 import ./block_mapping
+import ./interning_set
+
+export interning_set
 
 proc createCtfs*(
     blockSize: uint32 = DefaultBlockSize,
@@ -457,6 +460,21 @@ proc truncateFileContent*(c: var Ctfs, f: CtfsInternalFile):
     c.flushRootBlocks()
   ok(CtfsInternalFile(entryIndex: f.entryIndex, writePos: 0, dataBlockCount: 0))
 
+proc interningSetRefusal*(c: Ctfs): string =
+  ## The refusal of a container being written that carries a strict subset
+  ## of the interning-table members (`interning_set.nim`); "" when it carries
+  ## all eight or none.
+  var present: array[InterningTableMembers.len, bool]
+  for i, name in InterningTableMembers:
+    let key = base40Encode(name)
+    for k in 0 ..< int(c.maxRootEntries):
+      let off = c.fileEntryOffset(k)
+      if off + FileEntrySize > c.data.len: break
+      if readU64LE(c.data, off + 16) == key:
+        present[i] = true
+        break
+  interningSetRefusal(present)
+
 proc publish*(c: var Ctfs) =
   ## Hand everything written so far to the operating system, data before the
   ## root directory that publishes it (`ctfs-container.md` §6, "Writer
@@ -535,7 +553,15 @@ proc closeCtfs*(c: var Ctfs): Result[void, string] {.discardable.} =
   ## that reports success. `{.discardable.}` keeps the ~50 existing
   ## statement-position callers compiling, but a caller on a recording path
   ## should check it.
+  ##
+  ## A container that carries some but not all of the interning tables is
+  ## refused (`interningSetRefusal`). A streaming container is still flushed
+  ## and its file closed, since its members are on disk already; the refusal
+  ## is what the caller gets back.
+  let refusal = interningSetRefusal(c)
   if not c.streaming:
+    if refusal.len > 0:
+      return err(refusal)
     return ok()
   var failure = ""
   try:
@@ -551,6 +577,8 @@ proc closeCtfs*(c: var Ctfs): Result[void, string] {.discardable.} =
   c.streaming = false
   if failure.len > 0:
     return err(failure)
+  if refusal.len > 0:
+    return err(refusal)
   ok()
 
 proc entryIndex*(f: CtfsInternalFile): int =
@@ -565,8 +593,25 @@ proc toBytes*(c: Ctfs): seq[byte] =
   ## Return the raw container bytes for writing to disk.
   c.data
 
+proc finishCtfs*(c: Ctfs): Result[seq[byte], string] =
+  ## The finished container's bytes, for a container built in memory.
+  ##
+  ## Refuses a container that carries some but not all of the interning
+  ## tables (`interningSetRefusal`). `toBytes` hands back the image as it
+  ## stands, finished or not; a container that is written out as a recording
+  ## is finished here, by `writeCtfsToFile`, or by `closeCtfs`.
+  let refusal = interningSetRefusal(c)
+  if refusal.len > 0:
+    return err(refusal)
+  ok(c.data)
+
 proc writeCtfsToFile*(c: Ctfs, path: string): Result[void, string] =
-  ## Write the CTFS container to a file on disk.
+  ## Write the CTFS container to a file on disk. A container that carries
+  ## some but not all of the interning tables is refused and not written
+  ## (`interningSetRefusal`).
+  let refusal = interningSetRefusal(c)
+  if refusal.len > 0:
+    return err(refusal)
   try:
     writeFile(path, c.data)
     ok()
@@ -1293,3 +1338,13 @@ proc hasInternalFile*(data: openArray[byte], name: string,
   of cbCompact:
     let dir = readCompactDirectory(data)
     dir.isOk and findCompactMember(dir.get(), name) >= 0
+
+proc interningSetRefusal*(data: openArray[byte],
+    maxEntries: uint32 = DefaultMaxRootEntries): string =
+  ## The refusal of a container to read that carries a strict subset of the
+  ## interning-table members (`interning_set.nim`); "" when it carries all
+  ## eight or none. Presence is the name's, as `hasInternalFile` decides it.
+  var present: array[InterningTableMembers.len, bool]
+  for i, name in InterningTableMembers:
+    present[i] = hasInternalFile(data, name, maxEntries)
+  interningSetRefusal(present)

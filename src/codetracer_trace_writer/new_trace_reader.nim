@@ -602,9 +602,11 @@ proc refuseRetiredMembers*(containerBytes: openArray[byte],
 
 proc loadTable(image: ContainerImage, name: string, blockSize: uint32,
     maxEntries: uint32, dest: var InterningTableReader): Result[void, string] =
-  ## The interning table `name` into `dest`. A table that is absent is empty;
-  ## a table that is present but does not read is refused, not answered as
-  ## empty (`ctfs-container.md` §4, "A null is not an absence").
+  ## The interning table `name` into `dest`. A table that is absent is empty,
+  ## which the caller allows only when the container carries none of the four
+  ## (`interningSetRefusal`); a table that is present but does not read is
+  ## refused, not answered as empty (`ctfs-container.md` §4, "A null is not an
+  ## absence").
   if hasInternalFile(image.bytes, name & ".dat", maxEntries) or
       hasInternalFile(image.bytes, name & ".off", maxEntries):
     var tr = initInterningTableReader(image, name, blockSize, maxEntries)
@@ -648,9 +650,15 @@ proc openNewTraceFromImage(image: ContainerImage, blockSize: uint32,
       return err("meta.dat present but not readable: " & metaRes.unsafeError)
     reader.meta = metaRes.get()
 
-  # Load interning tables (these are small, load at startup). A table that
-  # is absent is empty; a table that is present but does not read is refused,
-  # not answered as empty (`ctfs-container.md` §4, "A null is not an absence").
+  # Load interning tables (these are small, load at startup). The four are
+  # carried together or not at all (`internal-files.md` "Interning Tables"),
+  # so a container with some but not all of them is refused, in the words
+  # the Rust readers use; with none, each table is empty. A table that is
+  # present but does not read is refused, not answered as empty
+  # (`ctfs-container.md` §4, "A null is not an absence").
+  let partialSet = interningSetRefusal(reader.image.bytes, maxEntries)
+  if partialSet.len > 0:
+    return err(partialSet)
   ? loadTable(reader.image, "paths", blockSize, maxEntries, reader.pathReader)
   ? loadTable(reader.image, "funcs", blockSize, maxEntries, reader.funcReader)
   ? loadTable(reader.image, "types", blockSize, maxEntries, reader.typeReader)

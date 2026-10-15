@@ -152,8 +152,8 @@ proc buildSyntheticBundle(osKind = 0'u8, withDat = true,
   var metaFile = ctfs.addFile("meta.dat").get()
   doAssert ctfs.writeToFile(metaFile, meta).isOk
 
-  var paths = initInterningTableWriter(ctfs, "paths").get()
-  doAssert ctfs.ensureId(paths, SourcePath).get() == 0
+  var tables = initTraceInterningTables(ctfs).get()
+  doAssert ctfs.ensurePathId(tables, SourcePath).get() == 0
 
   var t0File = ctfs.addFile(threadFileName(Tid0)).get()
   doAssert ctfs.writeToFile(t0File, t0Stream).isOk

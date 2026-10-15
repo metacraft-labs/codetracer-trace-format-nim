@@ -584,9 +584,9 @@ proc test_meta_dat_openTrace_binary() {.raises: [].} =
   let wRes = c.writeMetaDat(metaDatFile, meta, recorderId = "test-rec")
   doAssert wRes.isOk, "writeMetaDat failed: " & wRes.unsafeError
   # Source paths are `paths.dat`'s records; meta.dat carries none (v6).
-  var pathsTable = initInterningTableWriter(c, "paths").get()
+  var tables = initTraceInterningTables(c).get()
   for p in paths:
-    doAssert c.ensureId(pathsTable, p).isOk
+    doAssert c.ensurePathId(tables, p).isOk
 
   let tmpPath = getTempDir() / "test_meta_dat_binary.ct"
   let saveRes = c.writeCtfsToFile(tmpPath)

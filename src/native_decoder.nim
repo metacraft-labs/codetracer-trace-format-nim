@@ -215,6 +215,12 @@ proc detectNativeBundle*(data: openArray[byte]): Result[NativeBundleInfo, string
     elif nameVal == base40Encode("cpidx.idx"):
       info.hasCheckpointIndex = true
 
+  # The interning tables are carried all four or none (`internal-files.md`
+  # "Interning Tables"); `paths.dat` is read below only when the set is whole.
+  let partialSet = interningSetRefusal(data, maxRoot)
+  if partialSet.len > 0:
+    return err(partialSet)
+
   # Sort thread streams by ctTid for deterministic output.
   info.threadStreams.sort(proc(a, b: (uint32, string)): int =
     cmp(a[0], b[0]))
