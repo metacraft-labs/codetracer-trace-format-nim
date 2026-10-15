@@ -1,7 +1,6 @@
 # Read-only native Windows SDK/compiler boundary diagnostic; no original test acceptance.
 # No mocks. Real files/compiler, exclusively owned RUNNER_TEMP output only.
-param([Parameter(Mandatory=$true)][string]$NimInclude,
-      [Parameter(Mandatory=$true)][string]$ProjectInclude,
+param([Parameter(Mandatory=$true)][string]$ProjectInclude,
       [Parameter(Mandatory=$true)][string]$ProjectHeader)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -13,6 +12,47 @@ $gcc = @(Get-Command gcc -CommandType Application)[0].Source
 $nim = @(Get-Command nim -CommandType Application)[0].Source
 $before = (Get-FileHash -Algorithm SHA256 -LiteralPath $gcc).Hash
 $observedSources = @{}
+foreach ($tool in @($gcc, $nim)) {
+  if (![IO.Path]::IsPathFullyQualified($tool)) { throw 'relative selected compiler image' }
+  $toolFile = Get-Item -Force -LiteralPath $tool
+  if ($toolFile -isnot [IO.FileInfo] -or ($toolFile.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    throw 'nonregular selected compiler image'
+  }
+}
+$nimImageBefore = (Get-FileHash -Algorithm SHA256 -LiteralPath $nim).Hash
+$nimInput = Join-Path $work 'nimbase_probe.nim'
+[IO.File]::WriteAllText($nimInput, "discard`n", [Text.UTF8Encoding]::new($false))
+$dumpText = @(& $nim dump --dump.format:json $nimInput)
+if ($LASTEXITCODE -ne 0) { throw 'selected Nim library metadata query failed' }
+$metadata = ($dumpText -join "`n") | ConvertFrom-Json
+if ($metadata -isnot [System.Management.Automation.PSCustomObject] -or
+    $metadata.nimExe -isnot [string] -or $metadata.prefixdir -isnot [string] -or
+    $metadata.libpath -isnot [string] -or
+    ![IO.Path]::IsPathFullyQualified($metadata.nimExe) -or
+    ![IO.Path]::IsPathFullyQualified($metadata.prefixdir) -or
+    ![IO.Path]::IsPathFullyQualified($metadata.libpath)) {
+  throw 'selected Nim library metadata schema differs'
+}
+$nimPrefix = [IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($nim))
+if ([IO.Path]::GetFullPath($metadata.nimExe) -ne [IO.Path]::GetFullPath($nim) -or
+    [IO.Path]::GetFullPath($metadata.prefixdir) -ne [IO.Path]::GetFullPath($nimPrefix)) {
+  throw 'selected Nim library metadata image differs'
+}
+$NimInclude = [IO.Path]::GetFullPath($metadata.libpath)
+$prefix = [IO.Path]::GetFullPath($nimPrefix) + [IO.Path]::DirectorySeparatorChar
+if (!$NimInclude.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -or
+    (Get-FileHash -Algorithm SHA256 -LiteralPath $nim).Hash -ne $nimImageBefore) {
+  throw 'selected Nim library payload differs'
+}
+$directory = $NimInclude
+while ($true) {
+  $directoryItem = Get-Item -Force -LiteralPath $directory
+  if ($directoryItem -isnot [IO.DirectoryInfo] -or ($directoryItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    throw 'reparse selected Nim library payload'
+  }
+  if ($directory -eq [IO.Path]::GetFullPath($nimPrefix)) { break }
+  $directory = [IO.Path]::GetDirectoryName($directory)
+}
 if (![IO.Path]::IsPathFullyQualified($NimInclude)) { throw 'relative original Nim include prefix' }
 $nimHeader = Join-Path $NimInclude 'nimbase.h'
 foreach ($path in @($gcc,$nim,$nimHeader,(Join-Path $ProjectInclude $ProjectHeader))) {
@@ -31,10 +71,8 @@ foreach ($probe in @(@{name='project-and-string';include=$ProjectInclude;header=
   if ($probe.name -eq 'nimbase') {
     # Nim supplies NIM_INTBITS and the other generated-C header contracts.
     # A standalone hand-written include is not a genuine Nim translation unit.
-    $nimInput = Join-Path $work 'nimbase_probe.nim'
     $nimCache = Join-Path $work 'nimbase-cache'
     New-Item -ItemType Directory -Path $nimCache -ErrorAction Stop | Out-Null
-    [IO.File]::WriteAllText($nimInput, "discard`n", [Text.UTF8Encoding]::new($false))
     & $nim c --compileOnly ("--lib:" + $NimInclude) ("--nimcache:" + $nimCache) ("--out:" + (Join-Path $work 'nimbase_probe.exe')) $nimInput
     if ($LASTEXITCODE -ne 0) { throw 'selected Nim header-context generation failed' }
     $mainPath = Join-Path $nimCache '@mnimbase_probe.nim.c'

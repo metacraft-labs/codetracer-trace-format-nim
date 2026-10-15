@@ -131,8 +131,18 @@ jobs:
             [[ "$CT_ZSTD_LIB_DIR" =~ ^/nix/store/[a-z0-9]{32}-[^[:space:]]+/lib$ ]]
             test -f "$CT_ZSTD_INCLUDE_DIR/zstd.h"
             test -d "$CT_ZSTD_LIB_DIR"
-            printf "CT_ZSTD_INCLUDE_DIR=%s\nCT_ZSTD_LIB_DIR=%s\n" \
-              "$CT_ZSTD_INCLUDE_DIR" "$CT_ZSTD_LIB_DIR" >> "$GITHUB_ENV"
+            [[ "${CT_PCRE_LIB_DIR:?missing owning PCRE library}" =~ ^/nix/store/[a-z0-9]{32}-[^[:space:]]+/lib$ ]]
+            test -f "$CT_PCRE_LIB_DIR/libpcre.so" || test -f "$CT_PCRE_LIB_DIR/libpcre.dylib"
+            pkg_config_dir="${CT_ZSTD_INCLUDE_DIR%/include}/lib/pkgconfig"
+            test -f "$pkg_config_dir/libzstd.pc"
+            for key in CT_NIM_STEW_SRC CT_NIM_RESULTS_SRC CT_NIM_UNITTEST2_SRC; do
+              dependency="${!key:?missing owning locked Nim source}"
+              [[ "$dependency" =~ ^/nix/store/[a-z0-9]{32}-[^[:space:]]+$ ]]
+              test -d "$dependency"
+              printf "%s=%s\n" "$key" "$dependency" >> "$GITHUB_ENV"
+            done
+            printf "CT_ZSTD_INCLUDE_DIR=%s\nCT_ZSTD_LIB_DIR=%s\nCT_PCRE_LIB_DIR=%s\nPKG_CONFIG_PATH=%s\n" \
+              "$CT_ZSTD_INCLUDE_DIR" "$CT_ZSTD_LIB_DIR" "$CT_PCRE_LIB_DIR" "$pkg_config_dir" >> "$GITHUB_ENV"
           '
 
       - name: Acquire complete locked Nim source dependencies (Windows)
@@ -154,7 +164,7 @@ jobs:
         with:
           env-flavor: reprobuild
           repro-from-source: ${{ runner.os != 'Windows' && 'true' || 'false' }}
-          repro-build-pin: "76659f5730ecf698b1963c656494d2cb66eb256d"
+          repro-build-pin: "064daf5b154ea6a0758ddb2dcbcbc07685216e44"
           gh-token: ${{ steps.ci_token.outputs.token }}
 
       - name: Report measured Repro source identity
@@ -164,7 +174,7 @@ jobs:
           git rev-parse HEAD
           engine_source="$(git -C .reprobuild-src rev-parse HEAD)"
           echo "Repro source: $engine_source"
-          test "$engine_source" = 76659f5730ecf698b1963c656494d2cb66eb256d
+          test "$engine_source" = 064daf5b154ea6a0758ddb2dcbcbc07685216e44
           test -z "$(git -C .reprobuild-src status --porcelain)"
           test "$(command -v repro)" = "$GITHUB_WORKSPACE/.reprobuild-src/build/bin/repro"
           test "${REPROBUILD_NIX_DAEMON_BIN:?missing source daemon helper}" = "$GITHUB_WORKSPACE/.reprobuild-src/build/bin/reprobuild-nix-daemon"
@@ -183,7 +193,7 @@ jobs:
             if ($actual -ne $env:TRACE_NIM_GCC_IMAGE -or (Get-FileHash -LiteralPath $actual -Algorithm SHA256).Hash -ne $env:TRACE_NIM_GCC_SHA256) { throw "Declared GCC image differs" }
           '
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          dev-exec pwsh -NoProfile -File ./ci/inspect-gcc-header-boundary.ps1 -NimInclude C:/dev-deps/nim/lib -ProjectInclude (Join-Path $env:GITHUB_WORKSPACE "include") -ProjectHeader codetracer_crossing_state.h
+          dev-exec pwsh -NoProfile -File ./ci/inspect-gcc-header-boundary.ps1 -ProjectInclude (Join-Path $env:GITHUB_WORKSPACE "include") -ProjectHeader codetracer_crossing_state.h
 
       - name: repro build
         # Builds the conventional `build` collection declared in
@@ -199,7 +209,7 @@ jobs:
       - name: Inspect the original Windows compiler header boundary on failure
         if: failure() && runner.os == 'Windows'
         shell: pwsh
-        run: dev-exec pwsh -NoProfile -File ./ci/inspect-gcc-header-boundary.ps1 -NimInclude C:/dev-deps/nim/lib -ProjectInclude (Join-Path $env:GITHUB_WORKSPACE "include") -ProjectHeader codetracer_crossing_state.h
+        run: dev-exec pwsh -NoProfile -File ./ci/inspect-gcc-header-boundary.ps1 -ProjectInclude (Join-Path $env:GITHUB_WORKSPACE "include") -ProjectHeader codetracer_crossing_state.h
 
       - name: just build (cross-check)
         # Re-runs the legacy `just build` path inside the same env so

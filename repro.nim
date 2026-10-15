@@ -283,6 +283,8 @@ package codetracer_trace_format_nim:
     # back-end ``nim c`` shells out to.
     "nim >=2.2 <3.0"
     "nimble"
+    when not defined(windows):
+      "pkg-config"
     when defined(macosx):
       "clang"
     else:
@@ -322,12 +324,11 @@ package codetracer_trace_format_nim:
     let zstdInputs = (when defined(windows): newSeq[string]()
                      else: @[zstdIncludeDir / "zstd.h", zstdLibDir])
     var nimDependencyDirs: seq[string] = @[]
-    when defined(windows):
-      for key in ["CT_NIM_STEW_SRC", "CT_NIM_RESULTS_SRC", "CT_NIM_UNITTEST2_SRC"]:
-        let dependencyDir = getEnv(key)
-        doAssert dependencyDir.isAbsolute and dirExists(dependencyDir),
-          "owning Windows builds require complete declared Nim source dependency: " & key
-        nimDependencyDirs.add(dependencyDir)
+    for key in ["CT_NIM_STEW_SRC", "CT_NIM_RESULTS_SRC", "CT_NIM_UNITTEST2_SRC"]:
+      let dependencyDir = getEnv(key)
+      doAssert dependencyDir.isAbsolute and dirExists(dependencyDir),
+        "owning builds require complete declared Nim source dependency: " & key
+      nimDependencyDirs.add(dependencyDir)
     let ctPrintBuild = buildCtPrint(".", nativeIncludeDir = zstdIncludeDir,
       nativeLibDir = zstdLibDir, nimDependencyDirs = nimDependencyDirs)
 
@@ -345,11 +346,21 @@ package codetracer_trace_format_nim:
     let crossReadPool = buildPool(CrossReadPool, 1'u32)
     discard crossReadPool
 
-    # pcre lib dir for ``test_path_filter`` (see module doc). Threaded in
-    # by the outer dev-shell nesting via ``CT_PCRE_LIB_DIR``; when unset
-    # the edge links a bare ``-lpcre`` and relies on the C toolchain's
-    # default search path.
+    # Provider construction runs before its own dev environment is active.
+    # Bind the owning shell PCRE prefix and the same Zstd metadata output
+    # explicitly rather than depending on the caller compiler search path.
     let pcreLibDir = getEnv("CT_PCRE_LIB_DIR")
+    let zstdPkgConfigDir = (when defined(windows): ""
+                           else: zstdIncludeDir.parentDir / "lib" / "pkgconfig")
+    when not defined(windows):
+      doAssert pcreLibDir.isAbsolute and dirExists(pcreLibDir),
+        "owning typed builds require the declared PCRE library path"
+      doAssert fileExists(zstdPkgConfigDir / "libzstd.pc"),
+        "owning typed tests require the declared Zstd pkg-config input"
+    let executeEnvironment = (when defined(windows): newSeq[(string, string)]()
+                              else: @[("PKG_CONFIG_PATH", zstdPkgConfigDir)])
+    let executeInputs = (when defined(windows): newSeq[string]()
+                        else: @[zstdPkgConfigDir / "libzstd.pc"])
 
     var testBuildActions: seq[BuildActionDef] = @[]
     var testExecuteActions: seq[BuildActionDef] = @[]
@@ -371,6 +382,8 @@ package codetracer_trace_format_nim:
       if spec.pcre:
         if pcreLibDir.len > 0:
           extraPassL.add("-L" & pcreLibDir)
+          when not defined(windows):
+            extraPassL.add("-Wl,-rpath," & pcreLibDir)
         extraPassL.add("-lpcre")
 
       # The whole corpus compiles ``-d:release`` (a faithful superset of the
@@ -388,7 +401,8 @@ package codetracer_trace_format_nim:
         paths = @["src"] & nimDependencyDirs,
         extraPassC = extraPassC,
         extraPassL = extraPassL,
-        extraInputs = @["src", "codetracer_trace_format.nimble", "nim.cfg"] & zstdInputs & nimDependencyDirs,
+        extraInputs = @["src", "codetracer_trace_format.nimble", "nim.cfg"] & zstdInputs & nimDependencyDirs &
+          (if spec.pcre and pcreLibDir.len > 0: @[pcreLibDir] else: newSeq[string]()),
         actionId = "codetracer-trace-format-nim.test_build." & stem)
       when defined(macosx):
         appendRegisteredActionToolIdentityRefs(edge.action.id, ["clang"])
@@ -401,11 +415,21 @@ package codetracer_trace_format_nim:
           edge.testBinary.run(
             actionId = "codetracer-trace-format-nim.test_execute." & stem,
             pool = CrossReadPool,
+            extraEnv = executeEnvironment,
+            extraInputs = executeInputs,
             registerImplicitName = false)
         else:
           edge.testBinary.run(
             actionId = "codetracer-trace-format-nim.test_execute." & stem,
+            extraEnv = executeEnvironment,
+            extraInputs = executeInputs,
             registerImplicitName = false)
+      when not defined(windows):
+        appendRegisteredActionToolIdentityRefs(executeEdge.id, ["pkg-config", "nim"])
+        when defined(macosx):
+          appendRegisteredActionToolIdentityRefs(executeEdge.id, ["clang"])
+        else:
+          appendRegisteredActionToolIdentityRefs(executeEdge.id, ["gcc"])
       testExecuteActions.add(executeEdge)
 
     discard collect("test", testExecuteActions)

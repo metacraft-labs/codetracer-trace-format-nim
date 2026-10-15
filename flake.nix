@@ -279,6 +279,9 @@
             ++ preCommit.enabledPackages;
 
             PKG_CONFIG_PATH = "${pkgs.zstd.dev}/lib/pkgconfig";
+            CT_NIM_STEW_SRC = "${inputs.nim-stew}";
+            CT_NIM_RESULTS_SRC = "${inputs.nim-results}";
+            CT_NIM_UNITTEST2_SRC = "${inputs.nim-unittest2}";
             CT_ZSTD_INCLUDE_DIR = "${pkgs.zstd.dev}/include";
             CT_ZSTD_LIB_DIR = "${pkgs.zstd.out}/lib";
 
