@@ -184,6 +184,11 @@ jobs:
           command -v repro
           repro --version
 
+      - name: Validate native selected Nim payload binding
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: dev-exec pwsh -NoProfile -File ./ci/test-windows-nim-payload-binding.ps1
+
       - name: Verify declared compiler through the original Windows environment
         if: runner.os == 'Windows'
         shell: pwsh

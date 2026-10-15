@@ -44,15 +44,15 @@ if (!$NimInclude.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -or
     (Get-FileHash -Algorithm SHA256 -LiteralPath $nim).Hash -ne $nimImageBefore) {
   throw 'selected Nim library payload differs'
 }
-$directory = $NimInclude
-while ($true) {
-  $directoryItem = Get-Item -Force -LiteralPath $directory
-  if ($directoryItem -isnot [IO.DirectoryInfo] -or ($directoryItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-    throw 'reparse selected Nim library payload'
-  }
-  if ($directory -eq [IO.Path]::GetFullPath($nimPrefix)) { break }
-  $directory = [IO.Path]::GetDirectoryName($directory)
-}
+# The SDK exports its unshortened selected prefix independently of PATH's
+# p/<slot> directory junction. Bind that mapping and the actual image/header
+# using read-only native handles, held until all original probes finish.
+if (!$IsWindows) { throw 'Windows Nim payload binding requires Windows' }
+Add-Type -Path (Join-Path $PSScriptRoot 'NimPayloadBinding.cs')
+$payload = [NimPayloadBinding]::Bind($nimPrefix, $env:REPRO_PREFIX_NIM, $nim, $NimInclude)
+try {
+if ($payload.ImageSha256 -ne $nimImageBefore) { throw 'selected Nim image changed before binding' }
+$NimInclude = $payload.IncludePath
 if (![IO.Path]::IsPathFullyQualified($NimInclude)) { throw 'relative original Nim include prefix' }
 $nimHeader = Join-Path $NimInclude 'nimbase.h'
 foreach ($path in @($gcc,$nim,$nimHeader,(Join-Path $ProjectInclude $ProjectHeader))) {
@@ -62,6 +62,7 @@ foreach ($path in @($gcc,$nim,$nimHeader,(Join-Path $ProjectInclude $ProjectHead
   $observedSources[$file.FullName] = (Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName).Hash
   [ordered]@{role='observed SDK file';path=$file.FullName;length=$file.Length;sha256=$observedSources[$file.FullName]} | ConvertTo-Json -Compress
 }
+$payload.Verify()
 & $gcc --version
 if ($LASTEXITCODE -ne 0) { throw 'compiler version diagnostic failed' }
 $results = @()
@@ -73,6 +74,7 @@ foreach ($probe in @(@{name='project-and-string';include=$ProjectInclude;header=
     # A standalone hand-written include is not a genuine Nim translation unit.
     $nimCache = Join-Path $work 'nimbase-cache'
     New-Item -ItemType Directory -Path $nimCache -ErrorAction Stop | Out-Null
+    $payload.Verify()
     & $nim c --compileOnly ("--lib:" + $NimInclude) ("--nimcache:" + $nimCache) ("--out:" + (Join-Path $work 'nimbase_probe.exe')) $nimInput
     if ($LASTEXITCODE -ne 0) { throw 'selected Nim header-context generation failed' }
     $mainPath = Join-Path $nimCache '@mnimbase_probe.nim.c'
@@ -90,6 +92,7 @@ foreach ($probe in @(@{name='project-and-string';include=$ProjectInclude;header=
   }
   $arguments = @('-c',('-I'+$probe.include),'-o',$outputFile,$inputFile)
   [ordered]@{scope='actual declared SDK command selected inside original dev-exec wrapper; typed action profile identity remains separate';probe=$probe.name;compiler=$gcc;argv=$arguments} | ConvertTo-Json -Compress
+  $payload.Verify()
   & $gcc @arguments
   $result = $LASTEXITCODE
   $results += [ordered]@{probe=$probe.name;exit=$result}
@@ -98,6 +101,10 @@ foreach ($probe in @(@{name='project-and-string';include=$ProjectInclude;header=
 foreach ($path in $observedSources.Keys) {
   if ((Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash -ne $observedSources[$path]) { throw 'observed compiler/header source changed' }
 }
+$payload.Verify()
 $results | ConvertTo-Json -Compress
 if (@($results | Where-Object {$_.exit -ne 0}).Count) { exit 1 }
 exit 0
+} finally {
+  $payload.Dispose()
+}
