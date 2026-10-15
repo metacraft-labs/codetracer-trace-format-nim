@@ -44,6 +44,7 @@ import codetracer_trace_types
 import codetracer_ctfs/types
 import codetracer_ctfs/container
 import codetracer_ctfs/container_append
+import codetracer_ctfs/checked_io
 import codetracer_trace_writer/meta_dat
 import codetracer_trace_writer/multi_stream_writer
 import codetracer_trace_writer/interning_table
@@ -3894,8 +3895,13 @@ proc closeHandle(handle: TraceWriterHandle): cint =
       # Through a sibling temporary, so the file holds the full container
       # or the compact one and never a partial write.
       let tmp = handle.ctFilePath & ".compact.tmp"
+      let written = writeFileChecked(tmp, compactImage)
+      if written.isErr:
+        try: removeFile(tmp) except OSError: discard
+        setError("trace_writer_close: replacing " & handle.ctFilePath &
+          " with its compact container: " & written.error)
+        return 1.cint
       try:
-        writeFile(tmp, cast[string](compactImage))
         moveFile(tmp, handle.ctFilePath)
       except CatchableError:
         setError("trace_writer_close: replacing " & handle.ctFilePath &

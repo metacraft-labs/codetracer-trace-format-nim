@@ -79,6 +79,12 @@ task test, "Run all tests":
   exec "nim c -r -d:release tests/test_corrmark_builder.nim"
   exec "nim c -r tests/test_correlation_marker_api.nim"
   exec "nim c -r tests/test_close_publishes_entry_sizes.nim"
+  # A failed final flush or close (EFBIG under RLIMIT_FSIZE in a forked
+  # child) is reported by every writer that finishes a file. Linux only: the
+  # case relies on glibc's stdio buffering to make the flush the one write
+  # that fails.
+  when defined(linux):
+    exec "nim c -r -p:src tests/test_close_reports_final_flush_failure.nim"
   exec "nim c -r tests/test_meta_dat.nim"
   # The writer writes the MCR, replay-launch and layout blocks it is given.
   exec "nim c -r tests/test_writer_meta_blocks.nim"

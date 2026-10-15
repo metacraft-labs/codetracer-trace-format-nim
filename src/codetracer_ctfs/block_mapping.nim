@@ -32,6 +32,9 @@ proc markDirty(c: var Ctfs, offset: int, size: int) =
 proc flushBlockRange*(c: var Ctfs, offset: int, size: int) =
   ## Write a range of in-memory data to the streaming file — or, in deferred
   ## mode, note it for the next `publish`.
+  ##
+  ## A failed write is not reported, as in `publish`: `closeCtfs` writes the
+  ## whole image again and reports the failure of that write.
   if not c.streaming:
     return
   if offset + size > c.data.len:

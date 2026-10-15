@@ -67,10 +67,12 @@ when defined(nimPreviewSlimSystem):
 ##     copies.
 
 from std/posix import fsync
+import std/oserrors
 import results
 import ./types
 import ./base40
 import ./container
+import ./checked_io
 
 export container
 
@@ -163,18 +165,25 @@ proc findEntrySlot(c: Ctfs, encodedName: uint64): int =
       return i
   -1
 
-proc syncToDisk(f: File) =
-  ## Best-effort durability barrier between the two write phases.
+proc syncToDisk(f: File): Result[void, string] =
+  ## Durability barrier between the two write phases.
   ##
-  ## `flushFile` only drains the stdio buffer; the ordering guarantee the
-  ## append rests on ("the new blocks are on disk before block 0 points at
-  ## them") needs the page cache pushed out too. On platforms without
-  ## `fsync` the stdio flush is what there is, and the ordering still holds
-  ## against a process crash — which is the failure this protects against in
-  ## practice, since the container is written once and closed.
-  f.flushFile()
+  ## The stdio flush hands the buffered bytes to the operating system, and is
+  ## where a write `fwrite` only buffered fails (a full disk, a file-size
+  ## limit). The ordering guarantee the append rests on ("the new blocks are
+  ## on disk before block 0 points at them") needs the page cache pushed out
+  ## too, hence the `fsync`. On platforms without `fsync` the stdio flush is
+  ## what there is, and the ordering still holds against a process crash —
+  ## which is the failure this protects against in practice, since the
+  ## container is written once and closed.
+  ##
+  ## A failure of either is returned, so that the root region is never
+  ## rewritten to point at blocks that did not reach the file.
+  ? f.flushChecked()
   when defined(posix):
-    discard fsync(f.getFileHandle())
+    if fsync(f.getFileHandle()) != 0:
+      return err("fsync failed: " & osErrorMsg(osLastError()))
+  ok()
 
 when defined(ctfsAppendFaultInjection):
   var ctfsAppendStopAtMidpoint*: bool = false
@@ -201,14 +210,11 @@ when defined(ctfsAppendFaultInjection):
     ##
     ## See `tests/test_container_append_ordering.nim`.
 
-proc closeAfterFailure(f: File) {.raises: [].} =
+proc closeAfterFailure(f: var File) {.raises: [].} =
   ## Close `f` on the way out of a failed append. The failure already
-  ## reported is the one the caller needs; a close that fails as well (which
-  ## `-d:nimPreviewCheckedClose` raises) adds nothing to it.
-  try:
-    close(f)
-  except IOError:
-    discard
+  ## reported is the one the caller needs; a close that fails as well adds
+  ## nothing to it.
+  discard f.closeChecked()
 
 proc writeAppendedBlocks(c: Ctfs, path: string, firstNewBlock: uint64,
                          oldRootBlocks: uint64): Result[void, string] =
@@ -232,7 +238,11 @@ proc writeAppendedBlocks(c: Ctfs, path: string, firstNewBlock: uint64,
       if f.writeBuffer(unsafeAddr c.data[tailStart], n) != n:
         closeAfterFailure(f)
         return err(appendError(path, "short write appending " & $n & " bytes"))
-      syncToDisk(f)
+      let synced = syncToDisk(f)
+      if synced.isErr:
+        closeAfterFailure(f)
+        return err(appendError(path, "writing the appended blocks: " &
+          synced.error))
 
     # ---- the midpoint the durability argument turns on ----------------
     # Everything above is on disk; nothing below has run. A crash here is
@@ -254,7 +264,11 @@ proc writeAppendedBlocks(c: Ctfs, path: string, firstNewBlock: uint64,
       if f.writeBuffer(unsafeAddr c.data[midStart], n) != n:
         closeAfterFailure(f)
         return err(appendError(path, "short write rewriting moved mapping blocks"))
-      syncToDisk(f)
+      let synced = syncToDisk(f)
+      if synced.isErr:
+        closeAfterFailure(f)
+        return err(appendError(path, "rewriting moved mapping blocks: " &
+          synced.error))
 
     # Only now does anything point at the blocks just written.
     let rootBytes = int(rootBlocks) * bs
@@ -262,14 +276,19 @@ proc writeAppendedBlocks(c: Ctfs, path: string, firstNewBlock: uint64,
     if f.writeBuffer(unsafeAddr c.data[0], rootBytes) != rootBytes:
       closeAfterFailure(f)
       return err(appendError(path, "short write rewriting the root region"))
-    syncToDisk(f)
+    let synced = syncToDisk(f)
+    if synced.isErr:
+      closeAfterFailure(f)
+      return err(appendError(path, "rewriting the root region: " &
+        synced.error))
   except IOError, OSError:
     closeAfterFailure(f)
-    return err(appendError(path, "I/O error while appending"))
-  try:
-    close(f)
-  except IOError:
-    return err(appendError(path, "closing the container after the append"))
+    return err(appendError(path, "I/O error while appending: " &
+      getCurrentExceptionMsg()))
+  let closed = f.closeChecked()
+  if closed.isErr:
+    return err(appendError(path, "closing the container after the append: " &
+      closed.error))
   ok()
 
 proc appendInternalFiles*(path: string, names: openArray[string],

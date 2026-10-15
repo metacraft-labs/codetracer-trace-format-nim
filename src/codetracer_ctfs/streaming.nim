@@ -9,6 +9,7 @@ when defined(nimPreviewSlimSystem):
 import results
 import ./types
 import ./container
+import ./checked_io
 
 proc createCtfsStreaming*(path: string, blockSize: uint32 = DefaultBlockSize,
                           maxRootEntries: uint32 = DefaultMaxRootEntries,
@@ -25,17 +26,21 @@ proc createCtfsStreaming*(path: string, blockSize: uint32 = DefaultBlockSize,
   var c = createCtfs(blockSize, maxRootEntries, encryption, maxShards)
   try:
     c.streamFile = open(path, fmReadWrite)
-    c.streamPath = path
-    c.streaming = true
-    c.deferWrites = true
-    # Write the initial root region to disk.
-    discard c.streamFile.writeBuffer(addr c.data[0], c.data.len)
-    c.streamFile.flushFile()
-    ok(c)
-  except IOError:
-    err("failed to open streaming file: " & path)
-  except OSError:
-    err("failed to open streaming file: " & path)
+  except IOError, OSError:
+    return err("failed to open streaming file: " & path)
+  # What `fwrite` buffers of the root region reaches the file in the flush,
+  # so a failure to write it shows up there.
+  var wrote = c.streamFile.writeAllChecked(addr c.data[0], c.data.len)
+  if wrote.isOk:
+    wrote = c.streamFile.flushChecked()
+  if wrote.isErr:
+    discard c.streamFile.closeChecked()
+    return err("failed to write the root region of streaming file " & path &
+      ": " & wrote.error)
+  c.streamPath = path
+  c.streaming = true
+  c.deferWrites = true
+  ok(c)
 
 proc syncEntry*(c: var Ctfs, f: CtfsInternalFile) =
   ## Publish the container (see `publish`) so concurrent readers see every

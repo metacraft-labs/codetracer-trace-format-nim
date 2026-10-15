@@ -11,6 +11,7 @@ import ./types
 import ./base40
 import ./block_mapping
 import ./interning_set
+import ./checked_io
 
 export interning_set
 
@@ -483,6 +484,11 @@ proc publish*(c: var Ctfs) =
   ## every file entry's `Size` and `MapBlock`); then the stdio buffer is
   ## flushed, so the bytes have been `write`n and survive the process. No
   ## `fsync`: rule 5 does not require one.
+  ##
+  ## A failed write here is not reported: there is no caller to report it to
+  ## that could act on it mid-recording, and `closeCtfs` writes the whole
+  ## image again and reports the failure of that write, so a condition that
+  ## persists (a full disk, a size limit) fails the close.
   if not c.streaming:
     return
   let rootBlocks = c.rootBlockCount()
@@ -563,20 +569,25 @@ proc closeCtfs*(c: var Ctfs): Result[void, string] {.discardable.} =
     if refusal.len > 0:
       return err(refusal)
     return ok()
+  # The whole image is written again, so a block an earlier `publish` failed
+  # to hand over is rewritten here. The flush inside `fclose` is where the
+  # buffered tail of that write reaches the file, and so where a full disk or
+  # a file-size limit shows up; its result is the close's.
   var failure = ""
   try:
-    # Final flush of all in-memory data to disk.
     c.streamFile.setFilePos(0)
-    discard c.streamFile.writeBuffer(addr c.data[0], c.data.len)
-    c.streamFile.flushFile()
-    c.streamFile.close()
+    let wrote = c.streamFile.writeAllChecked(addr c.data[0], c.data.len)
+    if wrote.isErr:
+      failure = wrote.error
   except IOError as e:
-    failure = "failed to finalize CTFS container: " & e.msg
-  except OSError as e:
-    failure = "OS error finalizing CTFS container: " & e.msg
+    failure = "seek failed: " & e.msg
+  let closed = c.streamFile.closeChecked()
+  if failure.len == 0 and closed.isErr:
+    failure = closed.error
   c.streaming = false
   if failure.len > 0:
-    return err(failure)
+    return err("failed to finalize CTFS container " & c.streamPath & ": " &
+      failure)
   if refusal.len > 0:
     return err(refusal)
   ok()
@@ -612,13 +623,10 @@ proc writeCtfsToFile*(c: Ctfs, path: string): Result[void, string] =
   let refusal = interningSetRefusal(c)
   if refusal.len > 0:
     return err(refusal)
-  try:
-    writeFile(path, c.data)
-    ok()
-  except IOError as e:
-    err("failed to write CTFS file: " & path & " (" & e.msg & ")")
-  except OSError as e:
-    err("OS error writing CTFS file: " & path & " (" & e.msg & ")")
+  let written = writeFileChecked(path, c.data)
+  if written.isErr:
+    return err("failed to write CTFS file: " & written.error)
+  ok()
 
 proc readCtfsFromFile*(path: string): Result[seq[byte], string] =
   ## Read raw CTFS container bytes from a file.

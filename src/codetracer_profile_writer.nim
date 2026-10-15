@@ -36,6 +36,7 @@ when defined(nimPreviewSlimSystem):
 import std/os
 import results
 import codetracer_ctfs/types
+import codetracer_ctfs/checked_io
 import codetracer_trace_writer/multi_stream_writer
 import codetracer_trace_writer/compact_profile
 
@@ -85,14 +86,14 @@ proc rawMemberBytes*(pw: ProfileWriter): uint64 =
 proc replaceFile(path: string, image: openArray[byte]): Result[void, string] =
   ## Write `image` to `path` through a sibling temporary, so `path` holds the
   ## full container or the compact one and never a partial write.
+  ##
+  ## A temporary whose write, flush or close failed is removed, and `path`
+  ## keeps the full container.
   let tmp = path & ".compact.tmp"
-  try:
-    var f = open(tmp, fmWrite)
-    defer: f.close()
-    if image.len > 0 and f.writeBytes(image, 0, image.len) != image.len:
-      return err("short write to " & tmp)
-  except IOError, OSError:
-    return err("cannot write " & tmp & ": " & getCurrentExceptionMsg())
+  let written = writeFileChecked(tmp, image)
+  if written.isErr:
+    try: removeFile(tmp) except OSError: discard
+    return err("cannot write " & written.error)
   try:
     moveFile(tmp, path)
   except CatchableError:
