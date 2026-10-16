@@ -58,7 +58,7 @@ proc writeSmallTrace(): seq[byte] {.raises: [].} =
   # M24a-2: this helper writes a SPEC-framed value stream (initValueStreamWriter
   # + value_stream.flush below), so set has_value_stream so the FFI reader picks
   # the SPEC values.dat/values.idx layout (not the legacy .off VRT path).
-  let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/main.py", "/src/helper.py"],
+  let metaWr = ctfs.writeMetaDat(metaFile, meta,
     recorderId = "reader-test", hasStepStream = true, hasValueStream = true)
   doAssert metaWr.isOk
 
@@ -159,7 +159,7 @@ proc writeSmallTrace(): seq[byte] {.raises: [].} =
 
   # IO event
   let ioWr = ctfs.writeEvent(ioW, IOEvent(
-    kind: ioStdout, stepId: 3, data: "52\n".toBytes))
+    kind: elkWrite, stepId: 3, data: "52\n".toBytes))
   doAssert ioWr.isOk
 
   let flushRes = ctfs.flush(execW)
@@ -181,7 +181,7 @@ proc writeLargeTrace(numSteps: int, chunkSize: int = DefaultExecChunkSize): seq[
   # M24a-1: this helper writes a SPEC-framed exec stream, so the bundle must
   # set has_step_stream for the FFI reader to pick the SPEC layout.
   # M24a-2: likewise a SPEC-framed value stream ⇒ set has_value_stream.
-  let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/bench.py"],
+  let metaWr = ctfs.writeMetaDat(metaFile, meta,
     hasStepStream = true, hasValueStream = true)
   doAssert metaWr.isOk
 
@@ -288,7 +288,7 @@ proc bench_reader_startup_time() {.raises: [].} =
   doAssert metaFileRes.isOk
   var metaFile = metaFileRes.get()
   let meta = TraceMetadata(recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb", program: "bench_startup", args: @[], workdir: "/tmp")
-  let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/bench.py"])
+  let metaWr = ctfs.writeMetaDat(metaFile, meta)
   doAssert metaWr.isOk
 
   let tabRes = initTraceInterningTables(ctfs)

@@ -13,7 +13,7 @@ when defined(nimPreviewSlimSystem):
 ##
 ## Used for: paths.dat/off, funcs.dat/off, types.dat/off, varnames.dat/off.
 
-import std/tables
+import std/[tables, options]
 import std/strutils
 import results
 import ../codetracer_ctfs/types
@@ -98,6 +98,28 @@ proc ensureId*(ctfs: var Ctfs, it: var InterningTableWriter, name: string): Resu
   ## are provably the old bytes.
   ensureQualifiedId(ctfs, it, "", name)
 
+proc conventionalLineDiagnostic*(path: string, line: uint64): string =
+  ## THE refusal of a step past the last line of a file with the
+  ## conventional table. The Rust writer states it in the same words.
+  "step at line " & $line & " of " & path & ", which has the conventional " &
+    "table of 100000 lines; its position would fall inside the next " &
+    "file's range"
+
+proc lateColumnTableDiagnostic*(path: string,
+    recordedLines, offeredLines: int): string =
+  ## THE refusal of a table offered for a path interned with a different
+  ## one. The Rust writer states it in the same words.
+  "paths.dat: " & path & " was interned with a " & $recordedLines &
+    "-line table, and a later registration offering a different " &
+    $offeredLines & "-line table is refused; a file's table is fixed " &
+    "when the file is first interned, so register it before the file's " &
+    "first step, function or call"
+
+proc lookupId*(it: InterningTableWriter, payload: string): Option[uint64] =
+  ## The id ``payload`` is interned under, without interning it.
+  let existing = it.lookup.getOrDefault(payload, high(uint64))
+  if existing == high(uint64): none(uint64) else: some(existing)
+
 proc ensurePathIdColumnAware*(ctfs: var Ctfs, it: var InterningTableWriter,
     path: string, lineLengths: openArray[uint32]): Result[uint64, string] =
   ## P6.5 / Layout A: column-aware paths.dat record.
@@ -118,11 +140,11 @@ proc ensurePathIdColumnAware*(ctfs: var Ctfs, it: var InterningTableWriter,
   ## See ``codetracer-trace-format-spec/trace-events.md`` §"paths.dat
   ## per-line offset table" / "Layout A".
   ##
-  ## ``lineLengths`` may be empty (the recorder has not surfaced
-  ## per-line column counts yet) — in that case ``line_count = 0`` and
-  ## no per-line varints are emitted, but the ``path_len`` prefix is
-  ## still written so the reader can demarcate the path bytes from the
-  ## (empty) trailing block.
+  ## ``lineLengths`` is written as given. ``MultiStreamTraceWriter.registerPath``
+  ## decides it first (``columnTableAtFirstMention``), so a record it writes
+  ## always has a table of non-zero size (``internal-files.md`` §"`paths.dat`
+  ## Layout A"); an empty ``lineLengths`` is the conventional table, whose
+  ## only encoding is ``line_count = 0``.
   let existing = it.lookup.getOrDefault(path, high(uint64))
   if existing != high(uint64):
     return ok(existing)

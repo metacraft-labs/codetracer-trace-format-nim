@@ -6,6 +6,7 @@ import results
 import codetracer_ctfs
 import codetracer_trace_writer
 import codetracer_trace_writer/meta_dat
+import codetracer_trace_reader
 
 # ---------------------------------------------------------------------------
 # Helpers: read back internal files from raw CTFS bytes
@@ -35,6 +36,13 @@ proc readInternalFileData(data: openArray[byte], name: string,
     return @[]
 
   result = newSeq[byte](int(fileSize))
+  # A member of at most one block is stored direct: `MapBlock` is its only
+  # data block, tagged with bit 63 (`ctfs-container.md` §2).
+  if (mapBlock and (1'u64 shl 63)) != 0:
+    let blockOff = int(mapBlock and not (1'u64 shl 63)) * int(blockSize)
+    for i in 0 ..< int(fileSize):
+      result[i] = data[blockOff + i]
+    return
   let usable = uint64(blockSize) div 8 - 1
 
   var remaining = int(fileSize)
@@ -177,7 +185,8 @@ proc test_paths() =
   doAssert readRes.isOk
   let data = readRes.get()
 
-  # Paths ride in `meta.dat` now; the legacy `paths.json` sidecar is retired.
+  # Paths ride in `paths.dat`; the legacy `paths.json` sidecar is retired and
+  # meta.dat (version 6) carries no path list.
   doAssert findInternalFile(data, "paths.json") == (0'u64, 0'u64),
     "paths.json was written; the legacy JSON sidecar is retired"
 
@@ -185,7 +194,7 @@ proc test_paths() =
   doAssert metaBytes.len > 0, "meta.dat is empty"
   let parsed = readMetaDat(metaBytes)
   doAssert parsed.isOk, "meta.dat did not parse: " & parsed.error
-  let recordedPaths = parsed.get().paths
+  let recordedPaths = openTrace(path).get().paths
   doAssert recordedPaths.len == 5, "paths count mismatch: " & $recordedPaths.len
   for i in 0 ..< 5:
     doAssert recordedPaths[i] == testPaths[i],
@@ -469,8 +478,8 @@ proc test_rust_reader_format() =
   doAssert data[3] == 0xAC'u8
   doAssert data[4] == 0xE2'u8
 
-  # 2. Version byte = 3
-  doAssert data[5] == 4, "version should be 4, got: " & $data[5]
+  # 2. Version byte = 5
+  doAssert data[5] == 5, "version should be 5, got: " & $data[5]
 
   # 3. Block size = 4096 at offset 8
   var bsArr: array[4, byte]

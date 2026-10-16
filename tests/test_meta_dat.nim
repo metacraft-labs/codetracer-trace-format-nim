@@ -8,6 +8,7 @@ import codetracer_ctfs
 import codetracer_trace_types
 import codetracer_trace_writer
 import codetracer_trace_writer/meta_dat
+import codetracer_trace_writer/interning_table
 import codetracer_trace_writer/varint
 import codetracer_trace_writer/uuid_v7
 import codetracer_trace_reader
@@ -31,7 +32,7 @@ proc extractFileBytes(c: Ctfs, f: CtfsInternalFile): seq[byte] {.raises: [].} =
   var pos = 0
   var blockIdx = 0'u64
   while pos < fileSize:
-    let dataBlock = c.lookupDataBlock(mapBlock, blockIdx)
+    let dataBlock = c.resolveFileBlock(mapBlock, blockIdx)
     # `lookupDataBlock` answers "unresolved" with 0, and 0 is block 0 — the
     # container header and root directory. Without this the helper would
     # silently splice block 0's bytes in as `meta.dat`'s content and every
@@ -81,7 +82,7 @@ proc test_meta_dat_write_layout() {.raises: [].} =
   )
   let paths = @["/src/a.nim", "/src/b.nim"]
 
-  let wRes = c.writeMetaDat(f, meta, paths)
+  let wRes = c.writeMetaDat(f, meta)
   doAssert wRes.isOk, "writeMetaDat failed: " & wRes.error
 
   let raw = extractFileBytes(c, f)
@@ -100,6 +101,9 @@ proc test_meta_dat_write_layout() {.raises: [].} =
   # Flags
   doAssert readU16LEAt(raw, pos) == 0, "flags should be 0 (no MCR)"
   pos += 2
+  # flags_ext: always present at version 6
+  doAssert readU16LEAt(raw, pos) == 0 and readU16LEAt(raw, pos + 2) == 0
+  pos += 4
 
   # Recording id (M-REC-1)
   let recId = decodeString(raw, pos)
@@ -128,15 +132,7 @@ proc test_meta_dat_write_layout() {.raises: [].} =
   let rid = decodeString(raw, pos)
   doAssert rid.isOk and rid.get() == "", "recorder id should be empty"
 
-  # Paths
-  let pathsCount = decodeVarint(raw, pos)
-  doAssert pathsCount.isOk and pathsCount.get() == 2, "paths count mismatch"
-
-  let p0 = decodeString(raw, pos)
-  doAssert p0.isOk and p0.get() == "/src/a.nim", "path0 mismatch"
-
-  let p1 = decodeString(raw, pos)
-  doAssert p1.isOk and p1.get() == "/src/b.nim", "path1 mismatch"
+  # Version 6 carries no path list: nothing follows recorder_id.
 
   # Should have consumed all bytes
   doAssert pos == raw.len, "trailing bytes: consumed " & $pos & " of " & $raw.len
@@ -164,7 +160,7 @@ proc test_meta_dat_with_mcr_fields() {.raises: [].} =
     atomicMode: amRelaxed
   )
 
-  let wRes = c.writeMetaDat(f, meta, paths, mcrFields = some(mcr))
+  let wRes = c.writeMetaDat(f, meta, mcrFields = some(mcr))
   doAssert wRes.isOk, "writeMetaDat failed: " & wRes.error
 
   let raw = extractFileBytes(c, f)
@@ -182,10 +178,12 @@ proc test_meta_dat_with_mcr_fields() {.raises: [].} =
 
   # Flags — bit 0 should be set
   let flags = readU16LEAt(raw, pos)
+  doAssert readU16LEAt(raw, pos + 2) == 0 and readU16LEAt(raw, pos + 4) == 0,
+    "flags_ext is always present and zero here"
   doAssert (flags and 1) == 1, "flags bit 0 should be set for MCR fields"
-  pos += 2
+  pos += 6
 
-  # Skip recording_id, program, args, workdir, recorder_id, paths
+  # recording_id, program, args, workdir, recorder_id (version 6: no paths)
   let recId = decodeString(raw, pos)
   doAssert recId.isOk and recId.get() == TestRecordingId,
     "recording_id mismatch"
@@ -203,11 +201,6 @@ proc test_meta_dat_with_mcr_fields() {.raises: [].} =
 
   let rid = decodeString(raw, pos)
   doAssert rid.isOk and rid.get() == ""
-
-  let pathsCount = decodeVarint(raw, pos)
-  doAssert pathsCount.isOk and pathsCount.get() == 1
-  let p0 = decodeString(raw, pos)
-  doAssert p0.isOk and p0.get() == "/src/main.c"
 
   # MCR fields
   let tickSrc = decodeVarint(raw, pos)
@@ -279,7 +272,7 @@ proc test_meta_dat_empty_fields() {.raises: [].} =
   )
   let paths: seq[string] = @[]
 
-  let wRes = c.writeMetaDat(f, meta, paths)
+  let wRes = c.writeMetaDat(f, meta)
   doAssert wRes.isOk, "writeMetaDat failed: " & wRes.error
 
   let raw = extractFileBytes(c, f)
@@ -293,6 +286,8 @@ proc test_meta_dat_empty_fields() {.raises: [].} =
   pos += 2
   doAssert readU16LEAt(raw, pos) == 0
   pos += 2
+  doAssert readU16LEAt(raw, pos) == 0 and readU16LEAt(raw, pos + 2) == 0
+  pos += 4
 
   # Recording id (varint 36 + 36 bytes of canonical UUIDv7) — M-REC-1
   let recId = decodeString(raw, pos)
@@ -314,15 +309,11 @@ proc test_meta_dat_empty_fields() {.raises: [].} =
   let rid = decodeString(raw, pos)
   doAssert rid.isOk and rid.get() == ""
 
-  # Paths count = 0
-  let pathsCount = decodeVarint(raw, pos)
-  doAssert pathsCount.isOk and pathsCount.get() == 0
-
-  # 8 fixed bytes + 1 varint (=36) + 36 recording_id bytes + 5 varint
-  # zeros (each 1 byte) = 50 bytes total.
+  # 12 fixed bytes + 1 varint (=36) + 36 recording_id bytes + 4 varint
+  # zeros (each 1 byte) = 53 bytes total; no path list at version 6.
   doAssert pos == raw.len, "trailing bytes: consumed " & $pos & " of " & $raw.len
-  doAssert raw.len == 50,
-    "expected 50 bytes for a minimal meta.dat, got " & $raw.len
+  doAssert raw.len == 53,
+    "expected 53 bytes for a minimal meta.dat, got " & $raw.len
 
   c.closeCtfs()
   echo "PASS: test_meta_dat_empty_fields"
@@ -344,7 +335,7 @@ proc test_meta_dat_roundtrip() {.raises: [].} =
   let paths = @["/src/main.nim", "/src/utils.nim", "/src/lib.nim"]
   let recorderId = "nim-recorder-v1"
 
-  let wRes = c.writeMetaDat(f, meta, paths, recorderId = recorderId)
+  let wRes = c.writeMetaDat(f, meta, recorderId = recorderId)
   doAssert wRes.isOk, "writeMetaDat failed: " & wRes.unsafeError
 
   let raw = extractFileBytes(c, f)
@@ -362,10 +353,6 @@ proc test_meta_dat_roundtrip() {.raises: [].} =
   doAssert contents.args[1] == "-o", "arg1 mismatch"
   doAssert contents.args[2] == "output.txt", "arg2 mismatch"
   doAssert contents.recorderId == "nim-recorder-v1", "recorderId mismatch"
-  doAssert contents.paths.len == 3, "paths count mismatch"
-  doAssert contents.paths[0] == "/src/main.nim", "path0 mismatch"
-  doAssert contents.paths[1] == "/src/utils.nim", "path1 mismatch"
-  doAssert contents.paths[2] == "/src/lib.nim", "path2 mismatch"
   doAssert contents.mcrFields.isNone, "mcrFields should be None"
 
   c.closeCtfs()
@@ -397,7 +384,7 @@ proc test_meta_dat_roundtrip_with_mcr() {.raises: [].} =
     hookStrategies: @["ldpreload", "seccomp_unotify", "callsite_patch"],
   )
 
-  let wRes = c.writeMetaDat(f, meta, paths, recorderId = "mcr-rec",
+  let wRes = c.writeMetaDat(f, meta, recorderId = "mcr-rec",
                             mcrFields = some(mcr))
   doAssert wRes.isOk, "writeMetaDat failed: " & wRes.unsafeError
 
@@ -410,7 +397,6 @@ proc test_meta_dat_roundtrip_with_mcr() {.raises: [].} =
   doAssert contents.args == @["a"]
   doAssert contents.workdir == "/w"
   doAssert contents.recorderId == "mcr-rec"
-  doAssert contents.paths == @["/p1"]
   doAssert contents.mcrFields.isSome, "mcrFields should be present"
 
   let m = contents.mcrFields.get()
@@ -460,7 +446,7 @@ proc test_meta_dat_roundtrip_with_filter_provenance() {.raises: [].} =
     let fileRes = c.addFile("meta.dat")
     doAssert fileRes.isOk
     var f = fileRes.get()
-    let wRes = c.writeMetaDat(f, meta, paths,
+    let wRes = c.writeMetaDat(f, meta,
       filterProvenance = entries)
     doAssert wRes.isOk, "writeMetaDat failed: " & wRes.unsafeError
 
@@ -491,7 +477,7 @@ proc test_meta_dat_roundtrip_with_filter_provenance() {.raises: [].} =
 
   # ----- Buffer-based writer -----
   block:
-    let buf = writeMetaDatToBuffer(meta, paths,
+    let buf = writeMetaDatToBuffer(meta,
       filterProvenance = entries)
     let flags = readU16LEAt(buf, 6)
     doAssert (flags and FlagHasTraceFilterProvenance) != 0,
@@ -522,7 +508,7 @@ proc test_meta_dat_roundtrip_empty_filter_provenance() {.raises: [].} =
     recordingId: TestRecordingId, program: "prog", args: @[], workdir: "/w")
   let paths: seq[string] = @[]
 
-  let buf = writeMetaDatToBuffer(meta, paths,
+  let buf = writeMetaDatToBuffer(meta,
     filterProvenance = [], emitFilterProvenance = true)
   let flags = readU16LEAt(buf, 6)
   doAssert (flags and FlagHasTraceFilterProvenance) != 0,
@@ -543,7 +529,7 @@ proc test_meta_dat_no_filter_provenance_omits_flag() {.raises: [].} =
   let meta = TraceMetadata(
     recordingId: TestRecordingId, program: "prog", args: @[], workdir: "/w")
   let paths: seq[string] = @[]
-  let buf = writeMetaDatToBuffer(meta, paths)
+  let buf = writeMetaDatToBuffer(meta)
   let flags = readU16LEAt(buf, 6)
   doAssert (flags and FlagHasTraceFilterProvenance) == 0,
     "flag must be off when caller did not record provenance"
@@ -595,8 +581,12 @@ proc test_meta_dat_openTrace_binary() {.raises: [].} =
   )
   let paths = @["/src/main.nim", "/src/lib.nim"]
 
-  let wRes = c.writeMetaDat(metaDatFile, meta, paths, recorderId = "test-rec")
+  let wRes = c.writeMetaDat(metaDatFile, meta, recorderId = "test-rec")
   doAssert wRes.isOk, "writeMetaDat failed: " & wRes.unsafeError
+  # Source paths are `paths.dat`'s records; meta.dat carries none (v6).
+  var pathsTable = initInterningTableWriter(c, "paths").get()
+  for p in paths:
+    doAssert c.ensureId(pathsTable, p).isOk
 
   let tmpPath = getTempDir() / "test_meta_dat_binary.ct"
   let saveRes = c.writeCtfsToFile(tmpPath)
@@ -694,7 +684,7 @@ proc test_meta_dat_recording_id_required() {.raises: [].} =
   let meta = TraceMetadata(
     recordingId: "",  # invalid
     program: "p", args: @[], workdir: "/w")
-  let wRes = c.writeMetaDat(f, meta, @[])
+  let wRes = c.writeMetaDat(f, meta)
   doAssert wRes.isErr,
     "writeMetaDat must reject empty recording_id"
 
@@ -720,7 +710,7 @@ proc test_meta_dat_recording_id_malformed_rejected() {.raises: [].} =
     var f = fileRes.get()
     let meta = TraceMetadata(
       recordingId: bad, program: "p", args: @[], workdir: "/w")
-    let wRes = c.writeMetaDat(f, meta, @[])
+    let wRes = c.writeMetaDat(f, meta)
     doAssert wRes.isErr,
       "writeMetaDat must reject malformed recording_id: '" & bad & "'"
 
@@ -839,12 +829,14 @@ proc test_meta_dat_strict_unknown_flag_rejection() {.raises: [].} =
     buf.add(byte((MetaDatVersion shr 8) and 0xFF))
     buf.add(byte(flags and 0xFF))
     buf.add(byte((flags shr 8) and 0xFF))
+    # flags_ext — always present at version 6
+    buf.add(0'u8); buf.add(0'u8); buf.add(0'u8); buf.add(0'u8)
     # recording_id (canonical UUIDv7)
     encodeVarint(uint64(TestRecordingId.len), buf)
     for c in TestRecordingId:
       buf.add(byte(c))
-    # program, args_count, workdir, recorder_id, paths_count — all empty/zero.
-    buf.add(0'u8); buf.add(0'u8); buf.add(0'u8); buf.add(0'u8); buf.add(0'u8)
+    # program, args_count, workdir, recorder_id — all empty/zero.
+    buf.add(0'u8); buf.add(0'u8); buf.add(0'u8); buf.add(0'u8)
     buf
 
   proc craftVersion(version: uint16): seq[byte] {.raises: [].} =
@@ -1049,6 +1041,12 @@ proc test_meta_dat_strict_unknown_flag_rejection() {.raises: [].} =
     # the other half of the same contract.
     let res = readMetaDat(craftVersion(99'u16))
     doAssert res.isErr, "an unknown meta.dat version must be refused"
+    # Version 6 is the only one read; every other is refused by name
+    # (`internal-files.md` §"Version History", v6).
+    for v in [3'u16, 4, 5, 7]:
+      let old = readMetaDat(craftVersion(v))
+      doAssert old.isErr and ("version " & $v) in old.error and
+        "version 6" in old.error, "version " & $v & ": " & $old
 
   echo "PASS: test_meta_dat_strict_unknown_flag_rejection"
 

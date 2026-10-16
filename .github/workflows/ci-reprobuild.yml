@@ -52,7 +52,90 @@ jobs:
             runner: [self-hosted, windows, arm64]
     runs-on: ${{ matrix.runner }}
     steps:
+      - name: Preserve reused checkout before ordinary initialization
+        if: matrix.os == 'linux'
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          #!/usr/bin/env bash
+          # Proposed Linux-only pre-checkout constructor. No previous checkout code runs.
+          # The workflow must run this inline from RUNNER_TEMP before actions/checkout.
+          set -Eeuo pipefail
+          fail() { echo "fresh checkout constructor refused: $1" >&2; exit 1; }
+          test -z "${GIT_DIR-}${GIT_WORK_TREE-}${GIT_COMMON_DIR-}${GIT_CONFIG_PARAMETERS-}${GIT_CONFIG_COUNT-}" || fail git-selectors
+          workspace=${GITHUB_WORKSPACE:?missing workspace}
+          temporary=${RUNNER_TEMP:?missing runner temporary directory}
+          repository=${GITHUB_REPOSITORY:?missing event repository}
+          case "$repository" in metacraft-labs/codetracer-trace-format-nim) ;; *) fail event-repository ;; esac
+          for root in "$workspace" "$temporary"; do
+            case "$root" in /*) ;; *) fail nonabsolute-root ;; esac
+            test -d "$root" && test ! -L "$root" || fail root-kind
+            test "$(realpath -e -- "$root")" = "$root" || fail root-ancestry
+            test "$(stat -c %u -- "$root")" = "$(id -u)" || fail root-owner
+          done
+          case "$workspace/" in "$temporary/"*) fail nested-workspace ;; esac
+          case "$temporary/" in "$workspace/"*) fail nested-temporary ;; esac
+          test "$workspace" != / && test "$temporary" != / || fail root-directory
+          test "$(stat -c %d -- "$workspace")" = "$(stat -c %d -- "$temporary")" || fail cross-device
+          parent=${workspace%/*}
+          test -d "$parent" && test ! -L "$parent" || fail workspace-parent
+          test "$(stat -c %u -- "$parent")" = "$(id -u)" || fail parent-owner
+          # A first checkout needs no transition. Unknown non-repository content refuses.
+          if test ! -e "$workspace/.git"; then
+            test -z "$(find "$workspace" -mindepth 1 -maxdepth 1 -print -quit)" || fail unknown-workspace
+            exit 0
+          fi
+          test -d "$workspace/.git" && test ! -L "$workspace/.git" || fail git-topology
+          test ! -e "$workspace/.git/commondir" && test ! -e "$workspace/.git/objects/info/alternates" || fail shared-git
+          test -f "$workspace/.git/config" && test ! -L "$workspace/.git/config" || fail git-config-kind
+          origin=$(git -C "$workspace" config --no-includes --local --get remote.origin.url) || fail missing-origin
+          case "$origin" in
+            "https://github.com/$repository"|"https://github.com/$repository.git"|"git@github.com:$repository.git") ;;
+            *) fail foreign-origin ;;
+          esac
+          source_identity() {
+            stat -c '%d:%i:%u:%a' -- "$workspace" "$workspace/.git" || return 1
+            sha256sum -- "$workspace/.git/config" "$workspace/.git/index" || return 1
+            git -C "$workspace" rev-parse --verify HEAD || return 1
+            git -C "$workspace" ls-files --stage || return 1
+            git -C "$workspace" ls-files -z | while IFS= read -r -d '' member; do
+              if test -L "$workspace/$member"; then
+                printf '%s\0' "$member" || return 1
+                readlink -z -- "$workspace/$member" | sha256sum || return 1
+              elif test -f "$workspace/$member"; then
+                sha256sum -- "$workspace/$member" || return 1
+              else
+                return 1
+              fi
+            done
+          }
+          test -z "$(git -C "$workspace" ls-files --stage | sed -n '/^160000 /p')" || fail unsupported-gitlink
+          source_before=$(source_identity | sha256sum)
+          test "$(git -C "$workspace" rev-parse --show-toplevel)" = "$workspace" || fail worktree-root
+          old_identity=$(stat -c '%d:%i:%u:%a' -- "$workspace")
+          mode=$(stat -c %a -- "$workspace")
+          quarantine=$(mktemp -d "$temporary/trace-preserved-checkout.XXXXXXXX")
+          test "$(stat -c %a -- "$quarantine")" = 700 && test "$(stat -c %u -- "$quarantine")" = "$(id -u)" || fail quarantine-mode-owner
+          test ! -e "$quarantine/workspace" && test ! -L "$quarantine/workspace" || fail occupied-destination
+          # Exact source/index/config and root identity must still match at the mutation boundary.
+          test "$(source_identity | sha256sum)" = "$source_before" || fail source-identity-changed
+          # Exact same-filesystem rename preserves previous source, config, hooks and outputs.
+          mv -T -- "$workspace" "$quarantine/workspace"
+          if ! mkdir -m "$mode" -- "$workspace"; then
+            test ! -e "$workspace" && test ! -L "$workspace" || fail rollback-destination-occupied
+            mv -T -- "$quarantine/workspace" "$workspace"
+            fail root-creation-rolled-back
+          fi
+          test "$(stat -c '%d:%i:%u:%a' -- "$quarantine/workspace")" = "$old_identity" || fail preserved-identity
+          # Deliberately no old hooks/config values or authentication metadata in output.
+          printf 'Fresh checkout root created; prior checkout retained at %q\n' "$quarantine/workspace"
+
       - uses: actions/checkout@v4
+
+      - name: Capture actual initialized checkout Git templates
+        if: matrix.os == 'linux'
+        shell: bash
+        run: bash ci/capture-checkout-git-templates.sh "$RUNNER_TEMP/trace-checkout-git-templates"
 
       # Mint a GitHub App installation token via the CI Token Provider
       # app so the reprobuild flake/sibling steps can clone private
@@ -71,6 +154,86 @@ jobs:
           private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
           owner: metacraft-labs
 
+      - name: Install Nix for the declared platform shell
+        if: runner.os != 'Windows'
+        uses: metacraft-labs/metacraft-github-actions/setup-nix@dev
+        with:
+          gh-token: ${{ steps.ci_token.outputs.token }}
+
+      - name: Bind committed constructor before owning shell entry
+        if: runner.os != 'Windows'
+        env:
+          GH_TOKEN: ${{ steps.ci_token.outputs.token }}
+        run: bash .github/scripts/bind-unix-constructor.sh
+
+      - name: Reconcile authenticated inactive checkout templates
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          captured_head="$(cat "$RUNNER_TEMP/trace-checkout-git-templates/source-head.txt")"
+          test "$captured_head" = "$GITHUB_SHA"
+          initialized_git="$(cat "$RUNNER_TEMP/trace-checkout-git-templates/git-image.txt")"
+          sha256sum --check "$RUNNER_TEMP/trace-checkout-git-templates/git-image.sha256"
+          selected_git_package="$(nix build --no-link --no-write-lock-file --print-out-paths .#ci-checkout-git)"
+          selected_python_package="$(nix build --no-link --no-write-lock-file --print-out-paths .#ci-checkout-python)"
+          "$selected_python_package/bin/python3" ci/reconcile-checkout-templates.py \
+            --root "$GITHUB_WORKSPACE" --initialized-git "$initialized_git" \
+            --initialized-umask "$(cat "$RUNNER_TEMP/trace-checkout-git-templates/initialized-umask.txt")" \
+            --selected-git "$selected_git_package/bin/git" \
+            --expected-head "$captured_head" \
+            --receipt "$RUNNER_TEMP/trace-checkout-template-reconciliation.json"
+
+      - name: Expose the declared non-SIP shell
+        if: runner.os != 'Windows'
+        run: |
+          # Variables expand in the declared child shell rather than this runner shell.
+          # shellcheck disable=SC2016
+          nix develop --command bash -c '
+            shell_path="$(command -v bash)"
+            case "$shell_path" in
+              /nix/store/*/bin/bash) dirname "$shell_path" >> "$GITHUB_PATH" ;;
+              *) echo "Expected declared Nix bash, got $shell_path" >&2; exit 1 ;;
+            esac
+            # Provider graph construction needs these declared inputs before
+            # repro exec can introspect/activate this same owning shell.
+            case "${CT_ZSTD_INCLUDE_DIR:?missing owning Zstd include}" in
+              /nix/store/*/include) ;;
+              *) echo "Invalid declared Zstd include prefix" >&2; exit 1 ;;
+            esac
+            case "${CT_ZSTD_LIB_DIR:?missing owning Zstd library}" in
+              /nix/store/*/lib) ;;
+              *) echo "Invalid declared Zstd library prefix" >&2; exit 1 ;;
+            esac
+            [[ "$CT_ZSTD_INCLUDE_DIR" =~ ^/nix/store/[a-z0-9]{32}-[^[:space:]]+/include$ ]]
+            [[ "$CT_ZSTD_LIB_DIR" =~ ^/nix/store/[a-z0-9]{32}-[^[:space:]]+/lib$ ]]
+            test -f "$CT_ZSTD_INCLUDE_DIR/zstd.h"
+            test -d "$CT_ZSTD_LIB_DIR"
+            [[ "${CT_PCRE_LIB_DIR:?missing owning PCRE library}" =~ ^/nix/store/[a-z0-9]{32}-[^[:space:]]+/lib$ ]]
+            test -f "$CT_PCRE_LIB_DIR/libpcre.so" || test -f "$CT_PCRE_LIB_DIR/libpcre.dylib"
+            pkg_config_dir="${CT_ZSTD_INCLUDE_DIR%/include}/lib/pkgconfig"
+            test -f "$pkg_config_dir/libzstd.pc"
+            for key in CT_NIM_STEW_SRC CT_NIM_RESULTS_SRC CT_NIM_UNITTEST2_SRC; do
+              dependency="${!key:?missing owning locked Nim source}"
+              [[ "$dependency" =~ ^/nix/store/[a-z0-9]{32}-[^[:space:]]+$ ]]
+              test -d "$dependency"
+              printf "%s=%s\n" "$key" "$dependency" >> "$GITHUB_ENV"
+            done
+            printf "CT_ZSTD_INCLUDE_DIR=%s\nCT_ZSTD_LIB_DIR=%s\nCT_PCRE_LIB_DIR=%s\nPKG_CONFIG_PATH=%s\n" \
+              "$CT_ZSTD_INCLUDE_DIR" "$CT_ZSTD_LIB_DIR" "$CT_PCRE_LIB_DIR" "$pkg_config_dir" >> "$GITHUB_ENV"
+          '
+
+      - name: Acquire complete locked Nim source dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./ci/acquire-windows-nim-sources.ps1 -Destination "$env:RUNNER_TEMP/trace-nim-sources" -Manifest (Join-Path $env:GITHUB_WORKSPACE "ci/windows-complete-source-manifest.json") -Lock (Join-Path $env:GITHUB_WORKSPACE "flake.lock") -Receipt "$env:RUNNER_TEMP/trace-nim-source-receipt.json"
+
+      - name: Acquire declared Windows AMD64 C compiler
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./ci/ensure-declared-gcc.ps1 -Destination "$env:RUNNER_TEMP/trace-nim-gcc"
+
       - name: Setup dev env (reprobuild flavor)
         # setup-dev-env clones the siblings listed in .github/sibling-repos
         # (codetracer-trace-format, codetracer-trace-format-nim) at the
@@ -78,18 +241,76 @@ jobs:
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: reprobuild
+          repro-from-source: ${{ runner.os != 'Windows' && 'true' || 'false' }}
+          repro-build-pin: "064daf5b154ea6a0758ddb2dcbcbc07685216e44"
           gh-token: ${{ steps.ci_token.outputs.token }}
+
+      - name: Provision the declared Windows lease authority and Nim compiler payload
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP ('trace-windows-quota-bootstrap-' + [Guid]::NewGuid().ToString('N'))
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "TRACE_NIM_QUOTA_BOOTSTRAP_ROOT=$root"
+          ./ci/windows-quota-bootstrap/invoke-windows-quota-and-nim.ps1 -OutputRoot $root
+
+      - name: Provision the declared Windows Zstd package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $powerShell = (Get-Command pwsh -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+          repro exec ./ci/windows-zstd-prerequisite -- $powerShell -NoProfile -File "$env:GITHUB_WORKSPACE/ci/bind-declared-windows-zstd.ps1"
+          if ($LASTEXITCODE -ne 0) { throw "declared Windows Zstd prerequisite failed: $LASTEXITCODE" }
+
+      - name: Report measured Repro source identity
+        if: runner.os != 'Windows'
+        run: |
+          pwd
+          git rev-parse HEAD
+          engine_source="$(git -C .reprobuild-src rev-parse HEAD)"
+          echo "Repro source: $engine_source"
+          test "$engine_source" = 064daf5b154ea6a0758ddb2dcbcbc07685216e44
+          test -z "$(git -C .reprobuild-src status --porcelain)"
+          test "$(command -v repro)" = "$GITHUB_WORKSPACE/.reprobuild-src/build/bin/repro"
+          test "${REPROBUILD_NIX_DAEMON_BIN:?missing source daemon helper}" = "$GITHUB_WORKSPACE/.reprobuild-src/build/bin/reprobuild-nix-daemon"
+          test -x "$REPROBUILD_NIX_DAEMON_BIN"
+          "$REPROBUILD_NIX_DAEMON_BIN" --help
+          printf 'daemon helper: %s\n' "$REPROBUILD_NIX_DAEMON_BIN"
+          command -v repro
+          repro --version
+
+      - name: Validate native selected Nim payload binding
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: dev-exec pwsh -NoProfile -File ./ci/test-windows-nim-payload-binding.ps1
+
+      - name: Verify declared compiler through the original Windows environment
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          dev-exec pwsh -NoProfile -Command '
+            $actual = @(Get-Command gcc -CommandType Application)[0].Source
+            if ($actual -ne $env:TRACE_NIM_GCC_IMAGE -or (Get-FileHash -LiteralPath $actual -Algorithm SHA256).Hash -ne $env:TRACE_NIM_GCC_SHA256) { throw "Declared GCC image differs" }
+          '
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dev-exec pwsh -NoProfile -File ./ci/inspect-gcc-header-boundary.ps1 -ProjectInclude (Join-Path $env:GITHUB_WORKSPACE "include") -ProjectHeader codetracer_crossing_state.h
 
       - name: repro build
         # Builds the conventional `build` collection declared in
         # `repro.nim`. Verifies the primary shipping artefact (the
         # recorder binary or extension) materialises through the
         # reprobuild engine identically to `just build`.
-        run: dev-exec repro build
+        run: dev-exec repro build ${{ runner.os != 'Windows' && '--tool-provisioning=nix' || '' }}
 
       - name: repro test
         # Materialises the `test` collection.
-        run: dev-exec repro test
+        run: dev-exec repro test ${{ runner.os != 'Windows' && '--tool-provisioning=nix' || '' }}
+
+      - name: Inspect the original Windows compiler header boundary on failure
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: dev-exec pwsh -NoProfile -File ./ci/inspect-gcc-header-boundary.ps1 -ProjectInclude (Join-Path $env:GITHUB_WORKSPACE "include") -ProjectHeader codetracer_crossing_state.h
 
       - name: just build (cross-check)
         # Re-runs the legacy `just build` path inside the same env so
@@ -140,3 +361,42 @@ jobs:
           include-hidden-files: true
           retention-days: 7
           if-no-files-found: warn
+
+      - name: Retain constructor and narrow guard refusal evidence
+        if: always() && runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: constructor-binding-${{ matrix.os }}-${{ matrix.arch }}
+          path: .repro/constructor-binding/
+          include-hidden-files: true
+          if-no-files-found: error
+
+      - name: Retain checkout template authority hashes
+        if: always() && matrix.os == 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: trace-checkout-template-authority-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/trace-checkout-git-templates/*.tsv
+            ${{ runner.temp }}/trace-checkout-git-templates/git-image.txt
+            ${{ runner.temp }}/trace-checkout-git-templates/git-image.sha256
+            ${{ runner.temp }}/trace-checkout-git-templates/templates-source.txt
+            ${{ runner.temp }}/trace-checkout-git-templates/source-head.txt
+            ${{ runner.temp }}/trace-checkout-git-templates/result.txt
+            ${{ runner.temp }}/trace-checkout-template-reconciliation.json
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Retain declared Windows quota bootstrap evidence
+        if: always() && runner.os == 'Windows' && env.TRACE_NIM_QUOTA_BOOTSTRAP_ROOT != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: trace-windows-quota-bootstrap-${{ matrix.arch }}
+          path: |
+            ${{ env.TRACE_NIM_QUOTA_BOOTSTRAP_ROOT }}/*.json
+            ${{ env.TRACE_NIM_QUOTA_BOOTSTRAP_ROOT }}/*.stdout
+            ${{ env.TRACE_NIM_QUOTA_BOOTSTRAP_ROOT }}/*.stderr
+            ${{ env.TRACE_NIM_QUOTA_BOOTSTRAP_ROOT }}/build/*.stdout
+            ${{ env.TRACE_NIM_QUOTA_BOOTSTRAP_ROOT }}/build/*.stderr
+            ${{ env.TRACE_NIM_QUOTA_BOOTSTRAP_ROOT }}/inputs/*members.json
+          if-no-files-found: error

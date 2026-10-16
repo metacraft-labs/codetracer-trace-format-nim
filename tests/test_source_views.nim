@@ -33,10 +33,11 @@ proc toBytesSeq(s: string): seq[byte] {.raises: [].} =
 
 proc test_register_source_view_sets_flag_bit_5() {.raises: [].} =
   ## Registering a single source view must (a) increment the writer's
-  ## source-view count, (b) cause ``close()`` to set bit 5 on meta.dat,
-  ## and (c) cause the reader to surface
-  ## ``meta.hasAlternateSourceViews == true`` plus
-  ## ``sourceViewCount() == 1``.
+  ## source-view count and (b) make the reader surface
+  ## ``sourceViewCount() == 1``, found by ``srcviews.dat``'s presence.
+  ## ``meta.dat`` bit 5 stays clear: meta.dat is written at the first record,
+  ## before any view can be known (`internal-files.md` §"Stream-presence
+  ## flags are a hint, not a gate").
   let writerRes = initMultiStreamWriter("test_sv_flag.ct", "sv_flag")
   doAssert writerRes.isOk, "init failed: " & writerRes.error
   var w = writerRes.get()
@@ -65,8 +66,8 @@ proc test_register_source_view_sets_flag_bit_5() {.raises: [].} =
   doAssert readerRes.isOk, "open failed: " & readerRes.error
   let reader = readerRes.get()
 
-  doAssert reader.meta.hasAlternateSourceViews,
-    "meta.dat must carry FlagHasAlternateSourceViews after registerSourceView"
+  doAssert not reader.meta.hasAlternateSourceViews,
+    "meta.dat is written before the view; bit 5 must stay clear"
   doAssert reader.sourceViewCount() == 1'u64,
     "expected 1 source view, got " & $reader.sourceViewCount()
   echo "PASS: test_register_source_view_sets_flag_bit_5"
@@ -108,7 +109,6 @@ proc test_source_view_round_trip() {.raises: [].} =
   doAssert readerRes.isOk
   let reader = readerRes.get()
 
-  doAssert reader.meta.hasAlternateSourceViews
   doAssert reader.sourceViewCount() == 1'u64
 
   let svRes = reader.sourceView(0'u64)

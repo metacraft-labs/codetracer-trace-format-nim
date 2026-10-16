@@ -72,7 +72,7 @@ proc test_new_format_write_read_roundtrip() =
     workdir: "/tmp/cross"
   )
   let paths = @["/src/main.py", "/src/utils.py"]
-  let metaWr = ctfs.writeMetaDat(metaFile, meta, paths,
+  let metaWr = ctfs.writeMetaDat(metaFile, meta,
     recorderId = "cross-format-test", hasStepStream = true,
     hasValueStream = true, hasIoEventStream = true)
   doAssert metaWr.isOk, "writeMetaDat failed"
@@ -152,7 +152,7 @@ proc test_new_format_write_read_roundtrip() =
 
   # Write IO event
   let ioWr = ctfs.writeEvent(ioW, IOEvent(
-    kind: ioStdout, stepId: 2, data: "hello\n".toBytes))
+    kind: elkWrite, stepId: 2, data: "hello\n".toBytes))
   doAssert ioWr.isOk
 
   let flushRes = ctfs.flush(execW)
@@ -355,7 +355,7 @@ proc test_both_formats_produce_valid_ctfs() =
 
   # Verify old format CTFS magic
   doAssert hasCtfsMagic(oldData), "old format missing CTFS magic"
-  doAssert oldData[5] == 4'u8, "old format version mismatch"
+  doAssert oldData[5] == 5'u8, "old format version mismatch"
 
   # New format: write and verify CTFS magic
   var ctfs = createCtfs()
@@ -363,7 +363,7 @@ proc test_both_formats_produce_valid_ctfs() =
   doAssert metaFileRes.isOk
   var metaFile = metaFileRes.get()
   let meta = TraceMetadata(recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb", program: "compat_test", args: @[], workdir: "/tmp")
-  let metaWr = ctfs.writeMetaDat(metaFile, meta, @["/src/test.py"],
+  let metaWr = ctfs.writeMetaDat(metaFile, meta,
     hasStepStream = true, hasValueStream = true)
   doAssert metaWr.isOk
 
@@ -398,7 +398,7 @@ proc test_both_formats_produce_valid_ctfs() =
   doAssert newData[2] == 0x72'u8, "new format magic[2]"
   doAssert newData[3] == 0xAC'u8, "new format magic[3]"
   doAssert newData[4] == 0xE2'u8, "new format magic[4]"
-  doAssert newData[5] == 4'u8, "new format version mismatch"
+  doAssert newData[5] == 5'u8, "new format version mismatch"
 
   # Both use the same block size
   let oldBlockSize = readU32LE(oldData, 8)

@@ -22,9 +22,10 @@
 ##
 ## Each chunk's uncompressed content is the bare concatenation of encoded
 ## step events — there is NO per-chunk inline header (no event count).  The
-## first step record of every chunk is an AbsoluteStep so each chunk is
-## independently decodable (the running absolute global_position_index resets
-## at every chunk boundary).
+## first POSITION record of every chunk is an AbsoluteStep, whatever records
+## precede it, so each chunk is independently decodable: a reader starts each
+## chunk without a cursor and refuses a delta before the chunk's first
+## AbsoluteStep (`trace-events.md` §"Encoding Rules").
 ##
 ## Index layout (steps.idx):
 ##   [chunk_size: u32 LE]           # max events per chunk
@@ -50,6 +51,7 @@
 ## standalone callers that only ever read freshly-written bundles get the SPEC
 ## layout by default.
 
+import std/bitops
 import results
 import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
@@ -85,7 +87,14 @@ type
     eventCount: int            ## events in current buffer
     totalEvents: uint64
     dataOffset: uint64         ## running byte offset in data file
-    lastGlobalLineIndex: uint64  ## tracks current absolute position for delta context
+    lastGlobalLineIndex: uint64
+      ## The position of the last position record written (the stream's
+      ## cursor), used to resolve a caller's delta to a position.
+    hasPosition: bool
+      ## A position record has been written to this stream.
+    chunkHasCursor: bool
+      ## A position record has been written to the CURRENT chunk. Each chunk
+      ## starts without a cursor (`trace-events.md` §"Encoding Rules").
 
   ExecStreamReader* = object
     data: seq[byte]            ## raw steps.dat content
@@ -183,17 +192,15 @@ proc flushChunk(ctfs: var Ctfs, w: var ExecStreamWriter): Result[void, string] =
 
   let chunkStart = w.dataOffset
 
-  # DATA-FIRST-THEN-INDEX ordering (matches span_stream.flushChunk): append the
-  # compressed chunk to steps.dat and sync its size FIRST, then append the
-  # chunk's byte offset to steps.idx and sync.  A concurrent follow reader that
-  # observes N index entries can then always assume chunks 0..N-1 are fully on
-  # disk; the reverse order could publish an offset for bytes not yet written,
-  # yielding a transient short/zero decode.
+  # The chunk's bytes, then its offset in the companion index, then ONE
+  # publish: every block written since the last seal (the chunk, its mapping,
+  # the index, interning records), then the root entries that publish their
+  # sizes (`ctfs-container.md` §6, "Durability", rule 2). A follow reader that
+  # sees N index entries can assume chunks 0..N-1 are on disk.
   let datRes = ctfs.writeToFile(w.dataFile,
       compressed.toOpenArray(0, int(compressedSize) - 1))
   if datRes.isErr:
     return err("failed to write compressed chunk: " & datRes.error)
-  ctfs.syncEntry(w.dataFile)
 
   var offBytes: array[8, byte]
   let offLE = toBytesLE(chunkStart)
@@ -209,48 +216,74 @@ proc flushChunk(ctfs: var Ctfs, w: var ExecStreamWriter): Result[void, string] =
   w.buffer.setLen(0)
   ok()
 
+proc varintLen(v: uint64): int {.inline.} =
+  ## Bytes an unsigned LEB128 varint of `v` takes.
+  if v == 0: 1 else: (64 - countLeadingZeroBits(v) + 6) div 7
+
+proc zigzag(d: int64): uint64 {.inline.} =
+  cast[uint64](d shl 1) xor cast[uint64](ashr(d, 63))
+
 proc writeEvent*(ctfs: var Ctfs, w: var ExecStreamWriter,
     event: StepEvent): Result[void, string] =
   ## Write a step event to the execution stream.
   ##
-  ## At chunk boundaries (first event in a new chunk), if the event is a
-  ## DeltaStep it is automatically converted to an AbsoluteStep so each
-  ## chunk is independently decodable.
-
-  var ev = event
-
-  # At the start of a chunk, ensure an AbsoluteStep
+  ## A position event (`AbsoluteStep`, `DeltaStep` or `DeltaColumn`) is
+  ## resolved to its position — a delta relative to the last position written
+  ## — and then RE-ENCODED by the normative rule of `trace-events.md`
+  ## §"Encoding Rules", so two writers given one recording write the same
+  ## bytes:
+  ##
+  ## 1. the first position record of each chunk is an `AbsoluteStep`, whatever
+  ##    records precede it in the chunk;
+  ## 2. otherwise a delta when the varint of `zigzag(p - cursor)` is strictly
+  ##    shorter than the varint of `p` — a `DeltaColumn` when the caller
+  ##    registered a column step, a `DeltaStep` otherwise;
+  ## 3. otherwise an `AbsoluteStep` (a tie goes to the absolute).
+  ##
+  ## Every other record is written as given and leaves the cursor alone.
   if w.eventCount == 0:
-    case ev.kind
-    of sekDeltaStep:
-      # Convert delta to absolute using tracked position
-      let newIndex = uint64(int64(w.lastGlobalLineIndex) + ev.lineDelta)
-      ev = StepEvent(kind: sekAbsoluteStep, globalLineIndex: newIndex)
-    of sekDeltaColumn:
-      # In column-aware traces `global_position_index` is a single 1-D
-      # address over (line, column) tuples, so a column delta is also a
-      # position delta.  At chunk boundaries we promote it to an
-      # AbsoluteStep just like sekDeltaStep so the chunk is independently
-      # decodable.
-      let newIndex = uint64(int64(w.lastGlobalLineIndex) + ev.columnDelta)
-      ev = StepEvent(kind: sekAbsoluteStep, globalLineIndex: newIndex)
-    of sekAbsoluteStep:
-      discard  # already absolute, good
-    else:
-      discard  # Raise/Catch/ThreadSwitch are fine at chunk start
+    w.chunkHasCursor = false
 
-  # Track lastGlobalLineIndex
-  case ev.kind
+  var isPosition = true
+  var pos: uint64
+  var column = false
+  case event.kind
   of sekAbsoluteStep:
-    w.lastGlobalLineIndex = ev.globalLineIndex
-  of sekDeltaStep:
-    w.lastGlobalLineIndex = uint64(int64(w.lastGlobalLineIndex) + ev.lineDelta)
-  of sekDeltaColumn:
-    w.lastGlobalLineIndex = uint64(int64(w.lastGlobalLineIndex) + ev.columnDelta)
+    pos = event.globalLineIndex
+  of sekDeltaStep, sekDeltaColumn:
+    if not w.hasPosition:
+      return err("a " & (if event.kind == sekDeltaStep: "DeltaStep" else:
+        "DeltaColumn") & " was given before any position was written to " &
+        "steps.dat, so it has nothing to be relative to")
+    let d = if event.kind == sekDeltaStep: event.lineDelta else: event.columnDelta
+    let p = int64(w.lastGlobalLineIndex) + d
+    if p < 0:
+      return err("a step delta of " & $d & " from position " &
+        $w.lastGlobalLineIndex & " is a negative position")
+    pos = uint64(p)
+    column = event.kind == sekDeltaColumn
   else:
-    discard
+    isPosition = false
 
-  encodeStepEvent(ev, w.buffer)
+  if isPosition:
+    # Encoded straight into the chunk buffer: this is the per-step hot path.
+    var useAbsolute = true
+    var d: int64 = 0
+    if w.chunkHasCursor:
+      d = int64(pos) - int64(w.lastGlobalLineIndex)
+      useAbsolute = varintLen(pos) <= varintLen(zigzag(d))
+    if useAbsolute:
+      w.buffer.add(TagAbsoluteStep)
+      encodeVarint(pos, w.buffer)
+    else:
+      w.buffer.add(if column: TagDeltaColumn else: TagDeltaStep)
+      encodeVarint(zigzag(d), w.buffer)
+    w.lastGlobalLineIndex = pos
+    w.hasPosition = true
+    w.chunkHasCursor = true
+  else:
+    encodeStepEvent(event, w.buffer)
+
   w.eventCount += 1
   w.totalEvents += 1
 
@@ -592,6 +625,40 @@ proc readChunkEvents*(r: var ExecStreamReader,
     output.add(evRes.get())
 
   ok(firstEventIdx)
+
+proc resolveChunkPositions*(events: openArray[StepEvent], chunkIdx: int,
+    output: var seq[uint64]): Result[void, string] =
+  ## Resolve every record of one decoded chunk to the cursor position after
+  ## it, starting without a cursor (`trace-events.md` §"Encoding Rules",
+  ## "Reading"). A `DeltaStep` or `DeltaColumn` before the chunk's first
+  ## `AbsoluteStep` has nothing to be relative to and is refused, naming the
+  ## chunk; it is never resolved against 0 or a cursor carried over from the
+  ## previous chunk. A non-position record before the anchor reports 0.
+  output.setLen(events.len)
+  var cursor = 0'u64
+  var anchored = false
+  for i in 0 ..< events.len:
+    let ev = events[i]
+    case ev.kind
+    of sekAbsoluteStep:
+      cursor = ev.globalLineIndex
+      anchored = true
+    of sekDeltaStep, sekDeltaColumn:
+      if not anchored:
+        return err("steps.dat chunk " & $chunkIdx & ": record " & $i & " is a " &
+          (if ev.kind == sekDeltaStep: "DeltaStep" else: "DeltaColumn") &
+          " before the chunk's first AbsoluteStep, so it has no position to " &
+          "be relative to")
+      let d = if ev.kind == sekDeltaStep: ev.lineDelta else: ev.columnDelta
+      let p = int64(cursor) + d
+      if p < 0:
+        return err("steps.dat chunk " & $chunkIdx & ": record " & $i &
+          " resolves to a negative position")
+      cursor = uint64(p)
+    else:
+      discard
+    output[i] = cursor
+  ok()
 
 proc chunkIndexFor*(r: ExecStreamReader, eventIndex: uint64): int =
   ## Map a global event index to its containing chunk index.  Useful

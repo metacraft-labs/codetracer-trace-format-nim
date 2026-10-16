@@ -62,6 +62,8 @@ proc buildEventsLogBundle(path: string) =
   ## / paths.json), no split streams.
   removeFile(path)
   var w = newTraceWriter(path, "demo", @["--x"], "/wd").get()
+  # meta.dat is written once, before the first event.
+  doAssert w.writeMetaDat().isOk
   doAssert w.writePath("/wd/main.py").isOk
   doAssert w.writeFunction(0, 1, "main").isOk
   doAssert w.writeStep(0, 1).isOk
@@ -70,7 +72,6 @@ proc buildEventsLogBundle(path: string) =
   doAssert w.writeValue(0,
     ValueRecord(kind: vrkInt, intVal: 42, intTypeId: TypeId(0))).isOk
   doAssert w.writeReturn().isOk
-  doAssert w.writeMetaDat().isOk
   doAssert w.close().isOk
 
 proc buildSplitBundle(path: string): seq[byte] =

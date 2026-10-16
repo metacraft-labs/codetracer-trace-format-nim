@@ -1,7 +1,7 @@
 ## Tests for ct-print's native MCR shard decoder.
 ##
 ## The native recorder (codetracer-native-recorder/ct_recorder) writes a
-## CTFS container with per-thread `tNNNN` event streams + a `meta.json`
+## CTFS container with per-thread `tNNNN` event streams + canonical `meta.dat`
 ## blob, plus optional `event_log.dat`/`event_log.idx` files. ct-print
 ## previously did not understand this layout — it routed those bundles
 ## through the v4 multi-stream reader, which silently produced an empty
@@ -12,14 +12,14 @@
 ##
 ## Strategy:
 ##   1. Build a tiny synthetic native bundle in-process (CTFS container
-##      with meta.json + 2 thread streams + 1 event_log.dat/idx pair).
+##      with meta.dat + 2 thread streams + 1 event_log.dat/idx pair).
 ##      We don't import the native recorder package; we just hand-write
 ##      the bytes using the same on-the-wire layout the writer uses.
 ##   2. Decode the bundle via `decodeNativeFromFile` and assert on the
 ##      JSON shape: top-level keys, per-thread event counts, OS event
 ##      content, deterministic ordering by GEID.
 ##   3. Snapshot test against a committed golden under tests/goldens/.
-##      Set CT_PRINT_WRITE_GOLDEN=1 to refresh it.
+##      Missing goldens fail; deliberate updates require review.
 ##   4. Mutation test: flip a header byte and confirm the decoder reports
 ##      a specific error, not an empty document.
 ##   5. (Optional) Real-bundle test: when the sibling
@@ -27,7 +27,13 @@
 ##      caller passes CT_NATIVE_FIXTURE=<path>), decode that bundle and
 ##      assert non-zero counts so we exercise the real writer's output.
 
-import std/[os, json, strutils]
+## No mock: this independently constructs real wire events and owning binary
+## metadata in a real CTFS container, then exercises the production decoder
+## and filesystem. It complements the real native recorder integration suite.
+
+import std/[os, json, options, strutils]
+import codetracer_trace_types
+import codetracer_trace_writer/meta_dat
 import results
 import stew/endians2
 import codetracer_ctfs
@@ -125,34 +131,29 @@ const
   Tid0 = 0'u32
   Tid1 = 1'u32
 
-proc buildSyntheticBundle(): seq[byte] =
+proc buildSyntheticBundle(recordingMode = "hook"): seq[byte] =
   ## Construct a small native MCR bundle:
-  ##   meta.json — recordingMode=hook, tickSource=none, hookProfile=test
+  ##   meta.dat — recorderId=hook, tickSource=none, hookProfile=test
   ##   t00000000000 — 2 thread events (lock acquire begin/success)
   ##   t00000000001 — 1 thread event (write syscall)
   ##   event_log.dat + event_log.idx — 1 OS write event
   ##   paths.json — "[]"
   var ctfs = createCtfs()
 
-  # meta.json — same key set the native recorder writes. Embed
-  # `recordingMode` so isNativeBundle() routes us through this decoder.
-  let meta = """{
-  "version": "4",
-  "format": "ctfs",
-  "program": "/synthetic/program",
-  "args": ["--demo", "fixture"],
-  "recordingMode": "hook",
-  "platform": "linux",
-  "totalEvents": 0,
-  "totalThreads": 2,
-  "tickSource": "none",
-  "tickDefinition": "edge",
-  "hookProfile": "test",
-  "hookStrategies": ["ldpreload"]
-}"""
-  var metaFile = ctfs.addFile("meta.json").get()
-  doAssert ctfs.writeToFile(metaFile,
-    cast[seq[byte]](meta)).isOk
+  let metadata = TraceMetadata(
+    recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb",
+    program: "/synthetic/program", args: @["--demo", "fixture"], workdir: "")
+  let mcr = McrMetaFields(
+    platform: "linux", totalThreads: 2, tickSourceStr: "none",
+    tickGranularity: "edge", hookProfile: "test", hookStrategies: @["ldpreload"])
+  let encoded = encodeMetaDat(metadata,
+    MetaDatFlagsInput(recorderId: recordingMode, mcrFields: some(mcr))).get()
+  var metaFile = ctfs.addFile("meta.dat").get()
+  doAssert ctfs.writeToFile(metaFile, encoded).isOk
+  # Poison the retired JSON member: only the binary recorderId is authoritative.
+  var legacyFile = ctfs.addFile("meta.json").get()
+  doAssert ctfs.writeToFile(legacyFile,
+    cast[seq[byte]]("{\"recordingMode\":\"poisoned-legacy-mode\"}")).isOk
 
   # Thread 0: lock_acquire_begin (et=0) + lock_acquire_success (et=1).
   var t0Stream: seq[byte] = @[]
@@ -389,19 +390,9 @@ proc test_golden_snapshot() =
   let bytes = buildSyntheticBundle()
   let actualNode = buildNativeFullDocument(bytes,
     NativeOpts(stripPaths: true)).get()
+
   let actual = pretty(actualNode, indent = 2)
-
-  if getEnv("CT_PRINT_WRITE_GOLDEN", "") == "1":
-    createDir(goldenPath.parentDir())
-    writeFile(goldenPath, actual)
-    echo "[wrote golden] " & goldenPath
-    return
-
-  if not fileExists(goldenPath):
-    createDir(goldenPath.parentDir())
-    writeFile(goldenPath, actual)
-    echo "[init golden] " & goldenPath
-    return
+  doAssert fileExists(goldenPath), "required committed native golden is missing"
 
   # Parse both and compare canonical (re-pretty'd) form so the test is
   # robust against external JSON re-formatting passes.
@@ -460,6 +451,10 @@ proc test_real_fixture() =
 # Driver
 # ---------------------------------------------------------------------------
 
+for mode in ["hook", "instrumented", "mcr", "mcr-interpose", "mcr-interpose-debug"]:
+  let decoded = buildNativeFullDocument(buildSyntheticBundle(mode), NativeOpts()).get()
+  doAssert decoded["metadata"]["recording_mode"].getStr == mode,
+    "binary recorderId must survive verbatim despite poisoned legacy JSON"
 test_detection_picks_native_bundle()
 test_full_document_shape()
 test_thread_id_field_per_event()

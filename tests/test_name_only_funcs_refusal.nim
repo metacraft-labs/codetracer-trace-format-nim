@@ -42,7 +42,7 @@ proc containerWithBareFuncName(): seq[byte] =
   doAssert c.appendRecord(t.funcs, bareBytes).isOk
   let meta = TraceMetadata(recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb",
     program: "name_only")
-  let metaBytes = writeMetaDatToBuffer(meta, ["/src/game.gd"])
+  let metaBytes = writeMetaDatToBuffer(meta)
   var mf = c.addFile("meta.dat").get()
   doAssert c.writeToFile(mf, metaBytes).isOk
   c.toBytes()

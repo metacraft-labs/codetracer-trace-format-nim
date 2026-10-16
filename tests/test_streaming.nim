@@ -49,8 +49,9 @@ proc test_streaming_basic() {.raises: [].} =
   # Verify CTFS magic
   doAssert hasCtfsMagic(diskData), "CTFS magic not found on disk"
 
-  # Verify the file is large enough (at least root block + mapping block + data block)
-  doAssert diskData.len >= int(DefaultBlockSize) * 3,
+  # Root block + the member's one data block: a member that fits one block
+  # owns no mapping block (`ctfs-container.md` §2).
+  doAssert diskData.len >= int(DefaultBlockSize) * 2,
     "disk file too small: " & $diskData.len
 
   # 5. Write more data

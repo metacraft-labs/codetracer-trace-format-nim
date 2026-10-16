@@ -101,7 +101,7 @@ proc ctSelftest(): int32 {.exportc: "ct_selftest", cdecl.} =
   if ev.get().len == 0: return 9
 
   if readInternalFile(built, "events.fmt").isErr: return 10
-  if readInternalFile(built, "meta.json").isErr: return 11
-  if readInternalFile(built, "paths.json").isErr: return 12
+  if readInternalFile(built, "meta.dat").isErr: return 11
+  if readInternalFile(built, "paths.dat").isErr: return 12
 
   0

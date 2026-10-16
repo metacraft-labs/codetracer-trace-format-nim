@@ -228,7 +228,35 @@ proc test_a_clean_container_is_unaffected_by_the_bound() {.raises: [].} =
   dropDir(dir)
   echo "PASS: test_a_clean_container_is_unaffected_by_the_bound"
 
+proc test_reserved_root_blocks_are_not_member_data() {.raises: [].} =
+  ## Real allocation supplies the positive; changing only MapBlock isolates
+  ## an in-bounds pointer into unused allocated directory padding.
+  var c = createCtfs(blockSize=1024, maxRootEntries=128, maxShards=2)
+  let added = c.addFile("file1")
+  doAssert added.isOk
+  var f = added.get()
+  let content = pattern(11, 7)
+  doAssert c.writeToFile(f, content).isOk
+  doAssert c.closeCtfs().isOk
+  let good = c.toBytes()
+  let positive = readInternalFile(good, "file1", blockSize=1024, maxEntries=128)
+  doAssert positive.isOk and positive.get() == content
+  let layout = rootDirectoryLayout(good)
+  doAssert layout.error.len == 0
+  var corrupted = good
+  let pointer = CtfsDirect or 3'u64
+  for i in 0 ..< 8:
+    corrupted[layout.entryStart + 8 + i] = byte((pointer shr (8*i)) and 255)
+  let refused = readInternalFile(corrupted, "file1", blockSize=1024, maxEntries=128)
+  doAssert refused.isErr and "overlaps reserved root directory blocks" in refused.error
+  var tail = good
+  for i in 0 ..< 17: tail.add(0xAA'u8)
+  let tailRead = readInternalFile(tail, "file1", blockSize=1024, maxEntries=128)
+  doAssert tailRead.isOk and tailRead.get() == content
+  echo "PASS: test_reserved_root_blocks_are_not_member_data"
+
 when isMainModule:
+  test_reserved_root_blocks_are_not_member_data()
   test_a_partial_tail_costs_nothing()
   test_a_truncated_stream_is_refused_rather_than_served_short()
   test_the_append_still_refuses_a_partial_tail()
