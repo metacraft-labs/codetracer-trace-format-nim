@@ -24,7 +24,7 @@ try {
     $env:RUNQUOTAD_BIN = $bootstrap.daemon
     Add-Content -LiteralPath $env:GITHUB_ENV -Value "RUNQUOTAD_BIN=$env:RUNQUOTAD_BIN"
     $powerShell = (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
-    & $releasedImage develop ./ci/windows-nim-prerequisite --tool-provisioning=tarball -- $powerShell -NoProfile -File "$env:GITHUB_WORKSPACE/ci/bind-declared-windows-nim.ps1"
+    & $releasedImage develop ./ci/windows-nim-prerequisite --tool-provisioning=tarball -- $powerShell -NoProfile -File "$env:GITHUB_WORKSPACE/ci/bind-declared-windows-nim.ps1" -AuthenticatedArchive (Join-Path $OutputRoot 'inputs/nim.zip')
     if ($LASTEXITCODE -ne 0) { throw "declared Windows Nim prerequisite failed: $LASTEXITCODE" }
     $bootstrap.inputHold.Verify()
 
