@@ -5,6 +5,9 @@
  * Linux executes the held regular image descriptor; Darwin's path check is only
  * an observation and requires separate native platform qualification.
  */
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE 1
+#endif
 #define _POSIX_C_SOURCE 200809L
 #include <errno.h>
 #include <fcntl.h>
