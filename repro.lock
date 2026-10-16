@@ -3,7 +3,7 @@ schema = "reprobuild.solved-graph-lock.v2"
 [lock]
 platform = "amd64-linux"
 optimal = false
-inputs_digest = "fnv1a64:10225561cc1a6a59"
+inputs_digest = "fnv1a64:b65bd06357f484a7"
 variants = []
-packages = [{ name = "codetracer_trace_format_nim", version = "0.1.0", source = "codetracer_trace_format_nim", selection = "selected" }, { name = "gcc", version = "12.0.0", source = "gcc", selection = "selected" }, { name = "nim", version = "2.2.0", source = "nim", selection = "selected" }, { name = "nimble", version = "1.0.0", source = "nimble", selection = "selected" }]
-deps = [{ name = "codetracer-trace-format-nim", path = ".", coord_kind = "vcs", url = "https://github.com/metacraft-labs/codetracer-trace-format-nim", ref = "agents-to-dev-2026-10-03", revision = "7e06d011fc69f7e0fd22d24783ab83498bb365aa", integrity = "git-sha1:7e06d011fc69f7e0fd22d24783ab83498bb365aa", version = "", visibility = "public", participation = "", depends = "", tags = "" }]
+packages = [{ name = "codetracer_trace_format_nim", version = "0.1.0", source = "codetracer_trace_format_nim", selection = "selected" }, { name = "gcc", version = "12.0.0", source = "gcc", selection = "selected" }, { name = "nim", version = "2.2.0", source = "nim", selection = "selected" }, { name = "nimble", version = "1.0.0", source = "nimble", selection = "selected" }, { name = "pkg-config", version = "1.0.0", source = "pkg-config", selection = "selected" }]
+deps = [{ name = "codetracer-trace-format-nim", path = ".", coord_kind = "vcs", url = "https://github.com/metacraft-labs/codetracer-trace-format-nim", ref = "agents-to-dev-2026-10-03", revision = "dffece5bb495480197498021ca9f2cbfc113d481", integrity = "git-sha1:dffece5bb495480197498021ca9f2cbfc113d481", version = "", visibility = "public", participation = "", depends = "", tags = "" }]
