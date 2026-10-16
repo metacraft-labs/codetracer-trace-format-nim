@@ -19,6 +19,7 @@
  * No mocks: the real archive, the real header, real threads.
  */
 #include <pthread.h>
+#include "ffi_start_barrier.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,7 +36,14 @@ typedef struct {
   char err_seen[256];
 } job_t;
 
-static pthread_barrier_t start_line;
+static ffi_start_barrier start_line;
+
+static void check_thread_status(int status, const char *operation) {
+  if (status != 0) {
+    fprintf(stderr, "FAIL: %s: %s\n", operation, strerror(status));
+    abort();
+  }
+}
 
 static void *record(void *arg) {
   job_t *job = (job_t *)arg;
@@ -44,7 +52,7 @@ static void *record(void *arg) {
   /* Same recording id everywhere, so the containers can be compared. */
   if (!job->failed && (trace_writer_set_recording_id(w, "0190f0a0-0000-7000-8000-000000000001") != 0 ||
       trace_writer_begin_in_memory(w) != 0)) job->failed = 1;
-  pthread_barrier_wait(&start_line);
+  check_thread_status(ffi_start_barrier_wait(&start_line), "start barrier wait");
   if (!job->failed) {
   trace_writer_start(w, "/src/main.c", 1);
   char path[32], name[32];
@@ -60,7 +68,7 @@ static void *record(void *arg) {
     if (trace_writer_close(NULL) == 0) job->failed = 1;
   }
   }
-  pthread_barrier_wait(&start_line);
+  check_thread_status(ffi_start_barrier_wait(&start_line), "start barrier wait");
   if (job->failed) {
     if (w != NULL) trace_writer_free(w);
     return NULL;
@@ -76,15 +84,17 @@ static void *record(void *arg) {
 
 int main(void) {
   codetracer_trace_writer_init();
-  pthread_barrier_init(&start_line, NULL, THREADS);
+  check_thread_status(ffi_start_barrier_init(&start_line, THREADS), "start barrier init");
   pthread_t t[THREADS];
   job_t jobs[THREADS];
   memset(jobs, 0, sizeof jobs);
   for (int i = 0; i < THREADS; i++) {
     jobs[i].idx = i;
-    pthread_create(&t[i], NULL, record, &jobs[i]);
+    check_thread_status(pthread_create(&t[i], NULL, record, &jobs[i]), "pthread_create");
   }
-  for (int i = 0; i < THREADS; i++) pthread_join(t[i], NULL);
+  for (int i = 0; i < THREADS; i++)
+    check_thread_status(pthread_join(t[i], NULL), "pthread_join");
+  check_thread_status(ffi_start_barrier_destroy(&start_line), "start barrier destroy");
   for (int i = 0; i < THREADS; i++) {
     if (jobs[i].failed || jobs[i].len == 0) {
       fprintf(stderr, "FAIL: thread %d did not produce a container\n", i);

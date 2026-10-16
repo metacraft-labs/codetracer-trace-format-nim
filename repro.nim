@@ -290,6 +290,7 @@ package codetracer_trace_format_nim:
     else:
       "gcc >=12"
     when defined(windows):
+      "zstd >=1.5.6 <1.5.7"
       "vccexe"
       "cl"
       "link"
@@ -316,12 +317,18 @@ package codetracer_trace_format_nim:
     # -p:src -o:ct-print src/codetracer_ct_print.nim``). The output is the
     # repo-root ``ct-print`` so downstream recorder tests find it at the
     # fixed sibling path ``../codetracer-trace-format-nim/ct-print``.
-    let zstdIncludeDir = (when defined(windows): "" else: getEnv("CT_ZSTD_INCLUDE_DIR"))
+    let zstdIncludeDir = getEnv("CT_ZSTD_INCLUDE_DIR")
+    let zstdLibraryFile = (when defined(windows): getEnv("CT_ZSTD_LIBRARY_FILE") else: "")
     let zstdLibDir = (when defined(windows): "" else: getEnv("CT_ZSTD_LIB_DIR"))
-    when not defined(windows):
+    when defined(windows):
+      doAssert zstdIncludeDir.isAbsolute and dirExists(zstdIncludeDir) and
+        fileExists(zstdIncludeDir / "zstd.h") and
+        zstdLibraryFile.isAbsolute and fileExists(zstdLibraryFile),
+        "owning Windows builds require the declared Zstd header tree and library file"
+    else:
       doAssert zstdIncludeDir.isAbsolute and zstdLibDir.isAbsolute,
         "owning typed builds require declared Zstd include/library paths"
-    let zstdInputs = (when defined(windows): newSeq[string]()
+    let zstdInputs = (when defined(windows): @[zstdIncludeDir, zstdLibraryFile]
                      else: @[zstdIncludeDir / "zstd.h", zstdLibDir])
     var nimDependencyDirs: seq[string] = @[]
     for key in ["CT_NIM_STEW_SRC", "CT_NIM_RESULTS_SRC", "CT_NIM_UNITTEST2_SRC"]:
@@ -330,12 +337,12 @@ package codetracer_trace_format_nim:
         "owning builds require complete declared Nim source dependency: " & key
       nimDependencyDirs.add(dependencyDir)
     let ctPrintBuild = buildCtPrint(".", nativeIncludeDir = zstdIncludeDir,
-      nativeLibDir = zstdLibDir, nimDependencyDirs = nimDependencyDirs)
+      nativeLibDir = zstdLibDir, nimDependencyDirs = nimDependencyDirs, nativeLibraryFile = zstdLibraryFile)
 
     discard collect("default", @[ctPrintBuild])
 
     # Opt-in owning producer; no shipping/default or test corpus expansion.
-    discard collect("sharedLib", @[buildSharedLib(".", nativeIncludeDir = zstdIncludeDir, nativeLibDir = zstdLibDir, nimDependencyDirs = nimDependencyDirs)])
+    discard collect("sharedLib", @[buildSharedLib(".", nativeIncludeDir = zstdIncludeDir, nativeLibDir = zstdLibDir, nimDependencyDirs = nimDependencyDirs, nativeLibraryFile = zstdLibraryFile)])
 
     # ---- Test corpus (the `test` / `test-builds` collections) --------
     #
@@ -357,9 +364,10 @@ package codetracer_trace_format_nim:
         "owning typed builds require the declared PCRE library path"
       doAssert fileExists(zstdPkgConfigDir / "libzstd.pc"),
         "owning typed tests require the declared Zstd pkg-config input"
-    let executeEnvironment = (when defined(windows): newSeq[(string, string)]()
+    let executeEnvironment = (when defined(windows): @[( "CT_ZSTD_INCLUDE_DIR", zstdIncludeDir),
+        ("CT_ZSTD_LIBRARY_FILE", zstdLibraryFile)]
                               else: @[("PKG_CONFIG_PATH", zstdPkgConfigDir)])
-    let executeInputs = (when defined(windows): newSeq[string]()
+    let executeInputs = (when defined(windows): zstdInputs
                         else: @[zstdPkgConfigDir / "libzstd.pc"])
 
     # Shared producer data is provisioned at the explicit published revision in
@@ -381,7 +389,10 @@ package codetracer_trace_format_nim:
       # a bare ``-lpcre`` relies on the C toolchain's default search path.
       var extraPassC: seq[string] = @[]
       var extraPassL: seq[string] = @[]
-      when not defined(windows):
+      when defined(windows):
+        extraPassC.add("-I" & quoteShell(zstdIncludeDir))
+        extraPassL.add(quoteShell(zstdLibraryFile))
+      else:
         extraPassC.add("-I" & zstdIncludeDir)
         extraPassL.add("-L" & zstdLibDir)
         extraPassL.add("-Wl,-rpath," & zstdLibDir)
@@ -399,6 +410,9 @@ package codetracer_trace_format_nim:
       # Per-file defines the nimble task also passes (see ``defines`` doc).
       for d in spec.defines:
         buildDefines.add(d)
+      when defined(windows):
+        buildDefines.add("ctZstdIncludeDir=" & zstdIncludeDir)
+        buildDefines.add("ctZstdLibraryFile=" & zstdLibraryFile)
 
       let edge = buildNimUnittest.build(
         source = spec.source,
@@ -412,12 +426,15 @@ package codetracer_trace_format_nim:
         actionId = "codetracer-trace-format-nim.test_build." & stem)
       when defined(macosx):
         appendRegisteredActionToolIdentityRefs(edge.action.id, ["clang"])
-      elif not defined(windows):
+      else:
         appendRegisteredActionToolIdentityRefs(edge.action.id, ["gcc"])
       testBuildActions.add(edge.action)
 
       let testExecuteInputs = executeInputs &
         (if stem == "test_trace_storage_config": @[traceStorageFixtures]
+         else: newSeq[string]()) &
+        (if stem in ["test_ct_print_agreement", "test_ct_print_events_log_fallback"]:
+          @["src", "nim.cfg", "tests/ct_print_binary.nim"] & nimDependencyDirs
          else: newSeq[string]())
       let executeEdge =
         if spec.pooled:
@@ -433,7 +450,10 @@ package codetracer_trace_format_nim:
             extraEnv = executeEnvironment,
             extraInputs = testExecuteInputs,
             registerImplicitName = false)
-      when not defined(windows):
+      when defined(windows):
+        if stem in ["test_ct_print_agreement", "test_ct_print_events_log_fallback"]:
+          appendRegisteredActionToolIdentityRefs(executeEdge.id, ["nim", "gcc", "zstd"])
+      else:
         appendRegisteredActionToolIdentityRefs(executeEdge.id, ["pkg-config", "nim"])
         when defined(macosx):
           appendRegisteredActionToolIdentityRefs(executeEdge.id, ["clang"])

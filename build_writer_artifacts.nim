@@ -24,7 +24,8 @@ proc ctPrintPath*(projectRoot: string): string =
 proc buildSharedLib*(projectRoot: string;
                      compilerSdkRefs: seq[string] = @[];
                      nativeIncludeDir = ""; nativeLibDir = "";
-                     nimDependencyDirs: seq[string] = @[]): BuildActionDef =
+                     nimDependencyDirs: seq[string] = @[];
+                     nativeLibraryFile = ""): BuildActionDef =
   doAssert projectRoot.len > 0 and not projectRoot.isAbsolute
   const target = (when defined(windows): "msvc" else: "posix")
   let output = sharedLibraryPath(projectRoot)
@@ -35,7 +36,16 @@ proc buildSharedLib*(projectRoot: string;
     dependencyFlags.add("--path:" & dependencyDir)
   var nativeFlags: seq[string] = @[]
   var nativeInputs: seq[string] = @[]
-  when not defined(windows):
+  when defined(windows):
+    if nativeIncludeDir.len > 0 or nativeLibraryFile.len > 0:
+      doAssert nativeIncludeDir.isAbsolute and
+        fileExists(nativeIncludeDir / "zstd.h") and
+        nativeLibraryFile.isAbsolute and fileExists(nativeLibraryFile),
+        "declared Windows Zstd requires its actual header and library file"
+      nativeFlags = @["-d:ctZstdIncludeDir=" & nativeIncludeDir,
+        "-d:ctZstdLibraryFile=" & nativeLibraryFile]
+      nativeInputs = @[nativeIncludeDir, nativeLibraryFile]
+  else:
     if nativeIncludeDir.len > 0 or nativeLibDir.len > 0:
       doAssert nativeIncludeDir.isAbsolute and nativeLibDir.isAbsolute
       nativeFlags = @["--passC:-I" & nativeIncludeDir,
@@ -72,7 +82,8 @@ proc buildSharedLib*(projectRoot: string;
 proc buildCtPrint*(projectRoot: string;
                    compilerSdkRefs: seq[string] = @[];
                      nativeIncludeDir = ""; nativeLibDir = "";
-                     nimDependencyDirs: seq[string] = @[]): BuildActionDef =
+                     nimDependencyDirs: seq[string] = @[];
+                     nativeLibraryFile = ""): BuildActionDef =
   doAssert projectRoot.len > 0 and not projectRoot.isAbsolute
   let output = ctPrintPath(projectRoot)
   var dependencyFlags: seq[string] = @[]
@@ -82,7 +93,16 @@ proc buildCtPrint*(projectRoot: string;
     dependencyFlags.add("--path:" & dependencyDir)
   var nativeFlags: seq[string] = @[]
   var nativeInputs: seq[string] = @[]
-  when not defined(windows):
+  when defined(windows):
+    if nativeIncludeDir.len > 0 or nativeLibraryFile.len > 0:
+      doAssert nativeIncludeDir.isAbsolute and
+        fileExists(nativeIncludeDir / "zstd.h") and
+        nativeLibraryFile.isAbsolute and fileExists(nativeLibraryFile),
+        "declared Windows Zstd requires its actual header and library file"
+      nativeFlags = @["-d:ctZstdIncludeDir=" & nativeIncludeDir,
+        "-d:ctZstdLibraryFile=" & nativeLibraryFile]
+      nativeInputs = @[nativeIncludeDir, nativeLibraryFile]
+  else:
     if nativeIncludeDir.len > 0 or nativeLibDir.len > 0:
       doAssert nativeIncludeDir.isAbsolute and nativeLibDir.isAbsolute
       nativeFlags = @["--passC:-I" & nativeIncludeDir,

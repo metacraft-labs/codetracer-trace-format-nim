@@ -167,6 +167,15 @@ jobs:
           repro-build-pin: "064daf5b154ea6a0758ddb2dcbcbc07685216e44"
           gh-token: ${{ steps.ci_token.outputs.token }}
 
+      - name: Provision the declared Windows Zstd package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $powerShell = (Get-Command pwsh -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+          repro exec ./ci/windows-zstd-prerequisite -- $powerShell -NoProfile -File "$env:GITHUB_WORKSPACE/ci/bind-declared-windows-zstd.ps1"
+          if ($LASTEXITCODE -ne 0) { throw "declared Windows Zstd prerequisite failed: $LASTEXITCODE" }
+
       - name: Report measured Repro source identity
         if: runner.os != 'Windows'
         run: |
