@@ -52,6 +52,84 @@ jobs:
             runner: [self-hosted, windows, arm64]
     runs-on: ${{ matrix.runner }}
     steps:
+      - name: Preserve reused checkout before ordinary initialization
+        if: matrix.os == 'linux'
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          #!/usr/bin/env bash
+          # Proposed Linux-only pre-checkout constructor. No previous checkout code runs.
+          # The workflow must run this inline from RUNNER_TEMP before actions/checkout.
+          set -Eeuo pipefail
+          fail() { echo "fresh checkout constructor refused: $1" >&2; exit 1; }
+          test -z "${GIT_DIR-}${GIT_WORK_TREE-}${GIT_COMMON_DIR-}${GIT_CONFIG_PARAMETERS-}${GIT_CONFIG_COUNT-}" || fail git-selectors
+          workspace=${GITHUB_WORKSPACE:?missing workspace}
+          temporary=${RUNNER_TEMP:?missing runner temporary directory}
+          repository=${GITHUB_REPOSITORY:?missing event repository}
+          case "$repository" in metacraft-labs/codetracer-trace-format-nim) ;; *) fail event-repository ;; esac
+          for root in "$workspace" "$temporary"; do
+            case "$root" in /*) ;; *) fail nonabsolute-root ;; esac
+            test -d "$root" && test ! -L "$root" || fail root-kind
+            test "$(realpath -e -- "$root")" = "$root" || fail root-ancestry
+            test "$(stat -c %u -- "$root")" = "$(id -u)" || fail root-owner
+          done
+          case "$workspace/" in "$temporary/"*) fail nested-workspace ;; esac
+          case "$temporary/" in "$workspace/"*) fail nested-temporary ;; esac
+          test "$workspace" != / && test "$temporary" != / || fail root-directory
+          test "$(stat -c %d -- "$workspace")" = "$(stat -c %d -- "$temporary")" || fail cross-device
+          parent=${workspace%/*}
+          test -d "$parent" && test ! -L "$parent" || fail workspace-parent
+          test "$(stat -c %u -- "$parent")" = "$(id -u)" || fail parent-owner
+          # A first checkout needs no transition. Unknown non-repository content refuses.
+          if test ! -e "$workspace/.git"; then
+            test -z "$(find "$workspace" -mindepth 1 -maxdepth 1 -print -quit)" || fail unknown-workspace
+            exit 0
+          fi
+          test -d "$workspace/.git" && test ! -L "$workspace/.git" || fail git-topology
+          test ! -e "$workspace/.git/commondir" && test ! -e "$workspace/.git/objects/info/alternates" || fail shared-git
+          test -f "$workspace/.git/config" && test ! -L "$workspace/.git/config" || fail git-config-kind
+          origin=$(git -C "$workspace" config --no-includes --local --get remote.origin.url) || fail missing-origin
+          case "$origin" in
+            "https://github.com/$repository"|"https://github.com/$repository.git"|"git@github.com:$repository.git") ;;
+            *) fail foreign-origin ;;
+          esac
+          source_identity() {
+            stat -c '%d:%i:%u:%a' -- "$workspace" "$workspace/.git" || return 1
+            sha256sum -- "$workspace/.git/config" "$workspace/.git/index" || return 1
+            git -C "$workspace" rev-parse --verify HEAD || return 1
+            git -C "$workspace" ls-files --stage || return 1
+            git -C "$workspace" ls-files -z | while IFS= read -r -d '' member; do
+              if test -L "$workspace/$member"; then
+                printf '%s\0' "$member" || return 1
+                readlink -z -- "$workspace/$member" | sha256sum || return 1
+              elif test -f "$workspace/$member"; then
+                sha256sum -- "$workspace/$member" || return 1
+              else
+                return 1
+              fi
+            done
+          }
+          test -z "$(git -C "$workspace" ls-files --stage | sed -n '/^160000 /p')" || fail unsupported-gitlink
+          source_before=$(source_identity | sha256sum)
+          test "$(git -C "$workspace" rev-parse --show-toplevel)" = "$workspace" || fail worktree-root
+          old_identity=$(stat -c '%d:%i:%u:%a' -- "$workspace")
+          mode=$(stat -c %a -- "$workspace")
+          quarantine=$(mktemp -d "$temporary/trace-preserved-checkout.XXXXXXXX")
+          test "$(stat -c %a -- "$quarantine")" = 700 && test "$(stat -c %u -- "$quarantine")" = "$(id -u)" || fail quarantine-mode-owner
+          test ! -e "$quarantine/workspace" && test ! -L "$quarantine/workspace" || fail occupied-destination
+          # Exact source/index/config and root identity must still match at the mutation boundary.
+          test "$(source_identity | sha256sum)" = "$source_before" || fail source-identity-changed
+          # Exact same-filesystem rename preserves previous source, config, hooks and outputs.
+          mv -T -- "$workspace" "$quarantine/workspace"
+          if ! mkdir -m "$mode" -- "$workspace"; then
+            test ! -e "$workspace" && test ! -L "$workspace" || fail rollback-destination-occupied
+            mv -T -- "$quarantine/workspace" "$workspace"
+            fail root-creation-rolled-back
+          fi
+          test "$(stat -c '%d:%i:%u:%a' -- "$quarantine/workspace")" = "$old_identity" || fail preserved-identity
+          # Deliberately no old hooks/config values or authentication metadata in output.
+          printf 'Fresh checkout root created; prior checkout retained at %q\n' "$quarantine/workspace"
+
       - uses: actions/checkout@v4
 
       - name: Capture actual initialized checkout Git templates
