@@ -58,7 +58,19 @@ function Assert-NimPrefixInventory([string]$Prefix, $Members, $Hold) {
             if ($Members.ContainsKey($relative)) {
                 if ([IO.FileInfo]::new($entry).Length -ne $Members[$relative].size) { throw 'nim-prefix/member-size' }
                 $Hold.HoldFile($Prefix,$relative,$Members[$relative].sha256)
-            } elseif (-not $extras.Contains($relative)) { throw 'nim-prefix/undeclared-member' }
+            } elseif (-not $extras.Contains($relative)) {
+                # Refusal-only witness: filenames and metadata, never contents.
+                # The untrusted member remains rejected without reading its bytes.
+                try {
+                    [Console]::Error.WriteLine(([ordered]@{
+                        schemaId='trace_nim.undeclared_prefix_member.v1'
+                        relativePath=$relative; kind='file'; length=[IO.FileInfo]::new($entry).Length
+                    } | ConvertTo-Json -Compress))
+                } catch {
+                    # A vanished member or unavailable log must not mask refusal.
+                }
+                throw 'nim-prefix/undeclared-member'
+            }
         }
     }
     foreach ($member in $Members.Keys) {
