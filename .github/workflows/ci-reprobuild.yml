@@ -167,14 +167,14 @@ jobs:
           repro-build-pin: "064daf5b154ea6a0758ddb2dcbcbc07685216e44"
           gh-token: ${{ steps.ci_token.outputs.token }}
 
-      - name: Provision the declared Windows Nim compiler payload
+      - name: Provision the declared Windows lease authority and Nim compiler payload
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $powerShell = (Get-Command pwsh -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
-          repro develop ./ci/windows-nim-prerequisite --tool-provisioning=tarball -- $powerShell -NoProfile -File "$env:GITHUB_WORKSPACE/ci/bind-declared-windows-nim.ps1"
-          if ($LASTEXITCODE -ne 0) { throw "declared Windows Nim prerequisite failed: $LASTEXITCODE" }
+          $root = Join-Path $env:RUNNER_TEMP ('trace-windows-quota-bootstrap-' + [Guid]::NewGuid().ToString('N'))
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "TRACE_NIM_QUOTA_BOOTSTRAP_ROOT=$root"
+          ./ci/windows-quota-bootstrap/invoke-windows-quota-and-nim.ps1 -OutputRoot $root
 
       - name: Provision the declared Windows Zstd package
         if: runner.os == 'Windows'
@@ -308,3 +308,17 @@ jobs:
             ${{ runner.temp }}/trace-checkout-template-reconciliation.json
           if-no-files-found: warn
           retention-days: 7
+
+      - name: Retain declared Windows quota bootstrap evidence
+        if: always() && runner.os == 'Windows' && env.TRACE_NIM_QUOTA_BOOTSTRAP_ROOT != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: trace-windows-quota-bootstrap-${{ matrix.arch }}
+          path: |
+            ${{ env.TRACE_NIM_QUOTA_BOOTSTRAP_ROOT }}/*.json
+            ${{ env.TRACE_NIM_QUOTA_BOOTSTRAP_ROOT }}/*.stdout
+            ${{ env.TRACE_NIM_QUOTA_BOOTSTRAP_ROOT }}/*.stderr
+            ${{ env.TRACE_NIM_QUOTA_BOOTSTRAP_ROOT }}/build/*.stdout
+            ${{ env.TRACE_NIM_QUOTA_BOOTSTRAP_ROOT }}/build/*.stderr
+            ${{ env.TRACE_NIM_QUOTA_BOOTSTRAP_ROOT }}/inputs/*members.json
+          if-no-files-found: error
