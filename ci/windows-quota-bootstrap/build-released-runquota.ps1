@@ -89,7 +89,7 @@ try {
     # This PATH selects the declared C backend; a source-bound native observer
     # must additionally authenticate the compiler process/headers actually read.
     $env:PATH = (Split-Path -Parent $DeclaredGccImage) + [IO.Path]::PathSeparator + $beforePath
-    $actualGcc = (Get-Command gcc -CommandType Application).Source
+    $actualGcc = (Get-Command gcc -CommandType Application | Select-Object -First 1).Source
     if (-not [StringComparer]::OrdinalIgnoreCase.Equals($actualGcc, $DeclaredGccImage)) { throw 'quota-tool/first-gcc' }
     $env:SHM_LEASE_SRC = Join-Path $LeaseSourceRoot 'src'
     Push-Location $source

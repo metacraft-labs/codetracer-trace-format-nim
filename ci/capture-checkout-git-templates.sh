@@ -50,6 +50,13 @@ common=$(realpath "$(git rev-parse --path-format=absolute --git-common-dir)")
 test "$common" = "$(realpath "$own_root/.git")"
 refuse_hooks_path() {
   if git config --get core.hooksPath >/dev/null; then
+    local selector_source
+    if selector_source=$(git config --show-origin --show-scope --get-all core.hooksPath); then
+      # Only this path selector is exposed, shell-escaped on one diagnostic line.
+      printf 'checkout-hook-selector-source=%q\n' "$selector_source" >&2
+    else
+      echo 'checkout-hook-selector-source unavailable' >&2
+    fi
     echo 'configured hooksPath refused by ordinary checkout capture' >&2
     return 1
   else
