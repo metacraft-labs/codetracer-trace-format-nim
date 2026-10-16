@@ -127,7 +127,7 @@ public sealed class NimPayloadBinding : IDisposable {
     static string Digest(FileStream stream) {
         stream.Position = 0;
         using (var sha = SHA256.Create()) {
-            string result = BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", "");
+            string result = BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", "").ToLowerInvariant();
             stream.Position = 0; return result;
         }
     }
