@@ -47,6 +47,19 @@ try {
   $dump = @(& $nim dump --dump.format:json $probe)
   if ($LASTEXITCODE -ne 0) { throw 'actual selected Nim control metadata query failed' }
   $metadata = ($dump -join "`n") | ConvertFrom-Json
+  $nimPrefixRoles = @(
+    Get-ChildItem Env:REPRO_PREFIX_NIM* | Sort-Object Name | ForEach-Object {
+      [ordered]@{name=$_.Name;value=$_.Value}
+    }
+  )
+  [ordered]@{
+    role='actual Nim payload binding arguments'
+    selectedAlias=$metadata.prefixdir
+    declaredPhysicalPayload=$env:REPRO_PREFIX_NIM
+    selectedNimImage=$nim
+    metadataLibrary=$metadata.libpath
+    exportedNimPrefixRoles=$nimPrefixRoles
+  } | ConvertTo-Json -Depth 5 -Compress | Write-Output
   $actual = [NimPayloadBinding]::Bind($metadata.prefixdir,$env:REPRO_PREFIX_NIM,$nim,$metadata.libpath)
   try {
     $actual.Verify()

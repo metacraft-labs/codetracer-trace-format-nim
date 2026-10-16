@@ -89,7 +89,10 @@ proc recordStep*(b: var StepMapBuilder, pathId: uint64, line: uint64,
   ## the recorder registered, which are also the coordinates a breakpoint
   ## request arrives as.  `line` is narrowed to the u32 wire width of the
   ## `STMP` line field.
-  var byLine = addr b.byPath.mgetOrPut(pathId, initTable[uint32, seq[int64]]())
+  var byLine = addr b.byPath.mgetOrPut(pathId)
+  if byLine[].len == 0:
+    # Most newly recorded paths start with one line; grow for further lines.
+    byLine[] = initTable[uint32, seq[int64]](1)
   let line = if line == 0: 1'u32 else: uint32(line)
   var ids = addr byLine[].mgetOrPut(line, newSeq[int64]())
   ids[].add(int64(stepId))

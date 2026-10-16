@@ -49,6 +49,19 @@ if (!$NimInclude.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -or
 # using read-only native handles, held until all original probes finish.
 if (!$IsWindows) { throw 'Windows Nim payload binding requires Windows' }
 Add-Type -Path (Join-Path $PSScriptRoot 'NimPayloadBinding.cs')
+$nimPrefixRoles = @(
+  Get-ChildItem Env:REPRO_PREFIX_NIM* | Sort-Object Name | ForEach-Object {
+    [ordered]@{name=$_.Name;value=$_.Value}
+  }
+)
+[ordered]@{
+  role='actual Nim payload binding arguments'
+  selectedAlias=$nimPrefix
+  declaredPhysicalPayload=$env:REPRO_PREFIX_NIM
+  selectedNimImage=$nim
+  metadataLibrary=$NimInclude
+  exportedNimPrefixRoles=$nimPrefixRoles
+} | ConvertTo-Json -Depth 5 -Compress | Write-Output
 $payload = [NimPayloadBinding]::Bind($nimPrefix, $env:REPRO_PREFIX_NIM, $nim, $NimInclude)
 try {
 if ($payload.ImageSha256 -ne $nimImageBefore) { throw 'selected Nim image changed before binding' }
