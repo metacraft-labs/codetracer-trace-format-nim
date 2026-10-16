@@ -222,6 +222,9 @@ const testSpecs: seq[TestSpec] = @[
   # forms alike (version 5, version-6 full, compact, each of the last two
   # under whole-file zstd); the profile writer chooses on raw member bytes.
   TestSpec(source: "tests/test_version_6_containers_read.nim", binary: "build/test-bin/test_version_6_containers_read"),
+  # CCP-8: §1b's closed set and the set the library round-trips, equal in
+  # both directions, with the spec side parsed out of the spec file.
+  TestSpec(source: "tests/test_every_enumerated_scheme_is_implemented_or_not_enumerated.nim", binary: "build/test-bin/test_every_enumerated_scheme_is_implemented_or_not_enumerated"),
   TestSpec(source: "tests/test_profile_threshold_choice.nim", binary: "build/test-bin/test_profile_threshold_choice"),
   TestSpec(source: "tests/test_step_encoding_rule.nim", binary: "build/test-bin/test_step_encoding_rule"),
   TestSpec(source: "tests/test_step_map_v2.nim", binary: "build/test-bin/test_step_map_v2"),

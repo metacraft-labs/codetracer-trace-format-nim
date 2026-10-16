@@ -328,3 +328,39 @@ proc compressImage*(image: openArray[byte], level = 3):
   stored.setLen(V6HeaderSize + int(n))
   ok(stored)
 
+proc storeImage*(image: openArray[byte], scheme: CtfsWholeFileCompression,
+    level = 3): Result[seq[byte], string] =
+  ## The stored object of `image` under `scheme`: the writer-side mirror of
+  ## `reconstructImage`, and the one place a scheme's encoder is selected.
+  ##
+  ## **Why this exists rather than callers choosing a codec.** §1b says a
+  ## member of the closed set "is a promise that every reader of the format
+  ## implements the scheme". A set whose members are enumerated in one place
+  ## (`CtfsWholeFileCompression`) and whose encoders are selected ad hoc at
+  ## each call site cannot be checked against that promise: there is no
+  ## expression for "the set this library can actually store and recover". The
+  ## `case` below is that expression, and it is EXHAUSTIVE over the enum, so a
+  ## member added to the closed set without an encoder does not compile.
+  ## `test_every_enumerated_scheme_is_implemented_or_not_enumerated` reads the
+  ## set out of this function by probing it, and compares it with the set
+  ## `ctfs-container.md` §1b enumerates, in both directions.
+  ##
+  ## The header is stamped with `scheme` before the body is encoded, because
+  ## §1a's field covers the image from offset 24 onward and the 24-byte header
+  ## is the plaintext that declares it. `level` is the zstd level and is
+  ## ignored by a scheme that has no level.
+  if image.len < V6HeaderSize or image[5] != CtfsVersionV6:
+    return err("a whole-file scheme is declared in a version-6 header, and " &
+      "this image has none")
+  case scheme
+  of wfcNone:
+    # §1a: nothing covers the body, so the stored object IS the image. The
+    # header is still stamped, so a caller that handed in an image declaring
+    # another scheme gets bytes whose declaration matches them.
+    var stored = @image
+    stored[V6CompressionOffset] = uint8(ord(wfcNone))
+    ok(stored)
+  of wfcZstd:
+    var declared = @image
+    declared[V6CompressionOffset] = uint8(ord(wfcZstd))
+    compressImage(declared, level)

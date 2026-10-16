@@ -282,6 +282,11 @@ task test, "Run all tests":
   # carrying frames does not (the control), and the version-6 header's values
   # are refused by name.
   exec "nim c -r -d:release -p:src tests/test_version_6_containers_read.nim"
+  # CCP-8: the closed set of whole-file schemes in `ctfs-container.md` §1b and
+  # the set this library can store and recover must be the SAME set, asserted
+  # in both directions. The spec side is PARSED out of the spec rather than
+  # mirrored here, so neither side can move alone.
+  exec "nim c -r -d:release -p:src tests/test_every_enumerated_scheme_is_implemented_or_not_enumerated.nim"
   # The column-aware step encoding end to end: the writer's opt-in, the
   # DeltaColumn round-trip, Layout A paths.dat, the position decoder, and the
   # meta.dat unknown-flag-bit rejection that keeps the extension clean.
