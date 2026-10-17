@@ -29,6 +29,10 @@ session can name.  It serves the routes as codetracer-ci documents them
 --fail-upload-urls N answers the first N slice-upload-url calls
 503 upload_session_busy (a transient refusal the sender retries).
 
+--slow-local-writes SECONDS answers the first local-storage write that long
+after it arrives (the object is written either way): a request the sender
+is still waiting on, for the tests that interrupt that wait with a signal.
+
 --finalize-script scripts the first finalize calls, one comma-separated step
 per call, consumed in order; once it is used up, every finalize checks the
 store as above.  Steps: `slow:<seconds>` checks the store and answers after
@@ -281,7 +285,15 @@ def make_handler(store: Store):
             target = Path(store.args.local_root) / key
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
-            self.answer(204)
+            with store.lock:
+                delay = store.args.slow_local_writes
+                store.args.slow_local_writes = 0.0
+            if delay > 0:
+                time.sleep(delay)
+            try:
+                self.answer(204)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # the sender gave up waiting on this one
 
     return Handler
 
@@ -300,6 +312,7 @@ def main() -> int:
     parser.add_argument("--bad-signature", action="store_true")
     parser.add_argument("--finalize-script", default="")
     parser.add_argument("--fail-upload-urls", type=int, default=0)
+    parser.add_argument("--slow-local-writes", type=float, default=0.0)
     args = parser.parse_args()
     store = Store(args)
     if args.method == "presigned-url":

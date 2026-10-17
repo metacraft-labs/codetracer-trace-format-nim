@@ -1,4 +1,6 @@
 import std/[httpclient, json, net, os, strutils, times, uri]
+when defined(posix):
+  from std/posix import EINTR
 import ./managed_sender
 import ./trace_storage_config
 
@@ -67,11 +69,48 @@ proc newCodetracerCiSenderBackend*(config: CodetracerCiSenderConfig): Codetracer
 proc baseUrl(config: CodetracerCiSenderConfig): string =
   config.baseUrl.strip(leading = false, trailing = true, chars = {'/'})
 
-proc authedClient(config: CodetracerCiSenderConfig, timeoutMs = RequestTimeoutMs): HttpClient =
-  result = newHttpClient(timeout = timeoutMs)
-  result.headers = newHttpHeaders({
-    "Authorization": "Bearer " & config.bearerToken,
-  })
+const InterruptedRequestRepeats* = 3
+  ## How many times `sendRequest` repeats one request that a signal
+  ## interrupted, beyond its first try.
+
+proc interruptedBySignal(e: ref OSError): bool =
+  ## Whether a request failed because a signal interrupted the system call it
+  ## was waiting in (EINTR), not because of anything the server did.
+  when defined(posix):
+    e.errorCode == EINTR
+  else:
+    false
+
+proc sendRequest(url: string, httpMethod: HttpMethod, body: string,
+    headers: HttpHeaders, timeoutMs = RequestTimeoutMs): Response =
+  ## One request on a fresh connection, closed before this returns (a
+  ## synchronous `HttpClient` has read the whole body by then).
+  ##
+  ## A request whose wait a signal interrupted is repeated, up to
+  ## `InterruptedRequestRepeats` times. std `httpclient` waits for every
+  ## answer with a timeout, in `poll`/`select` (std/net `waitFor`), and those
+  ## calls fail with EINTR when a handled signal arrives, even when the
+  ## handler was installed with `SA_RESTART` (signal(7), "Interruption of
+  ## system calls and library functions by signal handlers":
+  ## https://man7.org/linux/man-pages/man7/signal.7.html). The recorder
+  ## handles SIGTERM and SIGINT as a graceful stop, so its own stop request
+  ## interrupted the upload it was waiting on. That is not an answer from
+  ## the server, and every request this sender makes may be repeated: an
+  ## object is written to the same key with the same bytes, a presigned URL
+  ## is issued again, and codetracer-ci's finalize is safe to repeat
+  ## (`ManagedRetryPolicy`). An upload session asked for twice leaves the
+  ## first one unused, as a retried session request already could.
+  var repeats = 0
+  while true:
+    let client = newHttpClient(timeout = timeoutMs)
+    try:
+      return client.request(url, httpMethod = httpMethod, body = body, headers = headers)
+    except OSError as e:
+      if not e.interruptedBySignal() or repeats >= InterruptedRequestRepeats:
+        raise
+      inc repeats
+    finally:
+      client.close()
 
 proc ensureSession(backend: CodetracerCiSenderBackend): bool =
   if backend.sessionId.len > 0:
@@ -88,10 +127,9 @@ proc ensureSession(backend: CodetracerCiSenderBackend): bool =
       "instanceId": backend.config.instanceId,
     }
   }
-  let client = authedClient(backend.config)
   try:
-    let response = client.request(url, httpMethod = HttpPost, body = $body,
-      headers = newHttpHeaders({
+    let response = sendRequest(url, HttpPost, $body,
+      newHttpHeaders({
         "Authorization": "Bearer " & backend.config.bearerToken,
         "Content-Type": "application/json",
       }))
@@ -110,8 +148,6 @@ proc ensureSession(backend: CodetracerCiSenderBackend): bool =
     backend.sessionId.len > 0 and backend.s3KeyPrefix.len > 0
   except CatchableError:
     false
-  finally:
-    client.close()
 
 proc sessionObjectKey(backend: CodetracerCiSenderBackend, item: ManagedUploadObject): string =
   if item.objectKey.startsWith(backend.s3KeyPrefix):
@@ -157,10 +193,9 @@ proc putLocalStorage(backend: CodetracerCiSenderBackend, objectKey, data,
   ## (http-api.md §4.4.1), which writes them into its store.
   let url = baseUrl(backend.config) & "/api/v1/observability/storage-policy/tenants/" &
     backend.config.tenantId & "/local-storage/objects/" & encodeUrl(objectKey)
-  let client = authedClient(backend.config)
   try:
-    let response = client.request(url, httpMethod = HttpPut, body = data,
-      headers = newHttpHeaders({
+    let response = sendRequest(url, HttpPut, data,
+      newHttpHeaders({
         "Authorization": "Bearer " & backend.config.bearerToken,
         "Content-Type": contentType,
         "Content-Length": $data.len,
@@ -171,8 +206,6 @@ proc putLocalStorage(backend: CodetracerCiSenderBackend, objectKey, data,
       message: "codetracer-ci upload failed: HTTP " & $response.code.int))
   except CatchableError as e:
     (false, ManagedUploadReceipt(), ManagedSenderError(retryable: true, message: e.msg))
-  finally:
-    client.close()
 
 proc putPresigned(backend: CodetracerCiSenderBackend, item: ManagedUploadObject,
     objectKey, data, contentType: string): tuple[ok: bool, receipt: ManagedUploadReceipt, err: ManagedSenderError] =
@@ -190,10 +223,9 @@ proc putPresigned(backend: CodetracerCiSenderBackend, item: ManagedUploadObject,
     "contentLength": data.len,
   }
   var uploadUrl, issuedKey: string
-  let client = authedClient(backend.config)
   try:
-    let response = client.request(url, httpMethod = HttpPost, body = $body,
-      headers = newHttpHeaders({
+    let response = sendRequest(url, HttpPost, $body,
+      newHttpHeaders({
         "Authorization": "Bearer " & backend.config.bearerToken,
         "Content-Type": "application/json",
       }))
@@ -205,8 +237,6 @@ proc putPresigned(backend: CodetracerCiSenderBackend, item: ManagedUploadObject,
     issuedKey = parsed{"s3Key"}.getStr()
   except CatchableError as e:
     return (false, ManagedUploadReceipt(), ManagedSenderError(retryable: true, message: e.msg))
-  finally:
-    client.close()
   if issuedKey != objectKey:
     return (false, ManagedUploadReceipt(), ManagedSenderError(retryable: false,
       message: "codetracer-ci issued an upload URL for " & issuedKey & ", not " & objectKey))
@@ -216,10 +246,9 @@ proc putPresigned(backend: CodetracerCiSenderBackend, item: ManagedUploadObject,
   # The presigned URL is the whole authorization: the store refuses a second
   # one, so the request carries no Authorization header (and the CI token is
   # not sent to the object store).
-  let store = newHttpClient(timeout = RequestTimeoutMs)
   try:
-    let response = store.request(uploadUrl, httpMethod = HttpPut, body = data,
-      headers = newHttpHeaders({
+    let response = sendRequest(uploadUrl, HttpPut, data,
+      newHttpHeaders({
         "Content-Type": contentType,
         "Content-Length": $data.len,
       }))
@@ -229,8 +258,6 @@ proc putPresigned(backend: CodetracerCiSenderBackend, item: ManagedUploadObject,
       message: "object store refused the presigned upload of " & objectKey & ": HTTP " & $response.code.int))
   except CatchableError as e:
     (false, ManagedUploadReceipt(), ManagedSenderError(retryable: true, message: e.msg))
-  finally:
-    store.close()
 
 proc uploadObject(backend: CodetracerCiSenderBackend, item: ManagedUploadObject,
     contentType: string): tuple[ok: bool, receipt: ManagedUploadReceipt, err: ManagedSenderError] =
@@ -482,13 +509,12 @@ method finalize*(backend: CodetracerCiSenderBackend,
   let body = backend.finalizePayloadJson(request)
   let url = baseUrl(backend.config) & "/api/v1/traces/" & backend.sessionId & "/finalize"
   let timeoutMs = backend.config.finalizeTimeoutMs(request)
-  let client = authedClient(backend.config, timeoutMs)
   try:
-    let response = client.request(url, httpMethod = HttpPost, body = $body,
-      headers = newHttpHeaders({
+    let response = sendRequest(url, HttpPost, $body,
+      newHttpHeaders({
         "Authorization": "Bearer " & backend.config.bearerToken,
         "Content-Type": "application/json",
-      }))
+      }), timeoutMs = timeoutMs)
     if response.code.int >= 200 and response.code.int < 300:
       return (true, ManagedSenderError())
     let code = response.problemCode()
@@ -501,8 +527,6 @@ method finalize*(backend: CodetracerCiSenderBackend,
       message: "codetracer-ci finalize did not answer within " & $timeoutMs & " ms: " & e.msg))
   except CatchableError as e:
     (false, ManagedSenderError(retryable: true, message: e.msg))
-  finally:
-    client.close()
 
 method health*(backend: CodetracerCiSenderBackend): ManagedSenderHealth =
   ManagedSenderHealth(healthy: backend.config.baseUrl.len > 0, message: backend.config.baseUrl)

@@ -19,6 +19,14 @@
 ##   finalize's own timeout outlasts the former fixed 10 s; a transient
 ##   refusal of a slice's upload URL is retried (managed_sender.nim,
 ##   `tryFinalizeManagedUpload`, `tryUploadWithBackend`).
+## - a handled signal that arrives while a request waits for its answer
+##   interrupts that wait (EINTR), and the request is repeated rather than
+##   reported as failed, even with no retry policy: a slice write and a
+##   finalize each complete on one policy attempt (managed_sender_ci.nim,
+##   `sendRequest`). The signal is a handler installed with `signal()`,
+##   which glibc installs with `SA_RESTART`, as codetracer-native-recorder
+##   installs its graceful-stop handler for SIGTERM; it is SIGUSR1 here so
+##   the test process is not stopped by it.
 ##
 ## What runs, and what is a double:
 ## - The object store is a real MinIO (`MINIO_BIN`, else `minio` on PATH;
@@ -44,6 +52,7 @@
 ## A missing MinIO or python3 fails the test; it never passes without them.
 
 import std/[json, os, osproc, httpclient, options, random, streams, strtabs, strutils, times, unittest]
+from std/posix import nil
 import codetracer_ctfs/[managed_sender, managed_sender_ci, trace_storage_config]
 
 const
@@ -130,7 +139,7 @@ waitFor(proc(): bool = answers(minioUrl & "/minio/health/ready"), "MinIO to be r
 var standins: seq[Process]
 
 proc startStandin(name, methodName: string, wrongKey = false, badSignature = false,
-    finalizeScript = "", failUploadUrls = 0): Running =
+    finalizeScript = "", failUploadUrls = 0, slowLocalWrites = 0.0): Running =
   let portFile = work / (name & ".port")
   var args = @[standinScript, "--port-file", portFile,
     "--token", Token, "--method", methodName, "--minio-url", minioUrl,
@@ -144,6 +153,8 @@ proc startStandin(name, methodName: string, wrongKey = false, badSignature = fal
     args.add ["--finalize-script", finalizeScript]
   if failUploadUrls > 0:
     args.add ["--fail-upload-urls", $failUploadUrls]
+  if slowLocalWrites > 0:
+    args.add ["--slow-local-writes", $slowLocalWrites]
   let p = startProcess(python, args = args, options = {poStdErrToStdOut, poParentStreams})
   standins.add p
   waitFor(proc(): bool = fileExists(portFile), "the codetracer-ci stand-in " & name)
@@ -232,6 +243,24 @@ proc finalizeTimes(standin: Running): seq[float] =
 
 proc quickRetries(budgetMs = 30_000): ManagedRetryPolicy =
   ManagedRetryPolicy(maxAttempts: 5, initialDelayMs: 100, maxDelayMs: 400, budgetMs: budgetMs)
+
+var handledSignals: int
+  ## SIGUSR1s this process handled; the handler only counts them.
+
+proc countSignal(sig: cint) {.noconv.} =
+  inc handledSignals
+
+proc signalThisProcessAfter(ms: int): Process =
+  ## A separate process sends this one SIGUSR1 `ms` milliseconds from now: a
+  ## process-directed signal, as `kill` from a stop script is, delivered
+  ## while the test's only thread waits in the request under test.
+  startProcess("/bin/sh", args = ["-c", "sleep " & formatFloat(ms / 1000, ffDecimal, 3) &
+    "; kill -USR1 " & $getCurrentProcessId()])
+
+proc storedSha256(standin: Running, name, key: string): string =
+  ## The SHA-256 of the object the local-storage route wrote.
+  let path = work / ("local-" & name) / key
+  if fileExists(path): sha256Hex(path) else: ""
 
 try:
   suite "codetracer-ci sender routes":
@@ -419,5 +448,43 @@ try:
       check not once.ok
       check once.err.retryable
       check "HTTP 503" in once.err.message
+  suite "codetracer-ci sender under a handled signal":
+    discard posix.signal(posix.SIGUSR1, countSignal)
+
+    test "a slice write whose wait a signal interrupts is repeated, and the object is stored":
+      # The stand-in answers the first write 2 s after it arrives; SIGUSR1
+      # arrives 0.7 s into the upload, while the sender waits for that answer.
+      let standin = startStandin("eintr-write", SliceUploadLocalStorage, slowLocalWrites = 2.0)
+      var state = initManagedSenderState("routes-eintr-write")
+      let item = sliceObject(sliceFile("eintr-write-slice_0000.ct", 5000), 0)
+      handledSignals = 0
+      let killer = signalThisProcessAfter(700)
+      let uploaded = state.tryUploadWithBackend(backendFor(standin), item, noManagedRetry())
+      discard killer.waitForExit()
+      killer.close()
+      # Vacuity guards: the signal was delivered and handled, and the write
+      # it interrupted was the one sent first (a second write follows only
+      # an interrupted one: there is no retry policy here).
+      check handledSignals == 1
+      check standin.requestsTo("/local-storage/objects/").len == 2
+      check uploaded.ok
+      check uploaded.err.message == ""
+      check standin.storedSha256("eintr-write", uploaded.receipt.objectKey) == item.sha256
+
+    test "a finalize whose wait a signal interrupts is repeated, and the repeat finalizes":
+      let standin = startStandin("eintr-finalize", SliceUploadPresignedUrl, finalizeScript = "slow:2")
+      let up = uploadTwoSlices(standin, "eintr-finalize")
+      var state = up.state
+      let request = finalizeRequest(receiptsOf(up))
+      handledSignals = 0
+      let killer = signalThisProcessAfter(700)
+      let finalized = state.tryFinalizeManagedUpload(up.backend, request, noManagedRetry())
+      discard killer.waitForExit()
+      killer.close()
+      check handledSignals == 1
+      check standin.finalizeTimes().len == 2
+      check finalized.ok
+      check finalized.err.message == ""
+      check state.finalized
 finally:
   stopAll()
