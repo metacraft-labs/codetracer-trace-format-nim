@@ -27,6 +27,15 @@
 ##   which glibc installs with `SA_RESTART`, as codetracer-native-recorder
 ##   installs its graceful-stop handler for SIGTERM; it is SIGUSR1 here so
 ##   the test process is not stopped by it.
+## - a request whose connection is refused (ECONNREFUSED: a socket error
+##   that is not EINTR) is not repeated: one connection attempt, then the
+##   failure (`sendRequest` repeats only an interrupted wait). The attempts
+##   are counted by `connect` below, which this test defines: it counts the
+##   calls that name the refused port and passes every call to the C
+##   library's `connect` unchanged. Justification: a refused connection
+##   reaches no listener that could count it, and the other socket errors a
+##   peer can cause (a reset) reach the sender as a closed connection, not
+##   as an OSError (std/net `isDisconnectionError`).
 ##
 ## What runs, and what is a double:
 ## - The object store is a real MinIO (`MINIO_BIN`, else `minio` on PATH;
@@ -51,7 +60,7 @@
 ##
 ## A missing MinIO or python3 fails the test; it never passes without them.
 
-import std/[json, os, osproc, httpclient, options, random, streams, strtabs, strutils, times, unittest]
+import std/[json, net, os, osproc, httpclient, options, random, streams, strtabs, strutils, times, unittest]
 from std/posix import nil
 import codetracer_ctfs/[managed_sender, managed_sender_ci, trace_storage_config]
 
@@ -243,6 +252,28 @@ proc finalizeTimes(standin: Running): seq[float] =
 
 proc quickRetries(budgetMs = 30_000): ManagedRetryPolicy =
   ManagedRetryPolicy(maxAttempts: 5, initialDelayMs: 100, maxDelayMs: 400, budgetMs: budgetMs)
+
+# The connection counter for "a refused connection is not repeated": this
+# program's `connect`, which its own calls (std/net's among them) bind to
+# ahead of the C library's. It counts the calls whose IPv4 destination port is
+# `countedPort` and returns what the C library's `connect` returns.
+{.emit: """
+#include <dlfcn.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+int ctTestCountedPort = 0;
+int ctTestCountedConnects = 0;
+int connect(int fd, const struct sockaddr *address, socklen_t length) {
+  static int (*real)(int, const struct sockaddr *, socklen_t) = 0;
+  if (real == 0) real = (int (*)(int, const struct sockaddr *, socklen_t))dlsym(RTLD_NEXT, "connect");
+  if (address != 0 && address->sa_family == AF_INET && ctTestCountedPort != 0 &&
+      ntohs(((const struct sockaddr_in *)address)->sin_port) == ctTestCountedPort)
+    ctTestCountedConnects++;
+  return real(fd, address, length);
+}
+""".}
+var countedPort {.importc: "ctTestCountedPort", nodecl.}: cint
+var countedConnects {.importc: "ctTestCountedConnects", nodecl.}: cint
 
 var handledSignals: int
   ## SIGUSR1s this process handled; the handler only counts them.
@@ -486,5 +517,26 @@ try:
       check finalized.ok
       check finalized.err.message == ""
       check state.finalized
+
+  suite "codetracer-ci sender under a socket error":
+    test "a refused connection is not repeated":
+      # A port nothing listens on: bound, then closed.
+      let probe = newSocket()
+      probe.bindAddr(Port(0), "127.0.0.1")
+      let refusedPort = probe.getLocalAddr()[1].int
+      probe.close()
+      var state = initManagedSenderState("routes-refused")
+      let item = sliceObject(sliceFile("refused-slice_0000.ct", 5000), 0)
+      let backend = newCodetracerCiSenderBackend(CodetracerCiSenderConfig(
+        baseUrl: "http://127.0.0.1:" & $refusedPort, tenantId: "tenant-routes",
+        bearerToken: Token, platform: "native", serviceName: "inventory", instanceId: "ct-mcr"))
+      countedPort = cint(refusedPort)
+      countedConnects = 0
+      let uploaded = state.tryUploadWithBackend(backend, item, noManagedRetry())
+      countedPort = 0
+      check not uploaded.ok
+      check "failed to create codetracer-ci upload session" in uploaded.err.message
+      # One attempt; the counter is not vacuous: it saw that attempt.
+      check countedConnects == 1
 finally:
   stopAll()
