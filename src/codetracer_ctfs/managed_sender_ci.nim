@@ -1,4 +1,4 @@
-import std/[httpclient, json, os, strutils, times, uri]
+import std/[httpclient, json, net, os, strutils, times, uri]
 import ./managed_sender
 import ./trace_storage_config
 
@@ -10,6 +10,9 @@ type
     platform*: string
     serviceName*: string
     instanceId*: string
+    finalizeTimeoutMs*: int
+      ## How long the finalize may take to answer, in milliseconds; 0 (the
+      ## default) derives it from the upload's size (`finalizeTimeoutMs`).
 
   CodetracerCiSenderBackend* = ref object of ManagedSenderBackend
     config*: CodetracerCiSenderConfig
@@ -19,6 +22,23 @@ type
     storageServerId: string
     storageEndpointUri: string
     sliceUploadMethod: string
+
+const
+  ## The timeout of every request but the finalize: each answers after a
+  ## bounded amount of work on codetracer-ci's side.
+  RequestTimeoutMs* = 10_000
+  ## The finalize's timeout when it is derived from the upload's size:
+  ## codetracer-ci reads every stored slice back from the object store and
+  ## hashes it before it answers (http-api.md, "POST
+  ## /api/v1/traces/{sessionId}/finalize"), so its latency grows with the
+  ## recording. A base for the request itself, plus one second per
+  ## `FinalizeReadBytesPerSecond` bytes uploaded, a floor for a slow or
+  ## nearly full store (on 2026-10-17 a finalize of one recording outlasted
+  ## the former fixed 10 s on runners whose volume was 97 to 98 percent
+  ## full), capped so a stalled server is still given up on.
+  FinalizeBaseTimeoutMs* = 30_000
+  FinalizeReadBytesPerSecond* = 4 * 1024 * 1024
+  FinalizeMaxTimeoutMs* = 600_000
 
 const
   ## The upload session's `sliceUploadMethod` (codetracer-ci
@@ -47,8 +67,8 @@ proc newCodetracerCiSenderBackend*(config: CodetracerCiSenderConfig): Codetracer
 proc baseUrl(config: CodetracerCiSenderConfig): string =
   config.baseUrl.strip(leading = false, trailing = true, chars = {'/'})
 
-proc authedClient(config: CodetracerCiSenderConfig): HttpClient =
-  result = newHttpClient(timeout = 10_000)
+proc authedClient(config: CodetracerCiSenderConfig, timeoutMs = RequestTimeoutMs): HttpClient =
+  result = newHttpClient(timeout = timeoutMs)
   result.headers = newHttpHeaders({
     "Authorization": "Bearer " & config.bearerToken,
   })
@@ -103,6 +123,25 @@ proc sessionObjectKey(backend: CodetracerCiSenderBackend, item: ManagedUploadObj
 
 proc retryableStatus(code: HttpCode): bool =
   code.int >= 500 or code in {Http408, Http429}
+
+proc retryAfterMs(response: Response): int =
+  ## `Retry-After` in its delay-seconds form (RFC 9110 §10.2.3,
+  ## https://www.rfc-editor.org/rfc/rfc9110#section-10.2.3), in milliseconds;
+  ## 0 when absent or given as a date (the retry policy's own pause applies).
+  let raw = response.headers.getOrDefault("retry-after").strip()
+  if raw.len == 0 or raw.len > 6:
+    return 0
+  for c in raw:
+    if c notin Digits:
+      return 0
+  parseInt(raw) * 1000
+
+proc problemCode(response: Response): string =
+  ## The `code` of a codetracer-ci problem answer (`ApiProblems`), or "".
+  try:
+    parseJson(response.body){"code"}.getStr()
+  except CatchableError:
+    ""
 
 proc receiptFor(backend: CodetracerCiSenderBackend, objectKey: string): ManagedUploadReceipt =
   ManagedUploadReceipt(
@@ -177,7 +216,7 @@ proc putPresigned(backend: CodetracerCiSenderBackend, item: ManagedUploadObject,
   # The presigned URL is the whole authorization: the store refuses a second
   # one, so the request carries no Authorization header (and the CI token is
   # not sent to the object store).
-  let store = newHttpClient(timeout = 10_000)
+  let store = newHttpClient(timeout = RequestTimeoutMs)
   try:
     let response = store.request(uploadUrl, httpMethod = HttpPut, body = data,
       headers = newHttpHeaders({
@@ -403,6 +442,36 @@ proc canFinalizeComplete(request: ManagedFinalizeRequest): bool =
           return false
   true
 
+proc uploadedBytes(request: ManagedFinalizeRequest): uint64 =
+  ## The bytes the finalize will read back: every slice, or every shard
+  ## replica of a sharded recording.
+  for segment in request.manifest.source.segments:
+    result += segment.file.sizeBytes
+  for segment in request.manifest.source.shardedSegments:
+    for shard in segment.shards:
+      for replica in shard.replicas:
+        result += replica.sizeBytes
+
+proc finalizeTimeoutMs*(config: CodetracerCiSenderConfig, request: ManagedFinalizeRequest): int =
+  ## The finalize's timeout: `config.finalizeTimeoutMs` when set, else
+  ## `FinalizeBaseTimeoutMs` plus one second per `FinalizeReadBytesPerSecond`
+  ## uploaded bytes, at most `FinalizeMaxTimeoutMs`.
+  if config.finalizeTimeoutMs > 0:
+    return config.finalizeTimeoutMs
+  let readMs = request.uploadedBytes() div uint64(FinalizeReadBytesPerSecond) * 1000
+  int(min(uint64(FinalizeBaseTimeoutMs) + readMs, uint64(FinalizeMaxTimeoutMs)))
+
+proc finalizeErrorRetryable(response: Response): bool =
+  ## Which finalize refusals a retry can get past (http-api.md, "POST
+  ## /api/v1/traces/{sessionId}/finalize"): `409 upload_finalizing` (a later
+  ## finalize took this one's claim over; repeating it commits or answers
+  ## 204), `503 upload_session_busy` and every other 5xx, 408 and 429. Every
+  ## other 409 (`slice_content_mismatch`, `recording_id_conflict`) and every
+  ## 4xx is the same on a retry.
+  if response.code == Http409:
+    return response.problemCode() == "upload_finalizing"
+  response.code.retryableStatus
+
 method finalize*(backend: CodetracerCiSenderBackend,
     request: ManagedFinalizeRequest): tuple[ok: bool, err: ManagedSenderError] =
   if not request.canFinalizeComplete():
@@ -412,7 +481,8 @@ method finalize*(backend: CodetracerCiSenderBackend,
     return (false, ManagedSenderError(retryable: true, message: "failed to create codetracer-ci upload session"))
   let body = backend.finalizePayloadJson(request)
   let url = baseUrl(backend.config) & "/api/v1/traces/" & backend.sessionId & "/finalize"
-  let client = authedClient(backend.config)
+  let timeoutMs = backend.config.finalizeTimeoutMs(request)
+  let client = authedClient(backend.config, timeoutMs)
   try:
     let response = client.request(url, httpMethod = HttpPost, body = $body,
       headers = newHttpHeaders({
@@ -421,9 +491,14 @@ method finalize*(backend: CodetracerCiSenderBackend,
       }))
     if response.code.int >= 200 and response.code.int < 300:
       return (true, ManagedSenderError())
-    let retryable = response.code.int >= 500 or response.code in {Http408, Http429}
-    (false, ManagedSenderError(retryable: retryable,
-      message: "codetracer-ci finalize failed: HTTP " & $response.code.int))
+    let code = response.problemCode()
+    (false, ManagedSenderError(retryable: response.finalizeErrorRetryable(),
+      retryAfterMs: response.retryAfterMs(),
+      message: "codetracer-ci finalize failed: HTTP " & $response.code.int &
+        (if code.len > 0: " " & code else: "")))
+  except TimeoutError as e:
+    (false, ManagedSenderError(retryable: true,
+      message: "codetracer-ci finalize did not answer within " & $timeoutMs & " ms: " & e.msg))
   except CatchableError as e:
     (false, ManagedSenderError(retryable: true, message: e.msg))
   finally:

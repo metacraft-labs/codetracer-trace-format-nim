@@ -12,6 +12,13 @@
 ##   method (a codetracer-ci from before the field): the local-storage `PUT`.
 ## - an unknown method, and an issued key that is not the one the sender
 ##   derived: refused, not retried.
+## - a finalize that does not answer within its timeout, `409
+##   upload_finalizing` and `503 upload_session_busy` (with `Retry-After`)
+##   are retried by the sender's retry policy, within its budget, and the
+##   retry finalizes; `409 slice_content_mismatch` is not retried; the
+##   finalize's own timeout outlasts the former fixed 10 s; a transient
+##   refusal of a slice's upload URL is retried (managed_sender.nim,
+##   `tryFinalizeManagedUpload`, `tryUploadWithBackend`).
 ##
 ## What runs, and what is a double:
 ## - The object store is a real MinIO (`MINIO_BIN`, else `minio` on PATH;
@@ -25,7 +32,11 @@
 ##   Version 4 against the MinIO, answers the local-storage route 403 on that
 ##   store as codetracer-ci does, and finalizes only when every slice it
 ##   reads back from the store has the length and SHA-256 the manifest
-##   declares. The real codetracer-ci on a real MinIO, with a real recording
+##   declares. For the retry tests it can also answer the first finalize
+##   calls slowly or with the refusals http-api.md defines for them
+##   (`--finalize-script`), and refuse the first slice-upload-url calls
+##   (`--fail-upload-urls`): the real Monolith produces those answers only
+##   under load or contention a test cannot schedule. The real codetracer-ci on a real MinIO, with a real recording
 ##   through this sender, is codetracer-observability-e2e's
 ##   `e2e_homeostate_recording_uploads_and_dive_in_resolves`; codetracer-ci's
 ##   own `ManagedUploadCiTokenTests` check the method each store names.
@@ -118,7 +129,8 @@ waitFor(proc(): bool = answers(minioUrl & "/minio/health/ready"), "MinIO to be r
 
 var standins: seq[Process]
 
-proc startStandin(name, methodName: string, wrongKey = false, badSignature = false): Running =
+proc startStandin(name, methodName: string, wrongKey = false, badSignature = false,
+    finalizeScript = "", failUploadUrls = 0): Running =
   let portFile = work / (name & ".port")
   var args = @[standinScript, "--port-file", portFile,
     "--token", Token, "--method", methodName, "--minio-url", minioUrl,
@@ -128,6 +140,10 @@ proc startStandin(name, methodName: string, wrongKey = false, badSignature = fal
     args.add "--wrong-key"
   if badSignature:
     args.add "--bad-signature"
+  if finalizeScript.len > 0:
+    args.add ["--finalize-script", finalizeScript]
+  if failUploadUrls > 0:
+    args.add ["--fail-upload-urls", $failUploadUrls]
   let p = startProcess(python, args = args, options = {poStdErrToStdOut, poParentStreams})
   standins.add p
   waitFor(proc(): bool = fileExists(portFile), "the codetracer-ci stand-in " & name)
@@ -155,10 +171,11 @@ proc sliceObject(path: string, index: int): ManagedUploadObject =
     contentLength: uint64(getFileSize(path)), sha256: sha256Hex(path),
     kind: mukMcrSlice, sliceIndex: index)
 
-proc backendFor(standin: Running): CodetracerCiSenderBackend =
+proc backendFor(standin: Running, finalizeTimeoutMs = 0): CodetracerCiSenderBackend =
   newCodetracerCiSenderBackend(CodetracerCiSenderConfig(
     baseUrl: "http://127.0.0.1:" & $standin.port, tenantId: "tenant-routes",
-    bearerToken: Token, platform: "native", serviceName: "inventory", instanceId: "ct-mcr"))
+    bearerToken: Token, platform: "native", serviceName: "inventory", instanceId: "ct-mcr",
+    finalizeTimeoutMs: finalizeTimeoutMs))
 
 proc getJson(standin: Running, path: string): JsonNode =
   let client = newHttpClient(timeout = 10_000)
@@ -191,16 +208,30 @@ proc finalizeRequest(receipts: seq[(ManagedUploadObject, ManagedUploadReceipt)])
         upload: usUploaded, dataState: dsRetained))
   ManagedFinalizeRequest(totalSlices: receipts.len, totalEvents: 20, manifest: manifest, idempotencyKey: "routes")
 
-proc uploadTwoSlices(standin: Running, tag: string):
+proc uploadTwoSlices(standin: Running, tag: string, finalizeTimeoutMs = 0):
     tuple[state: ManagedSenderState, backend: CodetracerCiSenderBackend,
           items: seq[ManagedUploadObject], results: seq[tuple[ok: bool, receipt: ManagedUploadReceipt, err: ManagedSenderError]]] =
-  result.backend = backendFor(standin)
+  result.backend = backendFor(standin, finalizeTimeoutMs)
   result.state = initManagedSenderState("routes-" & tag)
   # Sizes on both sides of MinIO's inline-data threshold (128 KiB).
   for i, size in [4093, 300_001]:
     let item = sliceObject(sliceFile(tag & "-slice_000" & $i & ".ct", size), i)
     result.items.add item
     result.results.add result.state.uploadWithBackend(result.backend, item)
+
+proc receiptsOf(up: tuple[state: ManagedSenderState, backend: CodetracerCiSenderBackend,
+    items: seq[ManagedUploadObject], results: seq[tuple[ok: bool, receipt: ManagedUploadReceipt, err: ManagedSenderError]]]):
+    seq[(ManagedUploadObject, ManagedUploadReceipt)] =
+  for i, r in up.results:
+    doAssert r.ok, "upload " & $i & " failed: " & r.err.message
+    result.add (up.items[i], r.receipt)
+
+proc finalizeTimes(standin: Running): seq[float] =
+  for r in standin.requestsTo("/finalize"):
+    result.add r["time"].getFloat()
+
+proc quickRetries(budgetMs = 30_000): ManagedRetryPolicy =
+  ManagedRetryPolicy(maxAttempts: 5, initialDelayMs: 100, maxDelayMs: 400, budgetMs: budgetMs)
 
 try:
   suite "codetracer-ci sender routes":
@@ -288,5 +319,105 @@ try:
         check not r.err.retryable
         check "other-" in r.err.message
       check standin.requestsTo("/slice-upload-url").len == 2
+
+  suite "codetracer-ci sender retries":
+    test "a finalize slower than its timeout fails on one attempt (negative control)":
+      # The `slow:3` step really outlasts a 1 s finalize timeout: without
+      # retrying, the finalize fails, retryably, naming the timeout.
+      let standin = startStandin("slow-once", SliceUploadPresignedUrl, finalizeScript = "slow:3")
+      let up = uploadTwoSlices(standin, "slow-once", finalizeTimeoutMs = 1000)
+      var state = up.state
+      let finalized = state.tryFinalizeManagedUpload(up.backend, finalizeRequest(receiptsOf(up)), noManagedRetry())
+      check not finalized.ok
+      check finalized.err.retryable
+      check "did not answer within 1000 ms" in finalized.err.message
+      check standin.finalizeTimes().len == 1
+
+    test "a finalize slower than its timeout is retried, and the retry finalizes":
+      let standin = startStandin("slow-retry", SliceUploadPresignedUrl, finalizeScript = "slow:3")
+      let up = uploadTwoSlices(standin, "slow-retry", finalizeTimeoutMs = 1000)
+      var state = up.state
+      let finalized = state.tryFinalizeManagedUpload(up.backend, finalizeRequest(receiptsOf(up)), quickRetries())
+      check finalized.ok
+      check finalized.err.message == ""
+      check standin.finalizeTimes().len == 2
+      check state.finalized
+      # The retry's check read every slice back with the uploaded bytes.
+      let objects = standin.getJson("/_test/objects")
+      for i, r in up.results:
+        check objects[r.receipt.objectKey]["sha256"].getStr() == up.items[i].sha256
+
+    test "503 upload_session_busy and 409 upload_finalizing are retried, Retry-After honored":
+      let standin = startStandin("busy", SliceUploadPresignedUrl, finalizeScript = "busy:2,finalizing")
+      let up = uploadTwoSlices(standin, "busy")
+      var state = up.state
+      let finalized = state.tryFinalizeManagedUpload(up.backend, finalizeRequest(receiptsOf(up)), quickRetries())
+      check finalized.ok
+      let times = standin.finalizeTimes()
+      check times.len == 3
+      if times.len == 3:
+        # The server's Retry-After (2 s) outweighs the policy's 100 ms; the
+        # next pause is the policy's own (200 ms).
+        check times[1] - times[0] >= 1.9
+        check times[2] - times[1] < 1.5
+
+    test "409 slice_content_mismatch is not retried":
+      let standin = startStandin("mismatch", SliceUploadPresignedUrl, finalizeScript = "mismatch")
+      let up = uploadTwoSlices(standin, "mismatch")
+      var state = up.state
+      let finalized = state.tryFinalizeManagedUpload(up.backend, finalizeRequest(receiptsOf(up)), quickRetries())
+      check not finalized.ok
+      check not finalized.err.retryable
+      check "409 slice_content_mismatch" in finalized.err.message
+      check standin.finalizeTimes().len == 1
+      check not state.finalized
+
+    test "the retries end within the budget":
+      # Every finalize outlasts the 1 s timeout; with a 2.5 s budget no
+      # attempt starts after 2.5 s, so the call returns within the budget
+      # plus one attempt's timeout (and scheduling slack).
+      let standin = startStandin("budget", SliceUploadPresignedUrl,
+        finalizeScript = "slow:3,slow:3,slow:3,slow:3,slow:3,slow:3")
+      let up = uploadTwoSlices(standin, "budget", finalizeTimeoutMs = 1000)
+      var state = up.state
+      let started = epochTime()
+      let finalized = state.tryFinalizeManagedUpload(up.backend, finalizeRequest(receiptsOf(up)),
+        ManagedRetryPolicy(maxAttempts: 10, initialDelayMs: 200, maxDelayMs: 200, budgetMs: 2500))
+      let elapsed = epochTime() - started
+      check not finalized.ok
+      check finalized.err.retryable
+      let attempts = standin.finalizeTimes().len
+      check attempts >= 2 and attempts < 10
+      check ("after " & $attempts & " attempts: ") in finalized.err.message
+      check elapsed < 2.5 + 1.0 + 1.0
+      check standin.finalizeTimes()[^1] - standin.finalizeTimes()[0] <= 2.5
+
+    test "the finalize's derived timeout outlasts the former fixed 10 s":
+      # No configured timeout and no retry: a finalize that answers after
+      # 11 s still finalizes on its one attempt.
+      let standin = startStandin("derived", SliceUploadPresignedUrl, finalizeScript = "slow:11")
+      let up = uploadTwoSlices(standin, "derived")
+      var state = up.state
+      let request = finalizeRequest(receiptsOf(up))
+      check up.backend.config.finalizeTimeoutMs(request) >= FinalizeBaseTimeoutMs
+      let finalized = state.tryFinalizeManagedUpload(up.backend, request, noManagedRetry())
+      check finalized.ok
+      check standin.finalizeTimes().len == 1
+
+    test "a transient refusal of a slice's upload URL is retried":
+      let standin = startStandin("urlbusy", SliceUploadPresignedUrl, failUploadUrls = 2)
+      var state = initManagedSenderState("routes-urlbusy")
+      let backend = backendFor(standin)
+      let item = sliceObject(sliceFile("urlbusy-slice_0000.ct", 5000), 0)
+      let uploaded = state.tryUploadWithBackend(backend, item, quickRetries())
+      check uploaded.ok
+      check standin.requestsTo("/slice-upload-url").len == 3
+      # Without retrying, the refusal is what the caller sees.
+      let standin2 = startStandin("urlbusy-once", SliceUploadPresignedUrl, failUploadUrls = 1)
+      var state2 = initManagedSenderState("routes-urlbusy-once")
+      let once = state2.tryUploadWithBackend(backendFor(standin2), item, noManagedRetry())
+      check not once.ok
+      check once.err.retryable
+      check "HTTP 503" in once.err.message
 finally:
   stopAll()

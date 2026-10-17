@@ -23,8 +23,21 @@ session can name.  It serves the routes as codetracer-ci documents them
   POST /api/v1/traces/{s}/finalize
        reads every slice the manifest names back from the store (MinIO
        through a presigned GET) and answers 204 only when each object's
-       length and SHA-256 are the manifest's, 409 otherwise, as codetracer-ci's
-       finalize checks them.
+       length and SHA-256 are the manifest's, 409 slice_content_mismatch
+       otherwise, as codetracer-ci's finalize checks them.
+
+--fail-upload-urls N answers the first N slice-upload-url calls
+503 upload_session_busy (a transient refusal the sender retries).
+
+--finalize-script scripts the first finalize calls, one comma-separated step
+per call, consumed in order; once it is used up, every finalize checks the
+store as above.  Steps: `slow:<seconds>` checks the store and answers after
+that long (a finalize slower than the sender's timeout: the sender has
+disconnected by then, and codetracer-ci then cancels the check, so this one
+answers nothing it would act on); `busy:<seconds>` answers
+503 upload_session_busy with `Retry-After: <seconds>`; `finalizing` answers
+409 upload_finalizing; `mismatch` answers 409 slice_content_mismatch without
+checking (http-api.md, "POST /api/v1/traces/{sessionId}/finalize").
 
 GET /_test/requests answers the requests seen (method, path, whether an
 Authorization header came), GET /_test/objects what the finalize read back.
@@ -45,6 +58,7 @@ import json
 import os
 import sys
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -92,6 +106,8 @@ class Store:
         self.requests: list[dict] = []
         self.sessions: dict[str, dict] = {}
         self.read_back: dict[str, dict] = {}
+        self.finalize_script: list[str] = [
+            step for step in (args.finalize_script or "").split(",") if step]
 
     def s3_url(self, method: str, key: str) -> str:
         a = self.args
@@ -121,8 +137,15 @@ def make_handler(store: Store):
             self.end_headers()
             self.wfile.write(raw)
 
-        def problem(self, status: int, code: str) -> None:
-            self.answer(status, {"status": status, "code": code})
+        def problem(self, status: int, code: str, headers: dict[str, str] | None = None) -> None:
+            raw = json.dumps({"status": status, "code": code}).encode()
+            self.send_response(status)
+            self.send_header("content-type", "application/problem+json")
+            self.send_header("content-length", str(len(raw)))
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
+            self.end_headers()
+            self.wfile.write(raw)
 
         def body(self) -> bytes:
             return self.rfile.read(int(self.headers.get("content-length") or 0))
@@ -133,6 +156,7 @@ def make_handler(store: Store):
                     "method": self.command,
                     "path": urlparse(self.path).path,
                     "authorization": "authorization" in {k.lower() for k in self.headers.keys()},
+                    "time": time.monotonic(),
                 })
 
         def authorized(self) -> bool:
@@ -173,6 +197,13 @@ def make_handler(store: Store):
                 self.answer(200, answer)
             # api/v1/traces/{s}/slice-upload-url
             elif parts[:3] == ["api", "v1", "traces"] and parts[4:] == ["slice-upload-url"]:
+                with store.lock:
+                    refuse = store.args.fail_upload_urls > 0
+                    if refuse:
+                        store.args.fail_upload_urls -= 1
+                if refuse:
+                    self.problem(503, "upload_session_busy")
+                    return
                 session = store.sessions.get(parts[3])
                 request = json.loads(data or b"{}")
                 name = str(request.get("fileName", ""))
@@ -196,6 +227,20 @@ def make_handler(store: Store):
                 if session is None:
                     self.problem(404, "session_not_found")
                     return
+                with store.lock:
+                    step = store.finalize_script.pop(0) if store.finalize_script else ""
+                kind, _, arg = step.partition(":")
+                if kind == "busy":
+                    self.problem(503, "upload_session_busy", {"retry-after": arg})
+                    return
+                if kind == "finalizing":
+                    self.problem(409, "upload_finalizing")
+                    return
+                if kind == "mismatch":
+                    self.problem(409, "slice_content_mismatch")
+                    return
+                if kind == "slow":
+                    time.sleep(float(arg))
                 manifest = json.loads(data)["recordingManifest"]
                 ok = bool(manifest.get("mcrSlices"))
                 for entry in manifest.get("mcrSlices", []):
@@ -209,10 +254,13 @@ def make_handler(store: Store):
                             or seen["length"] != entry.get("contentLength")
                             or f"sha256:{seen['sha256']}" != entry.get("contentHash")):
                         ok = False
-                if ok:
-                    self.answer(204)
-                else:
-                    self.problem(409, "finalize_failed")
+                try:
+                    if ok:
+                        self.answer(204)
+                    else:
+                        self.problem(409, "slice_content_mismatch")
+                except (BrokenPipeError, ConnectionResetError):
+                    pass  # the sender gave up on this one (a `slow` step)
             else:
                 self.problem(404, "not_found")
 
@@ -250,6 +298,8 @@ def main() -> int:
     parser.add_argument("--local-root", default="")
     parser.add_argument("--wrong-key", action="store_true")
     parser.add_argument("--bad-signature", action="store_true")
+    parser.add_argument("--finalize-script", default="")
+    parser.add_argument("--fail-upload-urls", type=int, default=0)
     args = parser.parse_args()
     store = Store(args)
     if args.method == "presigned-url":
