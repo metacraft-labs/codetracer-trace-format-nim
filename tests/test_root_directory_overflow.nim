@@ -37,7 +37,10 @@
 ##     reads every member back, and is byte-for-byte the unsharded container
 ##     except header byte 7;
 ##   * the negative control: an entry moved to the removed offset `16 + R` is
-##     not found by the canonical reader.
+##     not found by the canonical reader;
+##   * the entries start at the end of the header the image declares (§1a: 24
+##     bytes at version 6), for `root_blocks`, an entry's offset and a grown
+##     root alike.
 ##
 ## No mocks: real containers, in memory and on a real filesystem, read back
 ## with `readInternalFile` / `hasInternalFile`.
@@ -355,6 +358,49 @@ proc test_old_offset_is_not_read() =
     "hasInternalFile sees an entry at the removed offset " & $(16 + R)
   echo "PASS: test_old_offset_is_not_read"
 
+proc test_header_size_follows_the_version() =
+  ## §1 and §1a: the entry array starts at the end of the header, which is 16
+  ## bytes through version 5 and 24 at version 6, so `root_blocks` and an
+  ## entry's offset are computed from the header the image declares, not from
+  ## a constant.
+  doAssert containerHeaderSize(createCtfs().data) == 16
+  var v6 = newSeq[byte](4096)
+  v6[5] = CtfsVersionV6
+  doAssert containerHeaderSize(v6) == 24
+  doAssert containerHeaderSize(newSeq[byte](5)) == 16,
+    "an image too short for byte 5 reads as the 16-byte layout"
+  # 4096-byte blocks: version 5 fits 170 entries in block 0 (16 + 4080),
+  # version 6 fits 169 (24 + 4056 = 4080; 24 + 4080 = 4104 > 4096).
+  doAssert rootBlockCount(4096, 170, 0, 16) == 1
+  doAssert rootBlockCount(4096, 169, 0, V6HeaderSize) == 1
+  doAssert rootBlockCount(4096, 170, 0, V6HeaderSize) == 2,
+    "version 6: the 170th entry is in block 1"
+  doAssert rootBlockCount(4096, 340, 0, V6HeaderSize) == 2,
+    "version 6: 24 + 340*24 = 8184 <= 8192"
+  doAssert rootBlockCount(4096, 341, 0, V6HeaderSize) == 3,
+    "version 6: 24 + 341*24 = 8208 > 8192"
+  # The default is the version-5 header `createCtfs` writes.
+  doAssert rootBlockCount(4096, 170, 0) == rootBlockCount(4096, 170, 0, 16)
+  # A `Ctfs` sizes its root and finds its entries by its own header.
+  var c = createCtfs(maxRootEntries = 170)
+  doAssert c.fileEntryOffset(0) == 16 and c.fileEntryOffset(3) == 16 + 72
+  doAssert c.rootBlockCount() == 1
+  c.data[5] = CtfsVersionV6
+  doAssert c.fileEntryOffset(0) == 24 and c.fileEntryOffset(3) == 24 + 72,
+    "a version-6 image's entry 0 is at 24, got " & $c.fileEntryOffset(0)
+  doAssert c.rootBlockCount() == 2,
+    "170 entries after a 24-byte header overflow block 0"
+  # Growing the root is the inverse of `rootBlockCount` for the same header:
+  # 2 blocks double to 4, which hold (16384 - 24) div 24 = 681 entries after
+  # a 24-byte header. Sizing the grown array by the 16-byte header would
+  # declare 682, whose root is 5 blocks, past the 4 the growth claimed.
+  doAssert c.growRootDirectory().isOk
+  doAssert c.maxRootEntries == 681'u32,
+    "the grown version-6 root declares " & $c.maxRootEntries & " entries"
+  doAssert c.rootBlockCount() == 4,
+    "the grown root is " & $c.rootBlockCount() & " blocks, not the 4 it claimed"
+  echo "PASS: test_header_size_follows_the_version"
+
 when isMainModule:
   test_root_blocks_arithmetic()
   test_small_container_unchanged()
@@ -363,3 +409,4 @@ when isMainModule:
   test_sharded_small_container()
   test_sharded_layout_is_the_unsharded_layout()
   test_old_offset_is_not_read()
+  test_header_size_follows_the_version()

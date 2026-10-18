@@ -227,9 +227,7 @@ proc collectFullProfileMembers*(full: openArray[byte]):
   if profile != cpFull:
     return err("container declares profile " & $profile &
       ": collectFullProfileMembers reads the full body")
-  let headerSize =
-    if full.len >= 6 and full[5] == CtfsVersionV6: V6HeaderSize
-    else: HeaderSize + ExtHeaderSize
+  let headerSize = containerHeaderSize(full)
   if full.len < headerSize:
     return err("container is " & $full.len & " bytes, short of its " &
       $headerSize & "-byte header")

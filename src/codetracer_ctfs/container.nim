@@ -105,8 +105,10 @@ proc growRootDirectory*(c: var Ctfs): Result[void, string] =
   # The grown entry array fills its `newRoot` blocks after the header, the
   # inverse of `rootBlockCount`: no bytes are reserved between the header and
   # the entries for any shard count (`ctfs-container.md` §1, "The free list
-  # root area is removed (2026-10-08)").
-  let newMax = (newRoot * bs - uint64(HeaderSize + ExtHeaderSize)) div
+  # root area is removed (2026-10-08)").  The header is the one the image
+  # declares (`containerHeaderSize`), the size `rootBlockCount` and
+  # `fileEntryOffset` use, so the grown root is exactly `newRoot` blocks.
+  let newMax = (newRoot * bs - uint64(containerHeaderSize(c.data))) div
     uint64(FileEntrySize)
   if newMax > uint64(high(uint32)):
     return err("the root directory cannot grow past " & $high(uint32) & " entries")
@@ -671,9 +673,7 @@ proc findFileEntryKey*(data: openArray[byte], encoded: uint64,
   ## it from the header pass it through as stored, so a `0` is the auto-filled
   ## root of `ctfs-container.md` §1 ("Auto-fill"): the slots that fill the
   ## rest of block 0 after this image's own header, never none.
-  let base =
-    if data.len > 5 and data[5] == CtfsVersionV6: V6HeaderSize
-    else: HeaderSize + ExtHeaderSize
+  let base = containerHeaderSize(data)
   let slots =
     if maxEntries != 0'u32 or data.len < base: maxEntries
     else: rootEntryCount(readU32LE(data, 8), 0'u32, base)

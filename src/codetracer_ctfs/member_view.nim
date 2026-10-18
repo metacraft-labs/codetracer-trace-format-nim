@@ -169,7 +169,7 @@ proc rootEnd(d: openArray[byte], maxEntries: uint32): int =
   ## array after the header, as many entries as the header or the reader
   ## allows, whichever is more, and no further than the image. A declared `0`
   ## is the auto-filled root (`ctfs-container.md` §1, "Auto-fill").
-  let base = if d[5] == CtfsVersionV6: V6HeaderSize else: HeaderSize + ExtHeaderSize
+  let base = containerHeaderSize(d)
   let declared = headerRootEntryCount(d)
   int(min(uint64(base) + uint64(max(declared, maxEntries)) *
     uint64(FileEntrySize), uint64(d.len)))
@@ -182,7 +182,7 @@ proc rootMembers*(d: openArray[byte], maxEntries: uint32):
     seq[tuple[name, size: uint64]] =
   ## The root directory of the container image `d`: each populated entry's
   ## base40 name and `Size`, in slot order.
-  let base = if d[5] == CtfsVersionV6: V6HeaderSize else: HeaderSize + ExtHeaderSize
+  let base = containerHeaderSize(d)
   var at = base
   while at + FileEntrySize <= rootEnd(d, maxEntries):
     var size, name = 0'u64

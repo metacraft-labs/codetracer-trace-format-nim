@@ -164,25 +164,35 @@ proc usableEntries*(c: Ctfs): uint64 =
   ## Usable entries per mapping block (last entry reserved for chain pointer).
   c.entriesPerBlock() - 1
 
+proc containerHeaderSize*(data: openArray[byte]): int =
+  ## The byte length of a full-profile container's header, which is where its
+  ## entry array starts (`ctfs-container.md` §1, "Block 0 Layout"): 24 when
+  ## byte 5 declares version 6 (§1a), 16 for versions 2 through 5.  An image
+  ## too short to carry byte 5 reads as the 16-byte layout; every reader
+  ## refuses such an image before it resolves an entry.
+  if data.len > 5 and data[5] == CtfsVersionV6: V6HeaderSize
+  else: HeaderSize + ExtHeaderSize
+
 proc fileEntryOffset*(c: Ctfs, index: int): int =
   ## Byte offset of a file entry from the start of the container.  The entry
-  ## array starts in block 0 and, when it is larger than block 0, continues
-  ## into the blocks after it (`rootBlockCount`), so this is a plain byte
-  ## offset and may lie past the end of block 0.
-  ##
-  ## The version-5 layout (16-byte header), the only one a `Ctfs` holds:
-  ## `createCtfs` writes `CtfsVersion` and `openClosedCtfs` refuses any
-  ## other version.  A version-6 full container (24-byte header) is read
-  ## through the header-size-aware doors (`rootEntryCount`, `V6HeaderSize`),
-  ## never through this proc.
-  HeaderSize + ExtHeaderSize + index * FileEntrySize
+  ## array starts right after the header (`containerHeaderSize`; there is no
+  ## free list root area between them, `ctfs-container.md` §1) and, when it is
+  ## larger than block 0, continues into the blocks after it
+  ## (`rootBlockCount`), so this is a plain byte offset and may lie past the
+  ## end of block 0.
+  containerHeaderSize(c.data) + index * FileEntrySize
 
 proc rootBlockCount*(blockSize: uint32, maxRootEntries: uint32,
-                     maxShards: uint8): uint64 =
+                     maxShards: uint8,
+                     headerSize: int = HeaderSize + ExtHeaderSize): uint64 =
   ## `ctfs-container.md` §1: the number of contiguous blocks, starting at
   ## block 0, that hold the header and the file-entry array.
   ##
-  ##     root_blocks = ceil((16 + max_root_entries * 24) / block_size)
+  ##     root_blocks = ceil((header_size + max_root_entries * 24) / block_size)
+  ##
+  ## `headerSize` is 16 through version 5 and 24 at version 6
+  ## (`containerHeaderSize`); the default is the version-5 header that
+  ## `createCtfs` writes.
   ##
   ## Data block allocation begins at block `root_blocks`.  It is 1 whenever
   ## the entries fit block 0 (every container written before the overflow was
@@ -195,15 +205,15 @@ proc rootBlockCount*(blockSize: uint32, maxRootEntries: uint32,
   ## 0 for every shard count (no writer ever wrote it, and nothing keeps state
   ## there), so the entries start right after the header, at `fileEntryOffset`.
   ## The parameter stays so every caller states the container it sizes.
-  ## Like `fileEntryOffset`, this is the version-5 (16-byte header) layout.
   if blockSize == 0'u32:
     return 0
-  let rootBytes = uint64(HeaderSize + ExtHeaderSize) +
+  let rootBytes = uint64(headerSize) +
     uint64(maxRootEntries) * uint64(FileEntrySize)
   max(1'u64, (rootBytes + uint64(blockSize) - 1) div uint64(blockSize))
 
 proc rootBlockCount*(c: Ctfs): uint64 =
-  rootBlockCount(c.blockSize, c.maxRootEntries, c.maxShards)
+  rootBlockCount(c.blockSize, c.maxRootEntries, c.maxShards,
+                 containerHeaderSize(c.data))
 
 proc readU64LE*(data: openArray[byte], offset: int): uint64 =
   fromBytesLE(uint64, data.toOpenArray(offset, offset + 7))
@@ -241,8 +251,7 @@ proc headerRootEntryCount*(data: openArray[byte]): uint32 =
   ## an image too short to carry them.
   if data.len < HeaderSize + ExtHeaderSize:
     return 0
-  let headerSize =
-    if data[5] == CtfsVersionV6: V6HeaderSize else: HeaderSize + ExtHeaderSize
+  let headerSize = containerHeaderSize(data)
   rootEntryCount(readU32LE(data, 8), readU32LE(data, 12), headerSize)
 
 proc blockOffset*(c: Ctfs, blockNum: uint64): int =
