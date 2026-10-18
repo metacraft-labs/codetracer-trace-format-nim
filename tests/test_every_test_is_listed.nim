@@ -25,15 +25,18 @@
 ## cannot be run should be deleted, and its reason recorded in the commit that
 ## deletes it.
 ##
-## Falsifiability: add a `tests/test_*.nim` that no runner mentions and this
-## goes red naming it.
+## Falsifiability: add a `tests/test_*.nim` that no runner runs and this goes
+## red naming it. A runner "runs" a file when the file is on an executed
+## (non-comment) line of the nimble `test` task or is the `source:` of a
+## `repro.nim` `TestSpec`; a mention in a comment of either does not count.
 ##
 ## **Both runners, not either.** Being named by *a* runner is not enough:
 ## `repro.nim` models the corpus as its own build graph, so a file the nimble
 ## `test` task runs but no `repro.nim` `TestSpec` models is a test that a
 ## reprobuild `test` run never executes. Forty such files accumulated while
 ## the first check stayed green, because a mention anywhere in `repro.nim`,
-## a comment included, satisfied it (codetracer-pm
+## a comment included, satisfied it (that first check is now structural too;
+## codetracer-pm
 ## `issues/2026-10-18-trace-format-nim-repro-test-edges-miss-40-nimble-tests.md`).
 ## The second check reads both lists structurally: every `tests/test_*.nim` on
 ## an executed line of the nimble `test` task must be the `source:` of a
@@ -46,56 +49,17 @@ const
   repoRoot = currentSourcePath().parentDir.parentDir
   testsDir = repoRoot / "tests"
   # `nimble test` is the task CI runs; `repro.nim` is the reprobuild manifest,
-  # which drives a second set. A file counts as reachable when either names it.
-  runners = ["codetracer_trace_format.nimble", "repro.nim"]
+  # which drives a second set. A file counts as run when either runs it.
+  nimbleRunner = "codetracer_trace_format.nimble"
+  reproRunner = "repro.nim"
 
-proc runnerText(): string =
-  ## Every runner's source, concatenated. A file counts as reachable when any
-  ## of them names it — the two do not overlap and neither is authoritative
-  ## on its own.
-  for runner in runners:
-    let path = repoRoot / runner
-    doAssert fileExists(path),
-      "runner " & runner & " does not exist at " & path &
-      "; this check is looking in the wrong place and would pass vacuously"
-    result.add(readFile(path))
-    result.add("\n")
-
-proc test_every_test_file_is_named_by_a_runner() =
-  let text = runnerText()
-
-  var testFiles: seq[string]
-  for path in walkFiles(testsDir / "test_*.nim"):
-    testFiles.add(path.extractFilename)
-  testFiles.sort()
-
-  # Non-degeneracy: an empty directory listing satisfies the loop below
-  # without looking at anything, and a wrong `testsDir` produces exactly that.
-  doAssert testFiles.len > 50,
-    "expected the tests directory to hold well over 50 `test_*.nim` files; " &
-    "found " & $testFiles.len & " in " & testsDir & ". The check is " &
-    "pointed somewhere wrong and would otherwise pass without examining a " &
-    "single file."
-
-  var unlisted: seq[string]
-  for name in testFiles:
-    if name notin text:
-      unlisted.add(name)
-
-  # Echoed, not carried in the assertion message: see the note in
-  # `test_every_nimble_test_is_a_repro_test_spec`.
-  if unlisted.len > 0:
-    echo "FAIL: these test files are named by no runner, so nothing ever ",
-      "runs them:\n  ", unlisted.join("\n  "),
-      "\nAdd each to the `test` task in codetracer_trace_format.nimble, and ",
-      "a `TestSpec` for it to repro.nim, and expect it to fail the first ",
-      "time — a test that has not run in months is describing code that has ",
-      "moved on. Do not add an exemption here: an unrunnable test should be ",
-      "deleted, with the reason in the commit that deletes it."
-  doAssert unlisted.len == 0,
-    $unlisted.len & " test file(s) named by no runner; the list is printed above"
-
-  echo "PASS: all ", testFiles.len, " test files are named by a runner"
+proc readRunner(runner: string): string =
+  ## One runner's source, read from the repo root.
+  let path = repoRoot / runner
+  doAssert fileExists(path),
+    "runner " & runner & " does not exist at " & path &
+    "; this check is looking in the wrong place and would pass vacuously"
+  readFile(path)
 
 proc nimbleTestTaskFiles(nimble: string): HashSet[string] =
   ## The `tests/test_*.nim` files the nimble `test` task compiles: every such
@@ -145,8 +109,8 @@ proc unmodelled(nimble, repro: string): seq[string] =
   result.sort()
 
 proc test_every_nimble_test_is_a_repro_test_spec() =
-  let nimble = readFile(repoRoot / "codetracer_trace_format.nimble")
-  let repro = readFile(repoRoot / "repro.nim")
+  let nimble = readRunner(nimbleRunner)
+  let repro = readRunner(reproRunner)
 
   # Non-degeneracy: an extractor that matches nothing leaves the task "empty"
   # and the check below passes without looking at anything.
@@ -191,8 +155,8 @@ proc test_the_modelled_check_can_see_a_missing_spec() =
   ## The same predicate, run on a repro.nim with one real `TestSpec` removed,
   ## must report exactly that file, even though the file is still named in a
   ## comment where the `TestSpec` was.
-  let nimble = readFile(repoRoot / "codetracer_trace_format.nimble")
-  let repro = readFile(repoRoot / "repro.nim")
+  let nimble = readRunner(nimbleRunner)
+  let repro = readRunner(reproRunner)
   const victim = "test_base40.nim"
   const specLine = "TestSpec(source: \"tests/" & victim & "\""
   doAssert victim in nimbleTestTaskFiles(nimble),
@@ -213,19 +177,82 @@ proc test_the_modelled_check_can_see_a_missing_spec() =
     $reported & "): the modelled check cannot fail"
   echo "PASS: the modelled check reports a TestSpec removed from repro.nim"
 
+proc unreached(testFiles: openArray[string], nimble, repro: string): seq[string] =
+  ## The one predicate the rule and its control both call: the files in
+  ## `testFiles` that neither runner runs — not on an executed line of the
+  ## nimble `test` task and not the `source:` of a `TestSpec`. A name in a
+  ## comment of either runner is not a run, so it does not count.
+  let ran = nimbleTestTaskFiles(nimble) + reproModelledFiles(repro)
+  for name in testFiles:
+    if name notin ran:
+      result.add(name)
+  result.sort()
+
+proc test_every_test_file_is_run_by_a_runner() =
+  let nimble = readRunner(nimbleRunner)
+  let repro = readRunner(reproRunner)
+
+  var testFiles: seq[string]
+  for path in walkFiles(testsDir / "test_*.nim"):
+    testFiles.add(path.extractFilename)
+  testFiles.sort()
+
+  # Non-degeneracy: an empty directory listing satisfies the loop below
+  # without looking at anything, and a wrong `testsDir` produces exactly that.
+  doAssert testFiles.len > 50,
+    "expected the tests directory to hold well over 50 `test_*.nim` files; " &
+    "found " & $testFiles.len & " in " & testsDir & ". The check is " &
+    "pointed somewhere wrong and would otherwise pass without examining a " &
+    "single file."
+
+  let unlisted = unreached(testFiles, nimble, repro)
+  # Echoed, not carried in the assertion message: see the note in
+  # `test_every_nimble_test_is_a_repro_test_spec`.
+  if unlisted.len > 0:
+    echo "FAIL: these test files are run by no runner, so nothing ever ",
+      "runs them:\n  ", unlisted.join("\n  "),
+      "\nAdd each to the `test` task in codetracer_trace_format.nimble, and ",
+      "a `TestSpec` for it to repro.nim, and expect it to fail the first ",
+      "time — a test that has not run in months is describing code that has ",
+      "moved on. Naming a file in a comment does not run it. Do not add an ",
+      "exemption here: an unrunnable test should be deleted, with the reason ",
+      "in the commit that deletes it."
+  doAssert unlisted.len == 0,
+    $unlisted.len & " test file(s) run by no runner; the list is printed above"
+
+  echo "PASS: all ", testFiles.len, " test files are run by a runner"
+
 proc test_the_check_can_see_a_missing_file() =
-  ## The needle has to be able to miss. This confirms the containment test
-  ## reports absence for a name no runner carries, so the check above is
-  ## capable of failing rather than merely capable of passing.
-  let text = runnerText()
+  ## The predicate has to be able to miss, and a comment must not satisfy it.
+  ## An invented file is named in a comment of both runners and must still be
+  ## reported; added as a `TestSpec` source it must not be.
+  let nimble = readRunner(nimbleRunner)
+  let repro = readRunner(reproRunner)
   const absent = "test_a_file_that_does_not_exist_anywhere.nim"
-  doAssert absent notin text,
+  doAssert absent notin nimble and absent notin repro,
     "a name invented for this check appears in a runner, so the check " &
     "cannot distinguish listed from unlisted"
-  echo "PASS: the check reports a name no runner carries"
+  let mention = "\n  # tests/" & absent & "\n"
+  # The nimble mention goes inside the `test` task, where an executed line
+  # would count.
+  const taskHead = "task test,"
+  let at = nimble.find(taskHead)
+  doAssert at >= 0, "the control could not find the nimble `test` task"
+  let lineEnd = nimble.find('\n', at)
+  doAssert lineEnd >= 0
+  let commentedNimble = nimble[0 ..< lineEnd] & mention & nimble[lineEnd + 1 .. ^1]
+  let commentedRepro = repro & mention
+  doAssert unreached([absent], commentedNimble, commentedRepro) == @[absent],
+    "a file named only in runner comments was not reported: a comment " &
+    "satisfies the check"
+  let modelledRepro = repro & "\n  TestSpec(source: \"tests/" & absent &
+    "\", binary: \"build/test-bin/x\"),\n"
+  doAssert unreached([absent], nimble, modelledRepro).len == 0,
+    "a file that is a TestSpec source was reported as run by no runner"
+  echo "PASS: the check reports a file named only in runner comments"
 
 test_the_check_can_see_a_missing_file()
-test_every_test_file_is_named_by_a_runner()
+test_every_test_file_is_run_by_a_runner()
 test_the_modelled_check_can_see_a_missing_spec()
 test_every_nimble_test_is_a_repro_test_spec()
 
