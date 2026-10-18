@@ -29,6 +29,9 @@ session can name.  It serves the routes as codetracer-ci documents them
 --fail-upload-urls N answers the first N slice-upload-url calls
 503 upload_session_busy (a transient refusal the sender retries).
 
+--fail-sessions N answers the first N upload-session calls 503
+upload_session_busy (a transient refusal the sender retries).
+
 --slow-local-writes SECONDS answers the first local-storage write that long
 after it arrives (the object is written either way): a request the sender
 is still waiting on, for the tests that interrupt that wait with a signal.
@@ -189,6 +192,13 @@ def make_handler(store: Store):
                 return
             # api/v1/tenants/{t}/traces/upload-session
             if parts[:3] == ["api", "v1", "tenants"] and parts[4:] == ["traces", "upload-session"]:
+                with store.lock:
+                    refuse = store.args.fail_sessions > 0
+                    if refuse:
+                        store.args.fail_sessions -= 1
+                if refuse:
+                    self.problem(503, "upload_session_busy")
+                    return
                 tenant, session = parts[3], str(uuid.uuid4())
                 prefix = f"traces/{tenant}/{session}/slices/"
                 with store.lock:
@@ -312,6 +322,7 @@ def main() -> int:
     parser.add_argument("--bad-signature", action="store_true")
     parser.add_argument("--finalize-script", default="")
     parser.add_argument("--fail-upload-urls", type=int, default=0)
+    parser.add_argument("--fail-sessions", type=int, default=0)
     parser.add_argument("--slow-local-writes", type=float, default=0.0)
     args = parser.parse_args()
     store = Store(args)

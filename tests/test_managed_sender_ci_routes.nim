@@ -27,6 +27,10 @@
 ##   which glibc installs with `SA_RESTART`, as codetracer-native-recorder
 ##   installs its graceful-stop handler for SIGTERM; it is SIGUSR1 here so
 ##   the test process is not stopped by it.
+## - a session request that the stand-in refuses with 503 is retried by the
+##   retry policy, while a refused connection at session creation is not:
+##   one connection attempt under a retry policy too, reported as not
+##   retryable (managed_sender_ci.nim, `ensureSession`).
 ## - a request whose connection is refused (ECONNREFUSED: a socket error
 ##   that is not EINTR) is not repeated: one connection attempt, then the
 ##   failure (`sendRequest` repeats only an interrupted wait). The attempts
@@ -148,7 +152,8 @@ waitFor(proc(): bool = answers(minioUrl & "/minio/health/ready"), "MinIO to be r
 var standins: seq[Process]
 
 proc startStandin(name, methodName: string, wrongKey = false, badSignature = false,
-    finalizeScript = "", failUploadUrls = 0, slowLocalWrites = 0.0): Running =
+    finalizeScript = "", failUploadUrls = 0, slowLocalWrites = 0.0,
+    failSessions = 0): Running =
   let portFile = work / (name & ".port")
   var args = @[standinScript, "--port-file", portFile,
     "--token", Token, "--method", methodName, "--minio-url", minioUrl,
@@ -164,6 +169,8 @@ proc startStandin(name, methodName: string, wrongKey = false, badSignature = fal
     args.add ["--fail-upload-urls", $failUploadUrls]
   if slowLocalWrites > 0:
     args.add ["--slow-local-writes", $slowLocalWrites]
+  if failSessions > 0:
+    args.add ["--fail-sessions", $failSessions]
   let p = startProcess(python, args = args, options = {poStdErrToStdOut, poParentStreams})
   standins.add p
   waitFor(proc(): bool = fileExists(portFile), "the codetracer-ci stand-in " & name)
@@ -538,5 +545,44 @@ try:
       check "failed to create codetracer-ci upload session" in uploaded.err.message
       # One attempt; the counter is not vacuous: it saw that attempt.
       check countedConnects == 1
+
+    test "a refused connection at session creation is not retried by the retry policy":
+      # The same refused port under a retry policy: the session failure is
+      # reported as not retryable, so the policy makes no second attempt (it
+      # used to make five, pausing between them, for every object).
+      let probe = newSocket()
+      probe.bindAddr(Port(0), "127.0.0.1")
+      let refusedPort = probe.getLocalAddr()[1].int
+      probe.close()
+      var state = initManagedSenderState("routes-refused-policy")
+      let item = sliceObject(sliceFile("refused-policy-slice_0000.ct", 5000), 0)
+      let backend = newCodetracerCiSenderBackend(CodetracerCiSenderConfig(
+        baseUrl: "http://127.0.0.1:" & $refusedPort, tenantId: "tenant-routes",
+        bearerToken: Token, platform: "native", serviceName: "inventory", instanceId: "ct-mcr"))
+      countedPort = cint(refusedPort)
+      countedConnects = 0
+      let uploaded = state.tryUploadWithBackend(backend, item, quickRetries())
+      countedPort = 0
+      check not uploaded.ok
+      check not uploaded.err.retryable
+      check "failed to create codetracer-ci upload session" in uploaded.err.message
+      check "attempts" notin uploaded.err.message
+      check countedConnects == 1
+
+  suite "codetracer-ci sender session retries":
+    test "a 503 at session creation is retried, and the retry uploads":
+      let standin = startStandin("sessbusy", SliceUploadPresignedUrl, failSessions = 2)
+      var state = initManagedSenderState("routes-sessbusy")
+      let item = sliceObject(sliceFile("sessbusy-slice_0000.ct", 5000), 0)
+      let uploaded = state.tryUploadWithBackend(backendFor(standin), item, quickRetries())
+      check uploaded.ok
+      check standin.requestsTo("/upload-session").len == 3
+      # Without retrying, the refusal is what the caller sees, as retryable.
+      let standin2 = startStandin("sessbusy-once", SliceUploadPresignedUrl, failSessions = 1)
+      var state2 = initManagedSenderState("routes-sessbusy-once")
+      let once = state2.tryUploadWithBackend(backendFor(standin2), item, noManagedRetry())
+      check not once.ok
+      check once.err.retryable
+      check "HTTP 503" in once.err.message
 finally:
   stopAll()

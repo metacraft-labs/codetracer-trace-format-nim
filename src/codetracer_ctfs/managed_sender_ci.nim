@@ -1,6 +1,6 @@
 import std/[httpclient, json, net, os, strutils, times, uri]
 when defined(posix):
-  from std/posix import EINTR
+  from std/posix import EINTR, ECONNREFUSED
 import ./managed_sender
 import ./trace_storage_config
 
@@ -112,10 +112,23 @@ proc sendRequest(url: string, httpMethod: HttpMethod, body: string,
     finally:
       client.close()
 
-proc ensureSession(backend: CodetracerCiSenderBackend): bool =
+proc retryableStatus(code: HttpCode): bool
+proc retryAfterMs(response: Response): int
+
+const SessionFailure = "failed to create codetracer-ci upload session"
+
+proc ensureSession(backend: CodetracerCiSenderBackend,
+    err: var ManagedSenderError): bool =
+  ## Opens the upload session once. On failure, `err` says why and whether a
+  ## retry can help: a refused connection (nothing listens at the configured
+  ## address) or a refusal the server will repeat is reported as not
+  ## retryable, so the retry policy does not spend its pauses on it; a
+  ## timeout, a 5xx, 408 or 429 stays retryable.
   if backend.sessionId.len > 0:
     return true
   if backend.config.baseUrl.len == 0 or backend.config.tenantId.len == 0 or backend.config.bearerToken.len == 0:
+    err = ManagedSenderError(retryable: false,
+      message: SessionFailure & ": no base URL, tenant or token is configured")
     return false
   let url = baseUrl(backend.config) & "/api/v1/tenants/" & backend.config.tenantId & "/traces/upload-session"
   let body = %*{
@@ -134,6 +147,9 @@ proc ensureSession(backend: CodetracerCiSenderBackend): bool =
         "Content-Type": "application/json",
       }))
     if response.code notin {Http200, Http201}:
+      err = ManagedSenderError(retryable: response.code.retryableStatus,
+        retryAfterMs: response.retryAfterMs,
+        message: SessionFailure & ": HTTP " & $response.code.int)
       return false
     let parsed = parseJson(response.body)
     backend.sessionId = parsed{"sessionId"}.getStr()
@@ -145,9 +161,23 @@ proc ensureSession(backend: CodetracerCiSenderBackend): bool =
     # object through the local-storage route, so that is what an absent
     # field means.
     backend.sliceUploadMethod = parsed{"sliceUploadMethod"}.getStr(SliceUploadLocalStorage)
-    backend.sessionId.len > 0 and backend.s3KeyPrefix.len > 0
-  except CatchableError:
-    false
+    result = backend.sessionId.len > 0 and backend.s3KeyPrefix.len > 0
+    if not result:
+      err = ManagedSenderError(retryable: true,
+        message: SessionFailure & ": the answer names no session or key prefix")
+  except OSError as e:
+    # A refused connection is not repeated (as `sendRequest` does not repeat
+    # it): nothing listens there, and retrying only delays the failure the
+    # caller must report.
+    let refused =
+      when defined(posix): e.errorCode == ECONNREFUSED
+      else: false
+    err = ManagedSenderError(retryable: not refused,
+      message: SessionFailure & ": " & e.msg)
+    result = false
+  except CatchableError as e:
+    err = ManagedSenderError(retryable: true, message: SessionFailure & ": " & e.msg)
+    result = false
 
 proc sessionObjectKey(backend: CodetracerCiSenderBackend, item: ManagedUploadObject): string =
   if item.objectKey.startsWith(backend.s3KeyPrefix):
@@ -263,8 +293,9 @@ proc uploadObject(backend: CodetracerCiSenderBackend, item: ManagedUploadObject,
     contentType: string): tuple[ok: bool, receipt: ManagedUploadReceipt, err: ManagedSenderError] =
   ## Writes one object of the session by the route the session named
   ## (`sliceUploadMethod`).
-  if not backend.ensureSession():
-    return (false, ManagedUploadReceipt(), ManagedSenderError(retryable: true, message: "failed to create codetracer-ci upload session"))
+  var sessionErr: ManagedSenderError
+  if not backend.ensureSession(sessionErr):
+    return (false, ManagedUploadReceipt(), sessionErr)
   var data: string
   try:
     data = readFile(item.localPath)
@@ -504,8 +535,9 @@ method finalize*(backend: CodetracerCiSenderBackend,
   if not request.canFinalizeComplete():
     return (false, ManagedSenderError(retryable: false,
       message: "refusing complete finalize without uploaded MCR slice metadata"))
-  if not backend.ensureSession():
-    return (false, ManagedSenderError(retryable: true, message: "failed to create codetracer-ci upload session"))
+  var sessionErr: ManagedSenderError
+  if not backend.ensureSession(sessionErr):
+    return (false, sessionErr)
   let body = backend.finalizePayloadJson(request)
   let url = baseUrl(backend.config) & "/api/v1/traces/" & backend.sessionId & "/finalize"
   let timeoutMs = backend.config.finalizeTimeoutMs(request)
