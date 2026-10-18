@@ -145,6 +145,11 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_base40.nim", binary: "build/test-bin/test_base40"),
   TestSpec(source: "tests/test_container.nim", binary: "build/test-bin/test_container"),
   TestSpec(source: "tests/test_ctfs_v5_member_forms.nim", binary: "build/test-bin/test_ctfs_v5_member_forms"),
+  # `ctfs-container.md` §1: `root_blocks`, the overflow of the entry array past
+  # block 0 and its growth, with no free list root area at any `max_shards`
+  # (removed 2026-10-08), in memory and streaming.
+  TestSpec(source: "tests/test_root_directory_overflow.nim", binary: "build/test-bin/test_root_directory_overflow"),
+  TestSpec(source: "tests/test_root_directory_grows.nim", binary: "build/test-bin/test_root_directory_grows"),
   # `ctfs-container.md` §1d, the compact profile's body: the reference
   # encoder/decoder's byte-exact round trip, the flipped-directory-bit control,
   # and the no-block-map assertion with its must-fail control against a full
