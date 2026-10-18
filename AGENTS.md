@@ -124,7 +124,12 @@ choice the sibling Nim repos `io-mon`, `nim-stackable-hooks` and
 ## Testing notes
 
 - The corpus is declared in the `.nimble` `test` task, not discovered. Adding
-  a test file means adding it there (and to `repro.nim`'s `testSpecs`).
+  a test file means adding it there **and** a `TestSpec` with the same flags
+  to `repro.nim`'s `testSpecs`. `tests/test_every_test_is_listed.nim` fails
+  on either omission, and on a `TestSpec` whose source no longer exists.
+  A test that `include`s `codetracer_trace_writer_ffi` gets
+  `--nimMainPrefix:codetracerTraceWriter` from `tests/config.nims` under
+  both runners; the nimble line still spells it too.
 - **Benchmarks live in the `bench` task, correctness in `test`.** The two
   ChunkedCompressedTable microbenchmarks (`perLookupNs < 50000` per random
   lookup; `> 20M` records/sec write throughput) are in
@@ -237,11 +242,9 @@ choice the sibling Nim repos `io-mon`, `nim-stackable-hooks` and
   change, not a local one. The profile is recorded in
   `Value-Origin-Tracking.milestones.org` § M34c's watch-item update.
 - `tests/test_reader_ffi.nim` and
-  `tests/test_pending_value_after_delta_column.nim` are **not** in the corpus
-  (not in the `.nimble` task, not in CI, not in `repro.nim`). They predate the
-  SPEC-canonical step-stream migration and fail their own asserts. That is
-  known product/test drift in an off-corpus FFI reader path, tracked
-  separately — it is not a provisioning gap and must not be papered over.
+  `tests/test_pending_value_after_delta_column.nim` sat unlisted for months
+  and failed their own asserts once run. Both have since been fixed and are
+  in the nimble `test` task and in `repro.nim`; both pass.
 
 ## Specs
 

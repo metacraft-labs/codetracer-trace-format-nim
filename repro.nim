@@ -32,20 +32,26 @@
 ## flake on Nix hosts; ``defaultToolProvisioning "path"`` consumes its tools
 ## without changing the existing native build graph.
 ##
-## **libzstd.** ``test_ct_print_events_log_fallback`` compiles ct-print at
-## runtime. On POSIX it supplies ``pkg-config --cflags/--libs libzstd``; the
-## dev shell's ``PKG_CONFIG_PATH`` satisfies both. On Windows the binding names
-## the zstd archive directly: adding MSYS2's whole library directory would let
-## it replace the selected MinGW toolchain's implicit CRT and pthread archives.
+## **libzstd.** ``test_ct_print_agreement``, ``test_logical_step_count`` and
+## ``test_retired_streams_are_refused`` compile ct-print at runtime, through
+## ``tests/ct_print_binary.nim``. On POSIX that supplies ``pkg-config
+## --cflags/--libs libzstd``; the dev shell's ``PKG_CONFIG_PATH`` satisfies
+## both. On Windows the binding names the zstd archive directly: adding MSYS2's
+## whole library directory would let it replace the selected MinGW toolchain's
+## implicit CRT and pthread archives. All three build into the SAME cached
+## binary and nimcache (``.nimcache/test-ct-print/ct-print``), which the
+## nimble task never races because it runs them one after another. Here their
+## EXECUTE edges share a capacity-1 pool for the same reason.
 ##
-## **The three cross-read tests** (``test_nim_{step,value,io_event}_stream_crossread``)
+## **The four cross-read tests** (``test_nim_{step,value,io_event}_stream_crossread``
+## and ``test_nim_step_map_crossread``)
 ## prove a Nim-written production ``.ct`` bundle is byte-compatible with the
 ## canonical RUST reader: each writes a bundle, then invokes the sibling
 ## ``../codetracer-trace-format`` Rust integration test via ``cargo test``.
 ## The dev shell puts ``cargo`` on ``PATH`` (from the same Rust flake), so
 ## the test's ``haveCargo`` branch runs ``cargo`` DIRECTLY — it never enters
 ## the ``direnv exec`` fallback. The real cross-check runs; nothing is
-## skipped. Because all three drive ``cargo test`` against the SAME sibling
+## skipped. Because all four drive ``cargo test`` against the SAME sibling
 ## Rust target directory, they are sequenced through a capacity-1 build pool
 ## so their concurrent ``cargo`` runs do not race the shared target lock.
 ##
@@ -72,11 +78,17 @@ import std/os
 
 type
   TestSpec = object
-    ## One entry per test file.
+    ## One entry per test build. Every field mirrors a flag on that file's
+    ## line in the nimble ``test`` task, so the two runners compile the same
+    ## thing.
     ##   * ``source`` — repo-relative ``.nim`` path.
-    ##   * ``binary`` — ``build/test-bin/<stem>`` output.
-    ##   * ``pooled`` — run the EXECUTE edge in the capacity-1 cargo pool
-    ##     (the three cross-read tests share the sibling Rust target dir).
+    ##   * ``binary`` — ``build/test-bin/<stem>`` output. A file the nimble
+    ##     task compiles twice (``test_reader_is_gcsafe``, once per memory
+    ##     manager) has one entry per build, with distinct binaries.
+    ##   * ``pool`` — run the EXECUTE edge in this capacity-1 pool: the
+    ##     cross-read tests share the sibling Rust target dir
+    ##     (``CrossReadPool``), and the tests that compile ct-print at runtime
+    ##     share its cached binary (``CtPrintPool``). Empty runs unpooled.
     ##   * ``debugOnly`` — compile WITHOUT ``-d:release``. Matches the flags
     ##     the nimble ``test`` task uses for that file.
     ##     ``test_chunked_compressed_table`` is kept debug-only because that is
@@ -88,6 +100,9 @@ type
     ##     throughput gate — moved verbatim into ``tests/bench_chunked_table.nim``,
     ##     which only the ``bench`` task builds. Benchmarks are deliberately
     ##     NOT modelled here: they measure the host, not the build graph.
+    ##     Entries added on 2026-10-18 set it wherever their nimble line has
+    ##     no ``-d:release``; the older entries compile ``-d:release`` (see the
+    ##     corpus note below).
     ##   * ``pcre`` — link libpcre into the compile (``test_path_filter``).
     ##   * ``defines`` — extra ``-d:`` symbols this file needs, matching the
     ##     nimble ``test`` task's per-file flags.
@@ -95,52 +110,66 @@ type
     ##     ``-d:ctfsAppendFaultInjection``: it abandons an append between its
     ##     two write phases, and that seam is compiled out of every ordinary
     ##     build (including the FFI static library the Rust crate links).
+    ##     ``test_ffi_failures_reach_the_caller`` needs ``-d:ffiFaultInjection``
+    ##     for the same kind of reason.
+    ##   * ``mm`` — ``--mm:`` value, empty for Nim's default. The C-ABI tests
+    ##     that ``include`` ``codetracer_trace_writer_ffi`` compile ``arc``, as
+    ##     the static library does; ``test_reader_is_gcsafe`` is also built
+    ##     under ``refc``, because consumers build with it.
+    ##   * ``extraPaths`` — ``--path:`` entries beyond ``src``: ``tests`` for
+    ##     the files that import a helper module from ``tests/``
+    ##     (``-p:tests`` on their nimble line).
+    ##   * ``linuxOnly`` — the nimble task runs the file under
+    ##     ``when defined(linux)``; the edge is declared on Linux hosts only.
+    ##
+    ## The C-ABI tests also need ``--nimMainPrefix:codetracerTraceWriter``,
+    ## and ``buildNimUnittest.build`` has no parameter for an arbitrary
+    ## compiler switch. ``tests/config.nims`` sets it for every ``tests/``
+    ## module whose source has a line ``include codetracer_trace_writer_ffi``,
+    ## which is exactly the condition that makes the switch necessary, so no
+    ## field here carries it. Nim reads that file for the nimble compile and
+    ## for this recipe's compile alike, and the nimble line's own copy of the
+    ## flag sets the same value again. A module that needs the prefix and does
+    ## not get it fails to link, naming ``codetracerTraceWriterNimMain``.
     source: string
     binary: string
-    pooled: bool
+    pool: string
     debugOnly: bool
     pcre: bool
     defines: seq[string]
+    mm: string
+    extraPaths: seq[string]
+    linuxOnly: bool
 
 const
   CrossReadPool = "codetracer_trace_format_nim.crossread-serial"
+  CtPrintPool = "codetracer_trace_format_nim.ct-print-runtime-serial"
 
 # The reproducible green corpus. It is the union of the nimble ``test``
-# task and the four CI-only reader/network tests
-# (``test_cross_format`` / ``test_query_protocol`` / ``test_network_reader``
-# / ``test_replication``), PLUS the additional in-tree unit tests that
-# compile + run clean on a headless Linux host under ``-d:release -p:src``
-# (``test_ct_print_full`` / ``test_managed_sender`` / ``test_reader_v4`` /
-# ``test_source_views``).
-# Every listed file compiles and runs to exit 0 with ``-d:release -p:src``;
-# ``-d:release`` is a faithful superset of the per-file flags the nimble
-# task uses (the non-release files run identically under it).
+# task — every file it runs, each with that line's flags; that
+# ``tests/test_every_test_is_listed.nim`` fails otherwise — and the three
+# CI-only reader/network tests (``test_query_protocol`` /
+# ``test_network_reader`` / ``test_replication``), PLUS the additional in-tree
+# unit tests that compile + run clean on a headless Linux host under
+# ``-d:release -p:src`` (``test_ct_print_full`` / ``test_managed_sender`` /
+# ``test_reader_v4`` / ``test_source_views``).
+# The entries that predate 2026-10-18 compile ``-d:release`` even where the
+# nimble line does not; ``-d:release`` is a faithful superset of the per-file
+# flags the nimble task uses (the non-release files run identically under it).
 #
-# NOT modelled — the two FFI-``include`` tests ``test_reader_ffi`` and
-# ``test_pending_value_after_delta_column``. They are excluded from BOTH
-# the nimble ``test`` task AND CI (``.github/workflows/ci-reprobuild.yml``), require
-# a special ``--nimMainPrefix:codetracerTraceWriter`` compile, and their
-# read-back assertions predate the ``a99ae01`` SPEC-canonical step-stream
-# migration: the reader-FFI value path now returns an empty value array for
-# the fixture, so both fail their own ``doAssert``s in a pristine dev shell.
-# That is a product/test drift in an off-corpus FFI reader path, not a
-# provisioning gap, and fixing it is a separate reader-FFI milestone.
-#
-# ALSO not modelled, for the same ``--mm:arc
-# --nimMainPrefix:codetracerTraceWriter`` compile reason (``TestSpec`` has
-# no field for either flag) — but unlike the two above these DO run, in the
-# nimble ``test`` task and therefore in ``just test``:
-# ``tests/test_line_only_orphan_carry_forward.nim``,
-# ``tests/test_orphan_call_args_step_location.nim``,
-# ``tests/test_reader_ffi_column_aware_paths.nim``,
-# ``tests/test_reader_ffi_line_only_position_space.nim`` and
-# ``tests/test_reader_ffi_empty_names.nim`` (and
-# ``tests/test_ffi_fmt_2026_10.nim``). All of them drive the
-# C FFI entry points directly — the first two to pin ``flushPendingStep``'s
-# orphan-values branch, the last two to pin what the ABI does with a
-# ``paths.dat`` layout and a step position it cannot resolve on its own.
-# Teaching ``TestSpec`` about the two flags so reprobuild covers them as
-# well is worth doing and is tracked separately.
+# NOT modelled:
+#   * the two mutation builds of ``test_ffi_failures_reach_the_caller``
+#     (``-d:ffiGuardNoCatch`` / ``-d:ffiGuardNoLatch``), which the nimble task
+#     runs through ``gorgeEx`` and requires to FAIL. They are controls, not
+#     tests, and a build graph whose nodes must fail cannot tell them from
+#     broken ones — the same rule as the GDH falsifier arms below. The test
+#     itself is modelled.
+#   * ``tests/generate_golden_fixtures.nim``, which belongs to the nimble
+#     ``regenerateFixtures`` task, not to ``test``. It is a generator: it
+#     REWRITES the committed ``tests/fixtures/*.expected`` files and asserts
+#     nothing, so as a test edge it would modify tracked sources and could
+#     never fail. ``test_golden_fixtures`` is the test that reads them.
+#   * benchmarks (``tests/bench_*.nim``), see ``debugOnly``.
 const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_base40.nim", binary: "build/test-bin/test_base40"),
   TestSpec(source: "tests/test_container.nim", binary: "build/test-bin/test_container"),
@@ -183,12 +212,12 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_trace_types.nim", binary: "build/test-bin/test_trace_types"),
   TestSpec(source: "tests/test_varint.nim", binary: "build/test-bin/test_varint"),
   TestSpec(source: "tests/test_split_binary.nim", binary: "build/test-bin/test_split_binary"),
-  TestSpec(source: "tests/test_trace_writer.nim", binary: "build/test-bin/test_trace_writer"),
   TestSpec(source: "tests/test_trace_reader.nim", binary: "build/test-bin/test_trace_reader"),
-  # The reader's entry points stay callable from `{.gcsafe.}` code. Only the
-  # default memory manager is modelled; the nimble `test` task also compiles
-  # it under refc, which `TestSpec` has no field for.
+  # The reader's entry points stay callable from `{.gcsafe.}` code, under the
+  # default memory manager and under refc (consumers build with it), as the
+  # nimble `test` task compiles it.
   TestSpec(source: "tests/test_reader_is_gcsafe.nim", binary: "build/test-bin/test_reader_is_gcsafe"),
+  TestSpec(source: "tests/test_reader_is_gcsafe.nim", binary: "build/test-bin/test_reader_is_gcsafe_refc", mm: "refc"),
   TestSpec(source: "tests/test_golden_fixtures.nim", binary: "build/test-bin/test_golden_fixtures"),
   TestSpec(source: "tests/test_cross_compat.nim", binary: "build/test-bin/test_cross_compat"),
   TestSpec(source: "tests/test_xxh64.nim", binary: "build/test-bin/test_xxh64"),
@@ -226,9 +255,9 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_mixed_column_aware_position_space.nim", binary: "build/test-bin/test_mixed_column_aware_position_space"),
   TestSpec(source: "tests/test_reader_calls_events.nim", binary: "build/test-bin/test_reader_calls_events"),
   TestSpec(source: "tests/test_reader_integration.nim", binary: "build/test-bin/test_reader_integration"),
-  TestSpec(source: "tests/test_nim_step_stream_crossread.nim", binary: "build/test-bin/test_nim_step_stream_crossread", pooled: true),
-  TestSpec(source: "tests/test_nim_value_stream_crossread.nim", binary: "build/test-bin/test_nim_value_stream_crossread", pooled: true),
-  TestSpec(source: "tests/test_nim_io_event_stream_crossread.nim", binary: "build/test-bin/test_nim_io_event_stream_crossread", pooled: true),
+  TestSpec(source: "tests/test_nim_step_stream_crossread.nim", binary: "build/test-bin/test_nim_step_stream_crossread", pool: CrossReadPool),
+  TestSpec(source: "tests/test_nim_value_stream_crossread.nim", binary: "build/test-bin/test_nim_value_stream_crossread", pool: CrossReadPool),
+  TestSpec(source: "tests/test_nim_io_event_stream_crossread.nim", binary: "build/test-bin/test_nim_io_event_stream_crossread", pool: CrossReadPool),
   TestSpec(source: "tests/test_streaming_value_encoder.nim", binary: "build/test-bin/test_streaming_value_encoder"),
   TestSpec(source: "tests/test_value_ref.nim", binary: "build/test-bin/test_value_ref"),
   TestSpec(source: "tests/test_multi_stream_writer.nim", binary: "build/test-bin/test_multi_stream_writer"),
@@ -244,13 +273,8 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_split_trace.nim", binary: "build/test-bin/test_split_trace"),
   TestSpec(source: "tests/test_trace_storage_config.nim", binary: "build/test-bin/test_trace_storage_config"),
   TestSpec(source: "tests/test_path_filter.nim", binary: "build/test-bin/test_path_filter", pcre: true),
-  TestSpec(source: "tests/test_ct_print_events_log_fallback.nim", binary: "build/test-bin/test_ct_print_events_log_fallback"),
-  # A streaming-compressed `events.log` chunk pledges no content size;
-  # CONTENTSIZE_UNKNOWN used to reach `int(...)` and raise a RangeDefect.
-  TestSpec(source: "tests/test_events_log_unpledged_frame.nim", binary: "build/test-bin/test_events_log_unpledged_frame"),
   TestSpec(source: "tests/test_ct_print_unresolvable_position.nim", binary: "build/test-bin/test_ct_print_unresolvable_position"),
   # CI-only (not in the nimble task) reader / network suites.
-  TestSpec(source: "tests/test_cross_format.nim", binary: "build/test-bin/test_cross_format"),
   TestSpec(source: "tests/test_query_protocol.nim", binary: "build/test-bin/test_query_protocol"),
   TestSpec(source: "tests/test_network_reader.nim", binary: "build/test-bin/test_network_reader"),
   TestSpec(source: "tests/test_replication.nim", binary: "build/test-bin/test_replication"),
@@ -280,13 +304,72 @@ const testSpecs: seq[TestSpec] = @[
   # graph can express.
   TestSpec(source: "tests/test_gdh2_reload_marker.nim", binary: "build/test-bin/test_gdh2_reload_marker"),
   # GDH-M6 review — the C header declares every `trace_writer_*` export, or
-  # names it on a backlog. Modelled here (unlike
-  # `test_freestanding_writer_surface`, which re-invokes the compiler at RUN
-  # time and so is not a node this graph can express) because it only reads
-  # two files off disk: `src/codetracer_trace_writer_ffi.nim` and
-  # `include/codetracer_trace_writer.h`. Both are already `extraInputs` of the
-  # library edge, so its inputs are the ones that should invalidate it.
+  # names it on a backlog. It only reads two files off disk:
+  # `src/codetracer_trace_writer_ffi.nim` and `include/codetracer_trace_writer.h`.
+  # Both are already `extraInputs` of the library edge, so its inputs are the
+  # ones that should invalidate it.
   TestSpec(source: "tests/test_c_header_declares_the_writer_abi.nim", binary: "build/test-bin/test_c_header_declares_the_writer_abi"),
+  # ---- Added 2026-10-18: the rest of the nimble `test` task ----------
+  # Each entry carries its nimble line's flags. Debug-built (no
+  # `-d:release` on the nimble line):
+  TestSpec(source: "tests/test_nimcache_is_worktree_local.nim", binary: "build/test-bin/test_nimcache_is_worktree_local", debugOnly: true),
+  TestSpec(source: "tests/test_root_auto_fill.nim", binary: "build/test-bin/test_root_auto_fill", debugOnly: true),
+  TestSpec(source: "tests/test_namespace_images_refuse_malformed_input.nim", binary: "build/test-bin/test_namespace_images_refuse_malformed_input", debugOnly: true),
+  TestSpec(source: "tests/test_cbor_top_level_type_id.nim", binary: "build/test-bin/test_cbor_top_level_type_id", debugOnly: true),
+  TestSpec(source: "tests/test_follow_is_incremental.nim", binary: "build/test-bin/test_follow_is_incremental", debugOnly: true),
+  TestSpec(source: "tests/test_spec_layout_always.nim", binary: "build/test-bin/test_spec_layout_always", debugOnly: true),
+  # A failed final flush is reported (EFBIG under RLIMIT_FSIZE in a forked
+  # child); relies on glibc stdio buffering, so Linux only, as in nimble.
+  TestSpec(source: "tests/test_close_reports_final_flush_failure.nim", binary: "build/test-bin/test_close_reports_final_flush_failure", debugOnly: true, linuxOnly: true),
+  # Release-built:
+  TestSpec(source: "tests/test_paths_json_fallback.nim", binary: "build/test-bin/test_paths_json_fallback"),
+  TestSpec(source: "tests/test_global_line_index_boundary.nim", binary: "build/test-bin/test_global_line_index_boundary"),
+  TestSpec(source: "tests/test_line_count_table.nim", binary: "build/test-bin/test_line_count_table"),
+  TestSpec(source: "tests/test_compact_profile_header_refusal.nim", binary: "build/test-bin/test_compact_profile_header_refusal"),
+  TestSpec(source: "tests/test_function_declared_before_a_version.nim", binary: "build/test-bin/test_function_declared_before_a_version"),
+  TestSpec(source: "tests/test_deep_call_nesting_flush.nim", binary: "build/test-bin/test_deep_call_nesting_flush"),
+  TestSpec(source: "tests/test_linehits_reader.nim", binary: "build/test-bin/test_linehits_reader"),
+  TestSpec(source: "tests/test_every_test_is_listed.nim", binary: "build/test-bin/test_every_test_is_listed"),
+  # Re-runs the compiler over src/ for `--os:any` with `--compileOnly` and
+  # its own temporary nimcache; it needs no cross toolchain.
+  TestSpec(source: "tests/test_freestanding_writer_surface.nim", binary: "build/test-bin/test_freestanding_writer_surface"),
+  # Drives `cargo test` in the sibling Rust repo, like the other cross-reads.
+  TestSpec(source: "tests/test_nim_step_map_crossread.nim", binary: "build/test-bin/test_nim_step_map_crossread", pool: CrossReadPool),
+  # Compile ct-print at runtime through `tests/ct_print_binary.nim` (see the
+  # module doc) and import it from `tests/` (`-p:tests`).
+  TestSpec(source: "tests/test_ct_print_agreement.nim", binary: "build/test-bin/test_ct_print_agreement", pool: CtPrintPool, extraPaths: @["tests"]),
+  TestSpec(source: "tests/test_logical_step_count.nim", binary: "build/test-bin/test_logical_step_count", pool: CtPrintPool, mm: "arc", extraPaths: @["tests"]),
+  TestSpec(source: "tests/test_retired_streams_are_refused.nim", binary: "build/test-bin/test_retired_streams_are_refused", pool: CtPrintPool, mm: "arc", extraPaths: @["tests"]),
+  # The C-ABI tests: each `include`s `codetracer_trace_writer_ffi`, so each
+  # compiles `--mm:arc` here and gets `--nimMainPrefix:codetracerTraceWriter`
+  # from `tests/config.nims` (see `TestSpec`).
+  TestSpec(source: "tests/test_older_versions_are_refused.nim", binary: "build/test-bin/test_older_versions_are_refused", mm: "arc"),
+  TestSpec(source: "tests/test_line_only_orphan_carry_forward.nim", binary: "build/test-bin/test_line_only_orphan_carry_forward", mm: "arc"),
+  TestSpec(source: "tests/test_orphan_call_args_step_location.nim", binary: "build/test-bin/test_orphan_call_args_step_location", mm: "arc"),
+  TestSpec(source: "tests/test_pending_value_after_delta_column.nim", binary: "build/test-bin/test_pending_value_after_delta_column", mm: "arc"),
+  TestSpec(source: "tests/test_reader_ffi.nim", binary: "build/test-bin/test_reader_ffi", mm: "arc"),
+  TestSpec(source: "tests/test_reader_ffi_empty_names.nim", binary: "build/test-bin/test_reader_ffi_empty_names", mm: "arc"),
+  TestSpec(source: "tests/test_ffi_fmt_2026_10.nim", binary: "build/test-bin/test_ffi_fmt_2026_10", mm: "arc"),
+  TestSpec(source: "tests/test_io_event_pending_step_attribution.nim", binary: "build/test-bin/test_io_event_pending_step_attribution", mm: "arc"),
+  TestSpec(source: "tests/test_ffi_linehits_and_correlation_index.nim", binary: "build/test-bin/test_ffi_linehits_and_correlation_index", mm: "arc"),
+  TestSpec(source: "tests/test_reader_ffi_column_aware_paths.nim", binary: "build/test-bin/test_reader_ffi_column_aware_paths", mm: "arc"),
+  TestSpec(source: "tests/test_reader_ffi_line_only_position_space.nim", binary: "build/test-bin/test_reader_ffi_line_only_position_space", mm: "arc"),
+  TestSpec(source: "tests/test_ffi_line_count_table.nim", binary: "build/test-bin/test_ffi_line_count_table", mm: "arc"),
+  TestSpec(source: "tests/test_ffi_column_table_decided_at_first_mention.nim", binary: "build/test-bin/test_ffi_column_table_decided_at_first_mention", mm: "arc"),
+  TestSpec(source: "tests/test_ffi_register_path_and_varname.nim", binary: "build/test-bin/test_ffi_register_path_and_varname", mm: "arc"),
+  TestSpec(source: "tests/test_ffi_trailing_values_attach_to_the_last_step.nim", binary: "build/test-bin/test_ffi_trailing_values_attach_to_the_last_step", mm: "arc"),
+  TestSpec(source: "tests/test_ffi_exceptions_reach_the_container.nim", binary: "build/test-bin/test_ffi_exceptions_reach_the_container", mm: "arc"),
+  TestSpec(source: "tests/test_ffi_source_reload_order.nim", binary: "build/test-bin/test_ffi_source_reload_order", mm: "arc"),
+  TestSpec(source: "tests/test_ffi_call_entry_is_the_next_step.nim", binary: "build/test-bin/test_ffi_call_entry_is_the_next_step", mm: "arc"),
+  TestSpec(source: "tests/test_ffi_refused_column_stays_with_its_step.nim", binary: "build/test-bin/test_ffi_refused_column_stays_with_its_step", mm: "arc"),
+  TestSpec(source: "tests/test_block_size_is_one_of_three.nim", binary: "build/test-bin/test_block_size_is_one_of_three", mm: "arc"),
+  TestSpec(source: "tests/test_meta_text_is_utf8.nim", binary: "build/test-bin/test_meta_text_is_utf8", mm: "arc"),
+  TestSpec(source: "tests/test_ffi_assignment_refuses_unknown_kinds.nim", binary: "build/test-bin/test_ffi_assignment_refuses_unknown_kinds", mm: "arc"),
+  # The fault-injection seam is compiled in for this test only. Its two
+  # mutation controls are not modelled (see the corpus note above).
+  TestSpec(source: "tests/test_ffi_failures_reach_the_caller.nim", binary: "build/test-bin/test_ffi_failures_reach_the_caller", mm: "arc", defines: @["ffiFaultInjection"]),
+  TestSpec(source: "tests/test_ffi_in_memory.nim", binary: "build/test-bin/test_ffi_in_memory", mm: "arc"),
+  TestSpec(source: "tests/test_ffi_recording_id.nim", binary: "build/test-bin/test_ffi_recording_id", mm: "arc"),
 ]
 
 package codetracer_trace_format_nim:
@@ -345,11 +428,15 @@ package codetracer_trace_format_nim:
     # ---- Test corpus (the `test` / `test-builds` collections) --------
     #
     # Two-edge template per file: a compile-only BUILD edge collected into
-    # ``test-builds`` + an EXECUTE edge collected into ``test``. The three
-    # cross-read EXECUTE edges share a capacity-1 pool so their concurrent
-    # ``cargo test`` runs against the sibling Rust target dir do not race.
+    # ``test-builds`` + an EXECUTE edge collected into ``test``. Two
+    # capacity-1 pools sequence the EXECUTE edges that share a mutable
+    # resource: the cross-reads' ``cargo test`` runs against the sibling Rust
+    # target dir, and the runtime ct-print build's cached binary and nimcache
+    # (see module doc).
     let crossReadPool = buildPool(CrossReadPool, 1'u32)
     discard crossReadPool
+    let ctPrintPool = buildPool(CtPrintPool, 1'u32)
+    discard ctPrintPool
 
     # pcre lib dir for ``test_path_filter`` (see module doc). Threaded in
     # by the outer dev-shell nesting via ``CT_PCRE_LIB_DIR``; when unset
@@ -361,6 +448,10 @@ package codetracer_trace_format_nim:
     var testExecuteActions: seq[BuildActionDef] = @[]
 
     for spec in testSpecs:
+      # The nimble task runs a ``linuxOnly`` file under ``when
+      # defined(linux)``; the edge follows the same host condition.
+      if spec.linuxOnly and not defined(linux):
+        continue
       let stem = splitFile(spec.binary).name
 
       # ``test_path_filter`` links libpcre directly so Nim's ``re`` dynlib
@@ -374,8 +465,7 @@ package codetracer_trace_format_nim:
           extraPassL.add("-L" & pcreLibDir)
         extraPassL.add("-lpcre")
 
-      # The whole corpus compiles ``-d:release`` (a faithful superset of the
-      # nimble task's per-file flags), EXCEPT ``debugOnly`` files that the
+      # Compile ``-d:release`` EXCEPT for ``debugOnly`` files, which the
       # repo's own ``test`` corpus builds in debug (see ``debugOnly`` doc).
       var buildDefines = if spec.debugOnly: newSeq[string]() else: @["release"]
       # Per-file defines the nimble task also passes (see ``defines`` doc).
@@ -386,22 +476,20 @@ package codetracer_trace_format_nim:
         source = spec.source,
         binary = spec.binary,
         defines = buildDefines,
-        paths = @["src"],
+        paths = @["src"] & spec.extraPaths,
+        mm = spec.mm,
         extraPassL = extraPassL,
-        extraInputs = @["src", "codetracer_trace_format.nimble", "nim.cfg"],
+        # ``tests/config.nims`` decides the C-ABI tests' ``--nimMainPrefix``
+        # (see ``TestSpec``), so it is an input of every test compile.
+        extraInputs = @["src", "codetracer_trace_format.nimble", "nim.cfg",
+                        "tests/config.nims"],
         actionId = "codetracer-trace-format-nim.test_build." & stem)
       testBuildActions.add(edge.action)
 
-      let executeEdge =
-        if spec.pooled:
-          edge.testBinary.run(
-            actionId = "codetracer-trace-format-nim.test_execute." & stem,
-            pool = CrossReadPool,
-            registerImplicitName = false)
-        else:
-          edge.testBinary.run(
-            actionId = "codetracer-trace-format-nim.test_execute." & stem,
-            registerImplicitName = false)
+      let executeEdge = edge.testBinary.run(
+        actionId = "codetracer-trace-format-nim.test_execute." & stem,
+        pool = spec.pool,
+        registerImplicitName = false)
       testExecuteActions.add(executeEdge)
 
     discard collect("test", testExecuteActions)
