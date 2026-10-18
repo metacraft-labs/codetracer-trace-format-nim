@@ -487,7 +487,12 @@ task testFfiThreads, "C hosts: close after the recording thread exited; concurre
         "archive: the test no longer reaches the cross-thread free it guards")
     var lockCaught = false
     for attempt in 0 ..< 5:
-      let (_, code) = gorgeEx(dir & "/concurrent_writers-nolock")
+      # Unlocked concurrent entry into one heap is a data race, and it does
+      # not always crash: on 2026-10-18 this host deadlocked on futexes with
+      # no CPU time for 35 minutes. A hang is the same failure as a crash, so
+      # `timeout` turns it into a nonzero exit (124) instead of a stalled
+      # suite. The shipped-flags run above finishes in well under a second.
+      let (_, code) = gorgeEx("timeout 120 " & dir & "/concurrent_writers-nolock")
       if code != 0:
         lockCaught = true
         break
