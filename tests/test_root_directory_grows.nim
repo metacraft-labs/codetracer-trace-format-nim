@@ -24,7 +24,11 @@
 ##   * `appendInternalFiles` on a sealed container whose root is full grows it
 ##     too, and both the old and the appended members read back;
 ##   * the test-only `rootGrowthLimit` seam refuses growth past it, so the
-##     writers that use it to induce a full directory really get one.
+##     writers that use it to induce a full directory really get one;
+##   * a sharded root grows exactly as an unsharded one: each growth fills its
+##     blocks with `(root_blocks * 4096 - 16) div 24` entries (no free-list
+##     root area, `ctfs-container.md` §1, removed 2026-10-08), and the grown
+##     container is the unsharded one's bytes except header byte 7.
 ##
 ## No mocks: real containers, read back from disk by the canonical reader.
 
@@ -160,8 +164,72 @@ proc runLimit() =
     "rootGrowthLimit did not stop the growth"
   echo "  limit: growth past rootGrowthLimit refused"
 
+proc runSharded() =
+  ## `ctfs-container.md` §1, "The free list root area is removed (2026-10-08)":
+  ## a sharded root has no bytes between the header and the entries, so each
+  ## growth fills its `root_blocks` with `(root_blocks * 4096 - 16) div 24`
+  ## entries exactly as an unsharded root does.  Until 2026-10-08 growth
+  ## subtracted `R = 7 * max_shards * 6` too, and a sharded root grew to fewer
+  ## entries than its blocks hold.  The same members go into an unsharded and
+  ## a sharded container; after every addition their MaxRootEntries agree, and
+  ## at the end their bytes differ only in header byte 7.
+  for shards in [1'u8, 255]:
+    let tag = "max_shards " & $shards
+    var plain = createCtfs()
+    var sharded = createCtfs(maxShards = shards)
+    doAssert sharded.rootBlockCount() == plain.rootBlockCount(),
+      tag & ": the fresh root is " & $sharded.rootBlockCount() &
+      " blocks, the unsharded one " & $plain.rootBlockCount()
+    var grew = 0
+    var lastMax = sharded.maxRootEntries
+    var expected: seq[seq[byte]]
+    for i in 0 ..< 800:
+      let name = "s" & align($i, 11, '0')
+      var fp = plain.addFile(name).get()
+      let fs = sharded.addFile(name)
+      doAssert fs.isOk, tag & ": addFile " & name & ": " & (if fs.isErr: fs.error else: "")
+      var f = fs.get()
+      let p = payload(i, 0, sizeFor(i))
+      if p.len > 0:
+        doAssert plain.writeToFile(fp, p).isOk
+        doAssert sharded.writeToFile(f, p).isOk
+      expected.add p
+      if sharded.maxRootEntries != lastMax:
+        inc grew
+        lastMax = sharded.maxRootEntries
+        let fill = (sharded.rootBlockCount() * 4096'u64 - 16'u64) div 24'u64
+        doAssert uint64(sharded.maxRootEntries) == fill,
+          tag & ": after growth " & $grew & " the root is " &
+          $sharded.rootBlockCount() & " blocks of " & $sharded.maxRootEntries &
+          " entries; (" & $sharded.rootBlockCount() & " * 4096 - 16) div 24 = " &
+          $fill
+      doAssert sharded.maxRootEntries == plain.maxRootEntries,
+        tag & ": after member " & $i & " the sharded root has " &
+        $sharded.maxRootEntries & " entries, the unsharded one " &
+        $plain.maxRootEntries
+    doAssert grew >= 3, tag & ": the root grew " & $grew & " times, expected >= 3"
+    let pd = plain.toBytes()
+    let sd = sharded.toBytes()
+    doAssert sd.len == pd.len, tag & ": " & $sd.len & " bytes vs unsharded " & $pd.len
+    doAssert sd[7] == shards, tag & ": header byte 7"
+    for k in 0 ..< sd.len:
+      if k != 7:
+        doAssert sd[k] == pd[k], tag & ": byte " & $k & " differs from the unsharded container"
+    var bad = 0
+    for j in 0 ..< expected.len:
+      let name = "s" & align($j, 11, '0')
+      let r = readInternalFile(sd, name, u32le(sd, 8), u32le(sd, 12))
+      if expected[j].len == 0:
+        if r.isOk and r.get().len != 0: inc bad
+        continue
+      if r.isErr or r.get() != expected[j]: inc bad
+    doAssert bad == 0, tag & ": " & $bad & " members did not read back"
+    echo "  sharded (", tag, "): ", grew, " growths to ", sharded.maxRootEntries,
+      " entries, unsharded layout, all read back"
+
 run(streaming = true)
 run(streaming = false)
 runAppend()
 runLimit()
+runSharded()
 echo "PASS: test_root_directory_grows"

@@ -24,6 +24,11 @@
 ##    that fits in one block, and the Introduction's 86,016-byte mapping figure
 ##    is a VERSION-3 one that is largely already recovered. Measuring against
 ##    v3 would bank a saving that is already banked.
+## 4. `test_a_sharded_full_container_converts` — a full container with
+##    `max_shards != 0` is read entry for entry at `16 + 24 * i`, explicit and
+##    auto-filled (`ctfs-container.md` §1, free list root area removed
+##    2026-10-08). The control is an entry moved to the removed offset, which
+##    must not be collected.
 ##
 ## NO MOCKS. The full container is produced by this repository's own writer
 ## through the real stream writers; its members are read back through the real
@@ -45,6 +50,7 @@ import results
 import codetracer_ctfs/types
 import codetracer_ctfs/container
 import codetracer_ctfs/compact
+import codetracer_trace_writer/compact_profile
 import codetracer_ctfs/base40
 import codetracer_trace_types
 import codetracer_trace_writer/meta_dat
@@ -794,7 +800,7 @@ proc predictedFullV5Size(members: openArray[CompactMember],
   ## with the measured container is a finding about the layout rather than a
   ## rounding error.
   let usable = blockSize div 8 - 1
-  var blocks = 1  # block 0: header, free-list roots, FileEntry array
+  var blocks = 1  # block 0: header and FileEntry array
   for m in members:
     let size = m.payload.len
     if size == 0:
@@ -931,6 +937,108 @@ proc measure_the_overhead_reduction() {.raises: [].} =
 
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# test_a_sharded_full_container_converts
+# ---------------------------------------------------------------------------
+
+proc shardedMemberName(i: int): string {.raises: [].} =
+  "m" & $i & ".bin"
+
+proc shardedMemberContent(i: int): seq[byte] {.raises: [].} =
+  ## Every fifth member spans two data blocks, so it is MAPPED; the rest are
+  ## direct (`ctfs-container.md` §2).
+  let n = if i mod 5 == 0: 4096 + 7 + i else: 1 + (i mod 40)
+  result = newSeq[byte](n)
+  for k in 0 ..< n:
+    result[k] = byte((i * 37 + k * 3) and 0xFF)
+
+proc shardedFullContainer(shards: uint8, declared, count: int): seq[byte]
+    {.raises: [].} =
+  ## A full container written by this repository's writer, declaring
+  ## `declared` root entries and `shards` shards, with `count` members.
+  var c = createCtfs(maxRootEntries = uint32(declared), maxShards = shards)
+  for i in 0 ..< count:
+    var f = c.addFile(shardedMemberName(i)).valueOr:
+      doAssert false, "addFile #" & $i & ": " & error
+      return
+    doAssert c.writeToFile(f, shardedMemberContent(i)).isOk, "write #" & $i
+  c.toBytes()
+
+proc checkCollected(label: string, members: Result[seq[CompactMember], string],
+                    count: int) {.raises: [].} =
+  doAssert members.isOk, label & ": " & members.error
+  let got = members.get()
+  doAssert got.len == count,
+    label & ": " & $got.len & " members collected, the container has " & $count
+  for i in 0 ..< count:
+    doAssert got[i].name == shardedMemberName(i),
+      label & ": member " & $i & " is named '" & got[i].name & "', not '" &
+      shardedMemberName(i) & "'"
+    doAssert got[i].payload == shardedMemberContent(i),
+      label & ": member " & $i & " ('" & got[i].name & "') read back " &
+      $got[i].payload.len & " bytes that differ from the " &
+      $shardedMemberContent(i).len & " written"
+
+proc test_a_sharded_full_container_converts() {.raises: [].} =
+  ## `ctfs-container.md` §1, "The free list root area is removed
+  ## (2026-10-08)": entry `i` of every full container is at `16 + 24 * i`
+  ## whatever its `max_shards`, and the auto-filled count is
+  ## `(BlockSize - 16) / 24`. Until then `collectFullProfileMembers` skipped
+  ## `R = 7 * max_shards * 6` bytes before the entries — where no writer ever
+  ## left a gap — and subtracted `R` from the auto-fill count too, so it read
+  ## a sharded container's entries from the wrong bytes.
+  ##
+  ## Each case is read through `collectFullProfileMembers` and through
+  ## `compactMembersOf`, the conversion entry point built on it; every member
+  ## must come back with its own name and bytes, in root-directory order.
+  ## The auto-fill fixture fills all 170 slots and then rewrites only header
+  ## bytes 12..15 to 0 (the same container, `test_root_auto_fill.nim`); the
+  ## member in slot 169 is the one a reader that subtracted `R` would miss.
+  for shards in [1'u8, 16, 255]:
+    let tag = "max_shards " & $shards
+    let explicit = shardedFullContainer(shards, 170, 170)
+    checkCollected(tag & ", 170 declared entries",
+                   collectFullProfileMembers(explicit), 170)
+    checkCollected(tag & ", 170 declared entries, compactMembersOf",
+                   compactMembersOf(explicit), 170)
+    var auto = explicit
+    for k in 12 ..< 16:
+      auto[k] = 0
+    checkCollected(tag & ", auto-filled root (MaxRootEntries 0)",
+                   collectFullProfileMembers(auto), 170)
+    checkCollected(tag & ", auto-filled root, compactMembersOf",
+                   compactMembersOf(auto), 170)
+    # A root past block 0: entries in blocks 1 and 2.
+    let overflow = shardedFullContainer(shards, 400, 400)
+    checkCollected(tag & ", 400 declared entries",
+                   collectFullProfileMembers(overflow), 400)
+
+  # The negative control: entry 0 moved to where the removed rule put it,
+  # `16 + R`. The reader does not skip `R`, so `a.bin` is not a member there.
+  var c = createCtfs(maxRootEntries = 170, maxShards = 1)
+  var f = c.addFile("a.bin").valueOr:
+    doAssert false, "addFile a.bin: " & error
+    return
+  doAssert c.writeToFile(f, [1'u8, 2, 3]).isOk
+  let good = c.toBytes()
+  let goodMembers = collectFullProfileMembers(good)
+  doAssert goodMembers.isOk and goodMembers.get().len == 1 and
+    goodMembers.get()[0].name == "a.bin",
+    "control: the container as written has the one member a.bin"
+  const R = 7 * 1 * 6
+  var moved = good
+  for k in 0 ..< 24:
+    moved[16 + R + k] = good[16 + k]
+  for k in 0 ..< R:
+    moved[16 + k] = 0
+  let movedMembers = collectFullProfileMembers(moved)
+  if movedMembers.isOk:
+    for m in movedMembers.get():
+      doAssert m.name != "a.bin",
+        "an entry at the removed offset 16 + R = " & $(16 + R) &
+        " was collected as member a.bin"
+  echo "PASS: test_a_sharded_full_container_converts"
+
 when isMainModule:
   try:
     removeDir(TmpDir)
@@ -944,6 +1052,7 @@ when isMainModule:
   test_a_compact_container_round_trips_byte_exactly()
   test_the_compact_container_carries_no_block_map()
   measure_the_overhead_reduction()
+  test_a_sharded_full_container_converts()
 
   # `CCP2_KEEP_FIXTURES=1` leaves `full.ct` and `compact.ct` behind, so the
   # one-shot-compression figures can be taken over the same bytes from outside

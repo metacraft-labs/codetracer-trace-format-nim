@@ -174,20 +174,24 @@ proc fileEntryOffset*(c: Ctfs, index: int): int =
 proc rootBlockCount*(blockSize: uint32, maxRootEntries: uint32,
                      maxShards: uint8): uint64 =
   ## `ctfs-container.md` §1: the number of contiguous blocks, starting at
-  ## block 0, that hold the header, the free-list roots and the file-entry
-  ## array.
+  ## block 0, that hold the header and the file-entry array.
   ##
-  ##     R           = 7 * max_shards * 6
-  ##     root_blocks = ceil((16 + R + max_root_entries * 24) / block_size)
+  ##     root_blocks = ceil((16 + max_root_entries * 24) / block_size)
   ##
   ## Data block allocation begins at block `root_blocks`.  It is 1 whenever
   ## the entries fit block 0 (every container written before the overflow was
   ## implemented) and for `max_root_entries = 0` (auto-fill of block 0).
   ## 0 for a zero block size, which no reader accepts.
+  ##
+  ## `maxShards` does not enter the count.  Until 2026-10-08 §1 reserved a
+  ## free-list root area of `7 * max_shards * 6` bytes between the header and
+  ## the entries; "The free list root area is removed (2026-10-08)" makes it
+  ## 0 for every shard count (no writer ever wrote it, and nothing keeps state
+  ## there), so the entries start right after the header, at `fileEntryOffset`.
+  ## The parameter stays so every caller states the container it sizes.
   if blockSize == 0'u32:
     return 0
   let rootBytes = uint64(HeaderSize + ExtHeaderSize) +
-    7'u64 * uint64(maxShards) * 6'u64 +
     uint64(maxRootEntries) * uint64(FileEntrySize)
   max(1'u64, (rootBytes + uint64(blockSize) - 1) div uint64(blockSize))
 

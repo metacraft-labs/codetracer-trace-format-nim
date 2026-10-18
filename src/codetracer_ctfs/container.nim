@@ -102,8 +102,11 @@ proc growRootDirectory*(c: var Ctfs): Result[void, string] =
   let bs = uint64(c.blockSize)
   let oldRoot = c.rootBlockCount()
   let newRoot = max(oldRoot * 2'u64, oldRoot + 1'u64)
-  let rBytes = 7'u64 * uint64(c.maxShards) * 6'u64
-  let newMax = (newRoot * bs - uint64(HeaderSize + ExtHeaderSize) - rBytes) div
+  # The grown entry array fills its `newRoot` blocks after the header, the
+  # inverse of `rootBlockCount`: no bytes are reserved between the header and
+  # the entries for any shard count (`ctfs-container.md` §1, "The free list
+  # root area is removed (2026-10-08)").
+  let newMax = (newRoot * bs - uint64(HeaderSize + ExtHeaderSize)) div
     uint64(FileEntrySize)
   if newMax > uint64(high(uint32)):
     return err("the root directory cannot grow past " & $high(uint32) & " entries")

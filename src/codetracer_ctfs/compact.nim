@@ -237,16 +237,15 @@ proc collectFullProfileMembers*(full: openArray[byte]):
   let blockSize = readU32LE(full, 8)
   if blockSize == 0'u32:
     return err("full container declares a zero block size")
-  let maxShards = readMaxShards(full)
-  let rootArea = 7 * int(maxShards) * 6
-  var maxEntries = readU32LE(full, 12)
-  if maxEntries == 0'u32:
-    maxEntries = uint32((int(blockSize) - headerSize - rootArea) div
-      FileEntrySize)
+  # Entry `i` is at `header + 24 * i` and the auto-filled count is
+  # `(BlockSize - header) / 24`, whatever `max_shards` says: nothing lies
+  # between the header and the entries (`ctfs-container.md` §1, "The free
+  # list root area is removed (2026-10-08)": "a reader MUST NOT skip any").
+  let maxEntries = rootEntryCount(blockSize, readU32LE(full, 12), headerSize)
 
   var members: seq[CompactMember]
   for i in 0 ..< int(maxEntries):
-    let off = headerSize + rootArea + i * FileEntrySize
+    let off = headerSize + i * FileEntrySize
     if off + FileEntrySize > full.len:
       break
     let entrySize = readU64LE(full, off)
