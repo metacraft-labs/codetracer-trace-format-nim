@@ -169,6 +169,12 @@ proc fileEntryOffset*(c: Ctfs, index: int): int =
   ## array starts in block 0 and, when it is larger than block 0, continues
   ## into the blocks after it (`rootBlockCount`), so this is a plain byte
   ## offset and may lie past the end of block 0.
+  ##
+  ## The version-5 layout (16-byte header), the only one a `Ctfs` holds:
+  ## `createCtfs` writes `CtfsVersion` and `openClosedCtfs` refuses any
+  ## other version.  A version-6 full container (24-byte header) is read
+  ## through the header-size-aware doors (`rootEntryCount`, `V6HeaderSize`),
+  ## never through this proc.
   HeaderSize + ExtHeaderSize + index * FileEntrySize
 
 proc rootBlockCount*(blockSize: uint32, maxRootEntries: uint32,
@@ -189,6 +195,7 @@ proc rootBlockCount*(blockSize: uint32, maxRootEntries: uint32,
   ## 0 for every shard count (no writer ever wrote it, and nothing keeps state
   ## there), so the entries start right after the header, at `fileEntryOffset`.
   ## The parameter stays so every caller states the container it sizes.
+  ## Like `fileEntryOffset`, this is the version-5 (16-byte header) layout.
   if blockSize == 0'u32:
     return 0
   let rootBytes = uint64(HeaderSize + ExtHeaderSize) +
