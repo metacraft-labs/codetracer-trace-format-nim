@@ -485,14 +485,27 @@ task testFfiThreads, "C hosts: close after the recording thread exited; concurre
     if tlsCode == 0:
       raise newException(AssertionDefect, "the worker-thread host PASSED against a --threads:on " &
         "archive: the test no longer reaches the cross-thread free it guards")
+    # Unlocked concurrent entry into one heap is a data race, and it does not
+    # always crash: on 2026-10-18 this host deadlocked on futexes with no CPU
+    # time for 35 minutes. A hang is the same failure as a crash, so
+    # `timeout` turns it into a nonzero exit (124) instead of a stalled suite;
+    # `-k 10` follows the TERM with a KILL. The shipped-flags run above
+    # finishes in well under a second and is not bounded.
+    #
+    # `timeout` must exist, and its own failures (125: timeout failed, 126:
+    # not executable, 127: not found) must not count: each is a nonzero exit
+    # from a host that never ran, which would pass the control vacuously.
+    let timeoutExe = findExe("timeout")
+    if timeoutExe.len == 0:
+      raise newException(AssertionDefect, "testFfiThreads needs coreutils " &
+        "`timeout` on PATH to bound the no-lock control (the dev shell has it)")
     var lockCaught = false
     for attempt in 0 ..< 5:
-      # Unlocked concurrent entry into one heap is a data race, and it does
-      # not always crash: on 2026-10-18 this host deadlocked on futexes with
-      # no CPU time for 35 minutes. A hang is the same failure as a crash, so
-      # `timeout` turns it into a nonzero exit (124) instead of a stalled
-      # suite. The shipped-flags run above finishes in well under a second.
-      let (_, code) = gorgeEx("timeout 120 " & dir & "/concurrent_writers-nolock")
+      let (output, code) = gorgeEx(timeoutExe & " -k 10 120 " &
+        dir & "/concurrent_writers-nolock")
+      if code in 125 .. 127:
+        raise newException(AssertionDefect, "the no-lock concurrent-writers " &
+          "host did not run (exit " & $code & "): " & output)
       if code != 0:
         lockCaught = true
         break
