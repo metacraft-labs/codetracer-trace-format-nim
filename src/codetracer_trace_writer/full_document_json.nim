@@ -417,6 +417,26 @@ proc nonStepRecordJson*(ev: StepEvent, stepIndex: uint64): JsonNode =
     doAssert false, "nonStepRecordJson: " & $ev.kind & " is not a raise, " &
       "catch or thread record"
 
+proc ioEventJson(ev: IOEvent, idx: uint64): JsonNode =
+  var ioObj = newJObject()
+  ioObj["kind"] = newJString("io")
+  ioObj["io_kind"] = newJString(eventLogKindName(ev.kind))
+  ioObj["io_index"] = newJInt(int64(idx))
+  ioObj["step_id"] = newJInt(int64(ev.stepId))
+  # Surface both UTF-8 (best-effort) and base64 (exact bytes) so
+  # binary payloads are diff-friendly without losing fidelity.
+  var allPrintable = true
+  for b in ev.data:
+    if b < 0x20 and b != 0x0A and b != 0x0D and b != 0x09:
+      allPrintable = false
+      break
+  if allPrintable:
+    ioObj["text"] = newJString(bytesToUtf8(ev.data))
+  ioObj["bytes_b64"] = newJString(base64.encode(ev.data))
+  ioObj["bytes_len"] = newJInt(int64(ev.data.len))
+  addEventMetadata(ioObj, ev.metadata)
+  return ioObj
+
 proc buildFullDocument*(reader: var NewTraceReader,
     opts: FullOpts): JsonNode =
   ## Build the deterministic JSON document for `--full` and `--events` modes.
@@ -777,24 +797,7 @@ proc buildFullDocument*(reader: var NewTraceReader,
       # 3. Emit IO events at this step.
       for (sid, ev, idx) in ioByStep:
         if sid == stepIdx:
-          var ioObj = newJObject()
-          ioObj["kind"] = newJString("io")
-          ioObj["io_kind"] = newJString(eventLogKindName(ev.kind))
-          ioObj["io_index"] = newJInt(int64(idx))
-          ioObj["step_id"] = newJInt(int64(ev.stepId))
-          # Surface both UTF-8 (best-effort) and base64 (exact bytes) so
-          # binary payloads are diff-friendly without losing fidelity.
-          var allPrintable = true
-          for b in ev.data:
-            if b < 0x20 and b != 0x0A and b != 0x0D and b != 0x09:
-              allPrintable = false
-              break
-          if allPrintable:
-            ioObj["text"] = newJString(bytesToUtf8(ev.data))
-          ioObj["bytes_b64"] = newJString(base64.encode(ev.data))
-          ioObj["bytes_len"] = newJInt(int64(ev.data.len))
-          addEventMetadata(ioObj, ev.metadata)
-          eventsArr.add(ioObj)
+          eventsArr.add(ioEventJson(ev, idx))
 
       # 4. Emit call exit events at this step.
       for (es, rec, ck) in callsByExit:
@@ -870,6 +873,15 @@ proc buildFullDocument*(reader: var NewTraceReader,
         childrenJson.add(newJInt(int64(c)))
       callObj["children"] = childrenJson
       eventsArr.add(callObj)
+
+  # Markers registered before the first step use coordinate 0 to mean resume
+  # from the start. If no step ever arrives, the IO payload still exists and
+  # must remain visible. The same drain preserves explicitly supplied buffered
+  # coordinates beyond the emitted steps, without inventing a step or changing
+  # the coordinate that the correlation index reports.
+  for (sid, ev, idx) in ioByStep:
+    if sid >= uint64(allGlis.len):
+      eventsArr.add(ioEventJson(ev, idx))
 
   root["events"] = eventsArr
   return root

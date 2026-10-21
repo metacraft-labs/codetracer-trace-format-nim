@@ -2331,6 +2331,10 @@ proc registerCorrelationMarkerById*(w: var MultiStreamTraceWriter,
   ## `stepCount - 1` names the previous one (issue #601, the same accounting
   ## `trace_writer_register_special_event` documents).
   ##
+  ## Before any step, `none` resolves to 0: resume replay from the start,
+  ## even if this recording never emits a step. Zero is a coordinate, never
+  ## an unset sentinel, and registering the marker still mints no step.
+  ##
   ## `keyText` and `showText` are the NAMES the two values were read under —
   ## `key_text` is the textual form of the `key=<expr>` declaration, and
   ## `showText` is the binding the shown value came from. `showText` is
@@ -2426,7 +2430,8 @@ proc registerSpanCoverage*(w: var MultiStreamTraceWriter,
   ## from — and follows the same rule as a boundary marker's: `none` means the
   ## last step this writer emitted, and a caller that buffers its steps (the C
   ## ABI) passes the id explicitly. No step is minted, for the reason in
-  ## §11a.6.
+  ## §11a.6. Before any step, `none` resolves to 0 (resume from the start),
+  ## even when the recording closes without steps; zero is never unset.
   if w.closed:
     return err("writer is closed")
   ? w.commitMeta()
