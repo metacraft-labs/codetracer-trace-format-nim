@@ -101,3 +101,8 @@ nix-build:
 # `test`, which runs inside the shell.
 test-dev-shell:
     bash tests/test_dev_shell_writes_nothing_elsewhere.sh
+
+# Check refs with hermetic scanner controls before the network observation.
+check-ci-refs:
+    ci/check-ci-refs.sh --self-test
+    ci/check-ci-refs.sh
