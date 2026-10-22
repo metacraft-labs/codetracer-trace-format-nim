@@ -1,5 +1,8 @@
-import std/[json, options, tables, unittest]
+import std/[importutils, json, options, tables, unittest]
 import codetracer_ctfs/[managed_sender, managed_sender_ci, trace_storage_config]
+# `privateAccess` (below): the sharded-finalize test sets the placement an
+# `upload-session` answer leaves on the backend (private fields), without a
+# stand-in server (`ensureSession` is what sets them from the answer).
 import codetracer_trace_types
 import codetracer_trace_writer/[meta_dat, uuid_v7]
 
@@ -209,3 +212,66 @@ suite "managed shared sender":
     # rather than an empty string codetracer-ci would refuse.
     let undeclared = backend.finalizePayloadJson(requestFor(""))
     check not undeclared["recordingManifest"].hasKey("recordingId")
+
+suite "codetracer-ci sharded finalize payload":
+  # codetracer-ci holds every storage endpoint a managed finalize names to the
+  # session's own placement: a replica's `storageEndpointUri` must be exactly
+  # the endpoint `upload-session` answered, with its server and pool, and a
+  # session in the deployment's object store may name none (codetracer-ci
+  # rewrite-docs/04-apis-events/http-api.md §4.4.1). The sender used to write
+  # each replica's own object URI there, which codetracer-ci refuses with
+  # `400 finalize_failed` (`storage_endpoint_mismatch`).
+  proc shardedRequest(): ManagedFinalizeRequest =
+    var manifest = TraceStorageManifest(
+      schema: traceStorageSchema,
+      recordingId: "",
+      service: ServiceIdentity(serviceName: "inventory", environment: "test", instanceId: "ct-mcr", tenantId: "tenant-a"),
+      lifecycle: lsUploaded,
+      retry: RetryState(attempt: 0, nextRetryAt: none(string), lastError: none(string)),
+      finalize: FinalizeState(finalized: false, finalizedAt: none(string), idempotencyKey: "sharded"),
+      retention: dsRetained,
+      replication: ReplicationState(targetReplicas: 1, completedReplicas: 1))
+    manifest.source.kind = tskShardedSplitCtfs
+    manifest.source.shardedSegments = @[ShardedCtfsSegment(index: 0, geidStart: 0, geidEnd: 9,
+      shards: @[CtfsShard(shardIndex: 0, blockStart: 0, blockEnd: 3, replicas: @[PlacedObject(
+        objectId: "traces/tenant-a/session/slices/shard_0000_0000.ct",
+        # A producer records a replica's URI as the receipt's endpoint joined
+        # with its key (codetracer-native-recorder `managedUploadFile`): it
+        # is neither the key nor an endpoint the finalize may store.
+        uri: "http://10.0.10.5:18181/traces/tenant-a/session/slices/shard_0000_0000.ct",
+        sizeBytes: 64, sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        placement: Placement(pool: "recorded-pool", serverId: "recorded-server"),
+        upload: usUploaded, dataState: dsRetained)])])]
+    ManagedFinalizeRequest(totalSlices: 1, totalEvents: 10, manifest: manifest, idempotencyKey: "sharded")
+
+  proc newBackend(): CodetracerCiSenderBackend =
+    newCodetracerCiSenderBackend(CodetracerCiSenderConfig(
+      baseUrl: "http://127.0.0.1:8080", tenantId: "tenant-a", bearerToken: "ct_ci_token",
+      platform: "native", serviceName: "inventory", instanceId: "ct-mcr"))
+
+  test "codetracer_ci_sharded_replica_names_the_session_placement_nim":
+    privateAccess(CodetracerCiSenderBackend)
+    let backend = newBackend()
+    # What `ensureSession` keeps from an `upload-session` answer that placed
+    # the session on a registered storage server.
+    backend.storagePoolId = "0192f0c4-0000-7000-8000-000000000001"
+    backend.storageServerId = "0192f0c4-0000-7000-8000-000000000002"
+    backend.storageEndpointUri = "http://10.0.10.5:18181"
+    let replica = backend.finalizePayloadJson(shardedRequest())["recordingManifest"][
+      "shardedMcrSegments"][0]["shards"][0]["replicas"][0]
+    check replica["storageEndpointUri"].getStr() == "http://10.0.10.5:18181"
+    check replica["storageServerId"].getStr() == "0192f0c4-0000-7000-8000-000000000002"
+    check replica["storagePoolId"].getStr() == "0192f0c4-0000-7000-8000-000000000001"
+    check replica["objectKey"].getStr() == "traces/tenant-a/session/slices/shard_0000_0000.ct"
+
+  test "codetracer_ci_sharded_replica_names_no_endpoint_in_the_deployment_store_nim":
+    # A session in the deployment's object store: `upload-session` answers
+    # null pool, server and endpoint. The replica then names no endpoint (the
+    # object is read from that store) and keeps the recorded ids, which the
+    # finalize requires to be present.
+    let replica = newBackend().finalizePayloadJson(shardedRequest())["recordingManifest"][
+      "shardedMcrSegments"][0]["shards"][0]["replicas"][0]
+    check replica["storageEndpointUri"].kind == JNull
+    check replica["storageServerId"].getStr() == "recorded-server"
+    check replica["storagePoolId"].getStr() == "recorded-pool"
+    check replica["objectKey"].getStr() == "traces/tenant-a/session/slices/shard_0000_0000.ct"

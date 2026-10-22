@@ -409,17 +409,33 @@ proc segmentSliceJson(segment: CtfsSegment): JsonNode =
     "storageEndpointUri": segment.file.uri,
   }
 
-proc shardedSegmentJson(segment: ShardedCtfsSegment): JsonNode =
+proc sessionOr(sessionValue, recorded: string): string =
+  ## The session's own placement value when `upload-session` named one,
+  ## otherwise what the recorder recorded.
+  if sessionValue.len > 0: sessionValue else: recorded
+
+proc shardedSegmentJson(backend: CodetracerCiSenderBackend, segment: ShardedCtfsSegment): JsonNode =
+  ## A sharded segment as codetracer-ci's `ShardedMcrSegmentManifest`. Every
+  ## replica was written through this upload session, so its placement is the
+  ## one `upload-session` answered. codetracer-ci refuses a managed finalize
+  ## whose replica names a `storageEndpointUri` that is not exactly that
+  ## placement's endpoint, or that names any endpoint at all when the session
+  ## went to the deployment's object store (http-api.md §4.4.1, "POST
+  ## /api/v1/traces/{sessionId}/finalize"). So the endpoint is the session's,
+  ## or null when it named none, and never the replica's own object URI. The
+  ## object key is the key the object was stored under (`objectId`, the
+  ## upload receipt's key), as it is for a slice's `sliceKey`.
   let shards = newJArray()
   for shard in segment.shards:
     let replicas = newJArray()
     for replicaIndex, replica in shard.replicas:
       replicas.add(%*{
         "replicaIndex": replicaIndex,
-        "objectKey": replica.uri.replace("local://", ""),
-        "storagePoolId": replica.placement.pool,
-        "storageServerId": replica.placement.serverId,
-        "storageEndpointUri": replica.uri,
+        "objectKey": replica.objectId,
+        "storagePoolId": sessionOr(backend.storagePoolId, replica.placement.pool),
+        "storageServerId": sessionOr(backend.storageServerId, replica.placement.serverId),
+        "storageEndpointUri":
+          (if backend.storageEndpointUri.len > 0: %backend.storageEndpointUri else: newJNull()),
         "contentLength": replica.sizeBytes,
         "contentHash": replica.sha256,
         "uploadCompletionState": "complete",
@@ -446,12 +462,12 @@ proc mcrSlicesJson(manifest: TraceStorageManifest): JsonNode =
   for segment in manifest.source.segments:
     result.add(segment.segmentSliceJson())
 
-proc shardedMcrSegmentsJson(manifest: TraceStorageManifest): JsonNode =
+proc shardedMcrSegmentsJson(backend: CodetracerCiSenderBackend, manifest: TraceStorageManifest): JsonNode =
   result = newJArray()
   if manifest.source.kind != tskShardedSplitCtfs:
     return
   for segment in manifest.source.shardedSegments:
-    result.add(segment.shardedSegmentJson())
+    result.add(backend.shardedSegmentJson(segment))
 
 proc mcrTimeRangeJson(manifest: TraceStorageManifest): JsonNode =
   result = newJObject()
@@ -482,7 +498,7 @@ proc mcrManifestJson(backend: CodetracerCiSenderBackend, request: ManagedFinaliz
   let manifestKey = backend.s3KeyPrefix.strip(leading = false, trailing = true, chars = {'/'}) & "/manifest.json"
   let finalizedAt = now().utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'")
   let mcrSlices = request.manifest.mcrSlicesJson()
-  let shardedMcrSegments = request.manifest.shardedMcrSegmentsJson()
+  let shardedMcrSegments = backend.shardedMcrSegmentsJson(request.manifest)
   let timeRange = request.manifest.mcrTimeRangeJson()
   result = %*{
     "kind": "mcr_slices",
