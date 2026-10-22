@@ -31,6 +31,16 @@
 ##   retry policy, while a refused connection at session creation is not:
 ##   one connection attempt under a retry policy too, reported as not
 ##   retryable (managed_sender_ci.nim, `ensureSession`).
+## - no redirect is followed (RFC 9110 §15.4,
+##   https://www.rfc-editor.org/rfc/rfc9110#section-15.4): a presigned write
+##   the store answers 302 or 307, a slice-upload-url request answered 307, a
+##   local-storage write answered 308, a session request answered 301 and a
+##   finalize answered 303 each fail on one request, not retryable, naming
+##   the status, and the redirect's target receives nothing — no bytes, no
+##   CI token, no body-less GET a 2xx could make look like success. Nim's
+##   `std/httpclient` follows all five by default, turning a 301/302/303
+##   into a GET and keeping `Authorization` on a redirect to another port or
+##   a subdomain of the same host (managed_sender_ci.nim, `sendRequest`).
 ## - a request whose connection is refused (ECONNREFUSED: a socket error
 ##   that is not EINTR) is not repeated: one connection attempt, then the
 ##   failure (`sendRequest` repeats only an interrupted wait). The attempts
@@ -57,7 +67,15 @@
 ##   calls slowly or with the refusals http-api.md defines for them
 ##   (`--finalize-script`), and refuse the first slice-upload-url calls
 ##   (`--fail-upload-urls`): the real Monolith produces those answers only
-##   under load or contention a test cannot schedule. The real codetracer-ci on a real MinIO, with a real recording
+##   under load or contention a test cannot schedule. For the redirect tests
+##   it answers one route with a 3xx (`--redirect`), and stands in for the
+##   object store's side of a presigned write too, because MinIO cannot be
+##   made to redirect a write on its own endpoint; the redirect's target is
+##   the same script as a sink (`--sink`), a second listener on another
+##   port of 127.0.0.1 that answers 200 to anything and records what
+##   arrived. Another port of the same host is the case Nim keeps the
+##   Authorization header for, and a 200 is what a followed redirect would
+##   take for success; no real server offers either on demand. The real codetracer-ci on a real MinIO, with a real recording
 ##   through this sender, is codetracer-observability-e2e's
 ##   `e2e_homeostate_recording_uploads_and_dive_in_resolves`; codetracer-ci's
 ##   own `ManagedUploadCiTokenTests` check the method each store names.
@@ -153,7 +171,7 @@ var standins: seq[Process]
 
 proc startStandin(name, methodName: string, wrongKey = false, badSignature = false,
     finalizeScript = "", failUploadUrls = 0, slowLocalWrites = 0.0,
-    failSessions = 0): Running =
+    failSessions = 0, redirects: openArray[string] = [], redirectTo = ""): Running =
   let portFile = work / (name & ".port")
   var args = @[standinScript, "--port-file", portFile,
     "--token", Token, "--method", methodName, "--minio-url", minioUrl,
@@ -171,10 +189,26 @@ proc startStandin(name, methodName: string, wrongKey = false, badSignature = fal
     args.add ["--slow-local-writes", $slowLocalWrites]
   if failSessions > 0:
     args.add ["--fail-sessions", $failSessions]
+  for r in redirects:
+    args.add ["--redirect", r]
+  if redirectTo.len > 0:
+    args.add ["--redirect-to", redirectTo]
   let p = startProcess(python, args = args, options = {poStdErrToStdOut, poParentStreams})
   standins.add p
   waitFor(proc(): bool = fileExists(portFile), "the codetracer-ci stand-in " & name)
   Running(process: p, port: parseInt(readFile(portFile).strip()))
+
+proc startSink(name: string): Running =
+  ## A redirect target: the stand-in in `--sink` mode.
+  let portFile = work / (name & ".port")
+  let p = startProcess(python, args = [standinScript, "--sink", "--port-file", portFile,
+    "--token", Token], options = {poStdErrToStdOut, poParentStreams})
+  standins.add p
+  waitFor(proc(): bool = fileExists(portFile), "the redirect sink " & name)
+  Running(process: p, port: parseInt(readFile(portFile).strip()))
+
+proc url(r: Running): string =
+  "http://127.0.0.1:" & $r.port
 
 proc stopAll() =
   for p in standins:
@@ -299,6 +333,33 @@ proc storedSha256(standin: Running, name, key: string): string =
   ## The SHA-256 of the object the local-storage route wrote.
   let path = work / ("local-" & name) / key
   if fileExists(path): sha256Hex(path) else: ""
+
+proc redirectedStandin(name, methodName, redirect: string): tuple[standin, sink: Running] =
+  result.sink = startSink(name & "-sink")
+  result.standin = startStandin(name, methodName, redirects = [redirect], redirectTo = result.sink.url)
+
+proc uploadOne(standin: Running, tag: string): tuple[ok: bool, receipt: ManagedUploadReceipt, err: ManagedSenderError] =
+  ## One slice under a retry policy, so that a 3xx reported as retryable
+  ## would show as a second request.
+  var state = initManagedSenderState("routes-" & tag)
+  let item = sliceObject(sliceFile(tag & "-slice_0000.ct", 5000), 0)
+  state.tryUploadWithBackend(backendFor(standin), item, quickRetries())
+
+proc sinkRequests(sink: Running): seq[JsonNode] =
+  for r in sink.getJson("/_test/requests"):
+    result.add r
+
+proc tokensAt(sink: Running): int =
+  for r in sink.sinkRequests():
+    if r["token"].getBool():
+      inc result
+
+template checkRedirectRefused(err: ManagedSenderError, status: int) =
+  ## Inside a `test` only: `check` reports to the running test.
+  check not err.retryable
+  check ("HTTP " & $status) in err.message
+  check "redirect" in err.message
+  check "attempts" notin err.message
 
 try:
   suite "codetracer-ci sender routes":
@@ -584,5 +645,72 @@ try:
       check not once.ok
       check once.err.retryable
       check "HTTP 503" in once.err.message
+
+  suite "codetracer-ci sender redirects":
+    test "a presigned write answered 302 is a failed write, not a GET taken for one":
+      # Followed, the 302 becomes a body-less GET that the sink answers 200,
+      # and the sender would hold a receipt for an object it never wrote.
+      let (standin, sink) = redirectedStandin("store302", SliceUploadPresignedUrl, "store=302")
+      let uploaded = standin.uploadOne("store302")
+      check not uploaded.ok
+      check uploaded.receipt.objectKey == ""
+      checkRedirectRefused(uploaded.err, 302)
+      let writes = standin.requestsTo("/_store/")
+      check writes.len == 1
+      for w in writes:
+        check w["method"].getStr() == "PUT"
+        check not w["authorization"].getBool()
+      check sink.sinkRequests().len == 0
+
+    test "a presigned write answered 307 does not resend the bytes elsewhere":
+      let (standin, sink) = redirectedStandin("store307", SliceUploadPresignedUrl, "store=307")
+      let uploaded = standin.uploadOne("store307")
+      check not uploaded.ok
+      checkRedirectRefused(uploaded.err, 307)
+      check standin.requestsTo("/_store/").len == 1
+      check sink.sinkRequests().len == 0
+
+    test "a slice-upload-url request answered 307 does not take the CI token to another port":
+      let (standin, sink) = redirectedStandin("url307", SliceUploadPresignedUrl, "upload-url=307")
+      let uploaded = standin.uploadOne("url307")
+      check not uploaded.ok
+      checkRedirectRefused(uploaded.err, 307)
+      check "slice upload URL" in uploaded.err.message
+      check standin.requestsTo("/slice-upload-url").len == 1
+      check sink.tokensAt() == 0
+      check sink.sinkRequests().len == 0
+
+    test "a local-storage write answered 308 sends neither the token nor the bytes on":
+      let (standin, sink) = redirectedStandin("local308", SliceUploadLocalStorage, "local=308")
+      let uploaded = standin.uploadOne("local308")
+      check not uploaded.ok
+      checkRedirectRefused(uploaded.err, 308)
+      check standin.requestsTo("/local-storage/objects/").len == 1
+      check sink.tokensAt() == 0
+      check sink.sinkRequests().len == 0
+
+    test "an upload session request answered 301 is not replayed as a GET":
+      let (standin, sink) = redirectedStandin("session301", SliceUploadPresignedUrl, "session=301")
+      let uploaded = standin.uploadOne("session301")
+      check not uploaded.ok
+      checkRedirectRefused(uploaded.err, 301)
+      check "failed to create codetracer-ci upload session" in uploaded.err.message
+      check standin.requestsTo("/upload-session").len == 1
+      check sink.sinkRequests().len == 0
+
+    test "a finalize answered 303 is not replayed as a GET and taken for a finalize":
+      # The slices go to MinIO as usual; only the finalize is redirected.
+      # Followed, the 303 becomes a GET that the sink answers 200, which the
+      # sender would report as a committed upload.
+      let (standin, sink) = redirectedStandin("finalize303", SliceUploadPresignedUrl, "finalize=303")
+      let up = uploadTwoSlices(standin, "finalize303")
+      var state = up.state
+      let finalized = state.tryFinalizeManagedUpload(up.backend, finalizeRequest(receiptsOf(up)), quickRetries())
+      check not finalized.ok
+      checkRedirectRefused(finalized.err, 303)
+      check "finalize" in finalized.err.message
+      check standin.finalizeTimes().len == 1
+      check not state.finalized
+      check sink.sinkRequests().len == 0
 finally:
   stopAll()

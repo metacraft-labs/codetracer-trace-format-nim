@@ -46,10 +46,27 @@ answers nothing it would act on); `busy:<seconds>` answers
 409 upload_finalizing; `mismatch` answers 409 slice_content_mismatch without
 checking (http-api.md, "POST /api/v1/traces/{sessionId}/finalize").
 
+--redirect ROUTE=STATUS answers every call of one route with that 3xx status
+and `Location: <--redirect-to><request path>` instead of serving it, for the
+tests that check the sender follows no redirect (RFC 9110 §15.4,
+https://www.rfc-editor.org/rfc/rfc9110#section-15.4).  ROUTE is `session`,
+`upload-url`, `local` (the local-storage write) or `finalize`, which are
+codetracer-ci answering, or `store`, the object store answering the
+presigned write: slice-upload-url then answers a URL on this stand-in,
+`/_store/{key}`, whose PUT is answered with the redirect (MinIO cannot be
+made to redirect a presigned write on its own endpoint).  Repeatable.
+
+--sink runs a redirect target instead of the routes: it answers every
+request 200 with `{}`, which a followed redirect would take for success,
+and records each one (method, path, whether an Authorization header came,
+whether it carried --token, the body's length).
+
 GET /_test/requests answers the requests seen (method, path, whether an
 Authorization header came), GET /_test/objects what the finalize read back.
 
-Every request but the test routes needs `Authorization: Bearer <--token>`.
+Every request but the test routes and the stand-in object store's
+`/_store/` writes (a presigned write carries no Authorization header) needs
+`Authorization: Bearer <--token>`; the --sink asks for none.
 --wrong-key makes slice-upload-url answer a key other than the one the
 route derives (a server the sender must not trust blindly); --bad-signature
 makes it answer a URL whose signature the store refuses.
@@ -115,6 +132,10 @@ class Store:
         self.read_back: dict[str, dict] = {}
         self.finalize_script: list[str] = [
             step for step in (args.finalize_script or "").split(",") if step]
+        self.redirects: dict[str, int] = {}
+        for spec in args.redirect:
+            route, _, status = spec.partition("=")
+            self.redirects[route] = int(status)
 
     def s3_url(self, method: str, key: str) -> str:
         a = self.args
@@ -166,6 +187,18 @@ def make_handler(store: Store):
                     "time": time.monotonic(),
                 })
 
+        def redirected(self, route: str) -> bool:
+            """Answers the request with the redirect --redirect names for
+            `route`, if any; True when it did."""
+            status = store.redirects.get(route)
+            if status is None:
+                return False
+            self.send_response(status)
+            self.send_header("location", store.args.redirect_to + self.path)
+            self.send_header("content-length", "0")
+            self.end_headers()
+            return True
+
         def authorized(self) -> bool:
             if self.headers.get("authorization") == f"Bearer {store.args.token}":
                 return True
@@ -192,6 +225,8 @@ def make_handler(store: Store):
                 return
             # api/v1/tenants/{t}/traces/upload-session
             if parts[:3] == ["api", "v1", "tenants"] and parts[4:] == ["traces", "upload-session"]:
+                if self.redirected("session"):
+                    return
                 with store.lock:
                     refuse = store.args.fail_sessions > 0
                     if refuse:
@@ -211,6 +246,8 @@ def make_handler(store: Store):
                 self.answer(200, answer)
             # api/v1/traces/{s}/slice-upload-url
             elif parts[:3] == ["api", "v1", "traces"] and parts[4:] == ["slice-upload-url"]:
+                if self.redirected("upload-url"):
+                    return
                 with store.lock:
                     refuse = store.args.fail_upload_urls > 0
                     if refuse:
@@ -232,11 +269,15 @@ def make_handler(store: Store):
                     key = session["prefix"] + "other-" + name
                 url = (store.s3_url("PUT", key) if store.args.method == "presigned-url"
                        else Path(store.args.local_root, key).as_uri())
+                if "store" in store.redirects:
+                    url = f"http://127.0.0.1:{self.server.server_address[1]}/_store/{key}"
                 if store.args.bad_signature:
                     url = url[:-4] + ("0000" if not url.endswith("0000") else "1111")
                 self.answer(200, {"uploadUrl": url, "sliceIndex": request.get("sliceIndex"), "s3Key": key})
             # api/v1/traces/{s}/finalize
             elif parts[:3] == ["api", "v1", "traces"] and parts[4:] == ["finalize"]:
+                if self.redirected("finalize"):
+                    return
                 session = store.sessions.get(parts[3])
                 if session is None:
                     self.problem(404, "session_not_found")
@@ -283,10 +324,18 @@ def make_handler(store: Store):
             path = urlparse(self.path).path
             marker = "/local-storage/objects/"
             data = self.body()
+            if path.startswith("/_store/"):
+                # The object store's side: a presigned write carries no
+                # Authorization header, so none is asked for.
+                if not self.redirected("store"):
+                    self.problem(404, "not_found")
+                return
             if not self.authorized():
                 return
             if marker not in path:
                 self.problem(404, "not_found")
+                return
+            if self.redirected("local"):
                 return
             if store.args.method == "presigned-url":
                 self.problem(403, "storage_policy_access_denied")
@@ -308,11 +357,47 @@ def make_handler(store: Store):
     return Handler
 
 
+def make_sink_handler(store: Store):
+    """The --sink: where a followed redirect would land."""
+    class Sink(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args) -> None:  # quiet
+            return
+
+        def answer(self, raw: bytes) -> None:
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def any_method(self) -> None:
+            path = urlparse(self.path).path
+            if self.command == "GET" and path == "/_test/requests":
+                with store.lock:
+                    self.answer(json.dumps(store.requests).encode())
+                return
+            data = self.rfile.read(int(self.headers.get("content-length") or 0))
+            with store.lock:
+                store.requests.append({
+                    "method": self.command,
+                    "path": path,
+                    "authorization": "authorization" in {k.lower() for k in self.headers.keys()},
+                    "token": store.args.token in (self.headers.get("authorization") or ""),
+                    "length": len(data),
+                    "time": time.monotonic(),
+                })
+            self.answer(b"{}")
+
+        do_GET = do_POST = do_PUT = any_method
+
+    return Sink
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port-file", required=True)
     parser.add_argument("--token", required=True)
-    parser.add_argument("--method", required=True)
+    parser.add_argument("--method", default="")
     parser.add_argument("--minio-url", default="")
     parser.add_argument("--access-key", default="")
     parser.add_argument("--secret-key", default="")
@@ -324,9 +409,14 @@ def main() -> int:
     parser.add_argument("--fail-upload-urls", type=int, default=0)
     parser.add_argument("--fail-sessions", type=int, default=0)
     parser.add_argument("--slow-local-writes", type=float, default=0.0)
+    parser.add_argument("--redirect", action="append", default=[])
+    parser.add_argument("--redirect-to", default="")
+    parser.add_argument("--sink", action="store_true")
     args = parser.parse_args()
+    if not args.sink and not args.method:
+        parser.error("--method is required unless --sink is given")
     store = Store(args)
-    if args.method == "presigned-url":
+    if args.method == "presigned-url" and not args.sink:
         # The bucket, created through a presigned PUT like every other call.
         request = Request(presign("PUT", args.minio_url, f"/{args.bucket}", args.access_key, args.secret_key),
                           method="PUT", data=b"")
@@ -335,7 +425,8 @@ def main() -> int:
         except HTTPError as error:
             if error.code != 409:  # BucketAlreadyOwnedByYou
                 raise
-    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(store))
+    handler = make_sink_handler(store) if args.sink else make_handler(store)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     tmp = args.port_file + ".tmp"
     Path(tmp).write_text(str(server.server_address[1]))
     os.replace(tmp, args.port_file)

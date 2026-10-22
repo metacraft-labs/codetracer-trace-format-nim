@@ -100,9 +100,24 @@ proc sendRequest(url: string, httpMethod: HttpMethod, body: string,
   ## is issued again, and codetracer-ci's finalize is safe to repeat
   ## (`ManagedRetryPolicy`). An upload session asked for twice leaves the
   ## first one unused, as a retried session request already could.
+  ##
+  ## No redirect is followed: a 3xx answer (RFC 9110 §15.4,
+  ## https://www.rfc-editor.org/rfc/rfc9110#section-15.4) is returned to the
+  ## caller as it came, and each caller reports it as a failure
+  ## (`redirectRefusal`). std `httpclient` follows up to five by default
+  ## (`newHttpClient`'s `maxRedirects`), and in Nim 2.2.8 its `request`
+  ## replays a PUT or POST answered 301, 302 or 303 as a body-less GET, whose
+  ## 2xx the caller would take for a stored object or a committed finalize,
+  ## resends the body on a 307 or 308 to wherever the answer points, and
+  ## drops `Authorization` only when the redirect names another host name,
+  ## so another port of the same host, or a subdomain of it, would receive
+  ## the CI token. The sender writes where codetracer-ci told it to and
+  ## nowhere else (http-api.md §4.4.1: the presigned URL is the whole
+  ## authorization of the write), and the token stays at codetracer-ci's
+  ## origin.
   var repeats = 0
   while true:
-    let client = newHttpClient(timeout = timeoutMs)
+    let client = newHttpClient(timeout = timeoutMs, maxRedirects = 0)
     try:
       return client.request(url, httpMethod = httpMethod, body = body, headers = headers)
     except OSError as e:
@@ -114,6 +129,27 @@ proc sendRequest(url: string, httpMethod: HttpMethod, body: string,
 
 proc retryableStatus(code: HttpCode): bool
 proc retryAfterMs(response: Response): int
+
+proc redirectRefusal(what: string, response: Response): ManagedSenderError =
+  ## The failure for a 3xx answer, which `sendRequest` does not follow. It
+  ## is not retryable: codetracer-ci redirecting one of its own routes, or
+  ## the object store redirecting a URL the deployment's own store
+  ## presigned (an S3 region redirect cannot arise for it), is a
+  ## misconfiguration a retry meets again. The target is named without its
+  ## query, which may carry another signature, and without its user
+  ## information (RFC 3986 §3.2.1), which may carry a password.
+  var target = "no Location"
+  let location = response.headers.getOrDefault("location").strip()
+  if location.len > 0:
+    var uri = parseUri(location)
+    uri.username = ""
+    uri.password = ""
+    uri.query = ""
+    uri.anchor = ""
+    target = $uri
+  ManagedSenderError(retryable: false,
+    message: what & " answered a redirect (HTTP " & $response.code.int & " to " & target &
+      "), which the sender does not follow")
 
 const SessionFailure = "failed to create codetracer-ci upload session"
 
@@ -146,6 +182,9 @@ proc ensureSession(backend: CodetracerCiSenderBackend,
         "Authorization": "Bearer " & backend.config.bearerToken,
         "Content-Type": "application/json",
       }))
+    if response.code.is3xx:
+      err = redirectRefusal(SessionFailure & ": codetracer-ci", response)
+      return false
     if response.code notin {Http200, Http201}:
       err = ManagedSenderError(retryable: response.code.retryableStatus,
         retryAfterMs: response.retryAfterMs,
@@ -232,6 +271,9 @@ proc putLocalStorage(backend: CodetracerCiSenderBackend, objectKey, data,
       }))
     if response.code.int >= 200 and response.code.int < 300:
       return (true, backend.receiptFor(objectKey), ManagedSenderError())
+    if response.code.is3xx:
+      return (false, ManagedUploadReceipt(),
+        redirectRefusal("codetracer-ci's local-storage write of " & objectKey, response))
     (false, ManagedUploadReceipt(), ManagedSenderError(retryable: response.code.retryableStatus,
       message: "codetracer-ci upload failed: HTTP " & $response.code.int))
   except CatchableError as e:
@@ -259,6 +301,9 @@ proc putPresigned(backend: CodetracerCiSenderBackend, item: ManagedUploadObject,
         "Authorization": "Bearer " & backend.config.bearerToken,
         "Content-Type": "application/json",
       }))
+    if response.code.is3xx:
+      return (false, ManagedUploadReceipt(),
+        redirectRefusal("codetracer-ci's slice upload URL request for " & objectKey, response))
     if response.code.int < 200 or response.code.int >= 300:
       return (false, ManagedUploadReceipt(), ManagedSenderError(retryable: response.code.retryableStatus,
         message: "codetracer-ci slice upload URL refused: HTTP " & $response.code.int))
@@ -284,6 +329,9 @@ proc putPresigned(backend: CodetracerCiSenderBackend, item: ManagedUploadObject,
       }))
     if response.code.int >= 200 and response.code.int < 300:
       return (true, backend.receiptFor(objectKey), ManagedSenderError())
+    if response.code.is3xx:
+      return (false, ManagedUploadReceipt(),
+        redirectRefusal("the object store's presigned upload of " & objectKey, response))
     (false, ManagedUploadReceipt(), ManagedSenderError(retryable: response.code.retryableStatus,
       message: "object store refused the presigned upload of " & objectKey & ": HTTP " & $response.code.int))
   except CatchableError as e:
@@ -525,7 +573,8 @@ proc finalizeErrorRetryable(response: Response): bool =
   ## finalize took this one's claim over; repeating it commits or answers
   ## 204), `503 upload_session_busy` and every other 5xx, 408 and 429. Every
   ## other 409 (`slice_content_mismatch`, `recording_id_conflict`) and every
-  ## 4xx is the same on a retry.
+  ## 4xx is the same on a retry. A 3xx never reaches it: `finalize` reports
+  ## it by `redirectRefusal`, not retryable.
   if response.code == Http409:
     return response.problemCode() == "upload_finalizing"
   response.code.retryableStatus
@@ -549,6 +598,8 @@ method finalize*(backend: CodetracerCiSenderBackend,
       }), timeoutMs = timeoutMs)
     if response.code.int >= 200 and response.code.int < 300:
       return (true, ManagedSenderError())
+    if response.code.is3xx:
+      return (false, redirectRefusal("codetracer-ci finalize", response))
     let code = response.problemCode()
     (false, ManagedSenderError(retryable: response.finalizeErrorRetryable(),
       retryAfterMs: response.retryAfterMs(),
