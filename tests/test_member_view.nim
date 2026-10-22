@@ -12,7 +12,10 @@
 ## An image read from its file as it is used (`openFileImage`) answers every
 ## range alike, reads the blocks a read reaches and no others, refuses to read
 ## in place a range not yet read, refuses a file cut short after it was opened,
-## and reads a container whose members do not lie in blocks whole.
+## and reads a container whose members do not lie in blocks whole. A file that
+## does not begin with the CTFS magic — one too short to hold it, empty
+## included, or a longer one whose first bytes are something else — is refused
+## with an error naming it, never a defect.
 
 import std/[os, strutils]
 import results
@@ -155,3 +158,23 @@ block a_container_without_blocks_is_read_whole:
     doAssert not image.readsFromFile, what
     doAssert image.bytes == bytes, what
   echo "PASS a_container_without_blocks_is_read_whole"
+
+block a_file_without_the_ctfs_magic_is_refused:
+  # 0 and 1 bytes are the issue's cases (an empty file raised an
+  # IndexDefect); 4 is one short of the magic. 64 zero bytes, shorter than
+  # a block, take the read-whole branch: the file is read whole, and has no
+  # magic. Two zero-filled blocks take the read-as-used branch: block 0 is
+  # read, and has no magic.
+  for (what, bytes) in [("empty", newSeq[byte]()),
+      ("one-byte", @[CtfsMagic[0]]),
+      ("four-byte", @(CtfsMagic[0 ..< CtfsMagic.len - 1])),
+      ("sub-block", newSeq[byte](64)),
+      ("zero-blocks", newSeq[byte](2 * int(DefaultBlockSize)))]:
+    let path = tempPath(what & ".ct")
+    writeFile(path, cast[string](bytes))
+    let r = openFileImage(path)
+    removeFile(path)
+    doAssert r.isErr, what & " was opened"
+    doAssert "not a CTFS container: " in r.error and path in r.error,
+      what & ": " & r.error
+  echo "PASS a_file_without_the_ctfs_magic_is_refused"

@@ -24,6 +24,9 @@
 ## open until the image is released. A range must be loaded before it is read
 ## in place: `span` refuses, as a defect, to read a range of such an image
 ## that has not been. An image held whole (`newContainerImage`) needs no load.
+## A file that does not begin with the CTFS magic, one too short to hold it
+## included, is refused: it is no container, and an empty one has no byte to
+## read into.
 
 import results
 import ./types
@@ -202,6 +205,9 @@ when fileImages:
     ## could not read in place — a compact one, or one stored under a
     ## whole-file scheme, whose members do not lie in blocks — is read whole,
     ## and so is one shorter than a block. `readsFromFile` tells the two apart.
+    ## A file that does not begin with the CTFS magic is refused, with an
+    ## error naming it: one shorter than the magic (an empty one included)
+    ## before a byte of it is read, any other once its first block is.
     var f: File
     if not open(f, path, fmRead):
       return err("failed to read file: " & path)
@@ -210,11 +216,19 @@ when fileImages:
       image.bytes = newSeqUninit[byte](f.getFileSize())
     except IOError, OSError:
       return err("failed to read file: " & path)
+    if image.bytes.len < CtfsMagic.len:
+      return err("not a CTFS container: " & path & " is " &
+        $image.bytes.len & " bytes, shorter than the " & $CtfsMagic.len &
+        "-byte CTFS magic")
+    let noMagic = "not a CTFS container: " & path & " (" & $image.bytes.len &
+      " bytes) does not begin with the CTFS magic"
     let whole = image.bytes.len < int(blockSize) or blockSize == 0
     if not whole:
       image.loaded = newSeq[bool](image.bytes.len div int(blockSize) +
         ord(image.bytes.len mod int(blockSize) != 0))
       ? image.loadBlocks(0, 0)
+      if not hasCtfsMagic(image.bytes):
+        return err(noMagic)
     template d: untyped = image.bytes
     let blockBody = not whole and hasCtfsMagic(d) and d.len > V6CompressionOffset and
       (d[5] != CtfsVersionV6 or (d[V6ProfileOffset] == uint8(ord(cpFull)) and
@@ -228,6 +242,8 @@ when fileImages:
           return err("failed to read file: " & path)
       except IOError, OSError:
         return err("failed to read file: " & path)
+      if not hasCtfsMagic(image.bytes):
+        return err(noMagic)
       closeRead(image.file)
       image.file = nil
       return ok(image)
