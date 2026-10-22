@@ -218,14 +218,14 @@ proc printMetaJsonV4(reader: var NewTraceReader) =
   let cc = reader.callCount()
   let vc = reader.valueCount()
   let ic = reader.ioEventCount()
-  if sc.isOk: counts["steps"] = newJInt(int64(sc.get()))
-  if cc.isOk: counts["calls"] = newJInt(int64(cc.get()))
-  if vc.isOk: counts["values"] = newJInt(int64(vc.get()))
-  if ic.isOk: counts["io_events"] = newJInt(int64(ic.get()))
-  counts["paths"] = newJInt(int64(reader.pathCount()))
-  counts["functions"] = newJInt(int64(reader.functionCount()))
-  counts["types"] = newJInt(int64(reader.typeCount()))
-  counts["varnames"] = newJInt(int64(reader.varnameCount()))
+  if sc.isOk: counts["steps"] = unsignedJson(sc.get())
+  if cc.isOk: counts["calls"] = unsignedJson(cc.get())
+  if vc.isOk: counts["values"] = unsignedJson(vc.get())
+  if ic.isOk: counts["io_events"] = unsignedJson(ic.get())
+  counts["paths"] = unsignedJson(reader.pathCount())
+  counts["functions"] = unsignedJson(reader.functionCount())
+  counts["types"] = unsignedJson(reader.typeCount())
+  counts["varnames"] = unsignedJson(reader.varnameCount())
   # GDH-M2: how many source-reload markers the container carries.
   # ALWAYS emitted, including the `0` every trace without a reload
   # answers with, for the reason `path_version_ordinal` is always
@@ -235,7 +235,7 @@ proc printMetaJsonV4(reader: var NewTraceReader) =
   # COMPLETE: the step entries plus the source_reload entries must
   # account for every exec record.
   let srR = reader.sourceReloadCount()
-  counts["source_reloads"] = newJInt(if srR.isOk: int64(srR.get()) else: -1)
+  counts["source_reloads"] = if srR.isOk: unsignedJson(srR.get()) else: newJInt(-1)
   root["counts"] = counts
 
   echo pretty(root)
@@ -283,7 +283,7 @@ proc printJsonV4(reader: var NewTraceReader) =
   if allGlis.len > 0:
     for i in 0'u64 ..< uint64(allGlis.len):
       var stepObj = newJObject()
-      stepObj["index"] = newJInt(int64(i))
+      stepObj["index"] = unsignedJson(i)
       let loc = resolveStepLocation(reader, gli, allGlis[int(i)])
       if loc.isErr:
         # No `path_id` / `line` / `path` key at all: a consumer that reads
@@ -293,7 +293,7 @@ proc printJsonV4(reader: var NewTraceReader) =
       else:
         let (pathId, line) = loc.get()
         stepObj["path_id"] = newJInt(int64(pathId))
-        stepObj["line"] = newJInt(int64(line))
+        stepObj["line"] = unsignedJson(line)
         let pathStr = reader.path(uint64(pathId))
         if pathStr.isOk:
           stepObj["path"] = newJString(pathStr.get())
@@ -312,13 +312,13 @@ proc printJsonV4(reader: var NewTraceReader) =
       if c.isOk:
         let rec = c.get()
         var callObj = newJObject()
-        callObj["call_key"] = newJInt(int64(i))
-        callObj["function_id"] = newJInt(int64(rec.functionId))
+        callObj["call_key"] = unsignedJson(i)
+        callObj["function_id"] = unsignedJson(rec.functionId)
         let fn = reader.function(rec.functionId)
         if fn.isOk:
           callObj["function"] = newJString(fn.get())
-        callObj["entry_step"] = newJInt(int64(rec.entryStep))
-        callObj["exit_step"] = newJInt(int64(rec.exitStep))
+        callObj["entry_step"] = unsignedJson(rec.entryStep)
+        callObj["exit_step"] = unsignedJson(rec.exitStep)
         callObj["depth"] = newJInt(int64(rec.depth))
         callObj["arg_count"] = newJInt(int64(rec.args.len))
         callObj["children_count"] = newJInt(int64(rec.children.len))
@@ -334,8 +334,8 @@ proc printJsonV4(reader: var NewTraceReader) =
       if vals.isOk:
         for v in vals.get():
           var valObj = newJObject()
-          valObj["step"] = newJInt(int64(i))
-          valObj["varname_id"] = newJInt(int64(v.varnameId))
+          valObj["step"] = unsignedJson(i)
+          valObj["varname_id"] = unsignedJson(v.varnameId)
           let vn = reader.varname(v.varnameId)
           if vn.isOk:
             valObj["varname"] = newJString(vn.get())
@@ -355,9 +355,9 @@ proc printJsonV4(reader: var NewTraceReader) =
       if ev.isOk:
         let e = ev.get()
         var ioObj = newJObject()
-        ioObj["index"] = newJInt(int64(i))
+        ioObj["index"] = unsignedJson(i)
         ioObj["kind"] = newJString($e.kind)
-        ioObj["step_id"] = newJInt(int64(e.stepId))
+        ioObj["step_id"] = unsignedJson(e.stepId)
         ioObj["data"] = newJString(bytesToUtf8(e.data))
         ioArr.add(ioObj)
   root["ioEvents"] = ioArr
@@ -383,7 +383,7 @@ proc stepEventToJson(reader: var NewTraceReader, gli: GlobalLineIndex,
   # Step event
   var stepObj = newJObject()
   stepObj["type"] = newJString("step")
-  stepObj["step_index"] = newJInt(int64(stepIdx))
+  stepObj["step_index"] = unsignedJson(stepIdx)
 
   block resolveStep:
     let loc = resolveStepLocation(reader, gli, stepGli)
@@ -392,7 +392,7 @@ proc stepEventToJson(reader: var NewTraceReader, gli: GlobalLineIndex,
       break resolveStep
     let (pathId, line) = loc.get()
     stepObj["path_id"] = newJInt(int64(pathId))
-    stepObj["line"] = newJInt(int64(line))
+    stepObj["line"] = unsignedJson(line)
     let pathStr = reader.path(uint64(pathId))
     if pathStr.isOk:
       stepObj["path"] = newJString(pathStr.get())
@@ -420,7 +420,7 @@ proc stepEventToJson(reader: var NewTraceReader, gli: GlobalLineIndex,
   let callRes = reader.callForStep(stepIdx)
   if callRes.isOk:
     let c = callRes.get()
-    stepObj["function_id"] = newJInt(int64(c.functionId))
+    stepObj["function_id"] = unsignedJson(c.functionId)
     let fn = reader.function(c.functionId)
     if fn.isOk:
       stepObj["function"] = newJString(fn.get())
@@ -434,8 +434,8 @@ proc stepEventToJson(reader: var NewTraceReader, gli: GlobalLineIndex,
     for v in vals.get():
       var valObj = newJObject()
       valObj["type"] = newJString("value")
-      valObj["step_index"] = newJInt(int64(stepIdx))
-      valObj["varname_id"] = newJInt(int64(v.varnameId))
+      valObj["step_index"] = unsignedJson(stepIdx)
+      valObj["varname_id"] = unsignedJson(v.varnameId)
       let vn = reader.varname(v.varnameId)
       if vn.isOk:
         valObj["varname"] = newJString(vn.get())
@@ -455,9 +455,9 @@ proc stepEventToJson(reader: var NewTraceReader, gli: GlobalLineIndex,
     let io = ioEvents[idx]
     var ioObj = newJObject()
     ioObj["type"] = newJString("io")
-    ioObj["io_index"] = newJInt(int64(ioIndices[idx]))
+    ioObj["io_index"] = unsignedJson(ioIndices[idx])
     ioObj["kind"] = newJString($io.kind)
-    ioObj["step_id"] = newJInt(int64(io.stepId))
+    ioObj["step_id"] = unsignedJson(io.stepId)
     ioObj["data"] = newJString(bytesToUtf8(io.data))
     # The metadata slot, and a correlation marker hoisted out of it when the
     # slot holds one.  `--json-events` used to drop the slot entirely, which
@@ -505,7 +505,7 @@ proc printJsonEventsV4(reader: var NewTraceReader) =
   for i in 0'u64 ..< reader.pathCount():
     var obj = newJObject()
     obj["type"] = newJString("path")
-    obj["path_id"] = newJInt(int64(i))
+    obj["path_id"] = unsignedJson(i)
     let p = reader.path(i)
     if p.isOk:
       obj["name"] = newJString(p.get())
@@ -514,7 +514,7 @@ proc printJsonEventsV4(reader: var NewTraceReader) =
   for i in 0'u64 ..< reader.functionCount():
     var obj = newJObject()
     obj["type"] = newJString("function")
-    obj["function_id"] = newJInt(int64(i))
+    obj["function_id"] = unsignedJson(i)
     let f = reader.function(i)
     if f.isOk:
       obj["name"] = newJString(f.get())
@@ -523,7 +523,7 @@ proc printJsonEventsV4(reader: var NewTraceReader) =
   for i in 0'u64 ..< reader.varnameCount():
     var obj = newJObject()
     obj["type"] = newJString("varname")
-    obj["varname_id"] = newJInt(int64(i))
+    obj["varname_id"] = unsignedJson(i)
     let v = reader.varname(i)
     if v.isOk:
       obj["name"] = newJString(v.get())
@@ -532,7 +532,7 @@ proc printJsonEventsV4(reader: var NewTraceReader) =
   for i in 0'u64 ..< reader.typeCount():
     var obj = newJObject()
     obj["type"] = newJString("type")
-    obj["type_id"] = newJInt(int64(i))
+    obj["type_id"] = unsignedJson(i)
     let t = reader.typeName(i)
     if t.isOk:
       obj["name"] = newJString(t.get())
@@ -557,13 +557,13 @@ proc printJsonEventsV4(reader: var NewTraceReader) =
         if es == stepIdx:
           var callObj = newJObject()
           callObj["type"] = newJString("call")
-          callObj["call_key"] = newJInt(int64(ck))
-          callObj["function_id"] = newJInt(int64(rec.functionId))
+          callObj["call_key"] = unsignedJson(ck)
+          callObj["function_id"] = unsignedJson(rec.functionId)
           let fn = reader.function(rec.functionId)
           if fn.isOk:
             callObj["function"] = newJString(fn.get())
-          callObj["entry_step"] = newJInt(int64(rec.entryStep))
-          callObj["exit_step"] = newJInt(int64(rec.exitStep))
+          callObj["entry_step"] = unsignedJson(rec.entryStep)
+          callObj["exit_step"] = unsignedJson(rec.exitStep)
           callObj["depth"] = newJInt(int64(rec.depth))
           eventsArr.add(callObj)
 
@@ -1049,7 +1049,7 @@ proc followV4(filePath: string, pollMs: int) =
       for stepIdx in lastStepCount ..< sc.get():
         var stepObj = newJObject()
         stepObj["type"] = newJString("step")
-        stepObj["step_index"] = newJInt(int64(stepIdx))
+        stepObj["step_index"] = unsignedJson(stepIdx)
         if usableGlis:
           let loc = resolveGli(gli, newGlis[int(stepIdx - lastStepCount)])
           if loc.isErr:
@@ -1057,7 +1057,7 @@ proc followV4(filePath: string, pollMs: int) =
           else:
             let (pathId, line) = loc.get()
             stepObj["path_id"] = newJInt(int64(pathId))
-            stepObj["line"] = newJInt(int64(line))
+            stepObj["line"] = unsignedJson(line)
             let pathStr = reader.path(uint64(pathId))
             if pathStr.isOk:
               stepObj["path"] = newJString(pathStr.get())
@@ -1065,7 +1065,7 @@ proc followV4(filePath: string, pollMs: int) =
         let callRes = reader.callForStep(stepIdx)
         if callRes.isOk:
           let c = callRes.get()
-          stepObj["function_id"] = newJInt(int64(c.functionId))
+          stepObj["function_id"] = unsignedJson(c.functionId)
           let fn = reader.function(c.functionId)
           if fn.isOk:
             stepObj["function"] = newJString(fn.get())
@@ -1075,7 +1075,7 @@ proc followV4(filePath: string, pollMs: int) =
           var valArr = newJArray()
           for v in vals.get():
             var valObj = newJObject()
-            valObj["varname_id"] = newJInt(int64(v.varnameId))
+            valObj["varname_id"] = unsignedJson(v.varnameId)
             let vn = reader.varname(v.varnameId)
             if vn.isOk:
               valObj["varname"] = newJString(vn.get())
@@ -1096,9 +1096,9 @@ proc followV4(filePath: string, pollMs: int) =
           let e = ev.get()
           var ioObj = newJObject()
           ioObj["type"] = newJString("io")
-          ioObj["io_index"] = newJInt(int64(i))
+          ioObj["io_index"] = unsignedJson(i)
           ioObj["kind"] = newJString($e.kind)
-          ioObj["step_id"] = newJInt(int64(e.stepId))
+          ioObj["step_id"] = unsignedJson(e.stepId)
           ioObj["data"] = newJString(bytesToUtf8(e.data))
           echo $ioObj
           hadNewEvents = true
@@ -1112,13 +1112,13 @@ proc followV4(filePath: string, pollMs: int) =
           let rec = c.get()
           var callObj = newJObject()
           callObj["type"] = newJString("call")
-          callObj["call_key"] = newJInt(int64(i))
-          callObj["function_id"] = newJInt(int64(rec.functionId))
+          callObj["call_key"] = unsignedJson(i)
+          callObj["function_id"] = unsignedJson(rec.functionId)
           let fn = reader.function(rec.functionId)
           if fn.isOk:
             callObj["function"] = newJString(fn.get())
-          callObj["entry_step"] = newJInt(int64(rec.entryStep))
-          callObj["exit_step"] = newJInt(int64(rec.exitStep))
+          callObj["entry_step"] = unsignedJson(rec.entryStep)
+          callObj["exit_step"] = unsignedJson(rec.exitStep)
           callObj["depth"] = newJInt(int64(rec.depth))
           echo $callObj
           hadNewEvents = true

@@ -635,7 +635,7 @@ proc eventToJson(event: TraceLowLevelEvent): JsonNode =
   case event.kind
   of tleStep:
     result["type"] = newJString("Step")
-    result["path_id"] = newJInt(int64(uint64(event.step.pathId)))
+    result["path_id"] = unsignedJson(uint64(event.step.pathId))
     result["line"] = newJInt(int64(event.step.line))
     # P1.4: surface the column on column-aware traces so JSON-events
     # consumers can observe the per-step column without re-decoding the
@@ -660,20 +660,20 @@ proc eventToJson(event: TraceLowLevelEvent): JsonNode =
     result["lang_type"] = newJString(event.typeRecord.langType)
   of tleValue:
     result["type"] = newJString("Value")
-    result["variable_id"] = newJInt(int64(uint64(event.fullValue.variableId)))
+    result["variable_id"] = unsignedJson(uint64(event.fullValue.variableId))
     result["value"] = valueRecordToJson(event.fullValue.value)
   of tleFunction:
     result["type"] = newJString("Function")
-    result["path_id"] = newJInt(int64(uint64(event.functionRecord.pathId)))
+    result["path_id"] = unsignedJson(uint64(event.functionRecord.pathId))
     result["line"] = newJInt(int64(event.functionRecord.line))
     result["name"] = newJString(event.functionRecord.name)
   of tleCall:
     result["type"] = newJString("Call")
-    result["function_id"] = newJInt(int64(uint64(event.callRecord.functionId)))
+    result["function_id"] = unsignedJson(uint64(event.callRecord.functionId))
     var args = newJArray()
     for arg in event.callRecord.args:
       var argNode = newJObject()
-      argNode["variable_id"] = newJInt(int64(uint64(arg.variableId)))
+      argNode["variable_id"] = unsignedJson(uint64(arg.variableId))
       argNode["value"] = valueRecordToJson(arg.value)
       args.add(argNode)
     result["args"] = args
@@ -693,17 +693,17 @@ proc eventToJson(event: TraceLowLevelEvent): JsonNode =
     result["lines"] = lines
   of tleBindVariable:
     result["type"] = newJString("BindVariable")
-    result["variable_id"] = newJInt(int64(uint64(event.bindVar.variableId)))
+    result["variable_id"] = unsignedJson(uint64(event.bindVar.variableId))
     result["place"] = newJInt(int64(event.bindVar.place))
   of tleAssignment:
     result["type"] = newJString("Assignment")
-    result["to"] = newJInt(int64(uint64(event.assignment.to)))
+    result["to"] = unsignedJson(uint64(event.assignment.to))
     result["pass_by"] = newJString($event.assignment.passBy)
   of tleDropVariables:
     result["type"] = newJString("DropVariables")
     var ids = newJArray()
     for id in event.dropVarIds:
-      ids.add(newJInt(int64(uint64(id))))
+      ids.add(unsignedJson(uint64(id)))
     result["ids"] = ids
   of tleCompoundValue:
     result["type"] = newJString("CompoundValue")
@@ -724,11 +724,11 @@ proc eventToJson(event: TraceLowLevelEvent): JsonNode =
     result["value"] = valueRecordToJson(event.assignCell.newValue)
   of tleVariableCell:
     result["type"] = newJString("VariableCell")
-    result["variable_id"] = newJInt(int64(uint64(event.variableCell.variableId)))
+    result["variable_id"] = unsignedJson(uint64(event.variableCell.variableId))
     result["place"] = newJInt(int64(event.variableCell.place))
   of tleDropVariable:
     result["type"] = newJString("DropVariable")
-    result["variable_id"] = newJInt(int64(uint64(event.dropVarId)))
+    result["variable_id"] = unsignedJson(uint64(event.dropVarId))
   of tleThreadStart:
     result["type"] = newJString("ThreadStart")
     result["thread_id"] = unsignedJson(uint64(event.threadStartId))

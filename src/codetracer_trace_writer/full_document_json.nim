@@ -392,24 +392,24 @@ proc nonStepRecordJson*(ev: StepEvent, stepIndex: uint64): JsonNode =
   case ev.kind
   of sekRaise:
     result["kind"] = newJString("raise")
-    result["step_index"] = newJInt(int64(stepIndex))
+    result["step_index"] = unsignedJson(stepIndex)
     result["exception_type_id"] = unsignedJson(ev.exceptionTypeId)
     result["exception_message"] = newJString(bytesToUtf8(ev.message))
   of sekCatch:
     result["kind"] = newJString("catch")
-    result["step_index"] = newJInt(int64(stepIndex))
+    result["step_index"] = unsignedJson(stepIndex)
     result["exception_type_id"] = unsignedJson(ev.catchExceptionTypeId)
   of sekThreadStart:
     result["kind"] = newJString("thread_start")
-    result["step_index"] = newJInt(int64(stepIndex))
+    result["step_index"] = unsignedJson(stepIndex)
     result["thread_id"] = unsignedJson(ev.startThreadId)
   of sekThreadExit:
     result["kind"] = newJString("thread_exit")
-    result["step_index"] = newJInt(int64(stepIndex))
+    result["step_index"] = unsignedJson(stepIndex)
     result["thread_id"] = unsignedJson(ev.exitThreadId)
   of sekThreadSwitch:
     result["kind"] = newJString("thread_switch")
-    result["step_index"] = newJInt(int64(stepIndex))
+    result["step_index"] = unsignedJson(stepIndex)
     result["thread_id"] = unsignedJson(ev.threadId)
   else:
     doAssert false, "nonStepRecordJson: " & $ev.kind & " is not a raise, " &
@@ -419,8 +419,8 @@ proc ioEventJson(ev: IOEvent, idx: uint64): JsonNode =
   var ioObj = newJObject()
   ioObj["kind"] = newJString("io")
   ioObj["io_kind"] = newJString(eventLogKindName(ev.kind))
-  ioObj["io_index"] = newJInt(int64(idx))
-  ioObj["step_id"] = newJInt(int64(ev.stepId))
+  ioObj["io_index"] = unsignedJson(idx)
+  ioObj["step_id"] = unsignedJson(ev.stepId)
   # Surface both UTF-8 (best-effort) and base64 (exact bytes) so
   # binary payloads are diff-friendly without losing fidelity.
   var allPrintable = true
@@ -521,16 +521,16 @@ proc buildFullDocument*(reader: var NewTraceReader,
   var pathVersionsArr = newJArray()
   for i in 0'u64 ..< reader.pathCount():
     var vObj = newJObject()
-    vObj["path_id"] = newJInt(int64(i))
+    vObj["path_id"] = unsignedJson(i)
     let vo = reader.pathVersionOrdinal(i)
-    vObj["version_ordinal"] = if vo.isOk: newJInt(int64(vo.get()))
+    vObj["version_ordinal"] = if vo.isOk: unsignedJson(vo.get())
                               else: newJInt(-1)
     let vc = reader.pathVersionCount(i)
-    vObj["version_count"] = if vc.isOk: newJInt(int64(vc.get()))
+    vObj["version_count"] = if vc.isOk: unsignedJson(vc.get())
                             else: newJInt(-1)
     # 0 means "this container does not state this file's size", not "the
     # file has no lines" — see `recordedLineCount`.
-    vObj["recorded_line_count"] = newJInt(int64(reader.recordedLineCount(i)))
+    vObj["recorded_line_count"] = unsignedJson(reader.recordedLineCount(i))
     pathVersionsArr.add(vObj)
   root["path_versions"] = pathVersionsArr
 
@@ -565,7 +565,7 @@ proc buildFullDocument*(reader: var NewTraceReader,
     if svRes.isOk:
       let sv = svRes.get()
       var svObj = newJObject()
-      svObj["path_id"] = newJInt(int64(sv.pathId))
+      svObj["path_id"] = unsignedJson(sv.pathId)
       svObj["view_kind"] = newJInt(int64(sv.viewKind))
       svObj["view_name"] = newJString(sv.viewName)
       svObj["content_len"] = newJInt(int64(sv.content.len))
@@ -575,22 +575,22 @@ proc buildFullDocument*(reader: var NewTraceReader,
 
   # ----- counts (for golden anchoring) -----
   var counts = newJObject()
-  counts["paths"] = newJInt(int64(reader.pathCount()))
-  counts["functions"] = newJInt(int64(reader.functionCount()))
-  counts["varnames"] = newJInt(int64(reader.varnameCount()))
-  counts["types"] = newJInt(int64(reader.typeCount()))
-  counts["source_views"] = newJInt(int64(reader.sourceViewCount()))
+  counts["paths"] = unsignedJson(reader.pathCount())
+  counts["functions"] = unsignedJson(reader.functionCount())
+  counts["varnames"] = unsignedJson(reader.varnameCount())
+  counts["types"] = unsignedJson(reader.typeCount())
+  counts["source_views"] = unsignedJson(reader.sourceViewCount())
   # Use logicalStepCount so user-facing "steps" excludes DeltaColumn
   # nudges — column-aware traces interleave them with line moves but
   # they are not logical source-line steps.
   let scR = reader.logicalStepCount()
-  counts["steps"] = newJInt(if scR.isOk: int64(scR.get()) else: -1)
+  counts["steps"] = if scR.isOk: unsignedJson(scR.get()) else: newJInt(-1)
   let ccR = reader.callCount()
-  counts["calls"] = newJInt(if ccR.isOk: int64(ccR.get()) else: -1)
+  counts["calls"] = if ccR.isOk: unsignedJson(ccR.get()) else: newJInt(-1)
   let vcR = reader.valueCount()
-  counts["values"] = newJInt(if vcR.isOk: int64(vcR.get()) else: -1)
+  counts["values"] = if vcR.isOk: unsignedJson(vcR.get()) else: newJInt(-1)
   let icR = reader.ioEventCount()
-  counts["io_events"] = newJInt(if icR.isOk: int64(icR.get()) else: -1)
+  counts["io_events"] = if icR.isOk: unsignedJson(icR.get()) else: newJInt(-1)
   # GDH-M2: how many source-reload markers the container carries.
   # ALWAYS emitted, including the `0` every trace without a reload
   # answers with, for the reason `path_version_ordinal` is always
@@ -600,7 +600,7 @@ proc buildFullDocument*(reader: var NewTraceReader,
   # COMPLETE: the step entries plus the source_reload entries must
   # account for every exec record.
   let srR = reader.sourceReloadCount()
-  counts["source_reloads"] = newJInt(if srR.isOk: int64(srR.get()) else: -1)
+  counts["source_reloads"] = if srR.isOk: unsignedJson(srR.get()) else: newJInt(-1)
   root["counts"] = counts
 
   # ----- events (interleaved, source-order) -----
@@ -649,19 +649,19 @@ proc buildFullDocument*(reader: var NewTraceReader,
         if es == stepIdx:
           var callObj = newJObject()
           callObj["kind"] = newJString("call_entry")
-          callObj["call_key"] = newJInt(int64(ck))
-          callObj["function_id"] = newJInt(int64(rec.functionId))
+          callObj["call_key"] = unsignedJson(ck)
+          callObj["function_id"] = unsignedJson(rec.functionId)
           let fn = reader.function(rec.functionId)
           if fn.isOk:
             callObj["function"] = newJString(fn.get())
-          callObj["entry_step"] = newJInt(int64(rec.entryStep))
-          callObj["exit_step"] = newJInt(int64(rec.exitStep))
+          callObj["entry_step"] = unsignedJson(rec.entryStep)
+          callObj["exit_step"] = unsignedJson(rec.exitStep)
           callObj["depth"] = newJInt(int64(rec.depth))
           callObj["parent_call_key"] = newJInt(rec.parentCallKey)
           var argsJson = newJArray()
           for arg in rec.args:
             var argObj = newJObject()
-            argObj["varname_id"] = newJInt(int64(arg.varnameId))
+            argObj["varname_id"] = unsignedJson(arg.varnameId)
             let argVn = reader.varname(arg.varnameId)
             if argVn.isOk:
               argObj["varname"] = newJString(argVn.get())
@@ -670,7 +670,7 @@ proc buildFullDocument*(reader: var NewTraceReader,
           callObj["args"] = argsJson
           var childrenJson = newJArray()
           for c in rec.children:
-            childrenJson.add(newJInt(int64(c)))
+            childrenJson.add(unsignedJson(c))
           callObj["children"] = childrenJson
           eventsArr.add(callObj)
 
@@ -723,14 +723,14 @@ proc buildFullDocument*(reader: var NewTraceReader,
       if isUnreadable:
         var errObj = newJObject()
         errObj["kind"] = newJString("step_error")
-        errObj["step_index"] = newJInt(int64(stepIdx))
+        errObj["step_index"] = unsignedJson(stepIdx)
         errObj["error"] = newJString(stepEv.error)
         eventsArr.add(errObj)
       if not isDeltaColumnNudge and not isSourceReload and not isOtherRecord and
           not isUnreadable:
         var stepObj = newJObject()
         stepObj["kind"] = newJString("step")
-        stepObj["step_index"] = newJInt(int64(stepIdx))
+        stepObj["step_index"] = unsignedJson(stepIdx)
         block emitStep:
           let loc = resolveStepLocation(reader, gli, stepGli)
           if loc.isErr:
@@ -738,7 +738,7 @@ proc buildFullDocument*(reader: var NewTraceReader,
             break emitStep
           let (pathId, line) = loc.get()
           stepObj["path_id"] = newJInt(int64(pathId))
-          stepObj["line"] = newJInt(int64(line))
+          stepObj["line"] = unsignedJson(line)
           # GDH-M1 — which VERSION of that file the step ran in: the
           # 0-based ordinal of `path_id` among the paths.dat entries
           # carrying its string. Always emitted, including the `0`
@@ -749,7 +749,7 @@ proc buildFullDocument*(reader: var NewTraceReader,
           # that has none AND on a build that cannot see one.
           let vOrd = reader.pathVersionOrdinal(uint64(pathId))
           stepObj["path_version_ordinal"] =
-            if vOrd.isOk: newJInt(int64(vOrd.get())) else: newJInt(-1)
+            if vOrd.isOk: unsignedJson(vOrd.get()) else: newJInt(-1)
           let pStr = reader.path(uint64(pathId))
           if pStr.isOk:
             stepObj["path"] = newJString(
@@ -768,7 +768,7 @@ proc buildFullDocument*(reader: var NewTraceReader,
         let callForStep = reader.callForStep(stepIdx)
         if callForStep.isOk:
           let cs = callForStep.get()
-          stepObj["function_id"] = newJInt(int64(cs.functionId))
+          stepObj["function_id"] = unsignedJson(cs.functionId)
           let fn = reader.function(cs.functionId)
           if fn.isOk:
             stepObj["function"] = newJString(fn.get())
@@ -779,7 +779,7 @@ proc buildFullDocument*(reader: var NewTraceReader,
         if vals.isOk:
           for v in vals.get():
             var vObj = newJObject()
-            vObj["varname_id"] = newJInt(int64(v.varnameId))
+            vObj["varname_id"] = unsignedJson(v.varnameId)
             let vn = reader.varname(v.varnameId)
             if vn.isOk:
               vObj["varname"] = newJString(vn.get())
@@ -802,12 +802,12 @@ proc buildFullDocument*(reader: var NewTraceReader,
         if es == stepIdx:
           var exitObj = newJObject()
           exitObj["kind"] = newJString("call_exit")
-          exitObj["call_key"] = newJInt(int64(ck))
-          exitObj["function_id"] = newJInt(int64(rec.functionId))
+          exitObj["call_key"] = unsignedJson(ck)
+          exitObj["function_id"] = unsignedJson(rec.functionId)
           let fn = reader.function(rec.functionId)
           if fn.isOk:
             exitObj["function"] = newJString(fn.get())
-          exitObj["exit_step"] = newJInt(int64(rec.exitStep))
+          exitObj["exit_step"] = unsignedJson(rec.exitStep)
           exitObj["depth"] = newJInt(int64(rec.depth))
           exitObj["return_value"] = decodeValueBytesToJson(rec.returnValue)
           if rec.exception.len > 0:
@@ -844,22 +844,22 @@ proc buildFullDocument*(reader: var NewTraceReader,
     for (es, rec, ck) in pending:
       var callObj = newJObject()
       callObj["kind"] = newJString("call_entry")
-      callObj["call_key"] = newJInt(int64(ck))
-      callObj["function_id"] = newJInt(int64(rec.functionId))
+      callObj["call_key"] = unsignedJson(ck)
+      callObj["function_id"] = unsignedJson(rec.functionId)
       let fn = reader.function(rec.functionId)
       if fn.isOk:
         callObj["function"] = newJString(fn.get())
-      callObj["entry_step"] = newJInt(int64(rec.entryStep))
-      callObj["exit_step"] = newJInt(int64(rec.exitStep))
+      callObj["entry_step"] = unsignedJson(rec.entryStep)
+      callObj["exit_step"] = unsignedJson(rec.exitStep)
       callObj["depth"] = newJInt(int64(rec.depth))
       callObj["parent_call_key"] = newJInt(rec.parentCallKey)
       # Flag synthesized entries so downstream consumers can spot the
       # writer-close drain case (entry at last-step, exit already past).
-      callObj["synthesized_at_step"] = newJInt(int64(lastStep))
+      callObj["synthesized_at_step"] = unsignedJson(lastStep)
       var argsJson = newJArray()
       for arg in rec.args:
         var argObj = newJObject()
-        argObj["varname_id"] = newJInt(int64(arg.varnameId))
+        argObj["varname_id"] = unsignedJson(arg.varnameId)
         let argVn = reader.varname(arg.varnameId)
         if argVn.isOk:
           argObj["varname"] = newJString(argVn.get())
@@ -868,7 +868,7 @@ proc buildFullDocument*(reader: var NewTraceReader,
       callObj["args"] = argsJson
       var childrenJson = newJArray()
       for c in rec.children:
-        childrenJson.add(newJInt(int64(c)))
+        childrenJson.add(unsignedJson(c))
       callObj["children"] = childrenJson
       eventsArr.add(callObj)
 

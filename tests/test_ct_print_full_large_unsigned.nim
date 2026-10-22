@@ -37,7 +37,7 @@
 ## e.markerIdOf()))` in `--correlation-index`, and the last test fails naming
 ## that mode and its exit code.
 
-import std/[os, osproc, strutils, json, tempfiles]
+import std/[os, osproc, strutils, json, tempfiles, options]
 import results
 import codetracer_trace_types
 import codetracer_trace_writer/cbor
@@ -133,7 +133,9 @@ proc buildBundle(path: string) =
   doAssert w.registerCatch(uint64.high).isOk
   doAssert w.registerThreadSwitch(uint64.high).isOk
   # Correlation index entries: a boundary marker whose id has bit 63 set and
-  # a span-coverage entry whose thread id and timestamps are 2^64-1.
+  # a span-coverage entry whose thread id, timestamps and step coordinate
+  # (`geid`, taken from `stepId` as given -- the C ABI passes it explicitly
+  # for a buffered step) are 2^64-1.
   doAssert w.registerCorrelationMarkerById("send", uint64.high, "edge",
     "k").isOk
   var traceId = newSeq[byte](16)
@@ -141,7 +143,7 @@ proc buildBundle(path: string) =
   for i in 0 ..< traceId.len: traceId[i] = byte(i + 1)
   for i in 0 ..< spanId.len: spanId[i] = byte(0xA0 + i)
   doAssert w.registerSpanCoverage(traceId, spanId, uint64.high, uint64.high,
-    threadId = uint64.high).isOk
+    threadId = uint64.high, stepId = some(uint64.high)).isOk
   doAssert w.registerStep(p0, 3'u64, @[]).isOk
   doAssert w.close().isOk
   w.closeCtfs()
@@ -241,7 +243,7 @@ proc test_every_ct_print_mode_prints_upper_half_values() =
   let args = "--correlation-index --json-out"
   let index = runCtPrint(args, bundle)
   for key in ["marker_id", "thread_id", "wall_time_unix_ns",
-              "monotonic_time_ns"]:
+              "monotonic_time_ns", "geid"]:
     expectInOutput(index, key, args)
   echo "PASS: ct-print " & args & " prints ids and times of 2^64-1"
 

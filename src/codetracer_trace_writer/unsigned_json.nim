@@ -1,10 +1,16 @@
 ## Rendering an unsigned 64-bit trace field as a JSON number.
 ##
-## Its own module because two JSON renderers need it and neither may import
-## the other: ``full_document_json`` (the ``ct-print`` document, which
-## re-exports this) and ``codetracer_trace_reader`` (``TraceReader.toJson`` /
-## ``toJsonEvents``), which runs under ``{.push raises: [].}`` and should not
-## pull the whole ``ct-print`` assembly in for one conversion.
+## Its own module so the two JSON renderers that need it share one
+## definition without either depending on the other's code:
+## ``full_document_json`` (the ``ct-print`` document, which re-exports this)
+## and ``codetracer_trace_reader`` (``TraceReader.toJson`` /
+## ``toJsonEvents``). The reader could import ``full_document_json`` without
+## an import cycle, but that module assembles the whole ``ct-print``
+## document and imports the writer (``multi_stream_writer``), the meta and
+## source-reload renderers and every stream reader; the trace reader would
+## take all of that on for one conversion. This module depends on
+## ``std/json`` only, and it is ``raises: []`` so the reader, which runs
+## under ``{.push raises: [].}``, can call it.
 
 {.push raises: [].}
 

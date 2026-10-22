@@ -129,6 +129,19 @@ proc test_reader_json_prints_upper_half_values() =
   ## The serialized text is asserted, not a parsed node: `std/json` parses an
   ## integer too big for `BiggestInt` into a `JString`, so a parsed check
   ## could not tell `18446744073709551615` from `"18446744073709551615"`.
+  ##
+  ## Two more fields, through the two paths that can carry one:
+  ##
+  ## * a dense index, `variable_id`: the reader takes a value's id from the
+  ##   value stream as written, and the writer records whatever
+  ##   `VariableValue.varnameId` it is handed without checking it was ever
+  ##   registered. A recorder that passes a stale or garbage id therefore
+  ##   produces a trace whose `variable_id` is 2^64-1 — no corrupt file
+  ##   needed.
+  ## * `AssignCompoundItem.index`: no event in the split-stream format maps
+  ##   to it, so `readEvents` never produces one. It reaches `toJson` only
+  ##   through `TraceReader.events`, a public field a consumer may extend,
+  ##   which is how this test injects it.
   const maxText = "18446744073709551615"
   let path = getTmpPath("test_reader_json_upper_half.ct")
   cleanupFile(path)
@@ -143,7 +156,9 @@ proc test_reader_json_prints_upper_half_values() =
       mutable: true, refTypeId: TypeId(uint64.high)))),
     VariableValue(varnameId: vnLow, data: encodeValue(ValueRecord(
       kind: vrkReference, dereferenced: deref, address: 4096'u64,
-      mutable: false, refTypeId: TypeId(3))))
+      mutable: false, refTypeId: TypeId(3)))),
+    VariableValue(varnameId: uint64.high, data: encodeValue(ValueRecord(
+      kind: vrkInt, intVal: 1, intTypeId: TypeId(1))))
   ]).isOk
   doAssert w.registerThreadStart(uint64.high).isOk
   doAssert w.registerThreadSwitch(uint64.high).isOk
@@ -154,11 +169,14 @@ proc test_reader_json_prints_upper_half_values() =
 
   var reader = openTrace(path).get()
   doAssert reader.readEvents().isOk
+  reader.events.add(TraceLowLevelEvent(kind: tleAssignCompoundItem,
+    assignCompoundItem: AssignCompoundItemRecord(place: Place(1),
+      index: uint64.high, itemPlace: Place(2))))
   for (name, rendered) in [("toJson", reader.toJson()),
                            ("toJsonEvents", reader.toJsonEvents())]:
     # Pretty-printing writes `"key": value`; fold it to one spelling.
     let text = rendered.replace("\": ", "\":")
-    for key in ["address", "type_id"]:
+    for key in ["address", "type_id", "variable_id", "index"]:
       doAssert ("\"" & key & "\":" & maxText) in text,
         name & " did not print " & key & " as the unsigned number " &
         maxText & ":\n" & rendered
