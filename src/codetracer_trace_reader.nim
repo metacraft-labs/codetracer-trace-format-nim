@@ -25,6 +25,7 @@ import codetracer_trace_writer/call_stream as v4_call_stream
 import codetracer_trace_writer/io_event_stream as v4_io_event_stream
 import codetracer_trace_writer/cbor as v4_cbor
 import codetracer_trace_writer/global_line_index as v4_gli
+import codetracer_trace_writer/unsigned_json
 
 export results, codetracer_trace_types
 
@@ -528,22 +529,22 @@ proc valueRecordToJson(v: ValueRecord): JsonNode =
   of vrkInt:
     result["kind"] = newJString("Int")
     result["i"] = newJInt(v.intVal)
-    result["type_id"] = newJInt(int64(uint64(v.intTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.intTypeId))
   of vrkFloat:
     result["kind"] = newJString("Float")
     result["f"] = newJFloat(v.floatVal)
-    result["type_id"] = newJInt(int64(uint64(v.floatTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.floatTypeId))
   of vrkBool:
     result["kind"] = newJString("Bool")
     result["b"] = newJBool(v.boolVal)
     # `text` carries the printed boolean ("true"|"false"), matching the
     # 4-key CBOR map produced by writeBool / encodeCborValueRecord.
     result["text"] = newJString(if v.boolVal: "true" else: "false")
-    result["type_id"] = newJInt(int64(uint64(v.boolTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.boolTypeId))
   of vrkString:
     result["kind"] = newJString("String")
     result["text"] = newJString(v.text)
-    result["type_id"] = newJInt(int64(uint64(v.strTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.strTypeId))
   of vrkSequence:
     result["kind"] = newJString("Sequence")
     var elems = newJArray()
@@ -551,14 +552,14 @@ proc valueRecordToJson(v: ValueRecord): JsonNode =
       elems.add(valueRecordToJson(e))
     result["elements"] = elems
     result["is_slice"] = newJBool(v.isSlice)
-    result["type_id"] = newJInt(int64(uint64(v.seqTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.seqTypeId))
   of vrkTuple:
     result["kind"] = newJString("Tuple")
     var elems = newJArray()
     for e in v.tupleElements:
       elems.add(valueRecordToJson(e))
     result["elements"] = elems
-    result["type_id"] = newJInt(int64(uint64(v.tupleTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.tupleTypeId))
   of vrkStruct:
     result["kind"] = newJString("Struct")
     var fields = newJArray()
@@ -573,7 +574,7 @@ proc valueRecordToJson(v: ValueRecord): JsonNode =
         pair.add(valueRecordToJson(v.fieldValues[i]))
         pairs.add(pair)
       result["fields"] = pairs
-    result["type_id"] = newJInt(int64(uint64(v.structTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.structTypeId))
   of vrkVariant:
     result["kind"] = newJString("Variant")
     result["discriminator"] = newJString(v.discriminator)
@@ -581,38 +582,38 @@ proc valueRecordToJson(v: ValueRecord): JsonNode =
       result["contents"] = valueRecordToJson(v.contents[0])
     else:
       result["contents"] = newJNull()
-    result["type_id"] = newJInt(int64(uint64(v.variantTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.variantTypeId))
   of vrkReference:
     result["kind"] = newJString("Reference")
     if v.dereferenced.len > 0:
       result["dereferenced"] = valueRecordToJson(v.dereferenced[0])
     else:
       result["dereferenced"] = newJNull()
-    result["address"] = newJInt(int64(v.address))
+    result["address"] = unsignedJson(v.address)
     result["mutable"] = newJBool(v.mutable)
-    result["type_id"] = newJInt(int64(uint64(v.refTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.refTypeId))
   of vrkRaw:
     result["kind"] = newJString("Raw")
     result["r"] = newJString(v.rawStr)
-    result["type_id"] = newJInt(int64(uint64(v.rawTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.rawTypeId))
   of vrkError:
     result["kind"] = newJString("Error")
     result["msg"] = newJString(v.errorMsg)
-    result["type_id"] = newJInt(int64(uint64(v.errorTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.errorTypeId))
   of vrkNone:
     result["kind"] = newJString("None")
-    result["type_id"] = newJInt(int64(uint64(v.noneTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.noneTypeId))
   of vrkCell:
     result["kind"] = newJString("Cell")
     result["place"] = newJInt(int64(v.cellPlace))
   of vrkBigInt:
     result["kind"] = newJString("BigInt")
     result["negative"] = newJBool(v.negative)
-    result["type_id"] = newJInt(int64(uint64(v.bigIntTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.bigIntTypeId))
   of vrkChar:
     result["kind"] = newJString("Char")
     result["c"] = newJString($v.charVal)
-    result["type_id"] = newJInt(int64(uint64(v.charTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.charTypeId))
   of vrkValueRef:
     result["kind"] = newJString("ValueRef")
     result["ref_id"] = newJInt(int64(v.refId))
@@ -622,12 +623,12 @@ proc valueRecordToJson(v: ValueRecord): JsonNode =
     for e in v.setMembers:
       members.add(valueRecordToJson(e))
     result["members"] = members
-    result["type_id"] = newJInt(int64(uint64(v.setTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.setTypeId))
   of vrkEnum:
     result["kind"] = newJString("Enum")
     result["name"] = newJString(v.enumName)
     result["ordinal"] = newJInt(v.enumOrdinal)
-    result["type_id"] = newJInt(int64(uint64(v.enumTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.enumTypeId))
 
 proc eventToJson(event: TraceLowLevelEvent): JsonNode =
   result = newJObject()
@@ -715,7 +716,7 @@ proc eventToJson(event: TraceLowLevelEvent): JsonNode =
   of tleAssignCompoundItem:
     result["type"] = newJString("AssignCompoundItem")
     result["place"] = newJInt(int64(event.assignCompoundItem.place))
-    result["index"] = newJInt(int64(event.assignCompoundItem.index))
+    result["index"] = unsignedJson(event.assignCompoundItem.index)
     result["item_place"] = newJInt(int64(event.assignCompoundItem.itemPlace))
   of tleAssignCell:
     result["type"] = newJString("AssignCell")
@@ -730,13 +731,13 @@ proc eventToJson(event: TraceLowLevelEvent): JsonNode =
     result["variable_id"] = newJInt(int64(uint64(event.dropVarId)))
   of tleThreadStart:
     result["type"] = newJString("ThreadStart")
-    result["thread_id"] = newJInt(int64(uint64(event.threadStartId)))
+    result["thread_id"] = unsignedJson(uint64(event.threadStartId))
   of tleThreadExit:
     result["type"] = newJString("ThreadExit")
-    result["thread_id"] = newJInt(int64(uint64(event.threadExitId)))
+    result["thread_id"] = unsignedJson(uint64(event.threadExitId))
   of tleThreadSwitch:
     result["type"] = newJString("ThreadSwitch")
-    result["thread_id"] = newJInt(int64(uint64(event.threadSwitchId)))
+    result["thread_id"] = unsignedJson(uint64(event.threadSwitchId))
   of tleDropLastStep:
     result["type"] = newJString("DropLastStep")
 

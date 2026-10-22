@@ -40,9 +40,10 @@ import ./value_stream
 import ./global_line_index
 import ./multi_stream_writer
 import ./cbor
+import ./unsigned_json
 import ../codetracer_trace_types
 
-export json, results
+export json, results, unsigned_json
 
 # ---------------------------------------------------------------------------
 # Global line index resolution for v4 traces
@@ -200,23 +201,6 @@ proc bytesToHexLower*(data: seq[byte]): string =
 # ---------------------------------------------------------------------------
 # ValueRecord -> JsonNode
 # ---------------------------------------------------------------------------
-
-proc unsignedJson*(n: uint64): JsonNode =
-  ## Render an unsigned 64-bit value as a JSON number.
-  ##
-  ## Addresses, type ids, exception type ids and thread ids are unsigned
-  ## 64-bit fields whose values the recorder chooses: a pointer in the upper
-  ## half of the address space, or a tag in bit 63, is 2^63 or more.
-  ## ``newJInt(int64(n))`` raises ``RangeDefect`` for every such value, and
-  ## one of them used to abort the whole ``ct-print --full`` dump.
-  ##
-  ## A value below 2^63 stays an ordinary ``JInt``, so the document is
-  ## unchanged for every value that rendered before. A larger one becomes
-  ## ``std/json``'s raw-number node, which serializes as the exact unsigned
-  ## decimal digits, unquoted (``%`` for ``BiggestUInt``,
-  ## https://nim-lang.org/docs/json.html). A consumer that reads JSON integers
-  ## as signed 64-bit must read these fields as unsigned.
-  %BiggestUInt(n)
 
 proc valueRecordToJson*(v: ValueRecord): JsonNode =
   ## Convert a decoded ValueRecord into a structured JSON node, surfacing

@@ -6,6 +6,8 @@ import std/[os, json, strutils]
 import results
 import codetracer_trace_reader
 import codetracer_trace_writer/multi_stream_writer
+import codetracer_trace_writer/value_stream
+import codetracer_trace_writer/cbor
 
 proc getTmpPath(name: string): string =
   getTempDir() / name
@@ -110,9 +112,84 @@ proc test_reader_error_handling() =
   cleanupFile(path)
   echo "PASS: test_reader_error_handling"
 
+proc encodeValue(v: ValueRecord): seq[byte] =
+  var enc = CborEncoder.init()
+  enc.encodeCborValueRecord(v)
+  enc.getBytes()
+
+proc test_reader_json_prints_upper_half_values() =
+  ## `toJson` / `toJsonEvents` render a Reference's `address`, every value
+  ## `type_id` and a thread record's `thread_id` as unsigned 64-bit numbers.
+  ## Each is chosen by the recorder (a pointer in the upper half of the
+  ## address space, a tag in bit 63), and each used to be `newJInt(int64(x))`,
+  ## which raised RangeDefect at 2^63 — under `{.push raises: [].}` that is
+  ## an abort, not an error the caller can handle. Below 2^63 a value stays
+  ## an ordinary JSON integer.
+  ##
+  ## The serialized text is asserted, not a parsed node: `std/json` parses an
+  ## integer too big for `BiggestInt` into a `JString`, so a parsed check
+  ## could not tell `18446744073709551615` from `"18446744073709551615"`.
+  const maxText = "18446744073709551615"
+  let path = getTmpPath("test_reader_json_upper_half.ct")
+  cleanupFile(path)
+  var w = initMultiStreamWriter(path, "upper_half").get()
+  let p = w.registerPath("/src/main.c").get()
+  let vnPtr = w.registerVarname("ptr").get()
+  let vnLow = w.registerVarname("low").get()
+  let deref = @[ValueRecord(kind: vrkInt, intVal: 7, intTypeId: TypeId(1))]
+  doAssert w.registerStep(p, 1'u64, [
+    VariableValue(varnameId: vnPtr, data: encodeValue(ValueRecord(
+      kind: vrkReference, dereferenced: deref, address: uint64.high,
+      mutable: true, refTypeId: TypeId(uint64.high)))),
+    VariableValue(varnameId: vnLow, data: encodeValue(ValueRecord(
+      kind: vrkReference, dereferenced: deref, address: 4096'u64,
+      mutable: false, refTypeId: TypeId(3))))
+  ]).isOk
+  doAssert w.registerThreadStart(uint64.high).isOk
+  doAssert w.registerThreadSwitch(uint64.high).isOk
+  doAssert w.registerThreadExit(uint64.high).isOk
+  doAssert w.registerStep(p, 2'u64, []).isOk
+  doAssert w.close().isOk
+  doAssert w.closeCtfs().isOk
+
+  var reader = openTrace(path).get()
+  doAssert reader.readEvents().isOk
+  for (name, rendered) in [("toJson", reader.toJson()),
+                           ("toJsonEvents", reader.toJsonEvents())]:
+    # Pretty-printing writes `"key": value`; fold it to one spelling.
+    let text = rendered.replace("\": ", "\":")
+    for key in ["address", "type_id"]:
+      doAssert ("\"" & key & "\":" & maxText) in text,
+        name & " did not print " & key & " as the unsigned number " &
+        maxText & ":\n" & rendered
+    doAssert text.count("\"thread_id\":" & maxText) == 3,
+      name & " did not print the ThreadStart, ThreadSwitch and ThreadExit " &
+      "ids as " & maxText & ":\n" & rendered
+    doAssert ("\"" & maxText & "\"") notin text,
+      name & " printed an unsigned value as a string:\n" & rendered
+    # Below 2^63 the address is still an ordinary JSON integer.
+    try:
+      let node = parseJson(rendered)
+      let events = if node.kind == JArray: node.getElems()
+                   else: node["events"].getElems()
+      var lowAddresses: seq[JsonNode]
+      for ev in events:
+        if ev["type"].getStr() == "Value" and
+            ev["value"]["kind"].getStr() == "Reference" and
+            ev["value"]["address"].kind == JInt:
+          lowAddresses.add(ev["value"]["address"])
+      doAssert lowAddresses.len == 1 and
+        lowAddresses[0].getBiggestInt() == 4096,
+        name & ": the address 4096 must be a JInt, got " & $lowAddresses
+    except JsonParsingError, KeyError, ValueError, IOError, OSError:
+      doAssert false, name & " output is not JSON: " & getCurrentExceptionMsg()
+  cleanupFile(path)
+  echo "PASS: test_reader_json_prints_upper_half_values"
+
 test_reader_basic()
 test_reader_json_output()
 test_reader_text_output()
 test_reader_summary()
 test_reader_error_handling()
+test_reader_json_prints_upper_half_values()
 echo "ALL PASS: test_trace_reader"
