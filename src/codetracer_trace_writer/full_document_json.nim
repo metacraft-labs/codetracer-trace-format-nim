@@ -201,8 +201,22 @@ proc bytesToHexLower*(data: seq[byte]): string =
 # ValueRecord -> JsonNode
 # ---------------------------------------------------------------------------
 
-# ValueRecord -> JsonNode
-# ---------------------------------------------------------------------------
+proc unsignedJson*(n: uint64): JsonNode =
+  ## Render an unsigned 64-bit value as a JSON number.
+  ##
+  ## Addresses, type ids, exception type ids and thread ids are unsigned
+  ## 64-bit fields whose values the recorder chooses: a pointer in the upper
+  ## half of the address space, or a tag in bit 63, is 2^63 or more.
+  ## ``newJInt(int64(n))`` raises ``RangeDefect`` for every such value, and
+  ## one of them used to abort the whole ``ct-print --full`` dump.
+  ##
+  ## A value below 2^63 stays an ordinary ``JInt``, so the document is
+  ## unchanged for every value that rendered before. A larger one becomes
+  ## ``std/json``'s raw-number node, which serializes as the exact unsigned
+  ## decimal digits, unquoted (``%`` for ``BiggestUInt``,
+  ## https://nim-lang.org/docs/json.html). A consumer that reads JSON integers
+  ## as signed 64-bit must read these fields as unsigned.
+  %BiggestUInt(n)
 
 proc valueRecordToJson*(v: ValueRecord): JsonNode =
   ## Convert a decoded ValueRecord into a structured JSON node, surfacing
@@ -212,11 +226,11 @@ proc valueRecordToJson*(v: ValueRecord): JsonNode =
   of vrkInt:
     result["kind"] = newJString("Int")
     result["i"] = newJInt(v.intVal)
-    result["type_id"] = newJInt(int64(uint64(v.intTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.intTypeId))
   of vrkFloat:
     result["kind"] = newJString("Float")
     result["f"] = newJFloat(v.floatVal)
-    result["type_id"] = newJInt(int64(uint64(v.floatTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.floatTypeId))
   of vrkBool:
     result["kind"] = newJString("Bool")
     result["b"] = newJBool(v.boolVal)
@@ -224,11 +238,11 @@ proc valueRecordToJson*(v: ValueRecord): JsonNode =
     # querying `value.text` get the printed form regardless of `kind`.
     # Matches the 4-key CBOR map produced by writeBool / encodeCborValueRecord.
     result["text"] = newJString(if v.boolVal: "true" else: "false")
-    result["type_id"] = newJInt(int64(uint64(v.boolTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.boolTypeId))
   of vrkString:
     result["kind"] = newJString("String")
     result["text"] = newJString(v.text)
-    result["type_id"] = newJInt(int64(uint64(v.strTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.strTypeId))
   of vrkSequence:
     result["kind"] = newJString("Sequence")
     var elems = newJArray()
@@ -236,14 +250,14 @@ proc valueRecordToJson*(v: ValueRecord): JsonNode =
       elems.add(valueRecordToJson(e))
     result["elements"] = elems
     result["is_slice"] = newJBool(v.isSlice)
-    result["type_id"] = newJInt(int64(uint64(v.seqTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.seqTypeId))
   of vrkTuple:
     result["kind"] = newJString("Tuple")
     var elems = newJArray()
     for e in v.tupleElements:
       elems.add(valueRecordToJson(e))
     result["elements"] = elems
-    result["type_id"] = newJInt(int64(uint64(v.tupleTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.tupleTypeId))
   of vrkStruct:
     result["kind"] = newJString("Struct")
     # CTFS-M-TypeSchema: when the struct carries `fieldNames`, surface
@@ -263,7 +277,7 @@ proc valueRecordToJson*(v: ValueRecord): JsonNode =
         pair.add(valueRecordToJson(v.fieldValues[i]))
         pairs.add(pair)
       result["fields"] = pairs
-    result["type_id"] = newJInt(int64(uint64(v.structTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.structTypeId))
   of vrkVariant:
     result["kind"] = newJString("Variant")
     result["discriminator"] = newJString(v.discriminator)
@@ -271,27 +285,27 @@ proc valueRecordToJson*(v: ValueRecord): JsonNode =
       result["contents"] = valueRecordToJson(v.contents[0])
     else:
       result["contents"] = newJNull()
-    result["type_id"] = newJInt(int64(uint64(v.variantTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.variantTypeId))
   of vrkReference:
     result["kind"] = newJString("Reference")
     if v.dereferenced.len > 0:
       result["dereferenced"] = valueRecordToJson(v.dereferenced[0])
     else:
       result["dereferenced"] = newJNull()
-    result["address"] = newJInt(int64(v.address))
+    result["address"] = unsignedJson(v.address)
     result["mutable"] = newJBool(v.mutable)
-    result["type_id"] = newJInt(int64(uint64(v.refTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.refTypeId))
   of vrkRaw:
     result["kind"] = newJString("Raw")
     result["r"] = newJString(v.rawStr)
-    result["type_id"] = newJInt(int64(uint64(v.rawTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.rawTypeId))
   of vrkError:
     result["kind"] = newJString("Error")
     result["msg"] = newJString(v.errorMsg)
-    result["type_id"] = newJInt(int64(uint64(v.errorTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.errorTypeId))
   of vrkNone:
     result["kind"] = newJString("None")
-    result["type_id"] = newJInt(int64(uint64(v.noneTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.noneTypeId))
   of vrkCell:
     result["kind"] = newJString("Cell")
     result["place"] = newJInt(int64(v.cellPlace))
@@ -300,11 +314,11 @@ proc valueRecordToJson*(v: ValueRecord): JsonNode =
     result["b"] = newJString(base64.encode(v.bigIntBytes))
     result["b_hex"] = newJString(bytesToHexLower(v.bigIntBytes))
     result["negative"] = newJBool(v.negative)
-    result["type_id"] = newJInt(int64(uint64(v.bigIntTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.bigIntTypeId))
   of vrkChar:
     result["kind"] = newJString("Char")
     result["c"] = newJString($v.charVal)
-    result["type_id"] = newJInt(int64(uint64(v.charTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.charTypeId))
   of vrkValueRef:
     result["kind"] = newJString("ValueRef")
     result["ref_id"] = newJInt(int64(v.refId))
@@ -314,12 +328,12 @@ proc valueRecordToJson*(v: ValueRecord): JsonNode =
     for e in v.setMembers:
       members.add(valueRecordToJson(e))
     result["members"] = members
-    result["type_id"] = newJInt(int64(uint64(v.setTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.setTypeId))
   of vrkEnum:
     result["kind"] = newJString("Enum")
     result["name"] = newJString(v.enumName)
     result["ordinal"] = newJInt(v.enumOrdinal)
-    result["type_id"] = newJInt(int64(uint64(v.enumTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.enumTypeId))
 
 
 proc decodeValueBytesToJson*(data: seq[byte]): JsonNode =
@@ -395,24 +409,24 @@ proc nonStepRecordJson*(ev: StepEvent, stepIndex: uint64): JsonNode =
   of sekRaise:
     result["kind"] = newJString("raise")
     result["step_index"] = newJInt(int64(stepIndex))
-    result["exception_type_id"] = newJInt(int64(ev.exceptionTypeId))
+    result["exception_type_id"] = unsignedJson(ev.exceptionTypeId)
     result["exception_message"] = newJString(bytesToUtf8(ev.message))
   of sekCatch:
     result["kind"] = newJString("catch")
     result["step_index"] = newJInt(int64(stepIndex))
-    result["exception_type_id"] = newJInt(int64(ev.catchExceptionTypeId))
+    result["exception_type_id"] = unsignedJson(ev.catchExceptionTypeId)
   of sekThreadStart:
     result["kind"] = newJString("thread_start")
     result["step_index"] = newJInt(int64(stepIndex))
-    result["thread_id"] = newJInt(int64(ev.startThreadId))
+    result["thread_id"] = unsignedJson(ev.startThreadId)
   of sekThreadExit:
     result["kind"] = newJString("thread_exit")
     result["step_index"] = newJInt(int64(stepIndex))
-    result["thread_id"] = newJInt(int64(ev.exitThreadId))
+    result["thread_id"] = unsignedJson(ev.exitThreadId)
   of sekThreadSwitch:
     result["kind"] = newJString("thread_switch")
     result["step_index"] = newJInt(int64(stepIndex))
-    result["thread_id"] = newJInt(int64(ev.threadId))
+    result["thread_id"] = unsignedJson(ev.threadId)
   else:
     doAssert false, "nonStepRecordJson: " & $ev.kind & " is not a raise, " &
       "catch or thread record"
@@ -785,7 +799,7 @@ proc buildFullDocument*(reader: var NewTraceReader,
             let vn = reader.varname(v.varnameId)
             if vn.isOk:
               vObj["varname"] = newJString(vn.get())
-            vObj["type_id"] = newJInt(int64(v.typeId))
+            vObj["type_id"] = unsignedJson(v.typeId)
             let tn = reader.typeName(v.typeId)
             if tn.isOk:
               vObj["type_name"] = newJString(tn.get())

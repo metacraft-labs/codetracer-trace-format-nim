@@ -309,6 +309,11 @@ task test, "Run all tests":
   # only shape where the ordering is decided by the assembler rather than by
   # the step index.
   exec "nim c -r -d:release -p:src -p:tests tests/test_ct_print_agreement.nim"
+  # `ct-print --full` prints an address, type id, exception type id or thread
+  # id of 2^63 or more as its unsigned decimal value instead of aborting the
+  # whole dump with RangeDefect; below 2^63 each stays an ordinary integer.
+  # Builds ct-print through `tests/ct_print_binary.nim`, hence `-p:tests`.
+  exec "nim c -r -d:release -p:src -p:tests tests/test_ct_print_full_large_unsigned.nim"
   # A step count is the number of step records: raise, catch and thread
   # records are exec records but not steps, in the reader, the C ABI and
   # every ct-print view.

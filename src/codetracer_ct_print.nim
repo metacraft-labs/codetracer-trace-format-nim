@@ -19,6 +19,9 @@ when defined(nimPreviewSlimSystem):
 ##   - strings: {"kind": "String", "text": "hello", "type_id": 9}
 ##   - structs/sequences/tuples/variants/refs: full nested decode
 ##   - all variants of ValueRecord are surfaced; nothing is hex-blob'd.
+##   - a reference's "address", every "type_id", "exception_type_id" and
+##     "thread_id" are unsigned 64-bit decimal numbers and may exceed 2^63
+##     (e.g. "address": 18446744073709551615); read them as unsigned.
 
 import std/[os, parseopt, json, strutils, base64, algorithm]
 import results
@@ -336,7 +339,7 @@ proc printJsonV4(reader: var NewTraceReader) =
           let vn = reader.varname(v.varnameId)
           if vn.isOk:
             valObj["varname"] = newJString(vn.get())
-          valObj["type_id"] = newJInt(int64(v.typeId))
+          valObj["type_id"] = unsignedJson(v.typeId)
           let tn = reader.typeName(v.typeId)
           if tn.isOk:
             valObj["type"] = newJString(tn.get())
@@ -436,7 +439,7 @@ proc stepEventToJson(reader: var NewTraceReader, gli: GlobalLineIndex,
       let vn = reader.varname(v.varnameId)
       if vn.isOk:
         valObj["varname"] = newJString(vn.get())
-      valObj["type_id"] = newJInt(int64(v.typeId))
+      valObj["type_id"] = unsignedJson(v.typeId)
       let tn = reader.typeName(v.typeId)
       if tn.isOk:
         valObj["type_name"] = newJString(tn.get())
@@ -716,11 +719,11 @@ proc printCorrelationIndexV4(filePath: string, opts: FullOpts) =
         obj["span_id"] = newJString(e.spanIdHexOf())
       else:
         obj["kind"] = newJString("boundary")
-        obj["marker_id"] = newJInt(int64(e.markerIdOf()))
-      obj["wall_time_unix_ns"] = newJInt(int64(e.wallTimeUnixNs))
-      obj["monotonic_time_ns"] = newJInt(int64(e.monotonicTimeNs))
-      obj["geid"] = newJInt(int64(e.geid))
-      obj["thread_id"] = newJInt(int64(e.threadId))
+        obj["marker_id"] = unsignedJson(e.markerIdOf())
+      obj["wall_time_unix_ns"] = unsignedJson(e.wallTimeUnixNs)
+      obj["monotonic_time_ns"] = unsignedJson(e.monotonicTimeNs)
+      obj["geid"] = unsignedJson(e.geid)
+      obj["thread_id"] = unsignedJson(e.threadId)
       obj["exit"] = newJBool((e.flags and MarkerFlagExit) != 0)
       arr.add(obj)
     var root = newJObject()
@@ -1076,7 +1079,7 @@ proc followV4(filePath: string, pollMs: int) =
             let vn = reader.varname(v.varnameId)
             if vn.isOk:
               valObj["varname"] = newJString(vn.get())
-            valObj["type_id"] = newJInt(int64(v.typeId))
+            valObj["type_id"] = unsignedJson(v.typeId)
             valObj["value"] = decodeValueBytesToJson(v.data)
             valArr.add(valObj)
           stepObj["values"] = valArr
@@ -1205,7 +1208,9 @@ Output for --full / --events:
   Variable values, call args, and return values are decoded from CBOR into
   structured JSON: {"kind":"Int","i":42,"type_id":7},
   {"kind":"String","text":"hello",...}, structs/sequences/tuples nested,
-  references with addresses, BigInts as base64+hex, etc.
+  references with addresses, BigInts as base64+hex, etc. Addresses, type ids,
+  exception type ids and thread ids are unsigned 64-bit numbers and may
+  exceed 2^63.
 """
 
 # ---------------------------------------------------------------------------

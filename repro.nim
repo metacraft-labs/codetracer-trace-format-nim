@@ -338,6 +338,7 @@ const testSpecs: seq[TestSpec] = @[
   # Compile ct-print at runtime through `tests/ct_print_binary.nim` (see the
   # module doc) and import it from `tests/` (`-p:tests`).
   TestSpec(source: "tests/test_ct_print_agreement.nim", binary: "build/test-bin/test_ct_print_agreement", pool: CtPrintPool, extraPaths: @["tests"]),
+  TestSpec(source: "tests/test_ct_print_full_large_unsigned.nim", binary: "build/test-bin/test_ct_print_full_large_unsigned", pool: CtPrintPool, extraPaths: @["tests"]),
   TestSpec(source: "tests/test_logical_step_count.nim", binary: "build/test-bin/test_logical_step_count", pool: CtPrintPool, mm: "arc", extraPaths: @["tests"]),
   TestSpec(source: "tests/test_retired_streams_are_refused.nim", binary: "build/test-bin/test_retired_streams_are_refused", pool: CtPrintPool, mm: "arc", extraPaths: @["tests"]),
   # The C-ABI tests: each `include`s `codetracer_trace_writer_ffi`, so each
