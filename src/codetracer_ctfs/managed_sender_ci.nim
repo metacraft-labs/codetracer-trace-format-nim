@@ -409,10 +409,10 @@ proc segmentSliceJson(segment: CtfsSegment): JsonNode =
     "storageEndpointUri": segment.file.uri,
   }
 
-proc sessionOr(sessionValue, recorded: string): string =
-  ## The session's own placement value when `upload-session` named one,
-  ## otherwise what the recorder recorded.
-  if sessionValue.len > 0: sessionValue else: recorded
+proc sessionPlacementJson(sessionValue: string): JsonNode =
+  ## The session's own placement value, or JSON null when `upload-session`
+  ## named none.
+  if sessionValue.len > 0: %sessionValue else: newJNull()
 
 proc shardedSegmentJson(backend: CodetracerCiSenderBackend, segment: ShardedCtfsSegment): JsonNode =
   ## A sharded segment as codetracer-ci's `ShardedMcrSegmentManifest`. Every
@@ -421,10 +421,14 @@ proc shardedSegmentJson(backend: CodetracerCiSenderBackend, segment: ShardedCtfs
   ## whose replica names a `storageEndpointUri` that is not exactly that
   ## placement's endpoint, or that names any endpoint at all when the session
   ## went to the deployment's object store (http-api.md §4.4.1, "POST
-  ## /api/v1/traces/{sessionId}/finalize"). So the endpoint is the session's,
-  ## or null when it named none, and never the replica's own object URI. The
-  ## object key is the key the object was stored under (`objectId`, the
-  ## upload receipt's key), as it is for a slice's `sliceKey`.
+  ## /api/v1/traces/{sessionId}/finalize"). So the pool, server and endpoint
+  ## are the session's, and never the replica's own object URI or recorded
+  ## placement. A session in the deployment's object store has no pool, server
+  ## or endpoint, so the replica names none of the three (JSON null), which
+  ## the finalize accepts as an entry without placement, read from that
+  ## store. The object key is the key the object was stored under
+  ## (`objectId`, the upload receipt's key), as it is for a slice's
+  ## `sliceKey`.
   let shards = newJArray()
   for shard in segment.shards:
     let replicas = newJArray()
@@ -432,10 +436,9 @@ proc shardedSegmentJson(backend: CodetracerCiSenderBackend, segment: ShardedCtfs
       replicas.add(%*{
         "replicaIndex": replicaIndex,
         "objectKey": replica.objectId,
-        "storagePoolId": sessionOr(backend.storagePoolId, replica.placement.pool),
-        "storageServerId": sessionOr(backend.storageServerId, replica.placement.serverId),
-        "storageEndpointUri":
-          (if backend.storageEndpointUri.len > 0: %backend.storageEndpointUri else: newJNull()),
+        "storagePoolId": sessionPlacementJson(backend.storagePoolId),
+        "storageServerId": sessionPlacementJson(backend.storageServerId),
+        "storageEndpointUri": sessionPlacementJson(backend.storageEndpointUri),
         "contentLength": replica.sizeBytes,
         "contentHash": replica.sha256,
         "uploadCompletionState": "complete",

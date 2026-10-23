@@ -264,14 +264,21 @@ suite "codetracer-ci sharded finalize payload":
     check replica["storagePoolId"].getStr() == "0192f0c4-0000-7000-8000-000000000001"
     check replica["objectKey"].getStr() == "traces/tenant-a/session/slices/shard_0000_0000.ct"
 
-  test "codetracer_ci_sharded_replica_names_no_endpoint_in_the_deployment_store_nim":
+  test "codetracer_ci_sharded_replica_names_no_placement_in_the_deployment_store_nim":
     # A session in the deployment's object store: `upload-session` answers
-    # null pool, server and endpoint. The replica then names no endpoint (the
-    # object is read from that store) and keeps the recorded ids, which the
-    # finalize requires to be present.
-    let replica = newBackend().finalizePayloadJson(shardedRequest())["recordingManifest"][
-      "shardedMcrSegments"][0]["shards"][0]["replicas"][0]
-    check replica["storageEndpointUri"].kind == JNull
-    check replica["storageServerId"].getStr() == "recorded-server"
-    check replica["storagePoolId"].getStr() == "recorded-pool"
-    check replica["objectKey"].getStr() == "traces/tenant-a/session/slices/shard_0000_0000.ct"
+    # null pool, server and endpoint. The object has no pool or server, so
+    # the replica names none of the three (JSON null; the object is read from
+    # that store), whatever placement the producer recorded for it: a
+    # producer that builds it from the upload receipt records blanks, and any
+    # other value would be a placeholder (codetracer-pm issue
+    # 2026-10-22-a-sharded-managed-finalize-from-a-deployment-store-session-must-name-pool-and-server-ids-it-was-never-given).
+    for recorded in [Placement(pool: "recorded-pool", serverId: "recorded-server"),
+                     Placement(pool: "", serverId: "")]:
+      var request = shardedRequest()
+      request.manifest.source.shardedSegments[0].shards[0].replicas[0].placement = recorded
+      let replica = newBackend().finalizePayloadJson(request)["recordingManifest"][
+        "shardedMcrSegments"][0]["shards"][0]["replicas"][0]
+      check replica["storageEndpointUri"].kind == JNull
+      check replica["storageServerId"].kind == JNull
+      check replica["storagePoolId"].kind == JNull
+      check replica["objectKey"].getStr() == "traces/tenant-a/session/slices/shard_0000_0000.ct"
