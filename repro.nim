@@ -2,14 +2,15 @@
 ##
 ## **The linchpin recipe.** This repo ships ``ct-print`` (the ``.ct``
 ## container inspector every recorder in the CodeTracer subtree shells out
-## to) plus the whole CTFS reader/writer/container library. Downstream
-## recorder repos request the binary via the qualified selector
-## ``codetracer-trace-format-nim:ctPrint`` — the sibling-discovery logic in
-## ``repro_cli_support.findSiblingProjectFile``
-## (``reprobuild/libs/repro_cli_support/src/repro_cli_support.nim:620``)
-## materialises this file when a recorder runs
-## ``repro build codetracer-trace-format-nim:ctPrint --daemon=off`` from its
-## own working directory.
+## to) plus the whole CTFS reader/writer/container library. A recorder whose
+## tests need the binary puts it in its own test graph by importing
+## ``build_writer_artifacts`` from this checkout and calling
+## ``buildCtPrint("../codetracer-trace-format-nim")``: the same constructor
+## builds the ``default`` collection's edge below, so the flags live in one
+## place. (The qualified selector ``codetracer-trace-format-nim:ctPrint``
+## also reaches this recipe from a sibling, through
+## ``repro_cli_support.findSiblingProjectFile``, but repro 0.2.6 plans this
+## recipe's test builds along with it, so it does not build ct-print alone.)
 ##
 ## **Scope.** The recipe wires up:
 ##
@@ -75,6 +76,7 @@ import repro_dsl_stdlib/foreign_env
 import ct_test_nim_unittest
 
 import std/os
+import build_writer_artifacts
 
 type
   TestSpec = object
@@ -406,23 +408,11 @@ package codetracer_trace_format_nim:
     # (``codetracer_trace_format.nimble`` ``nim c -d:release --mm:arc
     # -p:src -o:ct-print src/codetracer_ct_print.nim``). The output is the
     # repo-root ``ct-print`` so downstream recorder tests find it at the
-    # fixed sibling path ``../codetracer-trace-format-nim/ct-print``.
-    const binarySuffix = (when defined(windows): ".exe" else: "")
-    const ctPrintBinary = "ct-print" & binarySuffix
-
-    let ctPrintBuild = nim.c(
-      source = "src/codetracer_ct_print.nim",
-      output = ctPrintBinary,
-      mm = "arc",
-      defines = @["release"],
-      paths = @["src"],
-      actionId = "codetracer-trace-format-nim.ct-print.nim-c",
-      extraInputs = @[
-        "src",
-        "codetracer_trace_format.nimble",
-        "nim.cfg",
-      ],
-      extraOutputs = @[ctPrintBinary])
+    # fixed sibling path ``../codetracer-trace-format-nim/ct-print``. The
+    # edge comes from ``build_writer_artifacts.buildCtPrint``, the same
+    # constructor the recorder recipes import so that their test graphs
+    # build this prerequisite; the flags are written down once, there.
+    let ctPrintBuild = buildCtPrint(".")
 
     discard collect("default", @[ctPrintBuild])
 
