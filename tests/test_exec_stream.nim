@@ -53,9 +53,13 @@ proc test_exec_stream_write_read() {.raises: [].} =
   doAssert reader.totalEvents == uint64(totalSteps),
     "reader totalEvents mismatch: " & $reader.totalEvents
 
-  # Track absolute position to verify semantics (not bit-exact encoding,
-  # since the writer may convert DeltaStep to AbsoluteStep at chunk boundaries)
+  # Compare positions, not encodings: the writer re-encodes every position
+  # record by the normative rule (`trace-events.md` §"Encoding Rules"), so a
+  # caller's AbsoluteStep may be written as a DeltaStep and vice versa. What
+  # must hold is that each position decodes, within its chunk, to the one the
+  # caller gave.
   var currentPos: uint64 = 0
+  var decodedPos: uint64 = 0
 
   for i in 0 ..< totalSteps:
     let readRes = reader.readEvent(uint64(i))
@@ -63,31 +67,24 @@ proc test_exec_stream_write_read() {.raises: [].} =
     let got = readRes.get()
     let orig = events[i]
 
-    # At chunk boundaries, DeltaStep may be converted to AbsoluteStep
-    # So we compare semantically: the line position must be consistent
-    case orig.kind
-    of sekAbsoluteStep:
-      currentPos = orig.globalLineIndex
-      # The reader should return AbsoluteStep with the same index
-      doAssert got.kind == sekAbsoluteStep,
-        "expected AbsoluteStep at " & $i & ", got " & $got.kind
-      doAssert got.globalLineIndex == orig.globalLineIndex,
-        "globalLineIndex mismatch at " & $i & ": expected " &
-        $orig.globalLineIndex & " got " & $got.globalLineIndex
+    if i mod 256 == 0:
+      decodedPos = high(uint64)    # each chunk starts without a cursor
+    case got.kind
+    of sekAbsoluteStep: decodedPos = got.globalLineIndex
     of sekDeltaStep:
-      let expectedPos = uint64(int64(currentPos) + orig.lineDelta)
-      currentPos = expectedPos
-      # Could be AbsoluteStep at chunk boundary or DeltaStep
-      case got.kind
-      of sekAbsoluteStep:
-        doAssert got.globalLineIndex == expectedPos,
-          "converted AbsoluteStep mismatch at " & $i & ": expected " &
-          $expectedPos & " got " & $got.globalLineIndex
-      of sekDeltaStep:
-        doAssert got.lineDelta == orig.lineDelta,
-          "lineDelta mismatch at " & $i
-      else:
-        doAssert false, "unexpected event kind at " & $i & ": " & $got.kind
+      doAssert decodedPos != high(uint64), "unanchored delta at " & $i
+      decodedPos = uint64(int64(decodedPos) + got.lineDelta)
+    else: discard
+
+    case orig.kind
+    of sekAbsoluteStep, sekDeltaStep:
+      currentPos =
+        if orig.kind == sekAbsoluteStep: orig.globalLineIndex
+        else: uint64(int64(currentPos) + orig.lineDelta)
+      doAssert got.kind in {sekAbsoluteStep, sekDeltaStep},
+        "expected a position record at " & $i & ", got " & $got.kind
+      doAssert decodedPos == currentPos, "position mismatch at " & $i &
+        ": expected " & $currentPos & " got " & $decodedPos
     of sekRaise:
       doAssert got.kind == sekRaise, "expected Raise at " & $i
       doAssert got.exceptionTypeId == orig.exceptionTypeId,
@@ -129,8 +126,11 @@ proc test_exec_stream_raise_catch() {.raises: [].} =
   doAssert writerRes.isOk
   var writer = writerRes.get()
 
+  # Position 1000 takes two varint bytes and each delta one, so by the
+  # normative rule (shorter encoding, a tie to the absolute) every record is
+  # written in the form given here.
   let events = @[
-    StepEvent(kind: sekAbsoluteStep, globalLineIndex: 100),
+    StepEvent(kind: sekAbsoluteStep, globalLineIndex: 1000),
     StepEvent(kind: sekDeltaStep, lineDelta: 1),
     StepEvent(kind: sekDeltaStep, lineDelta: 1),
     StepEvent(kind: sekRaise, exceptionTypeId: 1,
@@ -193,16 +193,19 @@ proc test_exec_stream_thread_switch() {.raises: [].} =
   doAssert writerRes.isOk
   var writer = writerRes.get()
 
+  # Positions chosen so the normative rule writes every record in the form
+  # given here: each absolute is no longer than its delta, each delta shorter
+  # than its position.
   let events = @[
-    StepEvent(kind: sekAbsoluteStep, globalLineIndex: 50),
+    StepEvent(kind: sekAbsoluteStep, globalLineIndex: 5000),
     StepEvent(kind: sekDeltaStep, lineDelta: 1),
     StepEvent(kind: sekDeltaStep, lineDelta: 1),
     StepEvent(kind: sekThreadSwitch, threadId: 1),
-    StepEvent(kind: sekAbsoluteStep, globalLineIndex: 200),
+    StepEvent(kind: sekAbsoluteStep, globalLineIndex: 20000),
     StepEvent(kind: sekDeltaStep, lineDelta: 3),
     StepEvent(kind: sekDeltaStep, lineDelta: -1),
     StepEvent(kind: sekThreadSwitch, threadId: 0),
-    StepEvent(kind: sekAbsoluteStep, globalLineIndex: 53),
+    StepEvent(kind: sekAbsoluteStep, globalLineIndex: 5003),
     StepEvent(kind: sekDeltaStep, lineDelta: 1),
   ]
 

@@ -1,2 +1,4 @@
-# Cross-repo siblings cloned by setup-dev-env at workspace-lock-pinned
-# revisions (see codetracer-specs/Testing/Cross-Repo-CI-Integration.md).
+# Build-time shared fixture and cross-reader source. This is an explicit
+# published source input to setup-dev-env's supported clone-siblings path;
+# the root-only solved graph currently contains no Rust library dependency.
+metacraft-labs/codetracer-trace-format=62a74e14e13a82751772c2e5da7f82db48d3de43

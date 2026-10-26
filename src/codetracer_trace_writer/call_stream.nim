@@ -205,6 +205,13 @@ proc decodeCallRecord*(data: openArray[byte]): Result[CallRecord, string] {.rais
   for i in 0 ..< childrenCount:
     rec.children[i] = ?decodeVarint(data, pos)
 
+  # `trace-events.md` §"Call Stream": a record's fields fill its
+  # `record_len` exactly. Bytes left over mean the record is not the one its
+  # frame claims, and the fields decoded above are not trustworthy either.
+  if pos != data.len:
+    return err("call record's fields end at byte " & $pos & " of its " &
+      $data.len & "-byte frame")
+
   ok(rec)
 
 # ---------------------------------------------------------------------------
@@ -295,26 +302,20 @@ proc flushChunk(ctfs: var Ctfs, w: var CallStreamWriter): Result[void, string] {
   ## Compress the buffered chunk, append it to calls.dat, and publish its byte
   ## offset in calls.idx. No-op when nothing is pending.
   ##
-  ## DATA-FIRST-THEN-INDEX ordering (matches `span_stream.flushChunk` and the
-  ## other chunked streams): the compressed chunk is appended to `calls.dat` and
-  ## that file's size synced FIRST, and only then is the chunk's byte offset
-  ## appended to `calls.idx` and synced. A concurrent follow reader that observes
-  ## N index entries can therefore always assume chunks `0..N-1` are fully
-  ## committed to `calls.dat`; the reverse order could publish an offset for
-  ## bytes not yet on disk, yielding a transient short/zero decode.
+  ## The chunk's bytes, then its offset in `calls.idx`, then one publish of
+  ## both, data before the root entries (`ctfs-container.md` §6,
+  ## "Durability", rule 2).
   if w.pendingCount == 0:
     return ok()
   let chunkStart = w.datOffset
   let compressed = ?zstdCompress(w.pending, w.zstdLevel)
 
-  # 1. Chunk body first, then publish its size to concurrent readers.
+  # 1. Chunk body.
   let writeRes = ctfs.writeToFile(w.datFile, compressed)
   if writeRes.isErr:
     return err("calls.dat chunk write failed: " & writeRes.error)
-  ctfs.syncEntry(w.datFile)
 
-  # 2. Only now the index entry appears — it means "this chunk is complete
-  #    and starts at chunkStart".
+  # 2. Its offset, then the publish.
   var offBuf: array[8, byte]
   writeU64LE(offBuf, 0, chunkStart)
   let idxRes = ctfs.writeToFile(w.indexFile, offBuf)
@@ -470,6 +471,9 @@ proc readCall*(r: var CallStreamReader,
 
   if within >= r.cachedRecords.len:
     return err("call record " & $within & " missing in chunk " & $chunkNumber)
-  decodeCallRecord(r.cachedRecords[within])
+  let rec = decodeCallRecord(r.cachedRecords[within])
+  if rec.isErr:
+    return err("calls.dat record " & $callKey & ": " & rec.error)
+  rec
 
 proc count*(r: CallStreamReader): uint64 = r.recordCount

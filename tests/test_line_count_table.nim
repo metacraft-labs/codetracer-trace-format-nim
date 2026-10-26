@@ -325,7 +325,7 @@ proc test_registerPath_refuses_a_path_with_no_count() =
   # records and size files in columns, so the two tables are refused
   # together.
   var col = initMultiStreamWriter(dir / "col.build", "col").get()
-  col.enableColumnAwareSteps()
+  doAssert col.enableColumnAwareSteps().isOk
   let colEnable = col.enableLineCountTable()
   doAssert colEnable.isErr,
     "the line-count table on a column-aware writer must be refused"
@@ -336,7 +336,7 @@ proc test_registerPath_refuses_a_path_with_no_count() =
   # `close()` is where that trace stops.
   var both = initMultiStreamWriter(dir / "both.build", "both").get()
   doAssert both.enableLineCountTable().isOk
-  both.enableColumnAwareSteps()
+  doAssert both.enableColumnAwareSteps().isOk
   let bothClose = both.close()
   doAssert bothClose.isErr,
     "a header declaring bit 4 AND bit 14 states the same field under two " &

@@ -13,6 +13,8 @@
 ##   - block_mapping: multi-level chain mapping
 ##   - container: create/read/write/close operations
 ##   - container_append: adding internal files to an already-closed container
+##   - compact: the version-6 compact profile's directory body (reference
+##     encoder and decoder; `ctfs-container.md` §1d)
 ##   - streaming: streaming mode for concurrent readers
 ##   - chunk_index: inline chunk header encode/decode
 
@@ -21,6 +23,7 @@ import codetracer_ctfs/types
 import codetracer_ctfs/block_mapping
 import codetracer_ctfs/container
 import codetracer_ctfs/container_append
+import codetracer_ctfs/compact
 import codetracer_ctfs/streaming
 import codetracer_ctfs/chunk_index
 import codetracer_ctfs/fixed_record_table
@@ -59,6 +62,7 @@ export types
 export block_mapping
 export container
 export container_append
+export compact
 export streaming
 export chunk_index
 export fixed_record_table

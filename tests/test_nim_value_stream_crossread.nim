@@ -46,7 +46,9 @@ proc which(exe: string): bool =
 
 proc main() =
   let repoRoot = getCurrentDir()
-  let rustRepo = absolutePath(RustRepoRel)
+  # `CODETRACER_TRACE_FORMAT_DIR` names a checkout that is not the sibling —
+  # a worktree of the Rust repo on the branch being cross-checked.
+  let rustRepo = absolutePath(getEnv("CODETRACER_TRACE_FORMAT_DIR", RustRepoRel))
   if not dirExists(rustRepo):
     echo "SKIP: sibling Rust repo not found at " & rustRepo &
       " (cross-read needs both checkouts)"

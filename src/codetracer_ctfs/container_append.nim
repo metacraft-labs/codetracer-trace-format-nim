@@ -50,10 +50,10 @@ when defined(nimPreviewSlimSystem):
 ##   - **The container must be quiescent.** No other process may be writing
 ##     it. The trace writer has closed it by the time a derived stream is
 ##     attached.
-##   - **v4 only.** v2/v3 headers spell bytes 6 and 7 differently
-##     (`container.nim`'s `readEncryptionMethod`), and this writer only ever
-##     produced v4. Appending into a header whose fields mean something else
-##     is refused rather than guessed at.
+##   - **Version 5 only.** Older headers are refused by name
+##     (`ctfs-container.md` §2), as every reader of this library refuses them;
+##     appending into a container no reader here would open
+##     is refused rather than attempted.
 ##   - **Never overwrites.** CTFS is append-only; a name that already exists
 ##     is an error, because a stale-but-present stream is exactly the
 ##     "returns the wrong bytes" failure the format's consumers cannot see.
@@ -106,8 +106,9 @@ proc openClosedCtfs*(path: string): Result[Ctfs, string] =
       "internal file can be added"))
 
   let blockSize = readU32LE(data, 8)
+  let entryStart = rootEntryStart(readMaxShards(data))
   if blockSize == 0'u32 or blockSize mod 8 != 0 or
-     int(blockSize) < HeaderSize + ExtHeaderSize + FileEntrySize:
+     int(blockSize) < entryStart + FileEntrySize:
     return err(appendError(path, "declares an unusable block size of " & $blockSize))
   if data.len mod int(blockSize) != 0:
     return err(appendError(path,
@@ -148,9 +149,8 @@ proc openClosedCtfs*(path: string): Result[Ctfs, string] =
     # table recommends exactly the 0 that half of this tree cannot read. That
     # makes the split a latent interop hazard rather than a style difference,
     # which is why it is written down here instead of quietly relied upon.
-    maxRootEntries = uint32(
-      (int(blockSize) - HeaderSize - ExtHeaderSize) div FileEntrySize)
-  if HeaderSize + ExtHeaderSize + int(maxRootEntries) * FileEntrySize > int(blockSize):
+    maxRootEntries = effectiveRootEntryCount(blockSize, maxRootEntries, readMaxShards(data))
+  if uint64(entryStart) + uint64(maxRootEntries) * uint64(FileEntrySize) > uint64(blockSize):
     return err(appendError(path,
       "declares " & $maxRootEntries & " root entries, which do not fit in its " &
       $blockSize & "-byte block 0; an entry array that spills past block 0 " &

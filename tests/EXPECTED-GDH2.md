@@ -64,7 +64,7 @@ empty container is free:
 - member_meta_dat_bytes: 131
 - member_steps_dat_bytes: 76
 
-**Exclusion ranges are forbidden.** The `recordingId` is *pinned*, not skipped.
+**Exclusion ranges are forbidden.** The `recordingId` is _pinned_, not skipped.
 The writer mints a fresh UUIDv7 per recording when the caller passes none
 (`multi_stream_writer.nim` `initMultiStreamWriter`), so two recordings of one
 program are not byte-identical for a reason that has nothing to do with this
@@ -79,19 +79,19 @@ and escalate, not a range to skip.
 `tests/test_gdh2_reload_marker.nim` builds one container with the production
 writer. Its shape, and every number the gate asserts against it:
 
-| | value |
-| --- | --- |
-| paths.dat entries | 5 |
-| path 0 | `res://gdh2/probe.gd`, 40 lines — v1 |
-| path 1 | `res://gdh2/autoload.gd`, 12 lines — an unrelated file |
-| path 2 | `res://gdh2/probe.gd`, 63 lines — v2 |
-| path 3 | `res://gdh2/probe.gd`, 71 lines — v3 |
-| exec records | 9 |
-| of which real steps | 7 |
-| of which reload markers | 2 |
-| value-stream records | 9 (parallel-indexed to the exec stream) |
-| meta.dat schema version | 5 |
-| flags_ext | `0x00000001` (`FlagExtHasSourceReload`) |
+|                         | value                                                  |
+| ----------------------- | ------------------------------------------------------ |
+| paths.dat entries       | 5                                                      |
+| path 0                  | `res://gdh2/probe.gd`, 40 lines — v1                   |
+| path 1                  | `res://gdh2/autoload.gd`, 12 lines — an unrelated file |
+| path 2                  | `res://gdh2/probe.gd`, 63 lines — v2                   |
+| path 3                  | `res://gdh2/probe.gd`, 71 lines — v3                   |
+| exec records            | 9                                                      |
+| of which real steps     | 7                                                      |
+| of which reload markers | 2                                                      |
+| value-stream records    | 9 (parallel-indexed to the exec stream)                |
+| meta.dat schema version | 5                                                      |
+| flags_ext               | `0x00000001` (`FlagExtHasSourceReload`)                |
 
 Marker 1: `reload_ordinal 1`, `changed [{old 0, new 2, generation 2}]`,
 `in_flight_frames 3`.
@@ -102,17 +102,17 @@ The two markers' `in_flight_frames` differ **on purpose**: a field that carries
 the same value at every site is not shown to carry anything.
 
 **The cross-ties, which are what GDH-G7 actually asserts.** A marker that is
-merely *present* satisfies "the reload is discoverable" while saying nothing
+merely _present_ satisfies "the reload is discoverable" while saying nothing
 checkable, and a marker of zeros satisfies it too. So every field is tied to
 something the marker did not produce:
 
-| marker field | tied to |
-| --- | --- |
-| `old_path_id` | the path id the step at `step_index - 1` resolves to, via the global position space |
-| `new_path_id` | the path id the step at `step_index + 1` resolves to |
-| both | the same `paths.dat` payload string, `res://gdh2/probe.gd` |
-| `generation` | the new version's container-side version ordinal, plus one (design §7.0 — the two are off by one BY CONSTRUCTION) |
-| `reload_ordinal` | its position in the decoded marker sequence |
+| marker field     | tied to                                                                                                           |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `old_path_id`    | the path id the step at `step_index - 1` resolves to, via the global position space                               |
+| `new_path_id`    | the path id the step at `step_index + 1` resolves to                                                              |
+| both             | the same `paths.dat` payload string, `res://gdh2/probe.gd`                                                        |
+| `generation`     | the new version's container-side version ordinal, plus one (design §7.0 — the two are off by one BY CONSTRUCTION) |
+| `reload_ordinal` | its position in the decoded marker sequence                                                                       |
 
 `stepPathId` resolves through `tryResolve`, never `resolve`: the unchecked form
 clamps an address above the top of the space to the last file, yielding a file
@@ -121,7 +121,7 @@ answer this campaign exists to remove.
 
 The lines v2 and v3 execute (45, 50, 70) lie **past the end of v1** (40 lines).
 That is what makes mis-attribution detectable at all: under a single path entry
-those addresses fall inside the *next* file's range and read back as a location
+those addresses fall inside the _next_ file's range and read back as a location
 that was never recorded (design §2.1, and GDH-M0's measured 129 of 196 steps).
 
 ---
@@ -155,7 +155,7 @@ Then:
 - reading the step stream FAILS,
 - the error contains `tag: 8`,
 - the error contains `FlagExtHasSourceReload`,
-- and the value stream still holds 9 records, so a decode that *succeeded* with
+- and the value stream still holds 9 records, so a decode that _succeeded_ with
   a different count would be caught by the comparison rather than by the error
   string.
 
@@ -198,18 +198,18 @@ marker count must be non-zero.
 
 ## 5. The falsifier arms, and which gate each is aimed at
 
-| arm | gate | what it mutates |
-| --- | --- | --- |
-| `gdh2FalsifyConstantOrdinal` | `gdh2_reload_marker_round_trips` | the encoder writes the ordinal as a literal `1` — `repro_hcr_agent.c:1338`'s defect transplanted |
-| `gdh2FalsifyZeroedMarker` | `gdh2_reload_marker_round_trips` | the writer drops every validation and emits an all-zero marker |
-| `gdh2FalsifyUncountedMarker` | `gdh2_reload_marker_round_trips` | the reader consumes the marker's bytes but does not count the record — a shorter, plausible step stream with no error |
-| `gdh2FalsifyAlwaysSetBit` | `gdh2_reload_marker_round_trips` + byte-identity | `writeMetaDat` sets the extended flag on every container |
-| `gdh2FalsifySkipUnknownTag` | `gdh2_unknown_tag_is_refused_by_name` | the decoder skips tag `0x08` instead of refusing it |
-| `gdh2FalsifyUngatedDecode` | `gdh2_unknown_tag_is_refused_by_name` | the decoder accepts tag `0x08` whatever the container declares |
-| *(driver-level)* baseline from HEAD | byte-identity | the baseline is regenerated from the post-campaign tree |
+| arm                                 | gate                                             | what it mutates                                                                                                       |
+| ----------------------------------- | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------- |
+| `gdh2FalsifyConstantOrdinal`        | `gdh2_reload_marker_round_trips`                 | the encoder writes the ordinal as a literal `1` — `repro_hcr_agent.c:1338`'s defect transplanted                      |
+| `gdh2FalsifyZeroedMarker`           | `gdh2_reload_marker_round_trips`                 | the writer drops every validation and emits an all-zero marker                                                        |
+| `gdh2FalsifyUncountedMarker`        | `gdh2_reload_marker_round_trips`                 | the reader consumes the marker's bytes but does not count the record — a shorter, plausible step stream with no error |
+| `gdh2FalsifyAlwaysSetBit`           | `gdh2_reload_marker_round_trips` + byte-identity | `writeMetaDat` sets the extended flag on every container                                                              |
+| `gdh2FalsifySkipUnknownTag`         | `gdh2_unknown_tag_is_refused_by_name`            | the decoder skips tag `0x08` instead of refusing it                                                                   |
+| `gdh2FalsifyUngatedDecode`          | `gdh2_unknown_tag_is_refused_by_name`            | the decoder accepts tag `0x08` whatever the container declares                                                        |
+| _(driver-level)_ baseline from HEAD | byte-identity                                    | the baseline is regenerated from the post-campaign tree                                                               |
 
 `gdh2FalsifyUncountedMarker` is not in the milestone's own list. It was added
-because the arm the milestone *does* name for the count comparison —
+because the arm the milestone _does_ name for the count comparison —
 `gdh2FalsifySkipUnknownTag` — cascades into a different tag error before the
 count check is reached, so it goes red on the error string instead. The count
 comparison against the value stream is the assertion the entry's falsifier

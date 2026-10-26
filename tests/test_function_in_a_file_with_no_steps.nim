@@ -32,7 +32,7 @@ import codetracer_trace_writer/global_line_index
 proc write(columnAware: bool, stepless: seq[string]): seq[byte] =
   var w = initMultiStreamWriter(getTempDir() / "fn_no_steps.ct", "fn_no_steps").get()
   if columnAware:
-    w.enableColumnAwareSteps()
+    doAssert w.enableColumnAwareSteps().isOk
   doAssert w.registerPath("/src/main.ex", [8'u32, 8]).isOk
   doAssert w.registerFunctionAt("/src/main.ex", 2, "main").isOk
   for i, p in stepless:
@@ -49,12 +49,8 @@ proc check(columnAware: bool, stepless: seq[string]) =
   var r = openNewTraceFromBytes(write(columnAware, stepless)).get()
   doAssert r.pathCount() == uint64(1 + stepless.len),
     "every declaration file is a paths.dat record; got " & $r.pathCount()
-  doAssert r.meta.paths.len == 1 + stepless.len,
-    "meta.dat's path list must name every paths.dat record; got " &
-    $r.meta.paths
   for i, p in stepless:
     doAssert r.path(uint64(1 + i)).get() == p
-    doAssert r.meta.paths[1 + i] == p
     let rec = r.functionRecord(uint64(1 + i)).get()
     # funcs.dat addresses are LINE addresses in both layouts, one
     # DefaultLinesPerFile slot per file (none of these files records a size).

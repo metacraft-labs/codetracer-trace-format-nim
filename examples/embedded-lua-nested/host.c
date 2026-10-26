@@ -90,26 +90,26 @@ static uint64_t g_host_tick = HOST_TICK_BASE;
 // host_native_index.json for the verifier).
 #define MAX_NATIVE 256
 static struct {
-	uint64_t geid;
-	uint64_t tick;
-	const char *desc;
+  uint64_t geid;
+  uint64_t tick;
+  const char *desc;
 } g_native[MAX_NATIVE];
 static int g_native_n = 0;
 
 // Allocate the next native (GEID, tick) for a host-side native event and record
 // it in the native index. Returns the allocated coordinate via out params.
 static void host_alloc_geid(const char *desc, uint64_t *out_geid, uint64_t *out_tick) {
-	uint64_t g = g_host_geid, t = g_host_tick;
-	if (g_native_n < MAX_NATIVE) {
-		g_native[g_native_n].geid = g;
-		g_native[g_native_n].tick = t;
-		g_native[g_native_n].desc = desc;
-		g_native_n++;
-	}
-	g_host_geid++;
-	g_host_tick += HOST_TICK_STEP;
-	*out_geid = g;
-	*out_tick = t;
+  uint64_t g = g_host_geid, t = g_host_tick;
+  if (g_native_n < MAX_NATIVE) {
+    g_native[g_native_n].geid = g;
+    g_native[g_native_n].tick = t;
+    g_native[g_native_n].desc = desc;
+    g_native_n++;
+  }
+  g_host_geid++;
+  g_host_tick += HOST_TICK_STEP;
+  *out_geid = g;
+  *out_tick = t;
 }
 
 // Deferred host->Lua call-enter join: allocated before lua_pcall (no Lua step
@@ -126,25 +126,25 @@ static const char *CT_JOIN_TAG = "ct-nested-join:lua";
 // trace_writer_next_step_index() - 1 rule N1 defined; consumers read `step`
 // from the payload). site: 0 call-enter / 1 call-exit / 2 native-call.
 static void emit_join(int site, uint64_t geid, uint64_t tick) {
-	if (!g_w || !g_started) {
-		return; // inert before a step exists (byte-identical standalone discipline)
-	}
-	uint64_t next = trace_writer_next_step_index(g_w);
-	uint64_t step = (next > 0) ? (next - 1) : 0;
-	const char *site_str = (site == 0) ? "call-enter" : (site == 1) ? "call-exit"
-																	: "native-call";
-	uint64_t thread = 1; // single-threaded host; main == 1 (N1 convention)
-	char content[224];
-	snprintf(content, sizeof(content),
-			"%s geid=%llu tick=%llu step=%llu site=%s thread=%llu",
-			CT_JOIN_TAG, (unsigned long long)geid, (unsigned long long)tick,
-			(unsigned long long)step, site_str, (unsigned long long)thread);
-	char meta[192];
-	snprintf(meta, sizeof(meta),
-			"geid=%llu tick=%llu step=%llu site=%s thread=%llu",
-			(unsigned long long)geid, (unsigned long long)tick,
-			(unsigned long long)step, site_str, (unsigned long long)thread);
-	trace_writer_register_special_event(g_w, FFI_EVENT_TRACE_LOG_EVENT, meta, content);
+  if (!g_w || !g_started) {
+    return; // inert before a step exists (byte-identical standalone discipline)
+  }
+  uint64_t next = trace_writer_next_step_index(g_w);
+  uint64_t step = (next > 0) ? (next - 1) : 0;
+  const char *site_str = (site == 0) ? "call-enter" : (site == 1) ? "call-exit"
+                                  : "native-call";
+  uint64_t thread = 1; // single-threaded host; main == 1 (N1 convention)
+  char content[224];
+  snprintf(content, sizeof(content),
+      "%s geid=%llu tick=%llu step=%llu site=%s thread=%llu",
+      CT_JOIN_TAG, (unsigned long long)geid, (unsigned long long)tick,
+      (unsigned long long)step, site_str, (unsigned long long)thread);
+  char meta[192];
+  snprintf(meta, sizeof(meta),
+      "geid=%llu tick=%llu step=%llu site=%s thread=%llu",
+      (unsigned long long)geid, (unsigned long long)tick,
+      (unsigned long long)step, site_str, (unsigned long long)thread);
+  trace_writer_register_special_event(g_w, FFI_EVENT_TRACE_LOG_EVENT, meta, content);
 }
 
 // --------------------------------------------------------------------------
@@ -153,43 +153,43 @@ static void emit_join(int site, uint64_t geid, uint64_t tick) {
 // simpler register_variable_int for integers.
 // --------------------------------------------------------------------------
 static void capture_scalar(lua_State *L, const char *name, int idx) {
-	if (lua_isinteger(L, idx)) {
-		trace_writer_register_variable_int(g_w, name, (int64_t)lua_tointeger(L, idx),
-				FFI_TYPE_INT, "int");
-		return;
-	}
-	if (lua_isnumber(L, idx)) {
-		ct_value_encoder_reset(g_enc);
-		ct_value_write_float(g_enc, (double)lua_tonumber(L, idx), g_t_float);
-		size_t n = 0;
-		const uint8_t *b = ct_value_get_bytes(g_enc, &n);
-		if (b && n) {
-			trace_writer_register_variable_cbor(g_w, name, b, n);
-		}
-		return;
-	}
-	if (lua_isboolean(L, idx)) {
-		ct_value_encoder_reset(g_enc);
-		ct_value_write_bool_typed(g_enc, lua_toboolean(L, idx), g_t_bool);
-		size_t n = 0;
-		const uint8_t *b = ct_value_get_bytes(g_enc, &n);
-		if (b && n) {
-			trace_writer_register_variable_cbor(g_w, name, b, n);
-		}
-		return;
-	}
-	if (lua_type(L, idx) == LUA_TSTRING) {
-		size_t slen = 0;
-		const char *s = lua_tolstring(L, idx, &slen);
-		ct_value_encoder_reset(g_enc);
-		ct_value_write_string(g_enc, (const uint8_t *)s, slen, g_t_string);
-		size_t n = 0;
-		const uint8_t *b = ct_value_get_bytes(g_enc, &n);
-		if (b && n) {
-			trace_writer_register_variable_cbor(g_w, name, b, n);
-		}
-		return;
-	}
+  if (lua_isinteger(L, idx)) {
+    trace_writer_register_variable_int(g_w, name, (int64_t)lua_tointeger(L, idx),
+        FFI_TYPE_INT, "int");
+    return;
+  }
+  if (lua_isnumber(L, idx)) {
+    ct_value_encoder_reset(g_enc);
+    ct_value_write_float(g_enc, (double)lua_tonumber(L, idx), g_t_float);
+    size_t n = 0;
+    const uint8_t *b = ct_value_get_bytes(g_enc, &n);
+    if (b && n) {
+      trace_writer_register_variable_cbor(g_w, name, b, n);
+    }
+    return;
+  }
+  if (lua_isboolean(L, idx)) {
+    ct_value_encoder_reset(g_enc);
+    ct_value_write_bool_typed(g_enc, lua_toboolean(L, idx), g_t_bool);
+    size_t n = 0;
+    const uint8_t *b = ct_value_get_bytes(g_enc, &n);
+    if (b && n) {
+      trace_writer_register_variable_cbor(g_w, name, b, n);
+    }
+    return;
+  }
+  if (lua_type(L, idx) == LUA_TSTRING) {
+    size_t slen = 0;
+    const char *s = lua_tolstring(L, idx, &slen);
+    ct_value_encoder_reset(g_enc);
+    ct_value_write_string(g_enc, (const uint8_t *)s, slen, g_t_string);
+    size_t n = 0;
+    const uint8_t *b = ct_value_get_bytes(g_enc, &n);
+    if (b && n) {
+      trace_writer_register_variable_cbor(g_w, name, b, n);
+    }
+    return;
+  }
 }
 
 // --------------------------------------------------------------------------
@@ -197,54 +197,54 @@ static void capture_scalar(lua_State *L, const char *name, int idx) {
 // this is Lua's own lua_Hook, installed with lua_sethook.
 // --------------------------------------------------------------------------
 static void ct_lua_hook(lua_State *L, lua_Debug *ar) {
-	if (ar->event == LUA_HOOKLINE) {
-		lua_getinfo(L, "Sl", ar);
-		const char *src = ar->source;
-		if (src && src[0] == '@') {
-			src++; // strip Lua's '@' file-chunk marker
-		}
-		if (!src || src[0] == '\0') {
-			src = g_script_path;
-		}
-		if (!g_started) {
-			g_started = 1;
-			trace_writer_start(g_w, src, (int64_t)ar->currentline);
-			// Emit the deferred host->Lua call-enter join onto this first step.
-			if (g_pending_enter) {
-				g_pending_enter = 0;
-				emit_join(0 /* call-enter */, g_enter_geid, g_enter_tick);
-			}
-		} else {
-			trace_writer_register_step(g_w, src, (int64_t)ar->currentline);
-		}
-		// Capture the frame's named scalar locals (skip Lua's internal
-		// "(temporary)" / "(for state)" slots, which start with '(').
-		for (int i = 1; i <= 32; i++) {
-			const char *name = lua_getlocal(L, ar, i);
-			if (!name) {
-				break;
-			}
-			if (name[0] != '(') {
-				capture_scalar(L, name, -1);
-			}
-			lua_pop(L, 1); // pop the value lua_getlocal pushed
-		}
-	} else if (ar->event == LUA_HOOKCALL || ar->event == LUA_HOOKTAILCALL) {
-		lua_getinfo(L, "Sn", ar);
-		const char *name = (ar->name && ar->name[0]) ? ar->name : "(main)";
-		const char *src = ar->source;
-		if (src && src[0] == '@') {
-			src++;
-		}
-		if (!src || src[0] == '\0') {
-			src = g_script_path;
-		}
-		size_t fid = trace_writer_ensure_function_id(g_w, name, src,
-				(int64_t)ar->linedefined);
-		trace_writer_register_call(g_w, fid);
-	} else if (ar->event == LUA_HOOKRET) {
-		trace_writer_register_return(g_w);
-	}
+  if (ar->event == LUA_HOOKLINE) {
+    lua_getinfo(L, "Sl", ar);
+    const char *src = ar->source;
+    if (src && src[0] == '@') {
+      src++; // strip Lua's '@' file-chunk marker
+    }
+    if (!src || src[0] == '\0') {
+      src = g_script_path;
+    }
+    if (!g_started) {
+      g_started = 1;
+      trace_writer_start(g_w, src, (int64_t)ar->currentline);
+      // Emit the deferred host->Lua call-enter join onto this first step.
+      if (g_pending_enter) {
+        g_pending_enter = 0;
+        emit_join(0 /* call-enter */, g_enter_geid, g_enter_tick);
+      }
+    } else {
+      trace_writer_register_step(g_w, src, (int64_t)ar->currentline);
+    }
+    // Capture the frame's named scalar locals (skip Lua's internal
+    // "(temporary)" / "(for state)" slots, which start with '(').
+    for (int i = 1; i <= 32; i++) {
+      const char *name = lua_getlocal(L, ar, i);
+      if (!name) {
+        break;
+      }
+      if (name[0] != '(') {
+        capture_scalar(L, name, -1);
+      }
+      lua_pop(L, 1); // pop the value lua_getlocal pushed
+    }
+  } else if (ar->event == LUA_HOOKCALL || ar->event == LUA_HOOKTAILCALL) {
+    lua_getinfo(L, "Sn", ar);
+    const char *name = (ar->name && ar->name[0]) ? ar->name : "(main)";
+    const char *src = ar->source;
+    if (src && src[0] == '@') {
+      src++;
+    }
+    if (!src || src[0] == '\0') {
+      src = g_script_path;
+    }
+    size_t fid = trace_writer_ensure_function_id(g_w, name, src,
+        (int64_t)ar->linedefined);
+    trace_writer_register_call(g_w, fid);
+  } else if (ar->event == LUA_HOOKRET) {
+    trace_writer_register_return(g_w);
+  }
 }
 
 // --------------------------------------------------------------------------
@@ -254,115 +254,115 @@ static void ct_lua_hook(lua_State *L, lua_Debug *ar) {
 // into the Lua trace.
 // --------------------------------------------------------------------------
 static int host_note(lua_State *L) {
-	const char *key = luaL_optstring(L, 1, "?");
-	lua_Integer val = luaL_optinteger(L, 2, 0);
-	uint64_t g = 0, t = 0;
-	host_alloc_geid("host_note", &g, &t);
-	emit_join(2 /* native-call */, g, t);
-	// Native-side work folded into the deterministic checksum.
-	g_host_checksum += (uint64_t)val + (uint64_t)(unsigned char)key[0];
-	return 0; // no Lua return values
+  const char *key = luaL_optstring(L, 1, "?");
+  lua_Integer val = luaL_optinteger(L, 2, 0);
+  uint64_t g = 0, t = 0;
+  host_alloc_geid("host_note", &g, &t);
+  emit_join(2 /* native-call */, g, t);
+  // Native-side work folded into the deterministic checksum.
+  g_host_checksum += (uint64_t)val + (uint64_t)(unsigned char)key[0];
+  return 0; // no Lua return values
 }
 
 int main(int argc, char **argv) {
-	const char *out_dir = getenv("CT_LUA_TRACE");
-	if (!out_dir || out_dir[0] == '\0') {
-		fprintf(stderr, "host: set CT_LUA_TRACE=<out-dir>\n");
-		return 2;
-	}
-	const char *script = (argc > 1) ? argv[1] : "script.lua";
-	g_script_path = script;
+  const char *out_dir = getenv("CT_LUA_TRACE");
+  if (!out_dir || out_dir[0] == '\0') {
+    fprintf(stderr, "host: set CT_LUA_TRACE=<out-dir>\n");
+    return 2;
+  }
+  const char *script = (argc > 1) ? argv[1] : "script.lua";
+  g_script_path = script;
 
-	// ---- CTFS writer bring-up (the codetracer-nim / python / ruby pattern) --
-	codetracer_trace_writer_init();
-	g_w = trace_writer_new("lua_trace", FFI_TRACE_FORMAT_BINARY); // format 2 == CTFS
-	if (!g_w) {
-		fprintf(stderr, "host: trace_writer_new failed: %s\n", trace_writer_last_error());
-		return 3;
-	}
-	char events_path[4096];
-	snprintf(events_path, sizeof(events_path), "%s/events.bin", out_dir);
-	trace_writer_set_workdir(g_w, out_dir);
-	trace_writer_begin_metadata(g_w, "");
-	trace_writer_begin_events(g_w, events_path);
-	trace_writer_begin_paths(g_w, "");
-	g_enc = ct_value_encoder_new();
-	g_t_float = trace_writer_ensure_type_id(g_w, FFI_TYPE_FLOAT, "float");
-	g_t_string = trace_writer_ensure_type_id(g_w, FFI_TYPE_STRING, "string");
-	g_t_bool = trace_writer_ensure_type_id(g_w, FFI_TYPE_BOOL, "bool");
+  // ---- CTFS writer bring-up (the codetracer-nim / python / ruby pattern) --
+  codetracer_trace_writer_init();
+  g_w = trace_writer_new("lua_trace", FFI_TRACE_FORMAT_BINARY); // format 2 == CTFS
+  if (!g_w) {
+    fprintf(stderr, "host: trace_writer_new failed: %s\n", trace_writer_last_error());
+    return 3;
+  }
+  char events_path[4096];
+  snprintf(events_path, sizeof(events_path), "%s/events.bin", out_dir);
+  trace_writer_set_workdir(g_w, out_dir);
+  trace_writer_begin_metadata(g_w, "");
+  trace_writer_begin_events(g_w, events_path);
+  trace_writer_begin_paths(g_w, "");
+  g_enc = ct_value_encoder_new();
+  g_t_float = trace_writer_ensure_type_id(g_w, FFI_TYPE_FLOAT, "float");
+  g_t_string = trace_writer_ensure_type_id(g_w, FFI_TYPE_STRING, "string");
+  g_t_bool = trace_writer_ensure_type_id(g_w, FFI_TYPE_BOOL, "bool");
 
-	// ---- native event: host start (native-only, before the VM enter) --------
-	uint64_t sg = 0, st = 0;
-	host_alloc_geid("host_start", &sg, &st);
+  // ---- native event: host start (native-only, before the VM enter) --------
+  uint64_t sg = 0, st = 0;
+  host_alloc_geid("host_start", &sg, &st);
 
-	// ---- embed Lua, install the per-line hook, run the script ---------------
-	lua_State *L = luaL_newstate();
-	luaL_openlibs(L);
-	lua_register(L, "host_note", host_note); // the Lua -> host callback
+  // ---- embed Lua, install the per-line hook, run the script ---------------
+  lua_State *L = luaL_newstate();
+  luaL_openlibs(L);
+  lua_register(L, "host_note", host_note); // the Lua -> host callback
 
-	if (luaL_loadfile(L, script) != LUA_OK) {
-		fprintf(stderr, "host: load %s: %s\n", script, lua_tostring(L, -1));
-		return 4;
-	}
+  if (luaL_loadfile(L, script) != LUA_OK) {
+    fprintf(stderr, "host: load %s: %s\n", script, lua_tostring(L, -1));
+    return 4;
+  }
 
-	// The VM's OWN per-line hook — the entire nested trace flows from here.
-	lua_sethook(L, ct_lua_hook, LUA_MASKLINE | LUA_MASKCALL | LUA_MASKRET, 0);
+  // The VM's OWN per-line hook — the entire nested trace flows from here.
+  lua_sethook(L, ct_lua_hook, LUA_MASKLINE | LUA_MASKCALL | LUA_MASKRET, 0);
 
-	// host -> VM call boundary: allocate the call-enter native GEID and defer the
-	// join to the first Lua step (no step exists yet).
-	host_alloc_geid("host->vm enter (lua_pcall)", &g_enter_geid, &g_enter_tick);
-	g_pending_enter = 1;
+  // host -> VM call boundary: allocate the call-enter native GEID and defer the
+  // join to the first Lua step (no step exists yet).
+  host_alloc_geid("host->vm enter (lua_pcall)", &g_enter_geid, &g_enter_tick);
+  g_pending_enter = 1;
 
-	int rc = lua_pcall(L, 0, 1, 0);
-	if (rc != LUA_OK) {
-		fprintf(stderr, "host: run %s: %s\n", script, lua_tostring(L, -1));
-		return 5;
-	}
+  int rc = lua_pcall(L, 0, 1, 0);
+  if (rc != LUA_OK) {
+    fprintf(stderr, "host: run %s: %s\n", script, lua_tostring(L, -1));
+    return 5;
+  }
 
-	// VM -> host return boundary: allocate the call-exit native GEID and emit the
-	// call-exit join, bound to the last recorded Lua step.
-	int64_t result = (int64_t)luaL_optinteger(L, -1, 0);
-	uint64_t xg = 0, xt = 0;
-	host_alloc_geid("vm->host return (lua_pcall)", &xg, &xt);
-	emit_join(1 /* call-exit */, xg, xt);
-	lua_close(L);
+  // VM -> host return boundary: allocate the call-exit native GEID and emit the
+  // call-exit join, bound to the last recorded Lua step.
+  int64_t result = (int64_t)luaL_optinteger(L, -1, 0);
+  uint64_t xg = 0, xt = 0;
+  host_alloc_geid("vm->host return (lua_pcall)", &xg, &xt);
+  emit_join(1 /* call-exit */, xg, xt);
+  lua_close(L);
 
-	// ---- native event: host shutdown (native-only, after the VM exit) -------
-	uint64_t hg = 0, ht = 0;
-	host_alloc_geid("host_shutdown", &hg, &ht);
+  // ---- native event: host shutdown (native-only, after the VM exit) -------
+  uint64_t hg = 0, ht = 0;
+  host_alloc_geid("host_shutdown", &hg, &ht);
 
-	// ---- serialize the Lua .ct ----------------------------------------------
-	trace_writer_finish_events(g_w);
-	trace_writer_finish_metadata(g_w);
-	trace_writer_finish_paths(g_w);
-	trace_writer_close(g_w);
-	trace_writer_free(g_w);
-	if (g_enc) {
-		ct_value_encoder_free(g_enc);
-	}
+  // ---- serialize the Lua .ct ----------------------------------------------
+  trace_writer_finish_events(g_w);
+  trace_writer_finish_metadata(g_w);
+  trace_writer_finish_paths(g_w);
+  trace_writer_close(g_w);
+  trace_writer_free(g_w);
+  if (g_enc) {
+    ct_value_encoder_free(g_enc);
+  }
 
-	// ---- emit the host native coordinate index (the join keys resolve against
-	//      this real, independently-emitted native trace) ---------------------
-	char idx_path[4096];
-	snprintf(idx_path, sizeof(idx_path), "%s/host_native_index.json", out_dir);
-	FILE *f = fopen(idx_path, "w");
-	if (f) {
-		fprintf(f, "{\n  \"base_geid\": %llu,\n  \"base_tick\": %llu,\n  \"events\": [\n",
-				(unsigned long long)HOST_GEID_BASE, (unsigned long long)HOST_TICK_BASE);
-		for (int i = 0; i < g_native_n; i++) {
-			fprintf(f, "    {\"geid\": %llu, \"tick\": %llu, \"desc\": \"%s\"}%s\n",
-					(unsigned long long)g_native[i].geid,
-					(unsigned long long)g_native[i].tick,
-					g_native[i].desc, (i + 1 < g_native_n) ? "," : "");
-		}
-		fprintf(f, "  ]\n}\n");
-		fclose(f);
-	}
+  // ---- emit the host native coordinate index (the join keys resolve against
+  //      this real, independently-emitted native trace) ---------------------
+  char idx_path[4096];
+  snprintf(idx_path, sizeof(idx_path), "%s/host_native_index.json", out_dir);
+  FILE *f = fopen(idx_path, "w");
+  if (f) {
+    fprintf(f, "{\n  \"base_geid\": %llu,\n  \"base_tick\": %llu,\n  \"events\": [\n",
+        (unsigned long long)HOST_GEID_BASE, (unsigned long long)HOST_TICK_BASE);
+    for (int i = 0; i < g_native_n; i++) {
+      fprintf(f, "    {\"geid\": %llu, \"tick\": %llu, \"desc\": \"%s\"}%s\n",
+          (unsigned long long)g_native[i].geid,
+          (unsigned long long)g_native[i].tick,
+          g_native[i].desc, (i + 1 < g_native_n) ? "," : "");
+    }
+    fprintf(f, "  ]\n}\n");
+    fclose(f);
+  }
 
-	// ---- deterministic result / checksum ------------------------------------
-	uint64_t checksum = (uint64_t)result + g_host_checksum + (uint64_t)g_native_n;
-	printf("CT_N3_RESULT result=%lld host_checksum=%llu native_events=%d checksum=%llu\n",
-			(long long)result, (unsigned long long)g_host_checksum, g_native_n,
-			(unsigned long long)checksum);
-	return 0;
+  // ---- deterministic result / checksum ------------------------------------
+  uint64_t checksum = (uint64_t)result + g_host_checksum + (uint64_t)g_native_n;
+  printf("CT_N3_RESULT result=%lld host_checksum=%llu native_events=%d checksum=%llu\n",
+      (long long)result, (unsigned long long)g_host_checksum, g_native_n,
+      (unsigned long long)checksum);
+  return 0;
 }

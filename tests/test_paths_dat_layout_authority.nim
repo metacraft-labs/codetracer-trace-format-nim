@@ -217,8 +217,7 @@ proc test_declared_column_aware_trace_is_unaffected() =
   let writerRes = initMultiStreamWriter("test_pd_column_aware.ct", "pd_col")
   doAssert writerRes.isOk, "init failed: " & writerRes.error
   var w = writerRes.get()
-  w.enableColumnAwareSteps()
-
+  doAssert w.enableColumnAwareSteps().isOk
   # File 0: 4 lines × 10 columns (size 40). File 1: 6 lines × 20 columns.
   let llA: seq[uint32] = @[10'u32, 10, 10, 10]
   let llB: seq[uint32] = @[20'u32, 20, 20, 20, 20, 20]

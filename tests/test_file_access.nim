@@ -96,7 +96,7 @@ proc test_file_write_read_roundtrip() {.raises: [].} =
   # Write IO events
   for i in 0 ..< numIOEvents:
     let msg = "output_" & $i & "\n"
-    let res = w.registerIOEvent(ioStdout, msg.toBytes)
+    let res = w.registerIOEvent(elkWrite, msg.toBytes)
     doAssert res.isOk
 
   doAssert w.stepCount == numSteps

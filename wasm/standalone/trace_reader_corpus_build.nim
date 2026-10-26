@@ -28,14 +28,14 @@ import ./trace_reader_corpus
 # ---------------------------------------------------------------------------
 
 proc buildCorpus*(): Result[seq[byte], string] =
-  ## Build the corpus container in linear memory. No path is opened: the
-  ## `path` argument of `initMultiStreamWriter` is metadata only.
-  var wr = initMultiStreamWriter("/ct/browser/probe.ct", CorpusProgram,
+  ## Build the corpus container in linear memory: the empty path selects the
+  ## in-memory container, so no file is opened.
+  var wr = initMultiStreamWriter("", CorpusProgram,
                                  recordingId = CorpusRecordingId)
   if wr.isErr: return err("initMultiStreamWriter: " & wr.error)
   var w = wr.get()
 
-  w.enableColumnAwareSteps()
+  doAssert w.enableColumnAwareSteps().isOk
   # Must precede the first step: the builder accumulates a hit per step as it
   # is registered, so enabling it later would index a suffix of the trace.
   w.enableLinehits()
@@ -186,14 +186,14 @@ proc encodeLegacyValueRecord(values: openArray[VariableValue]): seq[byte] =
     rec.add(v.data)
   rec
 
-proc encodeLegacyIoRecord(ev: IOEvent): seq[byte] =
+proc encodeLegacyIoRecord(ev: IOEvent, ordinal: uint8): seq[byte] =
   ## Legacy `.off` VRT IO record: `u8 kind, varint stepId, varint len, data`.
-  ## The kind byte is the four-value `IOEventKind` ordinal, NOT the
+  ## The kind byte is the old four-value API ordinal, NOT the
   ## `EventLogKind` ordinal the SPEC record carries, and there is no metadata
   ## field — which is why reading one framing as the other yields a decode
   ## that succeeds and means something else.
   var rec: seq[byte] = @[]
-  rec.add(byte(ev.kind))
+  rec.add(ordinal)
   encodeVarint(ev.stepId, rec)
   encodeVarint(uint64(ev.data.len), rec)
   rec.add(ev.data)
@@ -263,7 +263,7 @@ proc buildLegacyCorpusFlagged(claimSpecFraming: bool):
   for i in 0 ..< LegacyIoCount:
     let ev = IOEvent(kind: legacyIoKind(i), stepId: legacyIoStep(i),
                      metadata: @[], data: legacyIoData(i))
-    let a = ctfs.append(ioTable, encodeLegacyIoRecord(ev))
+    let a = ctfs.append(ioTable, encodeLegacyIoRecord(ev, legacyIoOrdinal(i)))
     if a.isErr: return err("append legacy io event: " & a.error)
 
   let metaFileRes = ctfs.addFile("meta.dat")
@@ -271,7 +271,7 @@ proc buildLegacyCorpusFlagged(claimSpecFraming: bool):
   var metaFile = metaFileRes.get()
   let meta = TraceMetadata(recordingId: LegacyRecordingId,
                            program: LegacyProgram, args: @[], workdir: "")
-  let mRes = ctfs.writeMetaDat(metaFile, meta, [LegacyPath0, LegacyPath1],
+  let mRes = ctfs.writeMetaDat(metaFile, meta,
     hasStepStream = claimSpecFraming,
     hasValueStream = claimSpecFraming,
     hasIoEventStream = claimSpecFraming)
