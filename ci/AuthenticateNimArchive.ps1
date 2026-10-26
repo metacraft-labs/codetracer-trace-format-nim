@@ -4,7 +4,18 @@ function Read-AuthenticatedNimArchive([string]$Archive, $Hold) {
     $sha = 'fe0686a9b298e5b13d0a983df37e002a8c6320f8b16cc45a51d15cf4046a109f'
     if (-not [IO.Path]::IsPathFullyQualified($Archive)) { throw 'nim-archive/absolute-path' }
     $Hold.HoldFile((Split-Path -Parent $Archive), (Split-Path -Leaf $Archive), $sha)
-    $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
+    # The upstream nim-2.2.10 Windows archive carries one legacy (non-UTF8-flagged)
+    # member -- tests/misc/åäö.nim -- whose name is DOS/OEM-encoded bytes with no
+    # declared code page. .NET's ZipFile.OpenRead() falls back to CP437 for such
+    # entries; the declared Windows Nim producer's own tool-store extraction (7-Zip)
+    # decodes the same bytes with the runner's ANSI code page (1252 on the hosted
+    # Windows runners) instead. Reading with CP437 here while the prefix on disk was
+    # written with CP1252 makes the two inventories disagree on this one file's name
+    # (åäö.nim vs. †„".nim) and fails the whole prefix as having an "undeclared
+    # member", even though both sides agree on every byte of content. Decode with the
+    # same ANSI code page the extractor uses so the two inventories compare equal.
+    $legacyEncoding = [Text.Encoding]::GetEncoding(1252)
+    $zip = [IO.Compression.ZipFile]::Open($Archive, [IO.Compression.ZipArchiveMode]::Read, $legacyEncoding)
     $members = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     [long]$total = 0; $top = $null
