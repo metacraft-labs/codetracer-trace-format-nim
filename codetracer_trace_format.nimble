@@ -509,6 +509,16 @@ task testFfiThreads, "C hosts: close after the recording thread exited; concurre
         raise newException(AssertionDefect, "testFfiThreads needs Guard Malloc (" &
           gmalloc & ") to make the --threads:on control fault on macOS")
       tlsRunner = "env DYLD_INSERT_LIBRARIES=" & gmalloc & " "
+      # The positive control under the same environment: the shipped archive
+      # must still pass under Guard Malloc. Without it, a Guard Malloc that
+      # crashed every program would make the --threads:on control below pass
+      # without having reached the cross-thread free at all.
+      let (shipOutput, shipCode) = gorgeEx(tlsRunner & dir & "/worker_thread_exit-ship")
+      if shipCode != 0:
+        raise newException(AssertionDefect, "the worker-thread host FAILED " &
+          "against the shipped archive under Guard Malloc (exit " & $shipCode &
+          "), so a crash of the --threads:on control would prove nothing: " &
+          shipOutput)
     let (tlsOutput, tlsCode) = gorgeEx(tlsRunner & dir & "/worker_thread_exit-tls")
     # 126/127 are `env`/the shell failing to start the host: a nonzero exit
     # from a host that never ran would pass this control vacuously.
