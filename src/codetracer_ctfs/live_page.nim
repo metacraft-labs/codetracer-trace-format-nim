@@ -759,6 +759,11 @@ proc claimWriterSlot(p: LivePage): Result[int, string] =
     " writer slots are taken (a page has 16, so at most 15 producer " &
     "processes beside the coordinator)")
 
+proc closeLivePage*(p: LivePage)
+
+var hostedPages {.threadvar.}: seq[LivePage]
+  ## The pages this process hosts and has not closed.
+
 proc initFresh(p: LivePage, capacity: int) =
   ## Lay out a page that has just been created (all zero).
   for i in 0 ..< 4:
@@ -794,6 +799,17 @@ proc createLivePage*(f: File, rootEntries: int,
   let id = ? fileIdentity(f).mapErr(proc (e: string): string =
     "live coordination page of " & what & ": " & e)
   let name = pageName(id)
+  # A page this process hosts for the same file belongs to a container this
+  # process created on the file and never closed; creating a container on the
+  # file again (which truncates it) supersedes that one: its page is closed.
+  var kept: seq[LivePage]
+  for old in hostedPages:
+    if old.closed: continue
+    if old.name == name and old.identity == id:
+      closeLivePage(old)
+    else:
+      kept.add old
+  hostedPages = kept
   let ext = extentsOffset(rootEntries)
   let slots = slotsOffset(rootEntries)
   if slots + 4096 > capacity:
@@ -848,6 +864,7 @@ proc createLivePage*(f: File, rootEntries: int,
   p.writerSlot = ? p.claimWriterSlot()
   p.view.store(OffState, PageStateLive)
   p.startHeartbeat()
+  hostedPages.add p
   ok(p)
 
 proc closeLivePage*(p: LivePage) =
