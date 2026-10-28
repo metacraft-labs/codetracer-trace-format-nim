@@ -518,7 +518,12 @@ proc candidates*(b: var B1Reader, r: var LiveReader, key: uint64):
     cands.setLen(0)
     let o = ? b.descend(r, key, cands)
     if o == doFound:
-      return ok(cands)
+      # A split leaves an entry in both halves until the left one shrinks:
+      # each candidate is returned once.
+      var once: seq[uint64]
+      for x in cands:
+        if x notin once: once.add x
+      return ok(once)
     ? r.refresh()
   err("B1 " & b.prefix & ": a descent for key " & $key & " reached a node " &
     "past the node member's Size twice")

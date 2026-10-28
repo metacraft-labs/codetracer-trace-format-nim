@@ -609,6 +609,20 @@ proc publishWords*(p: LivePage, seqOff: int, words: openArray[uint64]) =
   p.view.store(seqOff, s + 2)
   if p.tap != nil: p.tap(ptWords, seqOff, words)
 
+proc publishWordsOrdered*(p: LivePage, seqOff: int, words: openArray[uint64],
+                          order: openArray[int]) =
+  ## As `publishWords`, the payload words stored in `order` (indices into
+  ## `words`): the store order a record kind requires (for a stream
+  ## reference, `MapBlock` before `Size`), which is what makes a prefix of a
+  ## dead writer's stores a valid record (§6, "the crash rule").
+  let s = p.view.loadRelaxed(seqOff)
+  p.view.storeRelaxed(seqOff, s + 1)
+  fenceRelease()
+  for i in order:
+    p.view.storeRelaxed(seqOff + 8 + 8 * i, words[i])
+  p.view.store(seqOff, s + 2)
+  if p.tap != nil: p.tap(ptWords, seqOff, words)
+
 proc heartbeat*(p: LivePage) =
   if p == nil or p.closed: return
   p.view.store(OffWriters + p.writerSlot * WriterSlotSize + 16, monotonicNs())

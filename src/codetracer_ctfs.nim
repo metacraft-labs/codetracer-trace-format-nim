@@ -19,8 +19,10 @@
 ##   - chunk_index: inline chunk header encode/decode
 ##   - live_page: the live coordination page (`ctfs-container.md` §6)
 ##   - live_reader: opening and following a container, attached or file-only
-##   - keyed_store, b1, page_store: keyed members (`ctfs-container.md` §7a;
-##     `ctfs-keyed-families.md` §5.8), B1 and the MCR page store
+##   - keyed_store, keyed_stream, b1, page_store, h1, s3, corrmark_live,
+##     thread_records, snapshot_records, monotone_run: keyed
+##     members (`ctfs-container.md` §7a; `ctfs-keyed-families.md` §5.8) and
+##     the MCR families built on them
 
 import codetracer_ctfs/base40
 import codetracer_ctfs/types
@@ -35,6 +37,13 @@ import codetracer_ctfs/live_reader
 import codetracer_ctfs/keyed_store
 import codetracer_ctfs/b1
 import codetracer_ctfs/page_store
+import codetracer_ctfs/keyed_stream
+import codetracer_ctfs/h1
+import codetracer_ctfs/s3
+import codetracer_ctfs/corrmark_live
+import codetracer_ctfs/thread_records
+import codetracer_ctfs/snapshot_records
+import codetracer_ctfs/monotone_run
 import codetracer_ctfs/fixed_record_table
 import codetracer_ctfs/variable_record_table
 import codetracer_ctfs/zstd_bindings
@@ -79,6 +88,13 @@ export live_reader
 export keyed_store
 export b1
 export page_store
+export keyed_stream
+export h1
+export s3
+export corrmark_live
+export thread_records
+export snapshot_records
+export monotone_run
 export fixed_record_table
 export variable_record_table
 export zstd_bindings

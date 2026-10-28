@@ -322,6 +322,25 @@ proc readMember*(r: var LiveReader, slot: int, off: uint64, n: int):
     done += k
   ok(outp)
 
+proc readStream*(r: var LiveReader, label: string, size, mapBlock: uint64,
+                 off: uint64, n: int): Result[seq[byte], string] =
+  ## `n` bytes at `off` of a keyed stream whose record names `(size,
+  ## mapBlock)` (`ctfs-container.md` §7a), with every refusal a member's read
+  ## has.
+  if off + uint64(n) > size:
+    return err(label & ": " & $n & " bytes at " & $off & " are past its size " & $size)
+  var outp = newSeq[byte](n)
+  var done = 0
+  let bs = uint64(r.blockSize)
+  while done < n:
+    let at = off + uint64(done)
+    let b = ? r.resolveBlock(label, mapBlock, at div bs)
+    let k = min(n - done, int(bs - at mod bs))
+    let bytes = ? r.readRaw(b * bs + at mod bs, k)
+    copyMem(addr outp[done], unsafeAddr bytes[0], k)
+    done += k
+  ok(outp)
+
 proc readMemberU64*(r: var LiveReader, slot: int, off: uint64): Result[uint64, string] =
   let b = ? r.readMember(slot, off, 8)
   ok(readU64LE(b, 0))

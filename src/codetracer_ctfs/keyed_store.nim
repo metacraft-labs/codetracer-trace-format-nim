@@ -79,6 +79,7 @@ type
     of sokMirror:
       seqOff*: int
       words*: seq[uint64]
+      order*: seq[int]       ## store order; empty: index order
 
   SealPlan* = object
     ops*: seq[SealOp]
@@ -226,6 +227,11 @@ proc inPlaceItem*(p: var SealPlan, c: Ctfs, m: KMember, memberOff: uint64,
 proc mirror*(p: var SealPlan, seqOff: int, words: openArray[uint64]) =
   p.ops.add SealOp(kind: sokMirror, seqOff: seqOff, words: @words)
 
+proc mirrorOrdered*(p: var SealPlan, seqOff: int, words: openArray[uint64],
+                    order: openArray[int]) =
+  ## A mirror publication whose payload words are stored in `order`.
+  p.ops.add SealOp(kind: sokMirror, seqOff: seqOff, words: @words, order: @order)
+
 proc wordsOf*(bytes: openArray[byte], at: int): seq[SealWord] =
   ## The 8-byte words of `bytes`, which start at byte `at` of a record or node.
   var i = 0
@@ -311,7 +317,8 @@ proc executeSeal*(c: var Ctfs, p: SealPlan): Result[void, string] =
         c.markDirty(op.at, op.bytes.len)
     of sokMirror:
       if c.page != nil:
-        c.page.publishWords(op.seqOff, op.words)
+        if op.order.len > 0: c.page.publishWordsOrdered(op.seqOff, op.words, op.order)
+        else: c.page.publishWords(op.seqOff, op.words)
   if publishes:
     c.endSeal()
   if c.ioFailure.len > 0:

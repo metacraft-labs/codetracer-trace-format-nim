@@ -53,6 +53,13 @@ task test, "Run all tests":
   exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_keyed_b1.nim"
   exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_page_store.nim"
   exec "nim c -r -p:src tests/test_growth_refuses_with_keyed_member.nim"
+  # The other keyed families (`ctfs-keyed-families.md` §5.8): C1 with keyed
+  # streams (MCR's threads), D1/D2 (snapshots, bundled files) and M1, H1 with
+  # V2 extents and S3 (MCR's live correlation index); each with every write
+  # prefix, 200 real kills and its mutation arms.
+  exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_keyed_threads.nim"
+  exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_keyed_snapshots.nim"
+  exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_keyed_corrmark.nim"
   # Durability: a recording read while its writer is still open (what a
   # killed process leaves) has meta.dat, every sealed chunk and every interning
   # record registered before the seal.
