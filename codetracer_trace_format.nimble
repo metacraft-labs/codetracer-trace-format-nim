@@ -51,6 +51,8 @@ task test, "Run all tests":
   # B1 and the page store (`ctfs-keyed-families.md` §5.8.3;
   # `CTFS-Binary-Format.md` §2.6): every write prefix, real kills, a follower.
   exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_keyed_b1.nim"
+  exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_page_store.nim"
+  exec "nim c -r -p:src tests/test_growth_refuses_with_keyed_member.nim"
   # Durability: a recording read while its writer is still open (what a
   # killed process leaves) has meta.dat, every sealed chunk and every interning
   # record registered before the seal.
