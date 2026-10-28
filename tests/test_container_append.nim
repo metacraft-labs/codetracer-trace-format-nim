@@ -244,11 +244,13 @@ proc test_append_refuses_an_encrypted_container() {.raises: [].} =
   dropDir(dir)
   echo "PASS: test_append_refuses_an_encrypted_container"
 
-proc test_append_grows_a_full_entry_array() {.raises: [].} =
-  ## Until 2026-10-05 a full entry array refused the append ("no free file
-  ## entry slots").  The root directory now grows (`growRootDirectory`), so the
-  ## append succeeds, the header's MaxRootEntries grows, and every member --
-  ## the old ones and the new one -- reads back.
+proc test_append_refuses_a_full_entry_array() {.raises: [].} =
+  ## A batch the directory cannot hold whole is refused before anything is
+  ## written, naming the member that does not fit and the occupancy
+  ## (`ctfs-container.md` §5): a closed container's root does not grow (§1,
+  ## rule 2). From 2026-10-05 to CKF-4N this append grew the root directory
+  ## (`growRootDirectory`), rewriting everything from the new root to the old
+  ## end of file.
   let dir = tmpDir("full")
   let path = dir / "t.ct"
   var c = createCtfs()
@@ -258,22 +260,18 @@ proc test_append_grows_a_full_entry_array() {.raises: [].} =
     var f = h.get()
     doAssert c.writeToFile(f, pattern(8, i)).isOk
   doAssert writeCtfsToFile(c, path).isOk
+  let before = readCtfsFromFile(path).get()
   let res = appendInternalFiles(path, ["one.more"], [pattern(4, 0)])
-  doAssert res.isOk, "a full entry array refused another file: " &
-    (if res.isErr: res.error else: "")
-  let data = readCtfsFromFile(path)
-  doAssert data.isOk
-  let d = data.get()
-  let maxEntries = uint32(d[12]) or (uint32(d[13]) shl 8) or
-    (uint32(d[14]) shl 16) or (uint32(d[15]) shl 24)
-  doAssert maxEntries > DefaultMaxRootEntries, "the root directory did not grow"
+  doAssert res.isErr, "a full entry array took another file"
+  doAssert "one.more" in res.error and "31 of 31" in res.error,
+    "the refusal does not name the member and the occupancy: " & res.error
+  let d = readCtfsFromFile(path).get()
+  doAssert d == before, "a refused append changed the container"
   for i in 0 ..< int(DefaultMaxRootEntries):
-    let r = readInternalFile(d, "f" & $i & ".dat", 4096'u32, maxEntries)
+    let r = readInternalFile(d, "f" & $i & ".dat")
     doAssert r.isOk and r.get() == pattern(8, i), "member f" & $i & " lost"
-  let r = readInternalFile(d, "one.more", 4096'u32, maxEntries)
-  doAssert r.isOk and r.get() == pattern(4, 0), "the appended member lost"
   dropDir(dir)
-  echo "PASS: test_append_grows_a_full_entry_array"
+  echo "PASS: test_append_refuses_a_full_entry_array"
 
 proc test_mismatched_batch_is_refused() {.raises: [].} =
   let dir = tmpDir("mismatch")
@@ -297,6 +295,6 @@ when isMainModule:
   test_append_refuses_a_non_container()
   test_append_refuses_a_truncated_container()
   test_append_refuses_an_encrypted_container()
-  test_append_grows_a_full_entry_array()
+  test_append_refuses_a_full_entry_array()
   test_mismatched_batch_is_refused()
   echo "All container-append tests passed!"

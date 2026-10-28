@@ -58,13 +58,11 @@ when defined(nimPreviewSlimSystem):
 ##     is an error, because a stale-but-present stream is exactly the
 ##     "returns the wrong bytes" failure the format's consumers cannot see.
 ##   - **The entry array may span several blocks** (`ctfs-container.md` §1,
-##     `root_blocks`), and an append that runs out of entries grows it
-##     (`growRootDirectory`).  A growth moves the blocks the larger root takes
-##     over to the tail and rewrites the mapping blocks that pointed to them, so
-##     such an append writes, in order: the tail, then every block between the
-##     root region and the tail, then the root region.  An interruption after
-##     the first or second phase leaves the old root resolving to intact
-##     copies.
+##     `root_blocks`), and it does not grow: a batch the directory cannot hold
+##     whole is refused before anything is written, naming the first member
+##     that does not fit and the occupancy (§5). The append writes, in order:
+##     the tail, then the changed entries in one write. The header and every
+##     byte in `[root_blocks, previous end of file)` are never rewritten.
 
 from std/posix import fsync
 import std/oserrors
@@ -216,17 +214,33 @@ proc closeAfterFailure(f: var File) {.raises: [].} =
   ## nothing to it.
   discard f.closeChecked()
 
+when defined(ctfsAppendFaultInjection):
+  var ctfsAppendFailEntryWrite*: bool = false
+    ## Test-only: the entry write fails (as a full disk or an I/O error would
+    ## make it), after the tail is on disk. The append reports it, and the
+    ## container keeps its old entries.
+
 proc writeAppendedBlocks(c: Ctfs, path: string, firstNewBlock: uint64,
-                         oldRootBlocks: uint64): Result[void, string] =
-  ## Write the appended tail, then the root region.  Never touches anything
-  ## between -- unless the root directory grew, which moved blocks into the
-  ## tail and rewrote mapping blocks in place: then the blocks between the
-  ## (new) root region and the tail are written after the tail and before the
-  ## root.
+                         oldRoot: seq[byte]): Result[void, string] =
+  ## Write the appended tail, then the changed entries in one write
+  ## (`ctfs-container.md` §5, "Write ordering" and "Batching"): the header is
+  ## not rewritten, and nothing in `[root_blocks, previous end of file)` is.
   let bs = int(c.blockSize)
   let tailStart = int(firstNewBlock) * bs
   if tailStart > c.data.len:
     return err(appendError(path, "internal error: the appended image shrank"))
+  # The changed entries: the one range of the root region the append writes.
+  var lo = -1
+  var hi = -1
+  for k in 0 ..< min(oldRoot.len, c.data.len):
+    if oldRoot[k] != c.data[k]:
+      if k < containerHeaderSize(c.data):
+        return err(appendError(path, "internal error: the append changed the header"))
+      if lo < 0: lo = k
+      hi = k
+  if lo >= 0:
+    lo = containerHeaderSize(c.data) + ((lo - containerHeaderSize(c.data)) div FileEntrySize) * FileEntrySize
+    hi = containerHeaderSize(c.data) + ((hi - containerHeaderSize(c.data)) div FileEntrySize + 1) * FileEntrySize
 
   var f: File
   if not open(f, path, fmReadWriteExisting):
@@ -247,40 +261,31 @@ proc writeAppendedBlocks(c: Ctfs, path: string, firstNewBlock: uint64,
     # ---- the midpoint the durability argument turns on ----------------
     # Everything above is on disk; nothing below has run. A crash here is
     # the case `CTFS-Binary-Format.md` §5d describes: unreferenced trailing
-    # blocks, and block 0 still the old one. This statement sits *between*
-    # the two phases deliberately, so that swapping them moves the two
-    # writes around it rather than moving it along with either.
+    # blocks, and the old entries. This statement sits *between* the two
+    # phases deliberately, so that swapping them moves the two writes around
+    # it rather than moving it along with either.
     when defined(ctfsAppendFaultInjection):
       if ctfsAppendStopAtMidpoint:
         closeAfterFailure(f)
         return err(appendError(path,
-          "fault injection: abandoned between the tail write and block 0"))
+          "fault injection: abandoned between the tail write and the entries"))
 
-    let rootBlocks = c.rootBlockCount()
-    if rootBlocks > oldRootBlocks and firstNewBlock > rootBlocks:
-      let midStart = int(rootBlocks) * bs
-      let n = tailStart - midStart
-      f.setFilePos(int64(midStart))
-      if f.writeBuffer(unsafeAddr c.data[midStart], n) != n:
+    # Only now does anything point at the blocks just written: the changed
+    # entries, in one write.
+    if lo >= 0:
+      when defined(ctfsAppendFaultInjection):
+        if ctfsAppendFailEntryWrite:
+          closeAfterFailure(f)
+          return err(appendError(path, "fault injection: the entry write failed"))
+      f.setFilePos(int64(lo))
+      if f.writeBuffer(unsafeAddr c.data[lo], hi - lo) != hi - lo:
         closeAfterFailure(f)
-        return err(appendError(path, "short write rewriting moved mapping blocks"))
+        return err(appendError(path, "short write of the appended entries"))
       let synced = syncToDisk(f)
       if synced.isErr:
         closeAfterFailure(f)
-        return err(appendError(path, "rewriting moved mapping blocks: " &
+        return err(appendError(path, "writing the appended entries: " &
           synced.error))
-
-    # Only now does anything point at the blocks just written.
-    let rootBytes = int(rootBlocks) * bs
-    f.setFilePos(0)
-    if f.writeBuffer(unsafeAddr c.data[0], rootBytes) != rootBytes:
-      closeAfterFailure(f)
-      return err(appendError(path, "short write rewriting the root region"))
-    let synced = syncToDisk(f)
-    if synced.isErr:
-      closeAfterFailure(f)
-      return err(appendError(path, "rewriting the root region: " &
-        synced.error))
   except IOError, OSError:
     closeAfterFailure(f)
     return err(appendError(path, "I/O error while appending: " &
@@ -322,12 +327,30 @@ proc appendInternalFiles*(path: string, names: openArray[string],
 
   var c = ?openClosedCtfs(path)
   let firstNewBlock = c.nextFreeBlock
-  let oldRootBlocks = c.rootBlockCount()
+  let oldRoot = c.data[0 ..< min(c.data.len, int(c.rootBlockCount()) * int(c.blockSize))]
 
   for i in 0 ..< names.len:
     if c.findEntrySlot(encoded[i]) >= 0:
       return err(appendError(path, "already contains an internal file named " &
         names[i] & "; CTFS is append-only and this writer will not overwrite it"))
+
+  # A batch the directory cannot hold whole is refused before anything is
+  # written, naming the first member that does not fit and the occupancy
+  # (`ctfs-container.md` §5): the root does not grow (§1, rule 2), and no part
+  # of a batch is attached.
+  var free = 0
+  var used = 0
+  for i in 0 ..< int(c.maxRootEntries):
+    let off = c.fileEntryOffset(i)
+    if off + FileEntrySize > c.data.len: break
+    if readU64LE(c.data, off) == 0 and readU64LE(c.data, off + 8) == 0 and
+        readU64LE(c.data, off + 16) == 0: inc free
+    else: inc used
+  if free < names.len:
+    return err(appendError(path, "the root directory cannot hold the batch " &
+      "whole: " & names[free] & " does not fit (" & $used & " of " &
+      $c.maxRootEntries & " entries used, " & $free & " free, " & $names.len &
+      " to add); a closed container's root does not grow"))
 
   for i in 0 ..< names.len:
     let handle = c.addFile(names[i])
@@ -345,4 +368,4 @@ proc appendInternalFiles*(path: string, names: openArray[string],
   if partialSet.len > 0:
     return err(appendError(path, partialSet))
 
-  writeAppendedBlocks(c, path, firstNewBlock, oldRootBlocks)
+  writeAppendedBlocks(c, path, firstNewBlock, oldRoot)

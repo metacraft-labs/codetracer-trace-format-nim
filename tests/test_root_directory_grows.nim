@@ -140,18 +140,23 @@ proc runAppend() =
     names.add "a" & align($i, 11, '0')
     contents.add payload(i + 7, 1, sizeFor(i + 1))
     expected.add (names[^1], contents[^1])
+  # A closed container's root does not grow (`ctfs-container.md` §5, "Refuse a
+  # batch the directory cannot hold whole"; CKF-4N): the append is refused
+  # before it writes anything, and every member still reads back. Until
+  # CKF-4N this append grew the root.
+  let before = readCtfsFromFile(path).get()
   let a = appendInternalFiles(path, names, contents)
-  doAssert a.isOk, "append: " & (if a.isErr: a.error else: "")
+  doAssert a.isErr and "does not fit" in a.error,
+    "append into a full root was not refused: " & (if a.isErr: a.error else: "appended")
   let d = readCtfsFromFile(path).get()
-  doAssert u32le(d, 12) > full, "append did not grow the root"
+  doAssert d == before, "a refused append changed the container"
   var bad = 0
-  for (name, p) in expected:
+  for (name, p) in expected[0 ..< int(full)]:
     let r = readInternalFile(d, name, u32le(d, 8), u32le(d, 12))
     if p.len == 0: continue
     if r.isErr or r.get() != p: inc bad
   doAssert bad == 0, "append: " & $bad & " members did not read back"
-  echo "  append: ", full, " -> ", u32le(d, 12), " entries, ", expected.len,
-    " members read back"
+  echo "  append: a batch past a full root refused; ", full, " members read back"
   removeFile(path)
 
 proc runLimit() =
