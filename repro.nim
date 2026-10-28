@@ -221,6 +221,7 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_follower_attaches.nim", binary: "build/test-bin/test_follower_attaches"),
   TestSpec(source: "tests/test_container_append_batch_refusal.nim", binary: "build/test-bin/test_container_append_batch_refusal", defines: @["ctfsAppendFaultInjection"]),
   TestSpec(source: "tests/test_data_before_index.nim", binary: "build/test-bin/test_data_before_index"),
+  TestSpec(source: "tests/test_ctfs_salvage.nim", binary: "build/test-bin/test_ctfs_salvage"),
   TestSpec(source: "tests/test_chunk_index.nim", binary: "build/test-bin/test_chunk_index"),
   TestSpec(source: "tests/test_fixed_record_table.nim", binary: "build/test-bin/test_fixed_record_table"),
   TestSpec(source: "tests/test_variable_record_table.nim", binary: "build/test-bin/test_variable_record_table"),

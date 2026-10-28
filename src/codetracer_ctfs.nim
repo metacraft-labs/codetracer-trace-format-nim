@@ -23,7 +23,8 @@
 ##     thread_records, snapshot_records, monotone_run, namespace_live: keyed
 ##     members (`ctfs-container.md` §7a; `ctfs-keyed-families.md` §5.8) and
 ##     the MCR families built on them
-##   - repack: dead space and the canonical repack
+##   - repack, salvage: dead space and the canonical repack; salvage of an
+##     abandoned live coordination page
 
 import codetracer_ctfs/base40
 import codetracer_ctfs/types
@@ -47,6 +48,7 @@ import codetracer_ctfs/snapshot_records
 import codetracer_ctfs/monotone_run
 import codetracer_ctfs/namespace_live
 import codetracer_ctfs/repack
+import codetracer_ctfs/salvage
 import codetracer_ctfs/fixed_record_table
 import codetracer_ctfs/variable_record_table
 import codetracer_ctfs/zstd_bindings
@@ -100,6 +102,7 @@ export snapshot_records
 export monotone_run
 export namespace_live
 export repack
+export salvage
 export fixed_record_table
 export variable_record_table
 export zstd_bindings

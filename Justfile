@@ -9,7 +9,7 @@ alias fmt := format
 # Build every shipping artifact: the `ct-print` / `ct-space` inspectors and
 # the C-FFI static library the sibling Rust crate
 # (`codetracer-trace-format/codetracer_trace_writer_nim`) links against.
-build: build-ct-print build-ct-space build-static-lib
+build: build-ct-print build-ct-space build-ctfs-salvage build-static-lib
 
 # `ct-print` lands at the repo root on purpose — downstream recorder tests
 # resolve it at the fixed sibling path `../codetracer-trace-format-nim/ct-print`.
@@ -18,6 +18,11 @@ build-ct-print:
 
 build-ct-space:
     nimble buildCtSpace
+
+# `ctfs-salvage`: copies an abandoned live coordination page's root entries into
+# the file after every writer died (`ctfs-container.md` §6, "Every writer dies").
+build-ctfs-salvage:
+    nimble buildCtfsSalvage
 
 # `libcodetracer_trace_writer.a` — what `codetracer_trace_writer_nim`'s
 # build.rs compiles and links. Building it here proves this repo alone can

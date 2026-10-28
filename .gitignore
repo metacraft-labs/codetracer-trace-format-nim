@@ -79,6 +79,8 @@ ct-space
 # Windows builds the ct-print / ct-space utilities with a .exe suffix.
 ct-print.exe
 ct-space.exe
+ctfs-salvage
+ctfs-salvage.exe
 
 # Glob catch-all for compiled Nim test/bench binaries in tests/ (replaces
 # per-file maintenance burden; keep source files explicit via re-includes).

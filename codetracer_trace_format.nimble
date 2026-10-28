@@ -74,6 +74,7 @@ task test, "Run all tests":
   exec "nim c -r -d:release -p:src tests/test_follower_attaches.nim"
   exec "nim c -r -d:release -d:ctfsAppendFaultInjection -p:src tests/test_container_append_batch_refusal.nim"
   exec "nim c -r -d:release -p:src tests/test_data_before_index.nim"
+  exec "nim c -r -d:release -p:src tests/test_ctfs_salvage.nim"
   # Durability: a recording read while its writer is still open (what a
   # killed process leaves) has meta.dat, every sealed chunk and every interning
   # record registered before the seal.
@@ -485,6 +486,9 @@ task buildCtPrint, "Build ct-print utility":
 
 task buildCtSpace, "Build ct-space utility":
   exec "nim c -d:release --mm:arc -p:src -o:ct-space src/codetracer_ct_space.nim"
+
+task buildCtfsSalvage, "Build ctfs-salvage utility":
+  exec "nim c -d:release --mm:arc -p:src -o:ctfs-salvage src/codetracer_ctfs_salvage.nim"
 
 task testReader, "Run trace reader tests":
   exec "nim c -r -p:src tests/test_trace_reader.nim"
