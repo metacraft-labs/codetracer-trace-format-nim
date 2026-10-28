@@ -213,6 +213,7 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_keyed_threads.nim", binary: "build/test-bin/test_keyed_threads", defines: @["ctfsKeyedMutation"]),
   TestSpec(source: "tests/test_keyed_snapshots.nim", binary: "build/test-bin/test_keyed_snapshots", defines: @["ctfsKeyedMutation"]),
   TestSpec(source: "tests/test_keyed_corrmark.nim", binary: "build/test-bin/test_keyed_corrmark", defines: @["ctfsKeyedMutation"]),
+  TestSpec(source: "tests/test_namespace_live_commit.nim", binary: "build/test-bin/test_namespace_live_commit", defines: @["ctfsKeyedMutation"]),
   TestSpec(source: "tests/test_chunk_index.nim", binary: "build/test-bin/test_chunk_index"),
   TestSpec(source: "tests/test_fixed_record_table.nim", binary: "build/test-bin/test_fixed_record_table"),
   TestSpec(source: "tests/test_variable_record_table.nim", binary: "build/test-bin/test_variable_record_table"),

@@ -60,6 +60,8 @@ task test, "Run all tests":
   exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_keyed_threads.nim"
   exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_keyed_snapshots.nim"
   exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_keyed_corrmark.nim"
+  # A namespace committed live (`ctfs-container.md` §8).
+  exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_namespace_live_commit.nim"
   # Durability: a recording read while its writer is still open (what a
   # killed process leaves) has meta.dat, every sealed chunk and every interning
   # record registered before the seal.

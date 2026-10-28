@@ -20,7 +20,7 @@
 ##   - live_page: the live coordination page (`ctfs-container.md` §6)
 ##   - live_reader: opening and following a container, attached or file-only
 ##   - keyed_store, keyed_stream, b1, page_store, h1, s3, corrmark_live,
-##     thread_records, snapshot_records, monotone_run: keyed
+##     thread_records, snapshot_records, monotone_run, namespace_live: keyed
 ##     members (`ctfs-container.md` §7a; `ctfs-keyed-families.md` §5.8) and
 ##     the MCR families built on them
 
@@ -44,6 +44,7 @@ import codetracer_ctfs/corrmark_live
 import codetracer_ctfs/thread_records
 import codetracer_ctfs/snapshot_records
 import codetracer_ctfs/monotone_run
+import codetracer_ctfs/namespace_live
 import codetracer_ctfs/fixed_record_table
 import codetracer_ctfs/variable_record_table
 import codetracer_ctfs/zstd_bindings
@@ -95,6 +96,7 @@ export corrmark_live
 export thread_records
 export snapshot_records
 export monotone_run
+export namespace_live
 export fixed_record_table
 export variable_record_table
 export zstd_bindings
