@@ -75,6 +75,7 @@ task test, "Run all tests":
   exec "nim c -r -d:release -d:ctfsAppendFaultInjection -p:src tests/test_container_append_batch_refusal.nim"
   exec "nim c -r -d:release -p:src tests/test_data_before_index.nim"
   exec "nim c -r -d:release -p:src tests/test_ctfs_salvage.nim"
+  exec "nim c -r -d:release -p:src tests/test_live_page_writers.nim"
   # Durability: a recording read while its writer is still open (what a
   # killed process leaves) has meta.dat, every sealed chunk and every interning
   # record registered before the seal.

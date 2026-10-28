@@ -904,6 +904,59 @@ proc abandonLivePage*(p: LivePage) =
   else: shmUnmap(p.view, 0)
   p.closed = true
 
+proc joinLivePage*(f: File, rootEntries: int): Result[LivePage, string] =
+  ## Join the page of a container another process created, as an additional
+  ## writer (`ctfs-container.md` §6, W2 and the hybrid): the page must be
+  ## `live` and carry this file's identity; a writer slot is claimed (16 per
+  ## page, so at most 15 producers beside the coordinator, a 16th refused by
+  ## name) and kept alive by this process's heartbeat. The joiner never
+  ## creates, closes or removes the page.
+  let id = ? fileIdentity(f)
+  let name = pageName(id)
+  var v: PageView
+  var h = 0
+  if not shmOpen(name, true, v, h):
+    return err("live coordination page " & name & ": none to join")
+  if v.load(0) != PageMagicVersion or identityOf(v) != id or
+      v.load(OffState) != PageStateLive:
+    shmUnmap(v, h)
+    return err("live coordination page " & name & " is not a live page of this file")
+  var p = LivePage(view: v, name: name, identity: id, rootEntries: rootEntries,
+                   extentsOff: extentsOffset(rootEntries),
+                   slotsOff: slotsOffset(rootEntries))
+  when defined(windows): p.handle = h
+  let slot = p.claimWriterSlot()
+  if slot.isErr:
+    shmUnmap(p.view, h)
+    return err(slot.error)
+  p.writerSlot = slot.get()
+  p.startHeartbeat()
+  ok(p)
+
+proc settleDeadWriters*(p: LivePage): seq[int] =
+  ## A surviving writer's duty under W2 (§6, "A writer that dies"): every
+  ## writer slot whose writer is dead (its pid no longer names a process with
+  ## its start time, or its heartbeat is older than 10 seconds) is marked dead,
+  ## and every root mirror slot left odd is settled. A root entry is
+  ## prefix-valid (`MapBlock` before `Size`), so the settled value is the
+  ## page's payload: its `seq` is made even. A record slot left odd is left to
+  ## its readers, which retry a bounded number of times and then read the
+  ## record from the file: the crash rule's value for a record kind that is
+  ## not prefix-valid. Returns the slots marked dead.
+  let now = monotonicNs()
+  for i in 0 ..< PageWriterSlots:
+    let b = OffWriters + i * WriterSlotSize
+    if p.view.load(b + 32) == WriterSlotLive and i != p.writerSlot and
+        not writerAlive(p.view, i, now):
+      p.view.store(b + 32, WriterSlotDead)
+      result.add i
+  if result.len > 0:
+    for e in 0 ..< p.rootEntries:
+      let off = OffRootMirror + RootMirrorSlotSize * e
+      let s = p.view.load(off)
+      if (s and 1'u64) == 1'u64:
+        p.view.store(off, s + 1)
+
 # ---------------------------------------------------------------------------
 # The reader's side
 # ---------------------------------------------------------------------------
