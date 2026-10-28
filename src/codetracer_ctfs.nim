@@ -17,6 +17,7 @@
 ##     encoder and decoder; `ctfs-container.md` §1d)
 ##   - streaming: streaming mode for concurrent readers
 ##   - chunk_index: inline chunk header encode/decode
+##   - live_page: the live coordination page (`ctfs-container.md` §6)
 
 import codetracer_ctfs/base40
 import codetracer_ctfs/types
@@ -26,6 +27,7 @@ import codetracer_ctfs/container_append
 import codetracer_ctfs/compact
 import codetracer_ctfs/streaming
 import codetracer_ctfs/chunk_index
+import codetracer_ctfs/live_page
 import codetracer_ctfs/fixed_record_table
 import codetracer_ctfs/variable_record_table
 import codetracer_ctfs/zstd_bindings
@@ -65,6 +67,7 @@ export container_append
 export compact
 export streaming
 export chunk_index
+export live_page
 export fixed_record_table
 export variable_record_table
 export zstd_bindings

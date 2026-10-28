@@ -40,6 +40,10 @@ task test, "Run all tests":
   # stream. -d:release because one fixture is a 512-block two-level file.
   exec "nim c -r -d:release tests/test_write_null_data_block.nim"
   exec "nim c -r tests/test_streaming.nim"
+  # The live coordination page (`ctfs-container.md` §6): its seqlock against a
+  # hostile byte-splitting writer, and its lifetime (create, attach, close,
+  # a killed writer's page reaped, another file's identity refused).
+  exec "nim c -r -d:release -p:src tests/test_live_page_torn.nim"
   # Durability: a recording read while its writer is still open (what a
   # killed process leaves) has meta.dat, every sealed chunk and every interning
   # record registered before the seal.
