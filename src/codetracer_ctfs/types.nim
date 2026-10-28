@@ -6,6 +6,7 @@ when defined(nimPreviewSlimSystem):
 ## CTFS type definitions, constants, and low-level helpers.
 
 import stew/endians2
+import ./live_page
 export endians2
 
 when not defined(gcDestructors):
@@ -125,6 +126,50 @@ const
   DefaultChunkSize* = 4096   ## Default number of events per chunk
 
 type
+  WriteTap* = proc (offset: int64, bytes: openArray[byte]) {.closure, gcsafe,
+                                                           raises: [].}
+    ## Called with every write a streaming container hands the operating
+    ## system, before it is made (`Ctfs.writeTap`).
+
+  SealItemKind* = enum
+    ## The structural item kinds of `CTFS-Binary-Format.md` §2.15.4.
+    sikEntry    ## a root entry
+    sikRecord   ## a keyed record, new or a word of one
+    sikIndex    ## an index node, new or an in-place index word
+    sikStream   ## a keyed stream's growth
+
+  SealWord* = tuple[at: int, v: uint64]
+    ## An in-place word: its byte offset in the record or node, its value.
+
+  SealItem* = object
+    ## One publication of a seal, in the order the writer writes it.
+    kind*: SealItemKind
+    entry*: int           ## sikEntry: the root slot
+    name*: string         ## sikEntry: the member; otherwise the keyed member
+    size*: uint64         ## sikEntry, sikStream: the new `Size`
+    mapBlock*: uint64     ## sikEntry, sikStream: the new `MapBlock`
+    fromSize*: uint64     ## sikEntry, sikStream: the `Size` the file held
+    replace*: bool        ## sikEntry: truncated or rewritten below `fromSize`
+    masked*: int          ## sikEntry: in-place words zeroed in `[from, size)`
+    bytes*: seq[byte]     ## sikEntry: the bytes `[from, size)`, masked;
+                          ## sikRecord/sikIndex with `isNew`: the whole record
+                          ## or node, masked
+    record*: uint64       ## sikRecord: the record number;
+                          ## sikIndex: the node's byte offset in the member
+    isNew*: bool          ## sikRecord, sikIndex
+    words*: seq[SealWord] ## sikRecord, sikIndex: the in-place words written
+
+  SealObserver* = ref object
+    ## `CTFS-Binary-Format.md` §2.15.2's library observer: `beforeSeal` before
+    ## a seal's first publication write, with every item in write order;
+    ## `afterSeal` after the writer's `seal_epoch` increments (`epoch` is the
+    ## writer slot's `seal_epoch`, or the seal's ordinal when there is no
+    ## page).
+    beforeSeal*: proc (ordinal: uint64, items: seq[SealItem]) {.closure,
+                                                                gcsafe, raises: [].}
+    afterSeal*: proc (ordinal: uint64, epoch: uint64) {.closure, gcsafe,
+                                                         raises: [].}
+
   CtfsInternalFile* = object
     entryIndex*: int        ## Index in the file entry array
     writePos*: uint64       ## Current write position within the file
@@ -156,6 +201,33 @@ type
       ## default) is no limit beyond the u32 field.  A FAULT-INJECTION seam for
       ## tests of what a writer does with a member it could not store (the
       ## recorder's member-loss accounting): production code never sets it.
+    page*: LivePage
+      ## The live coordination page this writer hosts while it writes a
+      ## streaming container (`ctfs-container.md` §6): created with the
+      ## container, before its root region is first published, and closed by
+      ## `closeCtfs`. Every publication goes to it first and to the file
+      ## after. `nil` for a container built in memory, which has no file
+      ## identity for a reader to find a page by.
+    fileRoot*: seq[byte]
+      ## The root region as the file last received it. A publication writes
+      ## the entries that differ from it, each in one write, and never the
+      ## header again (`ctfs-container.md` §6, "Root publication").
+    writeTap*: WriteTap
+      ## A test seam: called with every write the container hands the
+      ## operating system, in order, before it is made.
+    ioFailure*: string
+      ## The first write that failed since the container was created. The
+      ## blocks it carried stay dirty, so the next publication retries them;
+      ## `closeCtfs` reports it when the final seal does not clear it.
+    keyedMembers*: seq[string]
+      ## The members that keyed families own (`ctfs-container.md` §7a). Root
+      ## growth refuses a container that holds one, naming it.
+    sealObserver*: SealObserver
+      ## The per-seal log observer (`CTFS-Binary-Format.md` §2.15.2), a test
+      ## API: `nil` unless a test or an armed recorder registered one.
+    sealOrdinal*: uint64
+      ## This writer's seals on this container (`ctfs-container.md` §6, "What
+      ## counts as a seal"), the ordinal the observer reports.
 
 proc entriesPerBlock*(c: Ctfs): uint64 =
   uint64(c.blockSize) div 8

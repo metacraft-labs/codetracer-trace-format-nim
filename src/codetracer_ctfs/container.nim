@@ -12,6 +12,8 @@ import ./base40
 import ./block_mapping
 import ./interning_set
 import ./checked_io
+import ./live_page
+import ./mutation_arms
 
 export interning_set
 
@@ -26,13 +28,19 @@ proc createCtfs*(
   ## Compression is NOT in the header — it is a property of each member's format.
   var c: Ctfs
   c.blockSize = blockSize
-  c.maxRootEntries = maxRootEntries
+  # A declared `0` is the auto-filled root (`ctfs-container.md` §1,
+  # "Auto-fill"): the header keeps the declaration, and the writer uses the
+  # slots that fill block 0 after the header, 170 at 4096 bytes, as every
+  # reader does (`rootEntryCount`). MCR declares it (`CTFS-Binary-Format.md`
+  # §2.2). Reading it as "no slots" made the first member a root growth.
+  c.maxRootEntries = rootEntryCount(blockSize, maxRootEntries,
+                                    HeaderSize + ExtHeaderSize)
   c.encryption = encryption
   c.maxShards = maxShards
   # `ctfs-container.md` §1: the root region is `root_blocks` contiguous blocks
   # from block 0 — one whenever the declared entries fit block 0, more when
   # they overflow it — and data allocation begins after it.
-  let rootBlocks = rootBlockCount(blockSize, maxRootEntries, maxShards)
+  let rootBlocks = rootBlockCount(blockSize, c.maxRootEntries, maxShards)
   c.data = newSeq[byte](int(rootBlocks) * int(blockSize))
   c.nextFreeBlock = rootBlocks
 
@@ -99,6 +107,14 @@ proc growRootDirectory*(c: var Ctfs): Result[void, string] =
   ## rewritten mapping blocks are written first, the root region (entries and
   ## header) last, so the old root keeps resolving to intact blocks until the
   ## new one replaces it.
+  # The growth guard (`CTFS-Keyed-Families` CKF-4N): growth moves blocks and
+  # rewrites only the root's MapBlocks and the mapping blocks it knows, so a
+  # keyed member's stored block numbers (a keyed stream's MapBlock) would name
+  # blocks that moved. Refused, naming the member.
+  if c.keyedMembers.len > 0:
+    return err("the root directory cannot grow: the container holds the " &
+      "keyed member " & c.keyedMembers[0] & ", whose stored block numbers a " &
+      "growth would leave pointing at moved blocks")
   let bs = uint64(c.blockSize)
   let oldRoot = c.rootBlockCount()
   let newRoot = max(oldRoot * 2'u64, oldRoot + 1'u64)
@@ -481,55 +497,197 @@ proc interningSetRefusal*(c: Ctfs): string =
         break
   interningSetRefusal(present)
 
-proc publish*(c: var Ctfs) =
-  ## Hand everything written so far to the operating system, data before the
-  ## root directory that publishes it (`ctfs-container.md` §6, "Writer
-  ## Protocol" and "Durability"): in deferred mode the dirty blocks outside
-  ## the root region, coalesced into runs, then the root region (header and
-  ## every file entry's `Size` and `MapBlock`); then the stdio buffer is
-  ## flushed, so the bytes have been `write`n and survive the process. No
-  ## `fsync`: rule 5 does not require one.
-  ##
-  ## A failed write here is not reported: there is no caller to report it to
-  ## that could act on it mid-recording, and `closeCtfs` writes the whole
-  ## image again and reports the failure of that write, so a condition that
-  ## persists (a full disk, a size limit) fails the close.
-  if not c.streaming:
+proc readMemberBytes*(data: openArray[byte], name: string,
+    fileSize: uint64, mapBlock: uint64,
+    blockSize: uint32): Result[seq[byte], string]
+
+proc flushDirtyData*(c: var Ctfs) =
+  ## Hand every block written since the last publication, outside the root
+  ## region, to the operating system: in block order, each run of consecutive
+  ## blocks in one write (`ctfs-container.md` §6, "Writer Protocol" steps 1-3,
+  ## and "Durability"). A run whose write fails stays dirty, so the next
+  ## publication writes it again. Root-region blocks are dropped from the set:
+  ## the root is published entry by entry (`publishEntry`).
+  if not (c.streaming and c.deferWrites) or c.dirtyBlocks.len == 0:
     return
   let rootBlocks = c.rootBlockCount()
-  if c.deferWrites and c.dirtyBlocks.len > 0:
-    c.dirtyBlocks.sort()
-    let bs = int(c.blockSize)
-    var i = 0
-    while i < c.dirtyBlocks.len:
-      var j = i
-      while j + 1 < c.dirtyBlocks.len and
-          c.dirtyBlocks[j + 1] == c.dirtyBlocks[j] + 1:
-        inc j
-      var first = c.dirtyBlocks[i]
-      let last = c.dirtyBlocks[j]
-      if last >= rootBlocks:
-        if first < rootBlocks:
-          first = rootBlocks
-        let off = int(first) * bs
-        let size = min(int(last + 1) * bs, c.data.len) - off
-        if size > 0:
-          try:
-            c.streamFile.setFilePos(int64(off))
-            discard c.streamFile.writeBuffer(addr c.data[off], size)
-          except IOError, OSError:
-            discard
-      i = j + 1
-    for b in c.dirtyBlocks:
-      c.dirtyMark[int(b)] = false
-    c.dirtyBlocks.setLen(0)
-  let rootBytes = min(int(rootBlocks) * int(c.blockSize), c.data.len)
-  try:
-    c.streamFile.setFilePos(0)
-    discard c.streamFile.writeBuffer(addr c.data[0], rootBytes)
-    c.streamFile.flushFile()
-  except IOError, OSError:
-    discard
+  c.dirtyBlocks.sort()
+  let bs = int(c.blockSize)
+  var keep: seq[uint64] = @[]
+  var i = 0
+  while i < c.dirtyBlocks.len:
+    var j = i
+    while j + 1 < c.dirtyBlocks.len and
+        c.dirtyBlocks[j + 1] == c.dirtyBlocks[j] + 1:
+      inc j
+    var first = c.dirtyBlocks[i]
+    let last = c.dirtyBlocks[j]
+    if last >= rootBlocks:
+      if first < rootBlocks:
+        first = rootBlocks
+      let off = int(first) * bs
+      let size = min(int(last + 1) * bs, c.data.len) - off
+      if size > 0 and not c.handToOs(off, size):
+        for b in first .. last: keep.add b
+    i = j + 1
+  for b in c.dirtyBlocks:
+    c.dirtyMark[int(b)] = false
+  c.dirtyBlocks.setLen(0)
+  for b in keep:
+    c.dirtyMark[int(b)] = true
+    c.dirtyBlocks.add b
+
+proc rootRegionBytes*(c: Ctfs): int =
+  ## The root region's size in bytes: `root_blocks` whole blocks.
+  min(int(c.rootBlockCount()) * int(c.blockSize), c.data.len)
+
+proc entryChanged*(c: Ctfs, i: int): bool =
+  ## Entry `i` differs from what the file last received.
+  let off = c.fileEntryOffset(i)
+  if off + FileEntrySize > c.fileRoot.len:
+    return true
+  for k in 0 ..< FileEntrySize:
+    if c.data[off + k] != c.fileRoot[off + k]:
+      return true
+  false
+
+proc rootLayoutChanged(c: Ctfs): bool =
+  ## The root region is not the one the file holds: its size, or its header,
+  ## differs. Only a root growth (`growRootDirectory`, retired by `CKF-8`)
+  ## does that.
+  let n = c.rootRegionBytes()
+  if c.fileRoot.len != n:
+    return true
+  for k in 0 ..< containerHeaderSize(c.data):
+    if c.data[k] != c.fileRoot[k]:
+      return true
+  false
+
+proc changedEntries*(c: Ctfs): seq[int] =
+  ## The root slots whose entry differs from what the file last received.
+  for i in 0 ..< int(c.maxRootEntries):
+    if c.fileEntryOffset(i) + FileEntrySize > c.data.len: break
+    if c.entryChanged(i):
+      result.add i
+
+proc entryItem*(c: Ctfs, i: int, withBytes: bool): SealItem =
+  ## The `entry` item (`CTFS-Binary-Format.md` §2.15.4) of publishing slot
+  ## `i` as it stands in the image.
+  let off = c.fileEntryOffset(i)
+  let size = readU64LE(c.data, off)
+  let mapBlock = readU64LE(c.data, off + 8)
+  let encoded = readU64LE(c.data, off + 16)
+  var fromSize =
+    if off + FileEntrySize <= c.fileRoot.len and
+        readU64LE(c.fileRoot, off + 16) == encoded:
+      readU64LE(c.fileRoot, off)
+    else: 0'u64
+  var replace = false
+  if size < fromSize:
+    replace = true
+    fromSize = 0
+  result = SealItem(kind: sikEntry, entry: i, name: base40Decode(encoded),
+    size: size, mapBlock: mapBlock, fromSize: fromSize, replace: replace)
+  if withBytes and size > fromSize:
+    let all = readMemberBytes(c.data, result.name, size, mapBlock, c.blockSize)
+    if all.isOk:
+      result.bytes = all.get()[int(fromSize) ..< int(size)]
+
+proc publishEntry*(c: var Ctfs, i: int): bool =
+  ## Publish slot `i`: its live coordination page mirror first, then its 24
+  ## bytes in one write (`ctfs-container.md` §6, "Root Publication" and
+  ## "Writing through the page"). False when the write failed; the file's
+  ## view of the entry is then left as it was, so the next publication tries
+  ## again.
+  let off = c.fileEntryOffset(i)
+  if c.page != nil:
+    c.page.publishRoot(i, readU64LE(c.data, off), readU64LE(c.data, off + 8),
+      readU64LE(c.data, off + 16))
+  if c.streaming and not c.handToOs(off, FileEntrySize):
+    return false
+  if c.fileRoot.len < off + FileEntrySize:
+    c.fileRoot.setLen(off + FileEntrySize)
+  copyMem(addr c.fileRoot[off], addr c.data[off], FileEntrySize)
+  true
+
+proc publishRootLayout(c: var Ctfs): bool =
+  ## The whole root region, header included, in one write: only after a root
+  ## growth changed its size and its header (`growRootDirectory`, which
+  ## `CKF-8` retires).
+  let n = c.rootRegionBytes()
+  if not c.handToOs(0, n):
+    return false
+  c.fileRoot = c.data[0 ..< n]
+  for i in 0 ..< int(c.maxRootEntries):
+    let off = c.fileEntryOffset(i)
+    if off + FileEntrySize > n: break
+    if c.page != nil and readU64LE(c.data, off + 16) != 0'u64:
+      c.page.publishRoot(i, readU64LE(c.data, off), readU64LE(c.data, off + 8),
+        readU64LE(c.data, off + 16))
+  true
+
+proc beginSeal*(c: var Ctfs, items: seq[SealItem]) =
+  ## A seal is about to make its first publication write: the observer sees
+  ## every item first (`CTFS-Binary-Format.md` §2.15.3, "intent").
+  if c.sealObserver != nil and c.sealObserver.beforeSeal != nil:
+    c.sealObserver.beforeSeal(c.sealOrdinal + 1, items)
+
+proc endSeal*(c: var Ctfs) =
+  ## A seal's file writes are done: `ctfs-container.md` §6 step 4, the
+  ## writer's `seal_epoch` and then the page's; then the observer's
+  ## `afterSeal`.
+  inc c.sealOrdinal
+  if c.page != nil:
+    c.page.sealDone()
+  if c.sealObserver != nil and c.sealObserver.afterSeal != nil:
+    let epoch =
+      if c.page != nil: c.page.writerSealEpoch() else: c.sealOrdinal
+    c.sealObserver.afterSeal(c.sealOrdinal, epoch)
+
+proc publish*(c: var Ctfs) =
+  ## The container's seal for its root members (`ctfs-container.md` §6,
+  ## "Writing through the page" steps 3 and 4, and "Durability"): every block
+  ## written since the last publication is handed to the operating system
+  ## first, in block order (`flushDirtyData`); then every root entry that
+  ## differs from what the file holds, each through the live coordination page
+  ## first and then in one write of its own; then the writer's `seal_epoch`.
+  ## The header is never written again after the container's creation, and
+  ## neither is an entry that did not change (§6, "Root Publication": "A
+  ## publication writes what changed").
+  ##
+  ## A publication that changes no entry is not a seal (§6, "What counts as a
+  ## seal"): it increments nothing and the observer does not see it. A write
+  ## that fails is retried by the next publication, and `closeCtfs` reports it
+  ## (`ioFailure`).
+  if not c.streaming:
+    return
+  c.flushDirtyData()
+  if c.rootLayoutChanged():
+    c.beginSeal(@[])
+    if c.publishRootLayout():
+      c.endSeal()
+    return
+  let changed = c.changedEntries()
+  if changed.len == 0:
+    return
+  if mutated("publish-whole-root"):
+    # Mutation arm: the former publication, the whole root region from offset
+    # 0 at every seal, header included.
+    c.beginSeal(@[])
+    if c.publishRootLayout():
+      c.endSeal()
+    return
+  if c.sealObserver != nil:
+    var items: seq[SealItem]
+    for i in changed:
+      items.add c.entryItem(i, withBytes = true)
+    c.beginSeal(items)
+  var any = false
+  for i in changed:
+    if c.publishEntry(i):
+      any = true
+  if any:
+    c.endSeal()
 
 proc syncRootBlock*(c: var Ctfs) =
   ## Publish block 0 — the header and the root file-entry array — to the
@@ -556,17 +714,21 @@ proc syncRootBlock*(c: var Ctfs) =
   c.publish()
 
 proc closeCtfs*(c: var Ctfs): Result[void, string] {.discardable.} =
-  ## Close the container. When streaming, flushes all data and closes the file.
+  ## Close the container. When streaming: the final seal (`publish`: every
+  ## block not yet handed over, then every entry that changed), then the live
+  ## coordination page is closed (its state `closed`, its name removed;
+  ## `ctfs-container.md` §6, "Close"), and the file.
   ##
-  ## Returns the I/O failure rather than swallowing it. The final write is the
-  ## one that publishes block 0's entry-size array, so losing it silently
-  ## yields a container whose members read back empty — a corrupt recording
-  ## that reports success. `{.discardable.}` keeps the ~50 existing
+  ## Returns the I/O failure rather than swallowing it: a write that failed
+  ## during the recording and that the final seal could not complete
+  ## (`ioFailure`), or the close of the file. Losing it silently yields a
+  ## container whose members read back short, a corrupt recording that
+  ## reports success. `{.discardable.}` keeps the ~50 existing
   ## statement-position callers compiling, but a caller on a recording path
   ## should check it.
   ##
   ## A container that carries some but not all of the interning tables is
-  ## refused (`interningSetRefusal`). A streaming container is still flushed
+  ## refused (`interningSetRefusal`). A streaming container is still sealed
   ## and its file closed, since its members are on disk already; the refusal
   ## is what the caller gets back.
   let refusal = interningSetRefusal(c)
@@ -574,18 +736,18 @@ proc closeCtfs*(c: var Ctfs): Result[void, string] {.discardable.} =
     if refusal.len > 0:
       return err(refusal)
     return ok()
-  # The whole image is written again, so a block an earlier `publish` failed
-  # to hand over is rewritten here. The flush inside `fclose` is where the
-  # buffered tail of that write reaches the file, and so where a full disk or
-  # a file-size limit shows up; its result is the close's.
-  var failure = ""
-  try:
-    c.streamFile.setFilePos(0)
-    let wrote = c.streamFile.writeAllChecked(addr c.data[0], c.data.len)
-    if wrote.isErr:
-      failure = wrote.error
-  except IOError as e:
-    failure = "seek failed: " & e.msg
+  # A failure an earlier publication left is retried by this seal: the
+  # blocks it carried are still dirty, and so is the entry it did not write.
+  let earlier = c.ioFailure
+  c.ioFailure = ""
+  c.publish()
+  var failure = c.ioFailure
+  if failure.len == 0 and (c.dirtyBlocks.len > 0 or c.changedEntries().len > 0):
+    failure = "the final seal left blocks or entries unwritten" &
+      (if earlier.len > 0: " (earlier: " & earlier & ")" else: "")
+  if c.page != nil:
+    closeLivePage(c.page)
+    c.page = nil
   let closed = c.streamFile.closeChecked()
   if failure.len == 0 and closed.isErr:
     failure = closed.error

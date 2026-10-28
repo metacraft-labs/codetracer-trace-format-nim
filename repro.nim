@@ -205,6 +205,8 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_trace_reader_null_mapping_root.nim", binary: "build/test-bin/test_trace_reader_null_mapping_root"),
   TestSpec(source: "tests/test_streaming.nim", binary: "build/test-bin/test_streaming"),
   TestSpec(source: "tests/test_live_page_torn.nim", binary: "build/test-bin/test_live_page_torn"),
+  TestSpec(source: "tests/test_live_page_lifetime.nim", binary: "build/test-bin/test_live_page_lifetime"),
+  TestSpec(source: "tests/test_root_publication_writes_changed_entries.nim", binary: "build/test-bin/test_root_publication_writes_changed_entries", defines: @["ctfsKeyedMutation"]),
   TestSpec(source: "tests/test_chunk_index.nim", binary: "build/test-bin/test_chunk_index"),
   TestSpec(source: "tests/test_fixed_record_table.nim", binary: "build/test-bin/test_fixed_record_table"),
   TestSpec(source: "tests/test_variable_record_table.nim", binary: "build/test-bin/test_variable_record_table"),

@@ -15,8 +15,41 @@ when defined(nimPreviewSlimSystem):
 
 import results
 import ./types
+import ./os_io
 
-proc markDirty(c: var Ctfs, offset: int, size: int) =
+proc handToOs*(c: var Ctfs, offset: int, size: int): bool =
+  ## Hand `size` bytes of the image at `offset` to the operating system, in
+  ## one positioned write (`os_io.nim`); every byte a streaming container
+  ## writes after its creation goes through here. The write tap sees the write
+  ## first. A failure is kept in `ioFailure` (the first one) and returned as
+  ## `false`; the caller keeps what it could not write dirty.
+  if size <= 0:
+    return true
+  if c.writeTap != nil:
+    c.writeTap(int64(offset), c.data.toOpenArray(offset, offset + size - 1))
+  let r = writeAtOs(c.streamFile, int64(offset), addr c.data[offset], size)
+  if r.isErr:
+    if c.ioFailure.len == 0:
+      c.ioFailure = r.error
+    return false
+  true
+
+proc handBytesToOs*(c: var Ctfs, offset: int, bytes: openArray[byte]): bool =
+  ## Hand `bytes` to the operating system at image offset `offset`, in one
+  ## positioned write: a value the writer holds apart from the image (an
+  ## entry as of an earlier phase of a seal). As `handToOs` otherwise.
+  if bytes.len == 0:
+    return true
+  if c.writeTap != nil:
+    c.writeTap(int64(offset), bytes)
+  let r = writeAtOs(c.streamFile, int64(offset), unsafeAddr bytes[0], bytes.len)
+  if r.isErr:
+    if c.ioFailure.len == 0:
+      c.ioFailure = r.error
+    return false
+  true
+
+proc markDirty*(c: var Ctfs, offset: int, size: int) =
   if size <= 0:
     return
   let bs = int(c.blockSize)
@@ -42,11 +75,8 @@ proc flushBlockRange*(c: var Ctfs, offset: int, size: int) =
   if c.deferWrites:
     c.markDirty(offset, size)
     return
-  try:
-    c.streamFile.setFilePos(int64(offset))
-    discard c.streamFile.writeBuffer(addr c.data[offset], size)
-  except IOError, OSError:
-    discard
+  if not c.handToOs(offset, size):
+    c.markDirty(offset, size)
 
 proc flushBlock*(c: var Ctfs, blockNum: uint64) =
   ## Write a single block to the streaming file.
