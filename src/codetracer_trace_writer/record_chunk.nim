@@ -1,3 +1,6 @@
+when defined(nimPreviewSlimSystem):
+  import std/[assertions]
+
 {.push raises: [].}
 
 ## One chunk of a stream whose chunks are zstd frames of varint-length-prefixed

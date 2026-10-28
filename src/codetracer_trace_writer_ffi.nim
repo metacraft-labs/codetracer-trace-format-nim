@@ -1,3 +1,6 @@
+when defined(nimPreviewSlimSystem):
+  import std/[syncio]
+
 {.push raises: [].}
 
 ## C FFI interface for the CodeTracer trace writer.

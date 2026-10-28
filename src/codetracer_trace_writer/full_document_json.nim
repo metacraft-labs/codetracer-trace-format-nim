@@ -1,3 +1,6 @@
+when defined(nimPreviewSlimSystem):
+  import std/[syncio, assertions]
+
 ## The ONE assembly of a CTFS container into the JSON document that
 ## ``ct-print --full`` / ``--events`` print.
 ##

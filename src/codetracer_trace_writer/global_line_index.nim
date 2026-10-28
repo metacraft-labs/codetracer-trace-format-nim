@@ -1,3 +1,6 @@
+when defined(nimPreviewSlimSystem):
+  import std/[assertions]
+
 {.push raises: [].}
 
 ## Global line index: collapses (file_id, line) into a single varint.

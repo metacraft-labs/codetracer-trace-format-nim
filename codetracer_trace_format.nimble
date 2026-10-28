@@ -413,6 +413,10 @@ task test, "Run all tests":
   # over src/ with `--os:any --cpu:wasm32 --compileOnly` and reads the emitted
   # C, so it needs no cross toolchain.
   exec "nim c -r -d:release -p:src tests/test_freestanding_writer_surface.nim"
+  # Every src/ module passes `nim check` under -d:nimPreviewSlimSystem, as
+  # the Nim fork's compiler-linked tools (nimony's nifler) build it. Drives
+  # the compiler over src/ with its own temporary nimcache.
+  exec "nim c -r tests/test_library_compiles_under_slim_system.nim"
   # Every `trace_writer_*` entry point the FFI exports is DECLARED in the C
   # header hosts vendor, or is on a named backlog. "Exported but undeclared"
   # breaks no build and fails no test — it just silently removes a capability

@@ -1,3 +1,6 @@
+when defined(nimPreviewSlimSystem):
+  import std/[assertions]
+
 ## The ONE rendering of a ``TagSourceReload`` step event as JSON.
 ##
 ## GDH-M2 / design §6.3 of

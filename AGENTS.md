@@ -130,6 +130,16 @@ choice the sibling Nim repos `io-mon`, `nim-stackable-hooks` and
   A test that `include`s `codetracer_trace_writer_ffi` gets
   `--nimMainPrefix:codetracerTraceWriter` from `tests/config.nims` under
   both runners; the nimble line still spells it too.
+- **Every `src/` module must compile under `-d:nimPreviewSlimSystem`.** The
+  CodeTracer Nim fork links this library into its compiler, and the tools
+  built from compiler modules with slim-system on (nimony's `nifler`, which
+  `koch nimsuggest` builds first) fail at the first module that uses
+  `File`/`readFile`/`stderr`, `doAssert` or `$` of a float through `system`.
+  Such a module starts with
+  `when defined(nimPreviewSlimSystem): import std/[syncio, assertions]`
+  (plus `formatfloat` where it needs it).
+  `tests/test_library_compiles_under_slim_system.nim` `nim check`s every
+  module under the define and fails on any error located in `src/`.
 - **Benchmarks live in the `bench` task, correctness in `test`.** The two
   ChunkedCompressedTable microbenchmarks (`perLookupNs < 50000` per random
   lookup; `> 20M` records/sec write throughput) are in

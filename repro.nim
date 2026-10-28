@@ -335,6 +335,9 @@ const testSpecs: seq[TestSpec] = @[
   # Re-runs the compiler over src/ for `--os:any` with `--compileOnly` and
   # its own temporary nimcache; it needs no cross toolchain.
   TestSpec(source: "tests/test_freestanding_writer_surface.nim", binary: "build/test-bin/test_freestanding_writer_surface"),
+  # `nim check` of every src/ module under -d:nimPreviewSlimSystem, with its
+  # own temporary nimcache; debug-built like its nimble line.
+  TestSpec(source: "tests/test_library_compiles_under_slim_system.nim", binary: "build/test-bin/test_library_compiles_under_slim_system", debugOnly: true),
   # Drives `cargo test` in the sibling Rust repo, like the other cross-reads.
   TestSpec(source: "tests/test_nim_step_map_crossread.nim", binary: "build/test-bin/test_nim_step_map_crossread", pool: CrossReadPool),
   # Compile ct-print at runtime through `tests/ct_print_binary.nim` (see the

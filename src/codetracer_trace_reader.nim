@@ -1,5 +1,5 @@
 when defined(nimPreviewSlimSystem):
-  import std/[syncio, assertions]
+  import std/[syncio, assertions, formatfloat]
 
 {.push raises: [].}
 

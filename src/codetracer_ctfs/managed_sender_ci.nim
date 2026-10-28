@@ -1,3 +1,6 @@
+when defined(nimPreviewSlimSystem):
+  import std/[syncio]
+
 import std/[httpclient, json, net, os, strutils, times, uri]
 when defined(posix):
   from std/posix import EINTR, ECONNREFUSED

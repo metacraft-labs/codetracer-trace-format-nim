@@ -1,3 +1,6 @@
+when defined(nimPreviewSlimSystem):
+  import std/[syncio]
+
 {.push raises: [].}
 
 ## Split-by-time trace directories for CTFS.
