@@ -214,6 +214,7 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_keyed_snapshots.nim", binary: "build/test-bin/test_keyed_snapshots", defines: @["ctfsKeyedMutation"]),
   TestSpec(source: "tests/test_keyed_corrmark.nim", binary: "build/test-bin/test_keyed_corrmark", defines: @["ctfsKeyedMutation"]),
   TestSpec(source: "tests/test_namespace_live_commit.nim", binary: "build/test-bin/test_namespace_live_commit", defines: @["ctfsKeyedMutation"]),
+  TestSpec(source: "tests/test_dead_space.nim", binary: "build/test-bin/test_dead_space", defines: @["ctfsKeyedMutation"]),
   TestSpec(source: "tests/test_seal_observer.nim", binary: "build/test-bin/test_seal_observer", defines: @["ctfsKeyedMutation"]),
   TestSpec(source: "tests/test_root_region_pointer_refused.nim", binary: "build/test-bin/test_root_region_pointer_refused"),
   TestSpec(source: "tests/test_block_caches.nim", binary: "build/test-bin/test_block_caches"),

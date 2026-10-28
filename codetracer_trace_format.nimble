@@ -62,6 +62,8 @@ task test, "Run all tests":
   exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_keyed_corrmark.nim"
   # A namespace committed live (`ctfs-container.md` §8).
   exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_namespace_live_commit.nim"
+  # Dead space and the canonical repack (`ctfs-keyed-families.md` §8.3 O-12).
+  exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_dead_space.nim"
   # The per-seal log observer (`CTFS-Binary-Format.md` §2.15.2).
   exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_seal_observer.nim"
   # Readers refuse a block number in [1, root_blocks); block caches keep
