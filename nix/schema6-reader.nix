@@ -52,9 +52,14 @@ pkgs.stdenv.mkDerivation {
     runHook postInstall
   '';
   doInstallCheck = true;
+  # The suite is compiled from a copy under its own name: interpolated as a
+  # Nix path it lands in the store as `<hash>-ct_print_profiles.nim`, and
+  # Nim refuses that as a module name, which failed every build of this
+  # reader.
   installCheckPhase = ''
+    cp ${./tests/ct_print_profiles.nim} $TMPDIR/ct_print_profiles.nim
     nim c -r -d:release --hints:off --nimcache:$TMPDIR/check-cache \
-      ${paths} -o:$TMPDIR/check-profiles ${./tests/ct_print_profiles.nim} $out/bin/ct-print
+      ${paths} -o:$TMPDIR/check-profiles $TMPDIR/ct_print_profiles.nim $out/bin/ct-print
   '';
   passthru = {
     inherit
