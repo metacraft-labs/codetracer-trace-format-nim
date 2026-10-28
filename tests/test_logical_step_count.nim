@@ -19,9 +19,13 @@ include codetracer_trace_writer_ffi
 import std/[os, osproc, strutils, json]
 import ct_print_binary
 
-const
-  outDir = "/tmp/ct_logical_step_count"
+let
+  # Per-process scratch under the user's temp directory, not a fixed `/tmp`
+  # path another account on a shared host may already own.
+  outDir = getTempDir() / ("ct_logical_step_count-" & $getCurrentProcessId())
   bundlePath = outDir / "raise_catch.ct"
+
+const
   stepRecords = 3'u64
   execRecords = 8'u64
 
@@ -98,6 +102,8 @@ proc test_ct_print_reports_three_steps_everywhere() =
     "the text view does not show the raise and the catch:\n" & text
   echo "PASS: ct-print reports three steps everywhere"
 
-test_the_reader_counts_step_records_only()
-test_ct_print_reports_three_steps_everywhere()
-removeDir(outDir)
+try:
+  test_the_reader_counts_step_records_only()
+  test_ct_print_reports_three_steps_everywhere()
+finally:
+  removeDir(outDir)

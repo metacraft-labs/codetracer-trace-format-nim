@@ -75,7 +75,10 @@ int main(void) {
      * descriptor usually survives by luck; a long-running host with many
      * threads (Godot) exhausts the cache and the memory is unmapped. The
      * worker runs on a stack this test owns, and unmapping it after the join
-     * makes that deterministic. */
+     * makes that deterministic on glibc. macOS keeps TLS in a malloc'd
+     * block rather than in the stack, so there `nimble testFfiThreads` runs
+     * the --threads:on control under Guard Malloc, which unmaps that block
+     * when the thread exits. */
     munmap(stack, STACK_SIZE);
 
     int rc = trace_writer_close(writer);

@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include "codetracer_trace_writer.h"
 
 #define ASSERT(cond, msg) do { \
@@ -17,11 +18,43 @@ static int file_exists(const char* path) {
     return stat(path, &st) == 0;
 }
 
+/* Every file this test writes goes into one directory created for this run
+ * under the user's temp directory ($TMPDIR, falling back to /tmp), never at a
+ * fixed /tmp path. A fixed path is shared by every account on the host:
+ * whichever user ran the test first owns the file, and every other user's
+ * run then fails to create or remove it. mkdtemp(3) makes the directory
+ * mode 0700 with a name no other run can pick. */
+static char scratch_dir[1024];
+
+static int make_scratch_dir(void) {
+    const char* tmp = getenv("TMPDIR");
+    size_t len;
+    if (tmp == NULL || tmp[0] == '\0') tmp = "/tmp";
+    len = strlen(tmp);
+    while (len > 1 && tmp[len - 1] == '/') len--;
+    if (snprintf(scratch_dir, sizeof scratch_dir, "%.*s/ct_test_ffi-XXXXXX",
+                 (int)len, tmp) >= (int)sizeof scratch_dir) {
+        return -1;
+    }
+    return mkdtemp(scratch_dir) != NULL ? 0 : -1;
+}
+
+/* `buf` receives `<scratch_dir>/<name>`. Returns `buf` so it can be passed
+ * straight to the API under test. */
+static const char* scratch_path(char* buf, size_t size, const char* name) {
+    snprintf(buf, size, "%s/%s", scratch_dir, name);
+    return buf;
+}
+#define SCRATCH(buf, name) scratch_path((buf), sizeof (buf), (name))
+
 int main(void) {
     /* Initialize Nim runtime */
     codetracer_trace_writer_init();
 
     printf("=== C FFI Test for codetracer_trace_writer ===\n\n");
+
+    ASSERT(make_scratch_dir() == 0, "create the per-run scratch directory");
+    printf("[OK] scratch directory: %s\n", scratch_dir);
 
     /* The archive this test links is the one build_ffi.nims produces, and it
      * must say so: a host library built any other way (--threads:on, no
@@ -41,11 +74,14 @@ int main(void) {
     printf("[OK] trace_writer_set_workdir\n");
 
     /* Begin metadata/events/paths (compatibility stubs) */
-    ASSERT(trace_writer_begin_metadata(writer, "/tmp/meta.json") == 0,
+    char path_buf[1100];
+    char ct_path[1100];
+    SCRATCH(ct_path, "test_program.ct");
+    ASSERT(trace_writer_begin_metadata(writer, SCRATCH(path_buf, "meta.json")) == 0,
         "begin_metadata should succeed");
-    ASSERT(trace_writer_begin_events(writer, "/tmp/events.bin") == 0,
+    ASSERT(trace_writer_begin_events(writer, SCRATCH(path_buf, "events.bin")) == 0,
         "begin_events should succeed");
-    ASSERT(trace_writer_begin_paths(writer, "/tmp/paths.json") == 0,
+    ASSERT(trace_writer_begin_paths(writer, SCRATCH(path_buf, "paths.json")) == 0,
         "begin_paths should succeed");
     printf("[OK] begin_metadata/events/paths\n");
 
@@ -107,8 +143,8 @@ int main(void) {
     printf("[OK] trace_writer_close\n");
 
     /* Verify the .ct file exists (it's created in the same dir as events path) */
-    ASSERT(file_exists("/tmp/test_program.ct"), "test_program.ct should exist in /tmp");
-    printf("[OK] /tmp/test_program.ct file exists\n");
+    ASSERT(file_exists(ct_path), "test_program.ct should exist in the scratch directory");
+    printf("[OK] %s file exists\n", ct_path);
 
     /* Free the writer */
     trace_writer_free(writer);
@@ -121,7 +157,7 @@ int main(void) {
     printf("[OK] NULL handle safety\n");
 
     /* Clean up */
-    remove("/tmp/test_program.ct");
+    remove(ct_path);
 
     printf("\n=== All tests passed! ===\n\n");
 
@@ -223,7 +259,7 @@ int main(void) {
         ASSERT(w != NULL, "trace_writer_new for meta_dat test");
 
         trace_writer_set_workdir(w, "/tmp/meta_workdir");
-        ASSERT(trace_writer_begin_events(w, "/tmp/events.bin") == 0,
+        ASSERT(trace_writer_begin_events(w, SCRATCH(path_buf, "events.bin")) == 0,
             "begin_events for meta_dat test");
 
         trace_writer_start(w, "/test/main.py", 1);
@@ -237,10 +273,12 @@ int main(void) {
         ASSERT(trace_writer_close(w) == 0, "close for meta_dat test");
         trace_writer_free(w);
 
-        /* Verify the .ct file was created (in /tmp, same dir as events path) */
-        ASSERT(file_exists("/tmp/meta_test_prog.ct"), "meta_test_prog.ct should exist in /tmp");
-        printf("[OK] /tmp/meta_test_prog.ct exists with meta.dat\n");
-        remove("/tmp/meta_test_prog.ct");
+        /* Verify the .ct file was created (in the scratch directory, the
+         * same dir as the events path) */
+        SCRATCH(ct_path, "meta_test_prog.ct");
+        ASSERT(file_exists(ct_path), "meta_test_prog.ct should exist in the scratch directory");
+        printf("[OK] %s exists with meta.dat\n", ct_path);
+        remove(ct_path);
     }
 
     printf("\n=== All meta.dat tests passed! ===\n\n");
@@ -269,7 +307,7 @@ int main(void) {
         ASSERT(w != NULL, "trace_writer_new (multi-stream)");
 
         trace_writer_set_workdir(w, "/tmp/ms_workdir");
-        ASSERT(trace_writer_begin_events(w, "/tmp/ms_events.bin") == 0,
+        ASSERT(trace_writer_begin_events(w, SCRATCH(path_buf, "ms_events.bin")) == 0,
             "begin_events (multi-stream)");
 
         /* Start tracing */
@@ -357,13 +395,13 @@ int main(void) {
 
         /* Close — this flushes pending step and writes .ct file */
         ASSERT(trace_writer_close(w) == 0, "close (multi-stream)");
-        ASSERT(file_exists("/tmp/ms_test.ct"), "ms_test.ct should exist");
+        ASSERT(file_exists(SCRATCH(ct_path, "ms_test.ct")), "ms_test.ct should exist");
         printf("[OK] ms: close + file exists\n");
 
         /* Verify file is non-empty */
         {
             struct stat st;
-            ASSERT(stat("/tmp/ms_test.ct", &st) == 0, "stat ms_test.ct");
+            ASSERT(stat(SCRATCH(ct_path, "ms_test.ct"), &st) == 0, "stat ms_test.ct");
             ASSERT(st.st_size > 100, "ms_test.ct should be non-trivial size");
             printf("[OK] ms: file size = %ld bytes\n", (long)st.st_size);
         }
@@ -371,9 +409,9 @@ int main(void) {
         /* Read it back through the reader ABI the header declares: from the
          * path, and from the bytes, which the caller frees straight away. */
         {
-            ct_reader_t from_path = ct_reader_open("/tmp/ms_test.ct");
+            ct_reader_t from_path = ct_reader_open(SCRATCH(ct_path, "ms_test.ct"));
             ASSERT(from_path != NULL, "ct_reader_open");
-            FILE* f = fopen("/tmp/ms_test.ct", "rb");
+            FILE* f = fopen(SCRATCH(ct_path, "ms_test.ct"), "rb");
             ASSERT(f != NULL, "fopen ms_test.ct");
             fseek(f, 0, SEEK_END);
             long n = ftell(f);
@@ -404,7 +442,7 @@ int main(void) {
         }
 
         trace_writer_free(w);
-        remove("/tmp/ms_test.ct");
+        remove(SCRATCH(ct_path, "ms_test.ct"));
     }
     printf("\n=== Multi-stream format test passed! ===\n");
 
@@ -420,21 +458,21 @@ int main(void) {
      * container file exists on disk while recording is still in progress.
      * We prove it: begin recording, assert the container is already present
      * on disk, drive all three chokepoints 2000x, then finalize at close.
-     * No mock: real FFI writer, real /tmp filesystem.
+     * No mock: real FFI writer, real filesystem (the per-run scratch dir).
      * ================================================================ */
     printf("=== MT1/MT2 chokepoint streaming property ===\n\n");
     {
-        remove("/tmp/cp_buffer_test.ct");
+        remove(SCRATCH(ct_path, "cp_buffer_test.ct"));
         trace_writer_t w = trace_writer_new("cp_buffer_test", FFI_TRACE_FORMAT_BINARY);
         ASSERT(w != NULL, "cp: trace_writer_new");
         trace_writer_set_workdir(w, "/tmp/cp_workdir");
-        ASSERT(trace_writer_begin_events(w, "/tmp/cp_events.bin") == 0, "cp: begin_events");
+        ASSERT(trace_writer_begin_events(w, SCRATCH(path_buf, "cp_events.bin")) == 0, "cp: begin_events");
         trace_writer_start(w, "/test/cp.py", 1);
 
         /* Streaming writer opens the container at init: it is on disk NOW,
          * mid-recording, which the old buffer-and-dump mode never was until
          * close. This is the property MCR's shared-writer attach needs. */
-        ASSERT(file_exists("/tmp/cp_buffer_test.ct"),
+        ASSERT(file_exists(SCRATCH(ct_path, "cp_buffer_test.ct")),
             "cp: streaming container exists on disk DURING recording (not buffered to close)");
         printf("[OK] cp: streaming container present on disk mid-recording\n");
 
@@ -450,12 +488,12 @@ int main(void) {
         ASSERT(trace_writer_close(w) == 0, "cp: close");
         {
             struct stat st;
-            ASSERT(stat("/tmp/cp_buffer_test.ct", &st) == 0 && st.st_size > 0,
+            ASSERT(stat(SCRATCH(ct_path, "cp_buffer_test.ct"), &st) == 0 && st.st_size > 0,
                 "cp: streaming container finalized at close");
             printf("[OK] cp: streaming container finalized at close (%ld bytes)\n", (long)st.st_size);
         }
         trace_writer_free(w);
-        remove("/tmp/cp_buffer_test.ct");
+        remove(SCRATCH(ct_path, "cp_buffer_test.ct"));
     }
     printf("\n=== MT1/MT2 chokepoint streaming test passed! ===\n");
 
@@ -471,7 +509,7 @@ int main(void) {
      * and the wasm recorder's `internal/ctfs/ffi_crossread_test.go`.
      * ---------------------------------------------------------------- */
     {
-        const char* path = "/tmp/ct_container_append_test.ct";
+        const char* path = SCRATCH(ct_path, "ct_container_append_test.ct");
         remove(path);
         ASSERT(ct_container_create(path, 0) == 0, "ct_container_create");
         ASSERT(file_exists(path), "the container file should exist");
@@ -524,7 +562,7 @@ int main(void) {
             }
 
             /* A container that is not a container. */
-            ASSERT(ct_container_append_files("/tmp/ct_container_append_test.missing",
+            ASSERT(ct_container_append_files(SCRATCH(path_buf, "ct_container_append_test.missing"),
                                              names, contents, lengths, 1) != 0,
                    "appending to a nonexistent container must fail");
             printf("[OK] container: append refuses a nonexistent container\n");
@@ -532,6 +570,10 @@ int main(void) {
         remove(path);
     }
     printf("\n=== CTFS container append test passed! ===\n");
+
+    /* Every file above was removed after its check, so the directory is
+     * empty; a failed check returns early and leaves it for inspection. */
+    ASSERT(rmdir(scratch_dir) == 0, "remove the (now empty) scratch directory");
 
     return 0;
 }

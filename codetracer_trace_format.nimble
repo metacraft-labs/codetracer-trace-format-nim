@@ -490,7 +490,31 @@ task testFfiThreads, "C hosts: close after the recording thread exited; concurre
         exec "gcc -O1 -o " & dir & "/" & t & "-" & v & " tests/test_ffi_" & t & ".c " & dir & "/lib-" & v & ".a -lzstd -lm -lpthread -I include" & extra
     exec dir & "/worker_thread_exit-ship"
     exec dir & "/concurrent_writers-ship"
-    let (_, tlsCode) = gorgeEx(dir & "/worker_thread_exit-tls")
+    # The host unmaps the dead worker's stack so the dead heap's descriptor,
+    # which Nim keeps in thread-local storage, is gone when the main thread
+    # frees into it. That holds on glibc, which places TLS inside the thread's
+    # stack. macOS does not: dyld allocates a thread's TLS block with malloc
+    # and frees it to malloc at thread exit, so the memory stays mapped, the
+    # free into it is silently accepted, and the control passed 5/5 runs on
+    # aarch64-darwin. Guard Malloc (libgmalloc(3)) unmaps every freed block,
+    # which makes the use of the dead descriptor fault deterministically
+    # (SIGSEGV, 3/3), while the shipped archive passes under it. A same-thread
+    # close against the same --threads:on archive also passes under it, so
+    # the fault is the cross-thread free and not Guard Malloc itself.
+    # https://developer.apple.com/library/archive/documentation/Performance/Conceptual/ManagingMemory/Articles/MallocDebug.html
+    var tlsRunner = ""
+    when hostOS == "macosx":
+      const gmalloc = "/usr/lib/libgmalloc.dylib"
+      if not fileExists(gmalloc):
+        raise newException(AssertionDefect, "testFfiThreads needs Guard Malloc (" &
+          gmalloc & ") to make the --threads:on control fault on macOS")
+      tlsRunner = "env DYLD_INSERT_LIBRARIES=" & gmalloc & " "
+    let (tlsOutput, tlsCode) = gorgeEx(tlsRunner & dir & "/worker_thread_exit-tls")
+    # 126/127 are `env`/the shell failing to start the host: a nonzero exit
+    # from a host that never ran would pass this control vacuously.
+    if tlsCode in 126 .. 127:
+      raise newException(AssertionDefect, "the --threads:on worker-thread " &
+        "host did not run (exit " & $tlsCode & "): " & tlsOutput)
     if tlsCode == 0:
       raise newException(AssertionDefect, "the worker-thread host PASSED against a --threads:on " &
         "archive: the test no longer reaches the cross-thread free it guards")

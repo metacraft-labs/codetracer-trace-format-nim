@@ -11,7 +11,7 @@ include codetracer_trace_writer_ffi
 # Pop the raises restriction so test code can use strutils.contains etc.
 {.pop.}
 
-import std/strutils
+import std/[os, strutils]
 
 # We also need these imports that may not be pulled in by the FFI include
 import codetracer_ctfs/container
@@ -200,12 +200,18 @@ proc writeTestTrace(path: string) =
     discard f.writeBuffer(unsafeAddr ctfsBytes[0], ctfsBytes.len)
   f.close()
 
+proc scratchPath(name: string): string =
+  ## A per-user, per-process path for one test's container. A fixed `/tmp`
+  ## path is shared by every account on the host, so a file another user left
+  ## there makes this run fail with `Permission denied`.
+  getTempDir() / (name & "-" & $getCurrentProcessId() & ".ct")
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
 proc test_reader_ffi_lifecycle() =
-  let tmpPath = "/tmp/test_reader_ffi.ct"
+  let tmpPath = scratchPath("test_reader_ffi")
   writeTestTrace(tmpPath)
 
   # NimMain already called by Nim's own startup for this executable
@@ -300,7 +306,7 @@ proc test_reader_ffi_lifecycle() =
 
 proc test_reader_ffi_structured_accessors() =
   ## Test the new structured FFI functions (no JSON parsing).
-  let tmpPath = "/tmp/test_reader_ffi_structured.ct"
+  let tmpPath = scratchPath("test_reader_ffi_structured")
   writeTestTrace(tmpPath)
 
   let h = ct_reader_open(cstring(tmpPath))
@@ -455,7 +461,7 @@ proc test_reader_ffi_structured_accessors() =
 proc test_reader_ffi_open_bytes() =
   ## `ct_reader_open_bytes` reads what `ct_reader_open` reads, from bytes the
   ## caller may free as soon as the call returns.
-  let tmpPath = "/tmp/test_reader_ffi_bytes.ct"
+  let tmpPath = scratchPath("test_reader_ffi_bytes")
   writeTestTrace(tmpPath)
   let fromPath = ct_reader_open(cstring(tmpPath))
   doAssert fromPath != nil, "ct_reader_open failed: " & $trace_writer_last_error()
@@ -490,7 +496,7 @@ proc test_reader_ffi_null_safety() =
   # NimMain already called by Nim's own startup for this executable
 
   doAssert ct_reader_open(nil) == nil
-  doAssert ct_reader_open(cstring("/tmp/nonexistent.ct")) == nil
+  doAssert ct_reader_open(cstring(scratchPath("nonexistent"))) == nil
   doAssert ct_reader_step_count(nil) == 0
   doAssert ct_reader_call_count(nil) == 0
   doAssert ct_reader_event_count(nil) == 0

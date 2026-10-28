@@ -38,8 +38,12 @@ import codetracer_trace_writer/new_trace_reader
 import codetracer_trace_writer/full_document_json
 import ct_print_binary
 
-const
-  outDir = "/tmp/ct_print_agreement"
+let
+  # Per-process scratch under the user's temp directory. A fixed `/tmp` path
+  # is shared by every account on the host: whichever user ran the test first
+  # owns it (mode 0755), and every other user's run then fails with
+  # `Permission denied` before the test starts.
+  outDir = getTempDir() / ("ct_print_agreement-" & $getCurrentProcessId())
   bundlePath = outDir / "shared_exit.ct"
 
 proc buildSharedExitBundle(path: string) =
@@ -142,7 +146,10 @@ proc test_a_call_closes_after_the_calls_inside_it() =
 
   echo "PASS: a call closes after the calls inside it"
 
-test_the_two_entry_points_agree()
-test_a_call_closes_after_the_calls_inside_it()
+try:
+  test_the_two_entry_points_agree()
+  test_a_call_closes_after_the_calls_inside_it()
+finally:
+  removeDir(outDir)
 
 echo "ALL PASS: test_ct_print_agreement"
