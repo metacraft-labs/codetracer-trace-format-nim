@@ -911,6 +911,17 @@ proc memberRuns*(data: openArray[byte], name: string,
   # floor, never `+ blockSize - 1`: rounding up would make the incomplete
   # final block addressable, which is the one arithmetic §5d forbids.
   let wholeBlocks = uint64(data.len div int(blockSize))
+  # No member's block lies in the root region (`ctfs-container.md` §6, Reader
+  # Protocol step 3): a block number in `[1, root_blocks)` is refused like 0.
+  let rootBlocks =
+    if data.len >= 16:
+      rootBlockCount(blockSize, headerRootEntryCount(data), 0,
+                     containerHeaderSize(data))
+    else: 1'u64
+  template inRoot(b: uint64): bool = b >= 1'u64 and b < rootBlocks
+  template rootRefusal(what: string, b: uint64): string =
+    "internal file " & name & ": " & what & " is block " & $b &
+      ", inside the container's " & $rootBlocks & "-block root region"
   # `<what> <n> of internal file <name><rest>` and the truncation note: one
   # formatter for every block number found past the container's end, called
   # only for a refusal.
@@ -934,6 +945,8 @@ proc memberRuns*(data: openArray[byte], name: string,
     if b == 0'u64:
       return err("internal file " & name & " names data block 0 directly; " &
         "block 0 is the container's root directory and no member may name it")
+    if inRoot(b):
+      return err(rootRefusal("its direct data block", b))
     if b >= wholeBlocks:
       return err(outOfBounds("direct data block", b, " is out of bounds"))
     if fileSize > uint64(blockSize):
@@ -945,6 +958,8 @@ proc memberRuns*(data: openArray[byte], name: string,
     return ok(@[(at: int(b) * int(blockSize), len: int(fileSize))])
 
   # Path 1 of 3: the entry's mapping root.
+  if inRoot(mapBlock):
+    return err(rootRefusal("its mapping root", mapBlock))
   if mapBlock >= wholeBlocks:
     return err(outOfBounds("mapping root block", mapBlock, " is out of bounds"))
   if fileSize == 0:
@@ -983,6 +998,8 @@ proc memberRuns*(data: openArray[byte], name: string,
           return err("missing chain pointer at level " & $level &
             " of internal file " & name)
         # Path 2a of 3: a mapping block reached through the chain.
+        if inRoot(chainPtr):
+          return err(rootRefusal("a chain pointer", chainPtr))
         if chainPtr >= wholeBlocks:
           return err(outOfBounds("chain pointer at level", level,
             " names block " & $chainPtr & ", which is out of bounds"))
@@ -1007,6 +1024,8 @@ proc memberRuns*(data: openArray[byte], name: string,
         return err("missing child block at level " & $navLevel &
           " of internal file " & name)
       # Path 2b of 3: a mapping block reached by descending the hierarchy.
+      if inRoot(childBlock):
+        return err(rootRefusal("a child pointer", childBlock))
       if childBlock >= wholeBlocks:
         return err(outOfBounds("child block pointer at level", navLevel,
           " names block " & $childBlock & ", which is out of bounds"))
@@ -1031,6 +1050,8 @@ proc memberRuns*(data: openArray[byte], name: string,
     # not own. Check the block NUMBER, before its bytes are touched — and
     # before it is multiplied by the block size, which on a damaged container
     # can overflow.
+    if inRoot(dataBlock):
+      return err(rootRefusal("data block " & $blockIdx, dataBlock))
     if dataBlock >= wholeBlocks:
       return err(outOfBounds("data block", blockIdx,
         " is block " & $dataBlock & ", which is out of bounds"))

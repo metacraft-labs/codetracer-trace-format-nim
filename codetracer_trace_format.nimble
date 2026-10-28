@@ -62,6 +62,10 @@ task test, "Run all tests":
   exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_keyed_corrmark.nim"
   # A namespace committed live (`ctfs-container.md` §8).
   exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_namespace_live_commit.nim"
+  # Readers refuse a block number in [1, root_blocks); block caches keep
+  # only what §6 lets them; closed-container appends; data before index;
+  # salvage of an abandoned page.
+  exec "nim c -r -d:release -p:src tests/test_root_region_pointer_refused.nim"
   # Durability: a recording read while its writer is still open (what a
   # killed process leaves) has meta.dat, every sealed chunk and every interning
   # record registered before the seal.
