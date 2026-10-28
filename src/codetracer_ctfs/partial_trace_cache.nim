@@ -25,6 +25,10 @@ type
     fetcher: BlockFetcher              ## How to get missing blocks
     maxCacheBytes*: uint64             ## Max cache size before eviction
     blockSize*: int
+    rootBlocks*: uint64
+      ## Blocks `[0, rootBlocks)` are the container's root region, re-read at
+      ## every revalidation (`ctfs-container.md` §6, "What Is Mutated In
+      ## Place, And What A Cache May Keep"): fetched every time, never kept.
 
 proc initPartialTraceCache*(fetcher: BlockFetcher,
     maxCacheBytes: uint64 = 256 * 1024 * 1024,
@@ -63,8 +67,23 @@ proc removeBlock(cache: var PartialTraceCache, blockId: uint64) =
   ## Remove a block from the in-memory store.
   cache.blocks.del(blockId)
 
+proc invalidate*(cache: var PartialTraceCache, blockIds: openArray[uint64]) =
+  ## Drop blocks a revalidation found changed (a member's last partial data
+  ## block and its mapping blocks, a keyed member's in-place blocks).
+  for b in blockIds:
+    if b in cache.presence and b notin cache.permanent:
+      cache.presence.excl b
+      cache.removeBlock(b)
+
 proc fetchBlock*(cache: var PartialTraceCache, blockId: uint64): Result[seq[byte], string] =
-  ## Get a block. Checks local cache first, fetches remotely if missing.
+  ## Get a block. Checks local cache first, fetches remotely if missing. A
+  ## root-region block is fetched every time and never kept.
+  if blockId < cache.rootBlocks:
+    let data = ?cache.fetcher(blockId)
+    if data.len != cache.blockSize:
+      return err("fetched block has wrong size: " & $data.len &
+        ", expected: " & $cache.blockSize)
+    return ok(data)
   if blockId in cache.presence:
     return cache.readLocalBlock(blockId)
 

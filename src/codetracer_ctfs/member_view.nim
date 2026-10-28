@@ -34,6 +34,7 @@ when defined(nimPreviewSlimSystem):
 import results
 import ./types
 import ./container
+import ./live_page
 
 export results
 
@@ -52,6 +53,11 @@ type
     when fileImages:
       file: File
       path: string
+      page: PageReader
+      attached: bool
+        ## The container's live coordination page is attached: the root
+        ## entries are read from its mirror (`ctfs-container.md` §6, Reader
+        ## Protocol step 2).
 
   ContainerImage* = ref ContainerImageObj
     ## A container's bytes, shared by the views of its members.
@@ -80,6 +86,9 @@ when fileImages:
 # (move/sink-friendly) form where it is accepted.
 template destroyContainerImageObj(x: untyped) =
   when fileImages:
+    if x.attached:
+      var pr = x.page
+      pr.detach()
     if x.file != nil:
       closeRead(x.file)
     `=destroy`(x.path)
@@ -181,8 +190,44 @@ proc rootEnd(d: openArray[byte], maxEntries: uint32): int =
     uint64(FileEntrySize), uint64(d.len)))
 
 proc loadRoot(image: ContainerImage, maxEntries: uint32): Result[void, string] =
-  ## Read the root directory of an image read from its file.
-  image.loadRange(0, rootEnd(image.bytes, maxEntries))
+  ## Read the root directory of an image read from its file, under §6's
+  ## reader protocol: from the live coordination page's root mirror when the
+  ## image is attached; otherwise from the file twice, until both reads agree
+  ## (the torn-read rule of a reader that cannot attach).
+  let n = rootEnd(image.bytes, maxEntries)
+  when fileImages:
+    if image.readsFromFile:
+      var accepted = false
+      for _ in 0 ..< 8:
+        for b in 0 .. (max(n, 1) - 1) div image.blockSize: image.loaded[b] = false
+        ? image.loadRange(0, n)
+        var first = image.bytes[0 ..< n]
+        for b in 0 .. (max(n, 1) - 1) div image.blockSize: image.loaded[b] = false
+        ? image.loadRange(0, n)
+        if first == image.bytes[0 ..< n]:
+          accepted = true
+          break
+      if not accepted:
+        return err("container file " & image.path & ": its root directory " &
+          "did not read the same twice in 8 attempts")
+      if image.attached:
+        if image.page.state() != PageStateLive:
+          # Closed or abandoned: the file is static from here.
+          image.page.detach()
+          image.attached = false
+        else:
+          let base = containerHeaderSize(image.bytes)
+          let slots = int(headerRootEntryCount(image.bytes))
+          for i in 0 ..< min(slots, image.page.rootEntries):
+            let at = base + FileEntrySize * i
+            if at + FileEntrySize > n: break
+            let m = image.page.readRoot(i)
+            if m.state == srOk:
+              writeU64LE(image.bytes, at, m.size)
+              writeU64LE(image.bytes, at + 8, m.mapBlock)
+              writeU64LE(image.bytes, at + 16, m.name)
+      return ok()
+  image.loadRange(0, n)
 
 proc rootMembers*(d: openArray[byte], maxEntries: uint32):
     seq[tuple[name, size: uint64]] =
@@ -250,6 +295,11 @@ when fileImages:
       closeRead(image.file)
       image.file = nil
       return ok(image)
+    let slots = int(headerRootEntryCount(image.bytes))
+    let page = attachLivePage(f, slots)
+    if page.isOk:
+      image.page = page.get()
+      image.attached = true
     ? image.loadRoot(maxEntries)
     ok(image)
 

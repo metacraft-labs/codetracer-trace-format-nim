@@ -345,6 +345,44 @@ proc readMemberU64*(r: var LiveReader, slot: int, off: uint64): Result[uint64, s
   let b = ? r.readMember(slot, off, 8)
   ok(readU64LE(b, 0))
 
+const InPlaceSuffixes = [".hdr", ".nod", ".bkt", ".ovf", ".top"]
+const InPlaceMembers = ["threads.rec", "corrmark.rec", "corrmark.ext"]
+
+proc updatesInPlace*(name: string): bool =
+  ## A keyed member whose realization updates blocks in place: a header, B1
+  ## nodes, H1 buckets and overflow blocks, C1's top table, and the records
+  ## and extents MCR's catalogue updates in place.
+  if name in InPlaceMembers: return true
+  for s in InPlaceSuffixes:
+    if name.len > s.len and name[name.len - s.len .. ^1] == s: return true
+  false
+
+proc blocksToDrop*(r: var LiveReader, before: seq[RootSlot]): seq[uint64] =
+  ## What a block cache must drop after a refresh that moved the root from
+  ## `before` to the reader's current entries (`ctfs-container.md` §6, "What
+  ## Is Mutated In Place, And What A Cache May Keep"): for a member whose
+  ## entry changed, its last partial data block as of `before` and its level-1
+  ## mapping block (a slot held as 0 must be re-read); for a keyed member that
+  ## updates blocks in place, every one of its blocks. The root region is
+  ## never kept, so it is not listed.
+  let bs = uint64(r.blockSize)
+  for i in 0 ..< r.slots:
+    let e = r.entries[i]
+    if e.name == 0: continue
+    let old = if i < before.len: before[i] else: RootSlot()
+    let name = r.slotName(i)
+    if updatesInPlace(name):
+      for lb in 0'u64 ..< (e.size + bs - 1) div bs:
+        let b = r.resolveBlock(name, e.mapBlock, lb)
+        if b.isOk: result.add b.get()
+      continue
+    if old == e: continue
+    if old.size mod bs != 0'u64 and old.mapBlock != 0'u64:
+      let b = r.resolveBlock(name, e.mapBlock, old.size div bs)
+      if b.isOk: result.add b.get()
+    if e.mapBlock != 0'u64 and not isDirectMapBlock(e.mapBlock):
+      result.add e.mapBlock
+
 # ---------------------------------------------------------------------------
 # Record mirrors
 # ---------------------------------------------------------------------------

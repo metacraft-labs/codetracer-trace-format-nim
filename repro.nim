@@ -215,6 +215,8 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_keyed_corrmark.nim", binary: "build/test-bin/test_keyed_corrmark", defines: @["ctfsKeyedMutation"]),
   TestSpec(source: "tests/test_namespace_live_commit.nim", binary: "build/test-bin/test_namespace_live_commit", defines: @["ctfsKeyedMutation"]),
   TestSpec(source: "tests/test_root_region_pointer_refused.nim", binary: "build/test-bin/test_root_region_pointer_refused"),
+  TestSpec(source: "tests/test_block_caches.nim", binary: "build/test-bin/test_block_caches"),
+  TestSpec(source: "tests/test_follower_attaches.nim", binary: "build/test-bin/test_follower_attaches"),
   TestSpec(source: "tests/test_chunk_index.nim", binary: "build/test-bin/test_chunk_index"),
   TestSpec(source: "tests/test_fixed_record_table.nim", binary: "build/test-bin/test_fixed_record_table"),
   TestSpec(source: "tests/test_variable_record_table.nim", binary: "build/test-bin/test_variable_record_table"),

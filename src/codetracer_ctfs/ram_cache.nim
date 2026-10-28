@@ -119,6 +119,15 @@ proc put*[K, V](cache: var LruCache[K, V], key: K, value: V, size: uint64) =
   cache.table[key] = node
   cache.currentBytes += size
 
+proc remove*[K, V](cache: var LruCache[K, V], key: K) =
+  ## Drop `key` if it is cached.
+  let node = cache.table.getOrDefault(key)
+  if node.isNil: return
+  cache.order.remove(node)
+  cache.currentBytes -= node.value.size
+  try: cache.table.del(key)
+  except KeyError: discard
+
 proc contains*[K, V](cache: LruCache[K, V], key: K): bool =
   ## Check if a key is in the cache without affecting LRU order.
   key in cache.table
