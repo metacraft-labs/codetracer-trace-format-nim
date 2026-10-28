@@ -137,6 +137,7 @@ type
     sikRecord   ## a keyed record, new or a word of one
     sikIndex    ## an index node, new or an in-place index word
     sikStream   ## a keyed stream's growth
+    sikSemantic ## an annotator's semantic item (§2.15.2, item 2), opaque here
 
   SealWord* = tuple[at: int, v: uint64]
     ## An in-place word: its byte offset in the record or node, its value.
@@ -158,6 +159,7 @@ type
                           ## sikIndex: the node's byte offset in the member
     isNew*: bool          ## sikRecord, sikIndex
     words*: seq[SealWord] ## sikRecord, sikIndex: the in-place words written
+    semantic*: string     ## sikSemantic: the item as its annotator renders it
 
   SealObserver* = ref object
     ## `CTFS-Binary-Format.md` §2.15.2's library observer: `beforeSeal` before
@@ -169,6 +171,10 @@ type
                                                                 gcsafe, raises: [].}
     afterSeal*: proc (ordinal: uint64, epoch: uint64) {.closure, gcsafe,
                                                          raises: [].}
+    annotate*: proc (item: SealItem): seq[string] {.closure, gcsafe, raises: [].}
+      ## The recorder's annotator (§2.15.2, item 2): called once per
+      ## structural item; the semantic items it returns are placed directly
+      ## after that item.
 
   CtfsInternalFile* = object
     entryIndex*: int        ## Index in the file entry array
@@ -225,6 +231,8 @@ type
     sealObserver*: SealObserver
       ## The per-seal log observer (`CTFS-Binary-Format.md` §2.15.2), a test
       ## API: `nil` unless a test or an armed recorder registered one.
+    inClose*: bool
+      ## Set while `closeCtfs` runs its final seal.
     sealOrdinal*: uint64
       ## This writer's seals on this container (`ctfs-container.md` §6, "What
       ## counts as a seal"), the ordinal the observer reports.

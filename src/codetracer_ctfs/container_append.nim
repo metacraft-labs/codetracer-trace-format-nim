@@ -63,6 +63,9 @@ when defined(nimPreviewSlimSystem):
 ##     that does not fit and the occupancy (§5). The append writes, in order:
 ##     the tail, then the changed entries in one write. The header and every
 ##     byte in `[root_blocks, previous end of file)` are never rewritten.
+##   - **Not while a seal observer watches the container**
+##     (`CTFS-Binary-Format.md` §2.15.2): the per-seal log has no item for an
+##     append, so it is refused, naming the container.
 
 from std/posix import fsync
 import std/oserrors
@@ -325,6 +328,10 @@ proc appendInternalFiles*(path: string, names: openArray[string],
       if encoded[j] == encoded[i]:
         return err("ctfs append: " & names[i] & " appears twice in one batch")
 
+  if hasSealObserver(path):
+    return err(appendError(path, "a seal observer is registered on this " &
+      "container; the per-seal log cannot observe an append " &
+      "(CTFS-Binary-Format.md §2.15.2)"))
   var c = ?openClosedCtfs(path)
   let firstNewBlock = c.nextFreeBlock
   let oldRoot = c.data[0 ..< min(c.data.len, int(c.rootBlockCount()) * int(c.blockSize))]

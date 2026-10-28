@@ -111,6 +111,10 @@ proc growRootDirectory*(c: var Ctfs): Result[void, string] =
   # rewrites only the root's MapBlocks and the mapping blocks it knows, so a
   # keyed member's stored block numbers (a keyed stream's MapBlock) would name
   # blocks that moved. Refused, naming the member.
+  if c.sealObserver != nil:
+    return err("the root directory of " & c.streamPath & " cannot grow while a " &
+      "seal observer is registered: the per-seal log has no item for a growth " &
+      "(CTFS-Binary-Format.md §2.15.2)")
   if c.keyedMembers.len > 0:
     return err("the root directory cannot grow: the container holds the " &
       "keyed member " & c.keyedMembers[0] & ", whose stored block numbers a " &
@@ -626,11 +630,38 @@ proc publishRootLayout(c: var Ctfs): bool =
         readU64LE(c.data, off + 16))
   true
 
+var observedPaths {.threadvar.}: seq[string]
+  ## The paths of the streaming containers that have a seal observer
+  ## registered (`registerSealObserver`): `appendInternalFiles` refuses them.
+
+proc registerSealObserver*(c: var Ctfs, o: SealObserver) =
+  ## Register the per-seal log observer of `CTFS-Binary-Format.md` §2.15.2 on
+  ## this container. While it is registered the library refuses the paths it
+  ## cannot observe on this container: root growth, and
+  ## `appendInternalFiles` on its path. `closeCtfs` unregisters it after the
+  ## final seal.
+  c.sealObserver = o
+  if c.streamPath.len > 0 and c.streamPath notin observedPaths:
+    observedPaths.add c.streamPath
+
+proc hasSealObserver*(path: string): bool =
+  path in observedPaths
+
 proc beginSeal*(c: var Ctfs, items: seq[SealItem]) =
   ## A seal is about to make its first publication write: the observer sees
   ## every item first (`CTFS-Binary-Format.md` §2.15.3, "intent").
   if c.sealObserver != nil and c.sealObserver.beforeSeal != nil:
-    c.sealObserver.beforeSeal(c.sealOrdinal + 1, items)
+    if c.inClose and mutated("observer-skips-close"):
+      return
+    if c.sealObserver.annotate == nil:
+      c.sealObserver.beforeSeal(c.sealOrdinal + 1, items)
+    else:
+      var all: seq[SealItem]
+      for it in items:
+        all.add it
+        for s in c.sealObserver.annotate(it):
+          all.add SealItem(kind: sikSemantic, semantic: s)
+      c.sealObserver.beforeSeal(c.sealOrdinal + 1, all)
 
 proc endSeal*(c: var Ctfs) =
   ## A seal's file writes are done: `ctfs-container.md` §6 step 4, the
@@ -639,6 +670,8 @@ proc endSeal*(c: var Ctfs) =
   inc c.sealOrdinal
   if c.page != nil:
     c.page.sealDone()
+  if c.inClose and mutated("observer-skips-close"):
+    return
   if c.sealObserver != nil and c.sealObserver.afterSeal != nil:
     let epoch =
       if c.page != nil: c.page.writerSealEpoch() else: c.sealOrdinal
@@ -669,6 +702,10 @@ proc publish*(c: var Ctfs) =
     return
   let changed = c.changedEntries()
   if changed.len == 0:
+    if c.sealObserver != nil and mutated("observer-empty-seal"):
+      # Mutation arm: a publication that changes nothing fires the observer.
+      c.beginSeal(@[])
+      c.endSeal()
     return
   if mutated("publish-whole-root"):
     # Mutation arm: the former publication, the whole root region from offset
@@ -740,7 +777,14 @@ proc closeCtfs*(c: var Ctfs): Result[void, string] {.discardable.} =
   # blocks it carried are still dirty, and so is the entry it did not write.
   let earlier = c.ioFailure
   c.ioFailure = ""
+  c.inClose = true
   c.publish()
+  c.inClose = false
+  if c.streamPath in observedPaths:
+    var kept: seq[string]
+    for p in observedPaths:
+      if p != c.streamPath: kept.add p
+    observedPaths = kept
   var failure = c.ioFailure
   if failure.len == 0 and (c.dirtyBlocks.len > 0 or c.changedEntries().len > 0):
     failure = "the final seal left blocks or entries unwritten" &
