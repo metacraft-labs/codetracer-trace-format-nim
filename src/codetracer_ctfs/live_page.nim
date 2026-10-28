@@ -967,12 +967,23 @@ proc pageReaderOfView*(v: PageView, rootEntries: int): PageReader =
              extentsOff: extentsOffset(rootEntries),
              slotsOff: slotsOffset(rootEntries))
 
+proc reapAbandonedPage*(f: File): tuple[found, reaped: bool]
+
 proc attachLivePage*(f: File, rootEntries: int,
-                     skipIdentityCheck = false): Result[PageReader, string] =
+                     skipIdentityCheck = false,
+                     reapIfAbandoned = true): Result[PageReader, string] =
   ## Attach to the page of the container open as `f`, read-only (§6,
   ## "Discovery"): only if the object exists, its magic and version are known,
   ## the identity stored in it equals the opened file's, and its state is
   ## `live`. Anything else is "not attached", with the reason.
+  ##
+  ## A `live` page that names no live writer is not attached either: every
+  ## writer died, and the opener is "the next process to open the container"
+  ## of §6, "Every writer dies", which sets `state = abandoned` and removes
+  ## the name. On Linux and macOS the object outlives its processes, so
+  ## without this a reader would follow a dead writer's page. The salvage
+  ## tool, which reads such a page before reaping it itself, passes
+  ## `reapIfAbandoned = false`.
   ## `skipIdentityCheck` is the mutation arm of `test_live_page_lifetime`;
   ## no reader passes it.
   let id = ? fileIdentity(f)
@@ -997,6 +1008,14 @@ proc attachLivePage*(f: File, rootEntries: int,
   if v.load(OffState) != PageStateLive:
     refuse("live coordination page " & name & " is not live (state " &
       $v.load(OffState) & ")")
+  if reapIfAbandoned and liveWriters(v).len == 0:
+    shmUnmap(r.view, h)
+    let (_, reaped) = reapAbandonedPage(f)
+    return err("live coordination page " & name & " names no live writer " &
+      "(every writer died); " &
+      (if reaped: "it was marked abandoned and its name removed"
+       else: "it could not be marked abandoned") &
+      " (ctfs-container.md §6, \"Every writer dies\")")
   ok(r)
 
 proc detach*(r: var PageReader) =

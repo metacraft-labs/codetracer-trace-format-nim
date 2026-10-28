@@ -41,7 +41,8 @@ proc salvageContainer*(path: string): Result[SalvageReport, string] =
   defer: r.close()
   let id = ? fileIdentity(f)
   let name = pageName(id)
-  var pr = attachLivePage(f, r.slots, skipIdentityCheck = false)
+  var pr = attachLivePage(f, r.slots, skipIdentityCheck = false,
+                          reapIfAbandoned = false)
   if pr.isErr:
     # Not live: a closed or abandoned page, or none. Nothing to salvage from
     # a page that is gone.

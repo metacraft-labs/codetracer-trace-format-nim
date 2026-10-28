@@ -2,7 +2,8 @@
 ## naming and discovery" and "Lifetime, and writers that die"): created with
 ## the container, attached by a reader of the same file, closed and unlinked
 ## at close; a page whose writer was killed is found dead and reaped by the
-## next opener, and a new writer of the same file then creates its page; a
+## next opener (an explicit reap, or a reader's open, which does not attach
+## to it), and a new writer of the same file then creates its page; a
 ## live writer's page refuses a second creator; a page that carries another
 ## file's identity is refused; a reader that cannot attach follows the file.
 ##
@@ -110,6 +111,39 @@ when isMainModule:
       expect(again.get().view.load(OffState) == PageStateLive, "the new page is not live")
       closeLivePage(again.get())
     close(f)
+    removeFile(path); removeFile(path & ".ready")
+
+  # 2b. A writer killed, then a reader opens the container: the reader is
+  #     "the next process to open the container" (§6, "Every writer dies").
+  #     It does not attach to the dead writer's page; it marks the page
+  #     abandoned and removes its name. On Linux and macOS the page outlives
+  #     the writer by itself; on Windows a held handle keeps it.
+  block:
+    let path = tmp("killedread")
+    removeFile(path); removeFile(path & ".ready")
+    var p = startProcess(getAppFilename(), args = ["--child", path],
+                         options = {poParentStreams})
+    waitFor(path & ".ready")
+    var held = openLiveReader(path).get()
+    expect(held.attached, "the reader did not attach to the child's page: " &
+      held.attachRefusal)
+    let name = held.page.name
+    p.terminate()
+    discard p.waitForExit()
+    close(p)
+    var r = openLiveReader(path).get()
+    expect(not r.attached, "a reader attached to the page of a killed writer")
+    expect("no live writer" in r.attachRefusal,
+      "the refusal does not name the dead writers: " & r.attachRefusal)
+    expect(held.page.state() == PageStateAbandoned,
+      "the reader that found every writer dead did not mark the page abandoned")
+    expect(r.memberSize(r.findSlot("x.dat")) == 3,
+      "the file-only reader's x.dat size after the writer died")
+    r.close()
+    held.close()
+    when not defined(windows):
+      expect(not pageObjectExists(name),
+        "the reader that found every writer dead did not remove the page's name")
     removeFile(path); removeFile(path & ".ready")
 
   # 3. A page that carries another file's identity is refused; the arm that
