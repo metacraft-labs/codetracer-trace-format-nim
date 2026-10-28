@@ -1,0 +1,169 @@
+--- a/src/native_decoder.nim
++++ b/src/native_decoder.nim
+@@ -68,10 +68,23 @@
+ import stew/endians2
+ import codetracer_ctfs/base40
+ import codetracer_ctfs/container
++import codetracer_ctfs/compact
+ import codetracer_ctfs/types
+ import codetracer_ctfs/zstd_bindings
+ import codetracer_trace_writer/meta_dat
+ import codetracer_trace_writer/interning_table
++
++proc readContainerImage*(filePath: string): Result[seq[byte], string] =
++  ## Probes and direct-member views inspect the same reconstructed image as
++  ## NewTraceReader. Offsets in a stored whole-file compressed body do not
++  ## address its members, and the reconstructed copy declares that fact.
++  var data = ? readCtfsFromFile(filePath)
++  if data.len > 5 and data[5] == CtfsVersionV6:
++    let scheme = ? readWholeFileCompression(data)
++    if scheme != wfcNone:
++      data = ? reconstructImage(data)
++      data[V6CompressionOffset] = uint8(ord(wfcNone))
++  ok(move data)
+ 
+ # ---------------------------------------------------------------------------
+ # Wire-format constants (must match the native recorder)
+@@ -152,22 +165,19 @@
+     v = v * 10 + uint32(ord(name[i]) - ord('0'))
+   v
+ 
+-proc detectNativeBundle*(data: openArray[byte]): Result[NativeBundleInfo, string] =
+-  ## Inspect a CTFS container's root block and decide whether it looks like a
+-  ## native MCR shard (per-thread `tNNN` streams + binary `meta.dat`).
+-  ## Returns the discovered structure on success, or an error message on
+-  ## inputs that aren't a valid CTFS file.
++proc probeContainerLayout*(data: openArray[byte]): Result[NativeBundleInfo, string] =
++  ## Inspect the actual directory to choose a decoder without applying the
++  ## native decoder's independent version-5 limit to split-stream recordings.
+   if data.len < HeaderSize + ExtHeaderSize:
+     return err("file too small to be a CTFS container")
+   if not hasCtfsMagic(data):
+     return err("invalid CTFS magic")
+-  let versionErr = ctfsVersionError(data)
+-  if versionErr.len > 0:
+-    return err(versionErr)
+-
+-  let blockSize = readU32LE(data, 8)
+-  let maxRoot = readU32LE(data, 12)
+-  if blockSize == 0 or maxRoot == 0 or int(maxRoot) > 4096:
++  ? checkReadableContainer(data)
++
++  let compact = isCompactContainer(data)
++  let blockSize = if compact: 0'u32 else: readU32LE(data, 8)
++  let maxRoot = if compact: 0'u32 else: readU32LE(data, 12)
++  if not compact and (blockSize == 0 or maxRoot == 0 or int(maxRoot) > 4096):
+     return err(
+       "nonsensical CTFS root header (blockSize=" & $blockSize &
+       " maxRoot=" & $maxRoot & ")")
+@@ -183,12 +193,20 @@
+     return err("meta.dat missing: " & metaDatR.error)
+   info.metaDat = metaDatR.get()
+ 
+-  # Enumerate root-block entries to find tNNNN streams and event_log files.
+-  for i in 0 ..< int(maxRoot):
+-    let off = HeaderSize + ExtHeaderSize + i * FileEntrySize
+-    if off + FileEntrySize > data.len:
+-      break
+-    let nameVal = readU64LE(data, off + 16)
++  # Enumerate the directory belonging to this container profile.
++  var names: seq[uint64]
++  if compact:
++    let directory = ? readCompactDirectory(data)
++    for entry in directory.entries:
++      names.add(entry.encodedName)
++  else:
++    let base = if data[5] == CtfsVersionV6: V6HeaderSize else: HeaderSize + ExtHeaderSize
++    for i in 0 ..< int(maxRoot):
++      let off = base + i * FileEntrySize
++      if off + FileEntrySize > data.len:
++        break
++      names.add(readU64LE(data, off + 16))
++  for nameVal in names:
+     if nameVal == 0:
+       continue
+     let name = base40Decode(nameVal)
+@@ -206,6 +224,15 @@
+     cmp(a[0], b[0]))
+ 
+   ok(info)
++
++proc detectNativeBundle*(data: openArray[byte]): Result[NativeBundleInfo, string] =
++  ## The native event decoder implements version 5 only. The CLI's generic
++  ## directory probe must not impose this limit on split-stream recordings.
++  if data.len >= HeaderSize + ExtHeaderSize and hasCtfsMagic(data):
++    let versionErr = ctfsVersionError(data)
++    if versionErr.len > 0:
++      return err(versionErr)
++  probeContainerLayout(data)
+ 
+ proc isNativeBundle*(data: openArray[byte]): bool =
+   ## True when the container carries per-thread `tNNN` streams, which is
+@@ -775,7 +802,7 @@
+ proc decodeNativeFromFile*(path: string, opts: NativeOpts):
+     Result[JsonNode, string] =
+   ## Convenience wrapper used by the CLI: read the file, then decode.
+-  let dataR = readCtfsFromFile(path)
++  let dataR = readContainerImage(path)
+   if dataR.isErr:
+     return err(dataR.error)
+   buildNativeFullDocument(dataR.get(), opts)
+--- a/src/codetracer_ct_print.nim
++++ b/src/codetracer_ct_print.nim
+@@ -657,7 +657,7 @@
+   ## the event streams is irrelevant here — and routing this through the v4
+   ## branch alone would have made the index invisible on exactly the
+   ## recordings (native, multi-threaded) whose lookups this campaign is about.
+-  let dataRes = ctfs_container.readCtfsFromFile(filePath)
++  let dataRes = readContainerImage(filePath)
+   if dataRes.isErr:
+     quit("Error: " & dataRes.error)
+   let data = dataRes.get()
+@@ -767,7 +767,7 @@
+   ## Records are shown SETTLED (last-record-wins per `span_id`), so a crossing
+   ## that was opened and later completed is one row carrying its final
+   ## `end_step`, not two.
+-  let dataR = ctfs_container.readCtfsFromFile(filePath)
++  let dataR = readContainerImage(filePath)
+   if dataR.isErr:
+     quit("ct-print: cannot read container: " & dataR.error)
+   let bytes = dataR.get()
+@@ -1212,7 +1212,7 @@
+   ## Inspect the file once and decide which decode path should claim it.
+   ## Returning a (kind, detail) pair lets the caller emit a precise error
+   ## message instead of silently falling through to an empty document.
+-  let dataR = ctfs_container.readCtfsFromFile(filePath)
++  let dataR = readContainerImage(filePath)
+   if dataR.isErr:
+     return (adkUnreadable, dataR.error)
+   let data = dataR.get()
+@@ -1222,7 +1222,7 @@
+   # anything; `tNNN` per-thread streams are what identify an MCR bundle.
+   # A container missing `meta.dat` entirely is left to the v4 reader, which
+   # reports the absence with its own message.
+-  let infoR = detectNativeBundle(data)
++  let infoR = probeContainerLayout(data)
+   if infoR.isErr:
+     if infoR.error.startsWith("meta.dat missing"):
+       # A bundle with no `meta.dat` was handed to the v4 reader on the stated
+@@ -1247,7 +1247,10 @@
+       return (adkCtfsCorrupt,
+         "meta.dat is missing — the bundle is truncated, or it is not a trace container")
+     return (adkCtfsCorrupt, infoR.error)
+-  if isNativeBundle(data):
++  if infoR.get().threadStreams.len > 0:
++    let versionErr = ctfs_types.ctfsVersionError(data)
++    if versionErr.len > 0:
++      return (adkCtfsCorrupt, "native MCR decoder: " & versionErr)
+     return (adkNative, "")
+   (adkV4MultiStream, "")
+ 
+@@ -1361,7 +1364,7 @@
+   block decideLayout:
+     if follow:
+       break decideLayout
+-    let dataR = ctfs_container.readCtfsFromFile(filePath)
++    let dataR = readContainerImage(filePath)
+     if dataR.isErr:
+       break decideLayout  # unreadable here ⇒ let openNewTrace surface the error
+     let layoutBytes = dataR.get()

@@ -36,6 +36,9 @@ import results
 import codetracer_trace_writer/multi_stream_writer
 import codetracer_trace_writer/new_trace_reader
 import codetracer_trace_writer/full_document_json
+import codetracer_trace_writer/compact_profile
+import codetracer_ctfs/[compact, types]
+import native_decoder
 import ct_print_binary
 
 let
@@ -146,9 +149,48 @@ proc test_a_call_closes_after_the_calls_inside_it() =
 
   echo "PASS: a call closes after the calls inside it"
 
+proc test_default_cli_reads_compact_recordings() =
+  ## The native-layout probe must not reject a materialized container before
+  ## the real split-stream reader can inspect it. Every representation comes
+  ## from the production writer and profile encoder, with no header relabeling.
+  ensureCtPrint()
+  buildSharedExitBundle(bundlePath)
+  let expected = binaryDocument(bundlePath)
+  let full = readFile(bundlePath)
+  var bytes = newSeq[byte](full.len)
+  for i, ch in full: bytes[i] = byte(ch)
+  let selected = selectProfile(bytes, high(uint64)).get()
+  doAssert selected[0] == cpCompact
+  let compactPath = outDir / "compact.ct"
+  writeFile(compactPath, selected[1])
+  doAssert binaryDocument(compactPath) == expected
+  let (summary, status) = execCmdEx(
+    quoteShell(ctPrintBin) & " --summary " & quoteShell(compactPath))
+  doAssert status == 0, summary
+  doAssert "steps: 3" in summary, summary
+
+  let storedPath = outDir / "compressed.ct"
+  let compressed = compressImage(selected[1]).get()
+  writeFile(storedPath, compressed)
+  doAssert binaryDocument(storedPath) == expected
+  # A thread-stream name selects the native decoder even if split streams
+  # coexist. Generic probing must not bypass that decoder's version-5 limit.
+  var nativeMembers = compactMembersOf(bytes).get()
+  nativeMembers.add(CompactMember(name: "t00000000000", payload: @[]))
+  let nativePath = outDir / "native-compact.ct"
+  let nativeCompact = encodeCompactContainer(nativeMembers).get()
+  writeFile(nativePath, nativeCompact)
+  doAssert probeContainerLayout(nativeCompact).get().threadStreams.len == 1
+  doAssert detectNativeBundle(nativeCompact).isErr
+  let (nativeOutput, nativeStatus) = execCmdEx(
+    quoteShell(ctPrintBin) & " --full " & quoteShell(nativePath))
+  doAssert nativeStatus != 0 and "native MCR decoder" in nativeOutput, nativeOutput
+  echo "PASS: default ct-print reads compact and whole-file compressed recordings"
+
 try:
   test_the_two_entry_points_agree()
   test_a_call_closes_after_the_calls_inside_it()
+  test_default_cli_reads_compact_recordings()
 finally:
   removeDir(outDir)
 

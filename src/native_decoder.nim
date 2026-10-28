@@ -69,10 +69,23 @@ import results
 import stew/endians2
 import codetracer_ctfs/base40
 import codetracer_ctfs/container
+import codetracer_ctfs/compact
 import codetracer_ctfs/types
 import codetracer_ctfs/zstd_bindings
 import codetracer_trace_writer/meta_dat
 import codetracer_trace_writer/interning_table
+
+proc readContainerImage*(filePath: string): Result[seq[byte], string] =
+  ## Probes and direct-member views inspect the same reconstructed image as
+  ## NewTraceReader. Offsets in a stored whole-file compressed body do not
+  ## address its members, and the reconstructed copy declares that fact.
+  var data = ? readCtfsFromFile(filePath)
+  if data.len > 5 and data[5] == CtfsVersionV6:
+    let scheme = ? readWholeFileCompression(data)
+    if scheme != wfcNone:
+      data = ? reconstructImage(data)
+      data[V6CompressionOffset] = uint8(ord(wfcNone))
+  ok(move data)
 
 # ---------------------------------------------------------------------------
 # Wire-format constants (must match the native recorder)
@@ -156,24 +169,22 @@ proc parseTidFromName(name: string): uint32 =
     v = v * 10 + uint32(ord(name[i]) - ord('0'))
   v
 
-proc detectNativeBundle*(data: openArray[byte]): Result[NativeBundleInfo, string] =
-  ## Inspect a CTFS container's root block and decide whether it looks like a
-  ## native MCR shard (per-thread `tNNN` streams + binary `meta.dat`).
-  ## Returns the discovered structure on success, or an error message on
-  ## inputs that aren't a valid CTFS file.
+proc probeContainerLayout*(data: openArray[byte]): Result[NativeBundleInfo, string] =
+  ## Inspect a readable CTFS directory to choose a decoder. Finding native
+  ## stream names does not claim that the native decoder reads this version;
+  ## detectNativeBundle keeps that decoder's independent version guard.
   if data.len < HeaderSize + ExtHeaderSize:
     return err("file too small to be a CTFS container")
   if not hasCtfsMagic(data):
     return err("invalid CTFS magic")
-  let versionErr = ctfsVersionError(data)
-  if versionErr.len > 0:
-    return err(versionErr)
+  ? checkReadableContainer(data)
 
-  let blockSize = readU32LE(data, 8)
+  let compact = isCompactContainer(data)
+  let blockSize = if compact: 0'u32 else: readU32LE(data, 8)
   # A declared `0` is the auto-filled root (`ctfs-container.md` §1,
   # "Auto-fill"), not a nonsensical header.
-  let maxRoot = headerRootEntryCount(data)
-  if blockSize == 0 or maxRoot == 0 or int(maxRoot) > 4096:
+  let maxRoot = if compact: 0'u32 else: headerRootEntryCount(data)
+  if not compact and (blockSize == 0 or maxRoot == 0 or int(maxRoot) > 4096):
     return err(
       "nonsensical CTFS root header (blockSize=" & $blockSize &
       " maxRoot=" & $maxRoot & ")")
@@ -189,12 +200,21 @@ proc detectNativeBundle*(data: openArray[byte]): Result[NativeBundleInfo, string
     return err("meta.dat missing: " & metaDatR.error)
   info.metaDat = metaDatR.get()
 
-  # Enumerate root-block entries to find tNNNN streams and eventlog files.
-  for i in 0 ..< int(maxRoot):
-    let off = HeaderSize + ExtHeaderSize + i * FileEntrySize
-    if off + FileEntrySize > data.len:
-      break
-    let nameVal = readU64LE(data, off + 16)
+  # The native stream names discriminate the layouts, independently of the
+  # container profile. Compact containers have a directory instead of a root
+  # block; full containers start their entries after their version's header.
+  var names: seq[uint64]
+  if compact:
+    let directory = ? readCompactDirectory(data)
+    for entry in directory.entries:
+      names.add(entry.encodedName)
+  else:
+    for i in 0 ..< int(maxRoot):
+      let off = containerHeaderSize(data) + i * FileEntrySize
+      if off + FileEntrySize > data.len:
+        break
+      names.add(readU64LE(data, off + 16))
+  for nameVal in names:
     if nameVal == 0:
       continue
     let name = base40Decode(nameVal)
@@ -226,6 +246,15 @@ proc detectNativeBundle*(data: openArray[byte]): Result[NativeBundleInfo, string
     cmp(a[0], b[0]))
 
   ok(info)
+
+proc detectNativeBundle*(data: openArray[byte]): Result[NativeBundleInfo, string] =
+  ## The native event decoder implements version 5 only. The CLI's generic
+  ## directory probe must not impose this limit on split-stream recordings.
+  if data.len >= HeaderSize + ExtHeaderSize and hasCtfsMagic(data):
+    let versionErr = ctfsVersionError(data)
+    if versionErr.len > 0:
+      return err(versionErr)
+  probeContainerLayout(data)
 
 proc isNativeBundle*(data: openArray[byte]): bool =
   ## True when the container carries per-thread `tNNN` streams, which is
@@ -795,7 +824,7 @@ proc buildNativeFullDocument*(data: openArray[byte], opts: NativeOpts):
 proc decodeNativeFromFile*(path: string, opts: NativeOpts):
     Result[JsonNode, string] =
   ## Convenience wrapper used by the CLI: read the file, then decode.
-  let dataR = readCtfsFromFile(path)
+  let dataR = readContainerImage(path)
   if dataR.isErr:
     return err(dataR.error)
   buildNativeFullDocument(dataR.get(), opts)

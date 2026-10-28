@@ -662,7 +662,7 @@ proc printCorrelationIndexV4(filePath: string, opts: FullOpts) =
   ## the event streams is irrelevant here — and routing this through the v4
   ## branch alone would have made the index invisible on exactly the
   ## recordings (native, multi-threaded) whose lookups this campaign is about.
-  let dataRes = ctfs_container.readCtfsFromFile(filePath)
+  let dataRes = readContainerImage(filePath)
   if dataRes.isErr:
     quit("Error: " & dataRes.error)
   let data = dataRes.get()
@@ -773,7 +773,7 @@ proc printSpans(filePath: string, jsonOut: bool) =
   ## Records are shown SETTLED (last-record-wins per `span_id`), so a crossing
   ## that was opened and later completed is one row carrying its final
   ## `end_step`, not two.
-  let dataR = ctfs_container.readCtfsFromFile(filePath)
+  let dataR = readContainerImage(filePath)
   if dataR.isErr:
     quit("ct-print: cannot read container: " & dataR.error)
   let bytes = dataR.get()
@@ -1256,7 +1256,7 @@ proc detectAutoKind(filePath: string): (AutoDetectKind, string) =
   ## Inspect the file once and decide which decode path should claim it.
   ## Returning a (kind, detail) pair lets the caller emit a precise error
   ## message instead of silently falling through to an empty document.
-  let dataR = ctfs_container.readCtfsFromFile(filePath)
+  let dataR = readContainerImage(filePath)
   if dataR.isErr:
     return (adkUnreadable, dataR.error)
   let data = dataR.get()
@@ -1266,7 +1266,7 @@ proc detectAutoKind(filePath: string): (AutoDetectKind, string) =
   # anything; `tNNN` per-thread streams are what identify an MCR bundle.
   # A container missing `meta.dat` entirely is left to the v4 reader, which
   # reports the absence with its own message.
-  let infoR = detectNativeBundle(data)
+  let infoR = probeContainerLayout(data)
   if infoR.isErr:
     if infoR.error.startsWith("meta.dat missing"):
       # A bundle with no `meta.dat` was handed to the v4 reader on the stated
@@ -1291,7 +1291,10 @@ proc detectAutoKind(filePath: string): (AutoDetectKind, string) =
       return (adkCtfsCorrupt,
         "meta.dat is missing — the bundle is truncated, or it is not a trace container")
     return (adkCtfsCorrupt, infoR.error)
-  if isNativeBundle(data):
+  if infoR.get().threadStreams.len > 0:
+    let versionErr = ctfs_types.ctfsVersionError(data)
+    if versionErr.len > 0:
+      return (adkCtfsCorrupt, "native MCR decoder: " & versionErr)
     return (adkNative, "")
   (adkV4MultiStream, "")
 
@@ -1405,7 +1408,7 @@ proc main() =
   block decideLayout:
     if follow:
       break decideLayout
-    let dataR = ctfs_container.readCtfsFromFile(filePath)
+    let dataR = readContainerImage(filePath)
     if dataR.isErr:
       break decideLayout  # unreadable here ⇒ let openNewTrace surface the error
     let layoutBytes = dataR.get()
