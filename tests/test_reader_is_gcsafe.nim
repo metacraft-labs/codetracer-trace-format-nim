@@ -20,6 +20,7 @@ import std/[os, assertions]
 import results
 import codetracer_trace_writer/multi_stream_writer
 import codetracer_trace_writer/new_trace_reader
+import codetracer_ctfs/live_page
 
 let dir = getTempDir() / "ctfnim-reader-is-gcsafe"
 createDir(dir)
@@ -29,6 +30,12 @@ proc openTrace(path: string): Result[NewTraceReader, string] {.gcsafe.} =
 
 proc openBytes(bytes: seq[byte]): Result[NewTraceReader, string] {.gcsafe.} =
   openNewTraceFromBytes(bytes)
+
+proc attachPage(file: File): Result[PageReader, string] {.gcsafe.} =
+  ## Opening a file-backed trace may reap its abandoned coordination page.
+  ## Keep that entry point checked directly so a missing forward-declaration
+  ## effect is diagnosed here rather than only at a distant reader consumer.
+  attachLivePage(file, rootEntries = 1)
 
 proc firstCall(r: var NewTraceReader):
     Result[(string, string, uint32), string] {.gcsafe.} =
@@ -63,6 +70,10 @@ proc writeTrace(name: string): string =
 
 proc test_the_reader_entry_points_run_from_gcsafe_procs() =
   let file = writeTrace("gcsafe")
+  let handle = open(file, fmRead)
+  let page = attachPage(handle)
+  close(handle)
+  doAssert page.isErr, "a closed trace must have no live page"
   var fromPath = openTrace(file)
   doAssert fromPath.isOk, "openNewTrace: " & fromPath.error
   let got = firstCall(fromPath.get())

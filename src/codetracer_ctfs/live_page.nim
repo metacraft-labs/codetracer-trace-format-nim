@@ -967,7 +967,10 @@ proc pageReaderOfView*(v: PageView, rootEntries: int): PageReader =
              extentsOff: extentsOffset(rootEntries),
              slotsOff: slotsOffset(rootEntries))
 
-proc reapAbandonedPage*(f: File): tuple[found, reaped: bool]
+proc reapAbandonedPage*(f: File): tuple[found, reaped: bool] {.gcsafe.}
+  ## Readers call this before its body below. State the effect here so that
+  ## their inferred GC-safety does not depend on declaration order; Nim still
+  ## checks the implementation against it.
 
 proc attachLivePage*(f: File, rootEntries: int,
                      skipIdentityCheck = false,
