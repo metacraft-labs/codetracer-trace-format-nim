@@ -48,6 +48,9 @@ task test, "Run all tests":
   # A publication writes the entries that changed, never the header again.
   # The keyed tests carry their mutation arms, so they build with them.
   exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_root_publication_writes_changed_entries.nim"
+  # B1 and the page store (`ctfs-keyed-families.md` §5.8.3;
+  # `CTFS-Binary-Format.md` §2.6): every write prefix, real kills, a follower.
+  exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_keyed_b1.nim"
   # Durability: a recording read while its writer is still open (what a
   # killed process leaves) has meta.dat, every sealed chunk and every interning
   # record registered before the seal.
