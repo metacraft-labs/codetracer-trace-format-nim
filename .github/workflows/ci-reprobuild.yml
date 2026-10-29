@@ -15,6 +15,7 @@ name: CI (reprobuild)
 # host without any other repo-side change.
 
 on:
+  workflow_dispatch:
   push:
     branches: [dev, stable]
   pull_request:
@@ -30,6 +31,9 @@ concurrency:
 
 jobs:
   reprobuild:
+    # Manual full-suite qualification uses feature refs. Agent landing and
+    # promotion branches stay without direct CI; promotion PRs still run.
+    if: github.event_name != 'workflow_dispatch' || (github.ref != 'refs/heads/agents' && !startsWith(github.ref, 'refs/heads/agents-to-dev-'))
     name: ${{ matrix.os }}-${{ matrix.arch }} — repro build/test
     strategy:
       fail-fast: false
