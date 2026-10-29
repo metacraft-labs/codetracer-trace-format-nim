@@ -200,28 +200,71 @@ proc slotsOffset*(rootEntries: int): int =
 proc wordPtr(v: PageView, off: int): ptr uint64 {.inline.} =
   cast[ptr uint64](cast[uint](v.base) + uint(off))
 
-proc load*(v: PageView, off: int): uint64 {.inline.} =
-  atomicLoadN(wordPtr(v, off), ATOMIC_ACQUIRE)
+when defined(vcc) or defined(clang_cl):
+  # This is a raw, cross-process mapped-page ABI, not an Atomic[T] object.
+  # In particular PageReader has a read-only view: an InterlockedOr(0) "load"
+  # would write to it and fault. Windows SDK accessors preserve the aligned
+  # 64-bit layout and supply the architecture's acquire/release barriers.
+  # https://learn.microsoft.com/windows/win32/sync/interlocked-variable-access
+  proc readAcquire64(p: ptr int64): int64 {.importc: "ReadAcquire64",
+    header: "<windows.h>".}
+  proc readNoFence64(p: ptr int64): int64 {.importc: "ReadNoFence64",
+    header: "<windows.h>".}
+  proc writeRelease64(p: ptr int64, x: int64) {.importc: "WriteRelease64",
+    header: "<windows.h>".}
+  proc writeNoFence64(p: ptr int64, x: int64) {.importc: "WriteNoFence64",
+    header: "<windows.h>".}
+  proc exchangeAdd64(p: ptr int64, x: int64): int64 {.
+    importc: "InterlockedExchangeAdd64", header: "<windows.h>".}
+  proc compareExchange64(p: ptr int64, desired, expected: int64): int64 {.
+    importc: "InterlockedCompareExchange64", header: "<windows.h>".}
+  proc memoryBarrier() {.importc: "MemoryBarrier", header: "<windows.h>".}
 
-proc loadRelaxed*(v: PageView, off: int): uint64 {.inline.} =
-  atomicLoadN(wordPtr(v, off), ATOMIC_RELAXED)
+  proc load*(v: PageView, off: int): uint64 {.inline.} =
+    cast[uint64](readAcquire64(cast[ptr int64](wordPtr(v, off))))
 
-proc store*(v: PageView, off: int, x: uint64) {.inline.} =
-  atomicStoreN(wordPtr(v, off), x, ATOMIC_RELEASE)
+  proc loadRelaxed*(v: PageView, off: int): uint64 {.inline.} =
+    cast[uint64](readNoFence64(cast[ptr int64](wordPtr(v, off))))
 
-proc storeRelaxed*(v: PageView, off: int, x: uint64) {.inline.} =
-  atomicStoreN(wordPtr(v, off), x, ATOMIC_RELAXED)
+  proc store*(v: PageView, off: int, x: uint64) {.inline.} =
+    writeRelease64(cast[ptr int64](wordPtr(v, off)), cast[int64](x))
 
-proc fetchAdd*(v: PageView, off: int, x: uint64): uint64 {.inline.} =
-  atomicFetchAdd(wordPtr(v, off), x, ATOMIC_ACQ_REL)
+  proc storeRelaxed*(v: PageView, off: int, x: uint64) {.inline.} =
+    writeNoFence64(cast[ptr int64](wordPtr(v, off)), cast[int64](x))
 
-proc casWord(v: PageView, off: int, expected, desired: uint64): bool =
-  var e = expected
-  atomicCompareExchangeN(wordPtr(v, off), addr e, desired, false,
-    ATOMIC_ACQ_REL, ATOMIC_RELAXED)
+  proc fetchAdd*(v: PageView, off: int, x: uint64): uint64 {.inline.} =
+    # Interlocked operations are full barriers (stronger than acq_rel).
+    cast[uint64](exchangeAdd64(cast[ptr int64](wordPtr(v, off)), cast[int64](x)))
 
-proc fenceRelease() {.inline.} = atomicThreadFence(ATOMIC_RELEASE)
-proc fenceAcquire() {.inline.} = atomicThreadFence(ATOMIC_ACQUIRE)
+  proc casWord(v: PageView, off: int, expected, desired: uint64): bool =
+    cast[uint64](compareExchange64(cast[ptr int64](wordPtr(v, off)),
+      cast[int64](desired), cast[int64](expected))) == expected
+
+  proc fenceRelease() {.inline.} = memoryBarrier()
+  proc fenceAcquire() {.inline.} = memoryBarrier()
+else:
+  proc load*(v: PageView, off: int): uint64 {.inline.} =
+    atomicLoadN(wordPtr(v, off), ATOMIC_ACQUIRE)
+
+  proc loadRelaxed*(v: PageView, off: int): uint64 {.inline.} =
+    atomicLoadN(wordPtr(v, off), ATOMIC_RELAXED)
+
+  proc store*(v: PageView, off: int, x: uint64) {.inline.} =
+    atomicStoreN(wordPtr(v, off), x, ATOMIC_RELEASE)
+
+  proc storeRelaxed*(v: PageView, off: int, x: uint64) {.inline.} =
+    atomicStoreN(wordPtr(v, off), x, ATOMIC_RELAXED)
+
+  proc fetchAdd*(v: PageView, off: int, x: uint64): uint64 {.inline.} =
+    atomicFetchAdd(wordPtr(v, off), x, ATOMIC_ACQ_REL)
+
+  proc casWord(v: PageView, off: int, expected, desired: uint64): bool =
+    var e = expected
+    atomicCompareExchangeN(wordPtr(v, off), addr e, desired, false,
+      ATOMIC_ACQ_REL, ATOMIC_RELAXED)
+
+  proc fenceRelease() {.inline.} = atomicThreadFence(ATOMIC_RELEASE)
+  proc fenceAcquire() {.inline.} = atomicThreadFence(ATOMIC_ACQUIRE)
 
 # ---------------------------------------------------------------------------
 # The machine's monotonic clock, process start times
@@ -767,18 +810,16 @@ when defined(windows):
   proc heartbeatMain(arg: pointer): uint32 {.stdcall, stackTrace: off,
       gcsafe.} =
     let ctl = cast[ptr HeartbeatCtl](arg)
-    while atomicLoadN(addr ctl.stop, ATOMIC_ACQUIRE) == 0:
-      atomicStoreN(cast[ptr uint64](cast[uint](ctl.page) + uint(ctl.slotOff)),
-        monotonicNs(), ATOMIC_RELEASE)
+    while PageView(base: addr ctl.stop, len: 8).load(0) == 0:
+      PageView(base: ctl.page).store(ctl.slotOff, monotonicNs())
       sleepMs(200)
     0
 else:
   proc heartbeatMain(arg: pointer): pointer {.noconv, stackTrace: off,
       gcsafe.} =
     let ctl = cast[ptr HeartbeatCtl](arg)
-    while atomicLoadN(addr ctl.stop, ATOMIC_ACQUIRE) == 0:
-      atomicStoreN(cast[ptr uint64](cast[uint](ctl.page) + uint(ctl.slotOff)),
-        monotonicNs(), ATOMIC_RELEASE)
+    while PageView(base: addr ctl.stop, len: 8).load(0) == 0:
+      PageView(base: ctl.page).store(ctl.slotOff, monotonicNs())
       var ts = Timespec(tv_sec: posix.Time(0), tv_nsec: 200_000_000)
       var rem: Timespec
       discard nanosleep(ts, rem)
@@ -805,7 +846,7 @@ proc startHeartbeat(p: LivePage) =
 proc stopHeartbeat(p: LivePage) =
   let ctl = p.hb
   if ctl == nil: return
-  atomicStoreN(addr ctl.stop, 1'i64, ATOMIC_RELEASE)
+  PageView(base: addr ctl.stop, len: 8).store(0, 1)
   when defined(windows):
     discard waitForSingleObject(ctl.thread, 0xFFFF_FFFF'u32)
     discard closeHandleW(ctl.thread)

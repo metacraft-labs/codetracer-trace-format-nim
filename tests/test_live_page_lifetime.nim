@@ -46,6 +46,51 @@ when isMainModule:
   if args.len == 2 and args[0] == "--child":
     childWriter(args[1])
 
+  if args.len == 2 and args[0] == "--readonly-write":
+    # A real attached mapping must reject stores. The marker distinguishes a
+    # fault at the protected word from an earlier open/attachment failure.
+    var f: File
+    doAssert open(f, args[1], fmRead)
+    var reader = attachLivePage(f, 31).get()
+    writeFile(args[1] & ".armed", "1")
+    reader.view.store(OffOverflowed, 19)
+    quit(0)
+
+  # 0. Every bit survives the signed Windows interlocked ABI, and loads really
+  #    work on a read-only mapping. An RMW masquerading as a load faults here.
+  #    The child store is the negative control for the mapping's protection;
+  #    no fake mapping, atomic adapter or OS protection result is substituted.
+  block:
+    let path = tmp("wordabi")
+    removeFile(path); removeFile(path & ".armed")
+    var c = createCtfsStreaming(path, livePage = lpmInGuest).get()
+    var f: File
+    doAssert open(f, path, fmRead)
+    var reader = attachLivePage(f, 31).get()
+    let highBit = 0x8000000000000001'u64
+    c.page.view.store(OffOverflowed, highBit)
+    expect(reader.view.load(OffOverflowed) == highBit, "acquire load lost the high bit")
+    c.page.view.storeRelaxed(OffOverflowed, high(uint64))
+    expect(reader.view.loadRelaxed(OffOverflowed) == high(uint64),
+      "relaxed store/load lost unsigned bits")
+    expect(c.page.view.fetchAdd(OffOverflowed, 1) == high(uint64),
+      "fetch-add did not return the previous full-width value")
+    expect(reader.view.load(OffOverflowed) == 0, "fetch-add did not wrap at 64 bits")
+    expect(c.page.view.fetchAdd(OffOverflowed, highBit) == 0,
+      "fetch-add did not return zero before adding a high-bit operand")
+    expect(reader.view.load(OffOverflowed) == highBit, "fetch-add lost a high-bit operand")
+    var child = startProcess(getAppFilename(), args = ["--readonly-write", path],
+                             options = {poParentStreams})
+    let childExit = child.waitForExit()
+    close(child)
+    expect(fileExists(path & ".armed"), "readonly child did not reach the protected store")
+    expect(childExit != 0, "a store to the reader mapping unexpectedly succeeded")
+    expect(reader.view.load(OffOverflowed) == highBit, "refused store changed the shared word")
+    reader.detach()
+    close(f)
+    doAssert c.closeCtfs().isOk
+    removeFile(path); removeFile(path & ".armed")
+
   # 1. Create, attach, close, unlink.
   block:
     let path = tmp("basic")

@@ -80,6 +80,14 @@ jobs:
           env-flavor: reprobuild
           gh-token: ${{ steps.ci_token.outputs.token }}
 
+      # The shipping Windows FFI uses MSVC with threads off. The regular
+      # corpus also runs unchanged; this selects that compiler explicitly so
+      # its mapped-page backend and read-only protection control cannot hide
+      # behind a default MinGW compiler.
+      - name: MSVC live-page read-only mapping and word ABI
+        if: matrix.os == 'windows'
+        run: dev-exec nim c -r --cc:vcc --threads:off --mm:arc -d:release -p:src -o:build/test-bin/test_live_page_lifetime_msvc.exe tests/test_live_page_lifetime.nim
+
       - name: repro build
         # Builds the conventional `build` collection declared in
         # `repro.nim`. Verifies the primary shipping artefact (the
