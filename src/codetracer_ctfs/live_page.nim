@@ -24,7 +24,7 @@ when defined(nimPreviewSlimSystem):
 ## | 48 | state: 0 creating, 1 live, 2 closed, 3 abandoned |
 ## | 56 | `seal_epoch` (every writer's seals) |
 ## | 64 | `overflowed` (mirror allocations refused) |
-## | 128 + 64·w | writer slot w (0..15): pid, start time, heartbeat, `seal_epoch`, state |
+## | 128 + 64·w | writer slot w (0..15): pid, start time, heartbeat, `seal_epoch`, state, liveness |
 ## | 1152 | `NextFreeBlock` |
 ## | 1160 + 8·f | family counter f (0..15) |
 ## | 1288 | `mirror_bump` |
@@ -41,10 +41,22 @@ when defined(nimPreviewSlimSystem):
 ## payload words in the order the record kind requires, `seq + 2` (even) with
 ## release. A reader (§6, "Reading") loads `seq`, the payload and `seq` again,
 ## and accepts only when the two loads agree and are even.
+##
+## Two kinds of writer (§6, "How a writer's liveness is judged"). A **hosted**
+## writer (the default) runs a heartbeat thread that stores the monotonic
+## clock into its slot every 200 ms, and is dead once that heartbeat is 10 s
+## old. An **in-guest** writer runs inside a process another tool records
+## (the macOS recorder's injected and cooperative writers): it creates no
+## thread, and after the container's creation it touches the page only with
+## memory stores and clock reads inside the seals it already makes. It stores
+## its heartbeat there, marks its slot `liveness = process`, and is judged
+## alive by its pid and start time alone, so a guest that is quiet for
+## minutes is not reaped.
 
 import std/widestrs
 import results
 import ./sha256
+import ./mutation_arms
 
 const
   PageMagicVersion* = 0x504C5443'u64 or (1'u64 shl 32)
@@ -65,7 +77,16 @@ const
   PageExtents* = 256
   HeartbeatDeadNs* = 10_000_000_000'u64
     ## A writer whose heartbeat is older than this is dead (§6, "A writer that
-    ## dies").
+    ## dies"), when its slot's liveness is `heartbeat`.
+  WriterLivenessHeartbeat* = 0'u64
+    ## Writer slot `+40`, the slot's liveness rule (§6, "How a writer's
+    ## liveness is judged"): `0`, dead when its pid no longer names a process
+    ## with its start time or its heartbeat is 10 s old.
+  WriterLivenessProcess* = 1'u64
+    ## `1`: an in-guest writer, which runs no heartbeat thread; dead only when
+    ## its pid no longer names a process with its start time.
+  OffSlotLiveness* = 40
+    ## The liveness word's offset inside a writer slot.
 
   OffIdentity* = 8
   OffCapacity* = 40
@@ -84,6 +105,15 @@ const
   ExtentTableBytes* = 12288
 
 type
+  LivePageMode* = enum
+    ## How a streaming writer hosts its container's live coordination page
+    ## (`ctfs-container.md` §6, "How a writer's liveness is judged").
+    lpmHosted   ## the page, kept alive by a heartbeat thread (the default)
+    lpmInGuest  ## the page, created with the container; no thread; after
+                ## creation only memory stores and clock reads, inside the
+                ## seals; liveness judged by pid and start time
+    lpmFileOnly ## no page: readers follow the file alone until close
+
   PageIdentity* = array[32, byte]
     ## A container file's identity (§6, "Identity"), packed as 32 bytes.
 
@@ -120,6 +150,9 @@ type
     writerSlot*: int
     tap*: PageTap
     closed*: bool
+    liveness*: uint64
+      ## This writer's slot liveness: `WriterLivenessHeartbeat` (a heartbeat
+      ## thread runs) or `WriterLivenessProcess` (in-guest: none does).
     hb: ptr HeartbeatCtl
     when defined(windows):
       handle: int
@@ -225,6 +258,9 @@ elif defined(macosx):
 else:
   import std/posix
 
+when defined(macosx):
+  var machNumer, machDenom: uint32
+
 proc monotonicNs*(): uint64 {.stackTrace: off.} =
   ## Nanoseconds of the machine's monotonic clock, which every process on the
   ## machine shares (§6, "The heartbeat").
@@ -236,10 +272,21 @@ proc monotonicNs*(): uint64 {.stackTrace: off.} =
     uint64(c div f) * 1_000_000_000'u64 +
       uint64(c mod f) * 1_000_000_000'u64 div uint64(f)
   elif defined(macosx):
-    var tb: MachTimebase
-    discard mach_timebase_info(addr tb)
+    # The timebase is read once and kept: an in-guest writer's first clock
+    # read is its slot claim, at the container's creation, so a seal's
+    # heartbeat store calls no kernel trap (mach_continuous_time reads the
+    # commpage).
+    var numer = atomicLoadN(addr machNumer, ATOMIC_RELAXED)
+    var denom = atomicLoadN(addr machDenom, ATOMIC_RELAXED)
+    if denom == 0:
+      var tb: MachTimebase
+      if mach_timebase_info(addr tb) == 0 and tb.denom != 0:
+        numer = tb.numer
+        denom = tb.denom
+        atomicStoreN(addr machNumer, numer, ATOMIC_RELAXED)
+        atomicStoreN(addr machDenom, denom, ATOMIC_RELAXED)
     let t = mach_continuous_time()
-    if tb.denom == 0: t else: t div uint64(tb.denom) * uint64(tb.numer)
+    if denom == 0: t else: t div uint64(denom) * uint64(numer)
   else:
     var ts: Timespec
     discard clock_gettime(CLOCK_MONOTONIC, ts)
@@ -574,20 +621,29 @@ proc identityOf(v: PageView): PageIdentity =
     for j in 0 ..< 8: result[8 * i + j] = byte((w shr (8 * j)) and 0xff)
 
 proc writerAlive*(v: PageView, slot: int, nowNs: uint64): bool =
-  ## Writer slot `slot` is live: claimed, its pid names a process with its
-  ## recorded start time, and its heartbeat is younger than 10 seconds.
+  ## Writer slot `slot` is live (§6, "How a writer's liveness is judged"):
+  ## claimed, and its pid names a process with its recorded start time; for
+  ## a slot of heartbeat liveness, also its heartbeat is younger than 10
+  ## seconds. A slot of process liveness (an in-guest writer) has no
+  ## heartbeat requirement.
   let b = OffWriters + slot * WriterSlotSize
   if v.load(b + 32) != WriterSlotLive: return false
   let pid = v.loadRelaxed(b)
   let start = v.loadRelaxed(b + 8)
+  let liveness = v.loadRelaxed(b + OffSlotLiveness)
   let hb = v.load(b + 16)
   if start == 0 or processStartTime(pid) != start: return false
+  if liveness == WriterLivenessProcess: return true
   nowNs < hb or nowNs - hb < HeartbeatDeadNs
 
-proc liveWriters*(v: PageView): seq[int] =
-  let now = monotonicNs()
+proc liveWritersAt*(v: PageView, nowNs: uint64): seq[int] =
+  ## The live writer slots as judged at clock value `nowNs` (a test passes a
+  ## time past the heartbeat's limit).
   for i in 0 ..< PageWriterSlots:
-    if writerAlive(v, i, now): result.add i
+    if writerAlive(v, i, nowNs): result.add i
+
+proc liveWriters*(v: PageView): seq[int] =
+  liveWritersAt(v, monotonicNs())
 
 # ---------------------------------------------------------------------------
 # The writer's side
@@ -677,7 +733,8 @@ proc publishRecord*(p: LivePage, x: MirrorExtent, rec: uint64,
   p.publishWords(x.slotOffset(rec), words)
 
 proc sealDone*(p: LivePage) =
-  ## §6 step 4: the writer's `seal_epoch`, then the page's.
+  ## §6 step 4: the writer's `seal_epoch`, then the page's; then the
+  ## heartbeat, the only place an in-guest writer stores it.
   if p == nil or p.closed: return
   let w = OffWriters + p.writerSlot * WriterSlotSize
   discard p.view.fetchAdd(w + 24, 1)
@@ -759,12 +816,14 @@ proc stopHeartbeat(p: LivePage) =
 
 proc claimWriterSlot(p: LivePage): Result[int, string] =
   ## A compare-exchange of a slot's state from 0 to 1, tried on slots 0 to 15
-  ## in order (a bounded scan), then pid, start time and heartbeat, stored with
-  ## release. A slot is never reused within a page's life.
+  ## in order (a bounded scan), then the slot's liveness, pid, start time and
+  ## heartbeat, the heartbeat stored with release. A slot is never reused
+  ## within a page's life.
   let pid = currentPid()
   for i in 0 ..< PageWriterSlots:
     let b = OffWriters + i * WriterSlotSize
     if p.view.casWord(b + 32, WriterSlotFree, WriterSlotLive):
+      p.view.storeRelaxed(b + OffSlotLiveness, p.liveness)
       p.view.storeRelaxed(b, pid)
       p.view.storeRelaxed(b + 8, processStartTime(pid))
       p.view.store(b + 16, monotonicNs())
@@ -774,6 +833,23 @@ proc claimWriterSlot(p: LivePage): Result[int, string] =
     "processes beside the coordinator)")
 
 proc closeLivePage*(p: LivePage)
+
+proc slotLiveness(mode: LivePageMode): uint64 =
+  ## The arm `inguest-heartbeat-liveness` marks an in-guest slot with the
+  ## heartbeat rule, which `test_live_page_in_guest` must catch: a quiet
+  ## guest is then judged dead and its page reaped.
+  if mode == lpmInGuest and not mutated("inguest-heartbeat-liveness"):
+    WriterLivenessProcess
+  else:
+    WriterLivenessHeartbeat
+
+proc startHeartbeatFor(p: LivePage, mode: LivePageMode) =
+  ## A hosted writer's heartbeat thread. An in-guest writer starts none (§6,
+  ## "How a writer's liveness is judged"); the arm `inguest-starts-heartbeat`
+  ## starts it anyway, which `test_live_page_in_guest` must catch.
+  if mode == lpmInGuest and not mutated("inguest-starts-heartbeat"):
+    return
+  p.startHeartbeat()
 
 var hostedPages {.threadvar.}: seq[LivePage]
   ## The pages this process hosts and has not closed.
@@ -802,13 +878,22 @@ proc clearUsed(v: PageView, slotsOff: int) =
 
 proc createLivePage*(f: File, rootEntries: int,
                      capacity: int = DefaultPageCapacity,
-                     containerName = ""): Result[LivePage, string] =
+                     containerName = "",
+                     mode: LivePageMode = lpmHosted): Result[LivePage, string] =
   ## Create the page of the container open as `f` (§6, "Lifetime",
   ## "Creation"): exclusively. An existing object of the same name is opened
   ## and inspected first; if every writer it names is dead it is marked
   ## abandoned and replaced, otherwise creation fails, naming the container.
   ## The creator registers as a writer and sets the state to `live`; the caller
   ## publishes the root region only after this returns.
+  ##
+  ## `mode` is `lpmHosted` (a heartbeat thread keeps the slot alive) or
+  ## `lpmInGuest` (no thread; the slot's liveness is `process`). Every call
+  ## into the operating system an in-guest page needs is made here, at
+  ## creation; after this returns it is touched only by memory stores and
+  ## clock reads inside the seals, and at close.
+  if mode == lpmFileOnly:
+    return err("createLivePage: lpmFileOnly has no page")
   let what = if containerName.len > 0: containerName else: "the container"
   let id = ? fileIdentity(f).mapErr(proc (e: string): string =
     "live coordination page of " & what & ": " & e)
@@ -830,7 +915,8 @@ proc createLivePage*(f: File, rootEntries: int,
     return err("live coordination page of " & what & ": capacity " &
       $capacity & " cannot hold the root mirror of " & $rootEntries & " entries")
   var p = LivePage(name: name, identity: id, rootEntries: rootEntries,
-                   extentsOff: ext, slotsOff: slots)
+                   extentsOff: ext, slotsOff: slots,
+                   liveness: slotLiveness(mode))
   var why = ""
   var handle = 0
   var view: PageView
@@ -877,7 +963,7 @@ proc createLivePage*(f: File, rootEntries: int,
           ": recreating it after removing an abandoned one failed: " & why)
   p.writerSlot = ? p.claimWriterSlot()
   p.view.store(OffState, PageStateLive)
-  p.startHeartbeat()
+  p.startHeartbeatFor(mode)
   hostedPages.add p
   ok(p)
 
@@ -904,13 +990,17 @@ proc abandonLivePage*(p: LivePage) =
   else: shmUnmap(p.view, 0)
   p.closed = true
 
-proc joinLivePage*(f: File, rootEntries: int): Result[LivePage, string] =
+proc joinLivePage*(f: File, rootEntries: int,
+                   mode: LivePageMode = lpmHosted): Result[LivePage, string] =
   ## Join the page of a container another process created, as an additional
   ## writer (`ctfs-container.md` §6, W2 and the hybrid): the page must be
   ## `live` and carry this file's identity; a writer slot is claimed (16 per
   ## page, so at most 15 producers beside the coordinator, a 16th refused by
-  ## name) and kept alive by this process's heartbeat. The joiner never
+  ## name) and kept alive by this process's heartbeat, or, for `lpmInGuest`,
+  ## judged by its pid and start time with no thread. The joiner never
   ## creates, closes or removes the page.
+  if mode == lpmFileOnly:
+    return err("joinLivePage: lpmFileOnly has no page")
   let id = ? fileIdentity(f)
   let name = pageName(id)
   var v: PageView
@@ -923,20 +1013,22 @@ proc joinLivePage*(f: File, rootEntries: int): Result[LivePage, string] =
     return err("live coordination page " & name & " is not a live page of this file")
   var p = LivePage(view: v, name: name, identity: id, rootEntries: rootEntries,
                    extentsOff: extentsOffset(rootEntries),
-                   slotsOff: slotsOffset(rootEntries))
+                   slotsOff: slotsOffset(rootEntries),
+                   liveness: slotLiveness(mode))
   when defined(windows): p.handle = h
   let slot = p.claimWriterSlot()
   if slot.isErr:
     shmUnmap(p.view, h)
     return err(slot.error)
   p.writerSlot = slot.get()
-  p.startHeartbeat()
+  p.startHeartbeatFor(mode)
   ok(p)
 
 proc settleDeadWriters*(p: LivePage): seq[int] =
   ## A surviving writer's duty under W2 (§6, "A writer that dies"): every
   ## writer slot whose writer is dead (its pid no longer names a process with
-  ## its start time, or its heartbeat is older than 10 seconds) is marked dead,
+  ## its start time, or, for a slot of heartbeat liveness, its heartbeat is
+  ## older than 10 seconds) is marked dead,
   ## and every root mirror slot left odd is settled. A root entry is
   ## prefix-valid (`MapBlock` before `Size`), so the settled value is the
   ## page's payload: its `seq` is made even. A record slot left odd is left to

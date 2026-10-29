@@ -45,6 +45,11 @@ task test, "Run all tests":
   # a killed writer's page reaped, another file's identity refused).
   exec "nim c -r -d:release -p:src tests/test_live_page_torn.nim"
   exec "nim c -r -d:release -p:src tests/test_live_page_lifetime.nim"
+  # The in-guest writer: no thread, its heartbeat stored only at its seals,
+  # judged alive by pid and start time; a quiet guest is followed, not
+  # reaped; the file-only form hosts no page. Arms: a heartbeat thread
+  # started anyway; the in-guest slot left on the heartbeat rule.
+  exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_live_page_in_guest.nim"
   # A publication writes the entries that changed, never the header again.
   # The keyed tests carry their mutation arms, so they build with them.
   exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_root_publication_writes_changed_entries.nim"

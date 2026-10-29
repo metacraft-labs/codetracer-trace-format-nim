@@ -17,7 +17,8 @@ proc createCtfsStreaming*(path: string, blockSize: uint32 = DefaultBlockSize,
                           maxRootEntries: uint32 = DefaultMaxRootEntries,
                           encryption: CtfsEncryptionMethod = emNone,
                           maxShards: uint8 = DefaultMaxShards,
-                          pageCapacity: int = DefaultPageCapacity):
+                          pageCapacity: int = DefaultPageCapacity,
+                          livePage: LivePageMode = lpmHosted):
                           Result[Ctfs, string] =
   ## Create a new CTFS container (version 5) that streams writes to disk.
   ##
@@ -27,6 +28,16 @@ proc createCtfsStreaming*(path: string, blockSize: uint32 = DefaultBlockSize,
   ## it as a writer and sets it `live`; only then is the root region (the
   ## header and the empty entry array) written, in one write. That write is
   ## not a seal (§6, "What counts as a seal"): it publishes no member.
+  ##
+  ## `livePage` says how this process hosts the page (§6, "How a writer's
+  ## liveness is judged"). `lpmHosted`, the default: a heartbeat thread keeps
+  ## it alive. `lpmInGuest`, for a writer that runs inside a process another
+  ## tool records: the page is created here and no thread is started; after
+  ## this returns the writer touches the page only with memory stores and
+  ## clock reads inside its seals (and at close), and readers judge it alive
+  ## by its pid and start time. `lpmFileOnly`: no page; readers follow the
+  ## file alone until close, with the guarantees of a reader that cannot
+  ## attach.
   let refusal = blockSizeRefusal(blockSize)
   if refusal.len > 0:
     return err(refusal)
@@ -36,17 +47,19 @@ proc createCtfsStreaming*(path: string, blockSize: uint32 = DefaultBlockSize,
   except IOError, OSError:
     return err("failed to open streaming file: " & path)
   let rootEntries = int(headerRootEntryCount(c.data))
-  let page = createLivePage(c.streamFile, rootEntries, pageCapacity, path)
-  if page.isErr:
-    discard c.streamFile.closeChecked()
-    return err(page.error)
-  c.page = page.get()
+  if livePage != lpmFileOnly:
+    let page = createLivePage(c.streamFile, rootEntries, pageCapacity, path,
+                              livePage)
+    if page.isErr:
+      discard c.streamFile.closeChecked()
+      return err(page.error)
+    c.page = page.get()
   c.streamPath = path
   c.streaming = true
   c.deferWrites = true
   let n = c.rootRegionBytes()
   if not c.handToOs(0, n):
-    closeLivePage(c.page)
+    if c.page != nil: closeLivePage(c.page)
     c.page = nil
     discard c.streamFile.closeChecked()
     return err("failed to write the root region of streaming file " & path &
