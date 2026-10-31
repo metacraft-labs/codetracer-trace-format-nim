@@ -76,7 +76,7 @@ const
   unpledgedBundle = tmpDir / "unpledged.ct"
 
   mandatoryFiles = ["meta.dat", "events.log"]
-  optionalFiles = ["meta.json", "paths.json", "paths.dat"]
+  optionalFiles = ["meta.json", "paths.json", "paths.dat", "paths.off"]
 
   ZstdMagic: array[4, byte] = [0x28'u8, 0xB5, 0x2F, 0xFD]
 
@@ -185,6 +185,8 @@ proc buildPledgedBundle(path: string) =
   ## pledges, so every chunk frame here carries a content size.
   removeFile(path)
   var w = newTraceWriter(path, "demo", @["--x"], "/wd").get()
+  # meta.dat is written once, before the first event.
+  doAssert w.writeMetaDat().isOk
   doAssert w.writePath("/wd/main.py").isOk
   doAssert w.writeFunction(0, 1, "main").isOk
   doAssert w.writeStep(0, 1).isOk
@@ -196,7 +198,6 @@ proc buildPledgedBundle(path: string) =
   doAssert w.writeValue(0,
     ValueRecord(kind: vrkInt, intVal: 43, intTypeId: TypeId(0))).isOk
   doAssert w.writeReturn().isOk
-  doAssert w.writeMetaDat().isOk
   doAssert w.close().isOk
 
 proc rewriteEventsLogUnpledged(payload: openArray[byte]):

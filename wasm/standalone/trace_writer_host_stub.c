@@ -12,6 +12,10 @@
  *                     which is a `random_get` import.
  *   fclose, fflush    referenced by `std/syncio`, which `host_stub.c` does not
  *                     stub because the container layer never reaches them.
+ *   fopen, setvbuf    referenced by `std/syncio`'s `open`, which the
+ *                     file-backed writer constructor names. A freestanding
+ *                     module has no files: `fopen` fails, so that constructor
+ *                     returns its error and the in-memory one is the way in.
  *
  * They are DEFINED here rather than imported so that the module's zero-import
  * property is a property of the module and not of a generous host. A browser
@@ -56,3 +60,11 @@ typedef struct _IO_FILE FILE;
 
 int fclose(FILE *f) { (void)f; return 0; }
 int fflush(FILE *f) { (void)f; return 0; }
+FILE *fopen(const char *path, const char *mode) {
+  (void)path; (void)mode;
+  return (FILE *)0;
+}
+int setvbuf(FILE *f, char *buf, int mode, size_t size) {
+  (void)f; (void)buf; (void)mode; (void)size;
+  return -1;
+}

@@ -87,7 +87,11 @@ proc main() {.raises: [].} =
   if not hasCtfsMagic(raw):
     fail(args[0] & " does not carry the CTFS magic")
   if not hasValidVersion(raw):
-    fail(args[0] & " has an unrecognised CTFS version byte " & $raw[5])
+    # `ctfsVersionError`'s wording, so this adjudicator and the library it
+    # adjudicates give the same account of the same byte. The message it
+    # replaced named the byte but not the version this reader reads, which is
+    # the half an operator holding a container from a newer writer needs.
+    fail(args[0] & ": " & ctfsVersionError(raw))
 
   # Read the geometry out of the header rather than assuming the defaults, so
   # the checker adjudicates the container the producer actually wrote.

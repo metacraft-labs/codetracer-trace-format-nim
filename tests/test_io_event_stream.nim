@@ -13,6 +13,7 @@ when defined(nimPreviewSlimSystem):
 ## metadata round-trip, and the legacy ``.off`` VRT back-compat path.
 
 import std/times
+import std/strutils
 import results
 import codetracer_ctfs/container
 import codetracer_ctfs/variable_record_table
@@ -41,7 +42,7 @@ proc makeData(rng: var Rng, length: int): seq[byte] =
   d
 
 proc makeIOEvent(rng: var Rng, idx: int): IOEvent =
-  let kind = IOEventKind(rng.next() mod 4)
+  let kind = EventLogKind(rng.next() mod 14)
   let stepId = rng.next() mod 100000
   let metaLen = int(rng.next() mod 8)  # 0..7 metadata bytes (incl. empty)
   let dataLen = int(rng.next() mod 50) + 1
@@ -143,23 +144,25 @@ proc test_io_event_stream_page_load() {.raises: [].} =
   echo "PASS: test_io_event_stream_page_load"
 
 # ---------------------------------------------------------------------------
-# test_io_event_kind_roundtrip — the IOEventKind ↔ EventLogKind-ordinal map
+# test_io_event_kind_roundtrip — every EventLogKind is stored and read exactly
 # ---------------------------------------------------------------------------
 
 proc test_io_event_kind_roundtrip() {.raises: [].} =
-  # Every coarse IOEventKind must survive the on-disk EventLogKind-ordinal
-  # encoding so ct-print's io_kind output is unchanged across the format flip.
-  for k in IOEventKind:
-    let ord = ioEventKindToOrdinal(k)
-    doAssert ordinalToIOEventKind(ord) == k,
-      "kind round-trip broken for " & $k & " (ord " & $ord & ")"
-
-  # And the canonical ordinals are exactly the spec EventLogKind values used by
-  # the cross-read sidecar.
-  doAssert ioEventKindToOrdinal(ioStdout) == 0'u8
-  doAssert ioEventKindToOrdinal(ioStderr) == 12'u8
-  doAssert ioEventKindToOrdinal(ioFileOp) == 4'u8
-  doAssert ioEventKindToOrdinal(ioError) == 11'u8
+  # `trace-events.md` §"EventLogKind (u8 enum)": the on-disk byte is the
+  # recorder's ordinal, read back as that kind; no coarser set in between.
+  for k in EventLogKind:
+    let rec = encodeIOEvent(IOEvent(kind: k, stepId: 1))
+    doAssert rec[0] == uint8(ord(k)), "kind " & $k & " stored as " & $rec[0]
+    let back = decodeIOEvent(rec)
+    doAssert back.isOk and back.get().kind == k,
+      "kind round-trip broken for " & $k
+  # An unassigned value is refused by value, not mapped onto a kind.
+  for v in [14'u8, 15, 200, 255]:
+    var rec = encodeIOEvent(IOEvent(kind: elkWrite, stepId: 1))
+    rec[0] = v
+    let back = decodeIOEvent(rec)
+    doAssert back.isErr and ($v) in back.error,
+      "an unassigned kind " & $v & " was not refused"
 
   echo "PASS: test_io_event_kind_roundtrip"
 
@@ -174,7 +177,11 @@ proc encodeLegacyIOEvent(ev: IOEvent): seq[byte] =
   ## can prove the reader's legacy path still works.  Note: legacy framing had
   ## no metadata field and the kind byte was the IOEventKind ordinal.
   var rec: seq[byte] = @[]
-  rec.add(byte(ev.kind))
+  rec.add(case ev.kind
+    of elkWrite: 0'u8
+    of elkWriteOther: 1'u8
+    of elkReadFile: 2'u8
+    else: 3'u8)
   encodeVarint(ev.stepId, rec)
   encodeVarint(uint64(ev.data.len), rec)
   rec.add(ev.data)
@@ -189,9 +196,9 @@ proc test_io_event_stream_legacy_back_compat() {.raises: [].} =
   var rng = initRng(555)
   var events: seq[IOEvent] = @[]
   for i in 0 ..< 50:
-    # Legacy events carry no metadata.
+    # Legacy events carry no metadata, and one of the legacy API's four kinds.
     let ev = IOEvent(
-      kind: IOEventKind(rng.next() mod 4),
+      kind: [elkWrite, elkWriteOther, elkReadFile, elkError][rng.next() mod 4],
       stepId: rng.next() mod 100000,
       metadata: @[],
       data: makeData(rng, int(rng.next() mod 30) + 1))

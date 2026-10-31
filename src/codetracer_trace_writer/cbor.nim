@@ -944,7 +944,7 @@ proc decodeCborTypeRecord*(dec: var CborDecoder): Result[TypeRecord, string] =
 # PassBy is a normal enum (serde default: externally tagged)
 # RValue is #[serde(tag = "kind")] enum
 
-proc encodeCborRValue(enc: var CborEncoder, rv: RValue) {.inline.} =
+proc encodeCborRValue*(enc: var CborEncoder, rv: RValue) {.inline.} =
   ## M14: ~RValue~ uses serde adjacently-tagged form
   ## ~#[serde(tag = "kind", content = "data")]~ so newtype tuple
   ## variants (~Simple~, ~Compound~) and struct variants work

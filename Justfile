@@ -44,6 +44,7 @@ test-nim:
 # against it and run it.
 test-ffi:
     nimble testFfi
+    nimble testFfiThreads
 
 # Benchmarks are not part of `test` — they assert throughput and are
 # machine-dependent.
@@ -61,10 +62,11 @@ lint-nim:
     # `-e` so ANY failing check fails the recipe rather than only the last.
     set -euo pipefail
     for m in src/codetracer_ctfs.nim \
-             src/codetracer_trace_types.nim \
-             src/codetracer_trace_writer.nim \
-             src/codetracer_trace_reader.nim \
-             src/codetracer_ct_print_lib.nim; do
+              src/codetracer_trace_types.nim \
+              src/codetracer_trace_writer.nim \
+              src/codetracer_profile_writer.nim \
+              src/codetracer_trace_reader.nim \
+              src/codetracer_ct_print_lib.nim; do
       nim check --hints:off --warnings:off -p:src "$m"
     done
 
@@ -87,3 +89,9 @@ format-nix:
 # Verify the flake's default package (`ct-print`) builds.
 nix-build:
     nix build .#default
+
+# Entering the dev shell from another git repository must write nothing
+# there (no git hooks, no .nimble). Runs `nix develop`, so it is not part of
+# `test`, which runs inside the shell.
+test-dev-shell:
+    bash tests/test_dev_shell_writes_nothing_elsewhere.sh

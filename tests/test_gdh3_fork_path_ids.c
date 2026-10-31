@@ -275,8 +275,8 @@ static int refusal(const char *out_dir) {
         GATE_FAIL(G, "CONTROL ARM: a valid registration was refused");
     if (strlen(trace_writer_last_error()) != 0)
         GATE_FAIL(G, "CONTROL ARM: a valid registration left last_error "
-                     "non-empty (`%s`), so a non-empty buffer cannot be read "
-                     "as `this call failed`", trace_writer_last_error());
+                      "non-empty (`%s`), so a non-empty buffer cannot be read "
+                      "as `this call failed`", trace_writer_last_error());
     printf("control_valid_id=%llu\n", (unsigned long long)good);
 
     /* ANTI-VACUITY: clear the buffer and PROVE it is empty before the call.
@@ -286,8 +286,8 @@ static int refusal(const char *out_dir) {
     trace_writer_clear_last_error();
     if (strlen(trace_writer_last_error()) != 0)
         GATE_FAIL(G, "last_error is not empty after clear_last_error, so any "
-                     "message seen after the next call cannot be attributed "
-                     "to it");
+                      "message seen after the next call cannot be attributed "
+                      "to it");
 
     uint64_t bad = trace_writer_register_path_version(w, PROBE, 0);
 
@@ -300,19 +300,19 @@ static int refusal(const char *out_dir) {
     const char *err = trace_writer_last_error();
     if (strlen(err) == 0)
         GATE_FAIL(G, "the refusal set NO last_error. This is the defect the "
-                     "writer's own history records for three other void entry "
-                     "points: a C caller's steps went missing with nothing in "
-                     "last_error to say why. It returned %llu",
+                      "writer's own history records for three other void entry "
+                      "points: a C caller's steps went missing with nothing in "
+                      "last_error to say why. It returned %llu",
                   (unsigned long long)bad);
     if (strstr(err, PROBE) == NULL)
         GATE_FAIL(G, "the refusal does not name the path (`%s`); got: %s",
                   PROBE, err);
     if (bad != CT_TW_INVALID_PATH_ID)
         GATE_FAIL(G, "a zero line count returned a plausible id (%llu) "
-                     "instead of CT_TW_INVALID_PATH_ID. A file sized 0 shares "
-                     "its base with the next file, so the caller would go on "
-                     "to attach source views and steps to a version the space "
-                     "cannot address", (unsigned long long)bad);
+                      "instead of CT_TW_INVALID_PATH_ID. A file sized 0 shares "
+                      "its base with the next file, so the caller would go on "
+                      "to attach source views and steps to a version the space "
+                      "cannot address", (unsigned long long)bad);
     printf("refusal_error=%s\n", err);
 
     /* And a second refusal shape: a path this writer has never seen must NOT
@@ -323,7 +323,7 @@ static int refusal(const char *out_dir) {
     uint64_t unknown = trace_writer_current_path_id(w, "res://gdh3/never.gd");
     if (unknown != CT_TW_INVALID_PATH_ID)
         GATE_FAIL(G, "current_path_id answered %llu for a path that was never "
-                     "registered", (unsigned long long)unknown);
+                      "registered", (unsigned long long)unknown);
     if (strlen(trace_writer_last_error()) == 0)
         GATE_FAIL(G, "current_path_id refused an unknown path silently");
 

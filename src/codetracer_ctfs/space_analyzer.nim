@@ -45,6 +45,7 @@ type
     totalBlocks*: int
     totalBytes*: uint64
     headerBytes*: int
+    freeListRootBytes*: int
     fileEntryBytes*: int
     files*: seq[FileStats]
     namespaces*: seq[NamespaceStats]
@@ -55,6 +56,12 @@ proc countFileBlocks(
     data: openArray[byte], mapBlock: uint64,
     blockSize: int): int =
   ## Count how many data blocks a file uses by walking the mapping chain.
+  ## An empty member uses none and a direct one exactly one
+  ## (`ctfs-container.md` §2).
+  if mapBlock == 0:
+    return 0
+  if isDirectMapBlock(mapBlock):
+    return 1
   let usable = uint64(blockSize) div 8 - 1
   var count = 0
   var blockIdx: uint64 = 0
@@ -127,23 +134,26 @@ proc analyzeCtfs*(data: openArray[byte],
 
   if not hasCtfsMagic(data):
     return err("invalid CTFS magic")
+  let versionErr = ctfsVersionError(data)
+  if versionErr.len > 0:
+    return err(versionErr)
 
-  # Read max root entries from extended header.
-  var maxEntries = int(DefaultMaxRootEntries)
-  if data.len >= HeaderSize + ExtHeaderSize:
-    var arr: array[4, byte]
-    for i in 0 ..< 4:
-      arr[i] = data[HeaderSize + 4 + i]
-    maxEntries = int(fromBytesLE(uint32, arr))
+  # Root traversal follows the header; the public blockSize parameter still
+  # controls the analyzer's block accounting exactly as before.
+  let layout = rootDirectoryLayout(data)
+  if layout.error.len > 0: return err(layout.error)
+  let maxEntries = int(layout.entryCount)
+  let entryStart = layout.entryStart
 
   var report: SpaceReport
   report.totalBytes = uint64(data.len)
   report.totalBlocks = data.len div blockSize
   report.headerBytes = HeaderSize + ExtHeaderSize
+  report.freeListRootBytes = entryStart - report.headerBytes
   report.fileEntryBytes = maxEntries * FileEntrySize
 
   for i in 0 ..< maxEntries:
-    let off = HeaderSize + ExtHeaderSize + i * FileEntrySize
+    let off = entryStart + i * FileEntrySize
     if off + FileEntrySize > data.len:
       break
 
@@ -290,6 +300,7 @@ proc toJson*(report: SpaceReport): string {.raises: [].} =
   j["totalBlocks"] = newJInt(report.totalBlocks)
   j["totalBytes"] = newJInt(int(report.totalBytes))
   j["headerBytes"] = newJInt(report.headerBytes)
+  j["freeListRootBytes"] = newJInt(report.freeListRootBytes)
   j["fileEntryBytes"] = newJInt(report.fileEntryBytes)
 
   var filesArr = newJArray()
@@ -364,6 +375,7 @@ proc toText*(report: SpaceReport): string {.raises: [].} =
   lines.add("Total blocks: " & $report.totalBlocks)
   lines.add("Total bytes:  " & $report.totalBytes)
   lines.add("Header bytes: " & $report.headerBytes)
+  lines.add("Free-list root bytes: " & $report.freeListRootBytes)
   lines.add("File entry bytes: " & $report.fileEntryBytes)
   lines.add("")
 

@@ -5,24 +5,21 @@ when defined(nimPreviewSlimSystem):
 
 ## Binary meta.dat writer for CTFS trace metadata.
 ##
-## Layout (version 4; version 5 adds one word, marked below):
+## Layout (version 6, `internal-files.md` §"Metadata (meta.dat)"):
 ##   [4] magic "CTMD"
-##   [2] version u16 LE
+##   [2] version u16 LE (6)
 ##   [2] flags u16 LE (bit 0: has_mcr_fields,
 ##                    bit 1: has_replay_launch_fields,
 ##                    bit 2: has_layout_snapshot,
-##                    bit 3: has_trace_filter_provenance)
-##   [4] flags_ext u32 LE   -- VERSION 5 ONLY (bit 0: has_source_reload)
-##                            Absent at version 4.  The version field is
-##                            the discriminator; nothing about the bytes
-##                            distinguishes the two shapes.
+##                    bit 3: has_trace_filter_provenance, ...)
+##   [4] flags_ext u32 LE   -- always present (bit 0: has_source_reload)
 ##   varint-prefixed recording_id string  (M-REC-1; required, UUIDv7,
 ##                                         lowercase hyphenated 36-char form)
 ##   varint-prefixed program string
 ##   varint args_count, then varint-prefixed arg strings
 ##   varint-prefixed workdir string
 ##   varint-prefixed recorder_id string
-##   varint paths_count, then varint-prefixed path strings
+##   (no path list: a trace's source paths are `paths.dat`'s records)
 ##   if has_mcr_fields:
 ##     varint tick_source
 ##     varint total_threads
@@ -122,6 +119,14 @@ when defined(nimPreviewSlimSystem):
 ##        ``MetaDatVersionExtendedFlags`` and
 ##        ``codetracer-specs/Planned-Features/GDScript-Hot-Reload-Multi-Version-Sources.md``
 ##        §6.3 / GDH-OQ-2.
+##   v6 — (2026-10-01): the path list after ``recorder_id`` is gone —
+##        ``paths.dat`` is the only list of source paths — and
+##        ``flags_ext`` is always present, so there is one header length.
+##        Readers refuse every other version, naming it: the bytes after
+##        ``recorder_id`` mean something different in v5 and below.
+##        ``meta.dat`` is written once, complete, at open; every flag is
+##        fixed then, so ``FlagExtHasSourceReload`` is a capability the
+##        recorder declares up front rather than a record of what happened.
 
 import std/options
 import std/strutils
@@ -131,69 +136,17 @@ import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
 import ./varint
 import ./uuid_v7
-import ./gdh2_arms
 
 const
   MetaDatMagic*: array[4, byte] = [0x43'u8, 0x54, 0x4D, 0x44]  # "CTMD"
-  MetaDatVersion*: uint16 = 4
-    ## The version written when NO extended flag is set — which is every
-    ## container any recorder produces today.  Kept at 4 deliberately:
-    ## see ``MetaDatVersionExtendedFlags``.
-  MetaDatVersionExtendedFlags*: uint16 = 5
-    ## GDH-M2 (2026-09-10) — the version written when at least one
-    ## EXTENDED flag is set.  A v5 header is a v4 header with a
-    ## ``[4] flags_ext u32 LE`` word inserted immediately after the
-    ## ``[2] flags u16 LE`` word; everything after it is unchanged.
-    ##
-    ## **Why the field widened rather than spending "the last bit".**
-    ## There is no last bit.  Bits 0..15 are all assigned above, and bit
-    ## 15 (``FlagHasCorrelationIndex``) took the final one.  GDH-OQ-2 was
-    ## posed as "spend bit 15 or widen"; the first arm was already gone
-    ## when the question was written, so widening is the only option that
-    ## exists, not the more expensive of two.
-    ##
-    ## **Why the version is CONDITIONAL rather than bumped outright.**
-    ## An unconditional bump would change the bytes of every container,
-    ## including ones with no reload in them — which GDH-G9 forbids, and
-    ## which would make every current reader refuse every current trace
-    ## for a feature it does not use.  Emitting v5 only when an extended
-    ## flag is actually set gives three properties at once:
-    ##
-    ##   * a recording with no reload is BYTE-IDENTICAL to what this
-    ##     writer produced before GDH-M2 — same version, same 8-byte
-    ##     header, no ext word;
-    ##   * a reader that predates this constant refuses a v5 container by
-    ##     name (``unsupported version 5``) at metadata-parse time,
-    ##     before a step stream is touched — the same strict-rejection
-    ##     rollout rule bits 13/14/15 record, obtained from the version
-    ##     field instead of from a flag bit there is no room for;
-    ##   * the container carries its own discriminator, so the two header
-    ##     shapes are never distinguished by guessing.  That is the rule
-    ##     the v4 bump itself was written to enforce (see the v4 note in
-    ##     the version history): when two encodings of one field are both
-    ##     in range, the version is what tells them apart.
-    ##
-    ## The rollout cost is unchanged from a flag bit's: reader support
-    ## must ship everywhere BEFORE any writer sets an extended flag.
-  SupportedMetaDatVersions*: array[2, uint16] = [4'u16, 5'u16]
-    ## Every schema version ``readMetaDat`` decodes.  A singleton until
-    ## GDH-M2; v5 differs from v4 by exactly the ``flags_ext`` word, and
-    ## the version says which shape the bytes are in, so accepting both
-    ## costs no ambiguity.  Versions at or below
-    ## ``LastShiftedGlobalIndexVersion`` are refused by name before this
-    ## set is consulted.
-  LastShiftedGlobalIndexVersion*: uint16 = 3
-    ## The highest schema version whose writer packed a line-only
-    ## ``global_position_index`` as ``prefixSum[path_id] + line``.
-    ##
-    ## Containers at or below it are refused by ``readMetaDat``: their
-    ## addresses are one above what the current decode inverts, and
-    ## nothing else in the container says so.  It is named rather than
-    ## written as a literal `3` at the refusal because the refusal and
-    ## this definition have to move together — a later version that
-    ## changed the packing again would raise the bound, and a reader
-    ## comparing against a stale literal would answer such a container
-    ## instead of refusing it.
+  MetaDatVersion*: uint16 = 6
+    ## The only schema version this library writes or reads
+    ## (`internal-files.md` §"Metadata (meta.dat)", "Version History": v6).
+    ## Every other version is refused by name; pre-1.0 there is no
+    ## compatibility path, and older containers are re-recorded.
+  MetaDatHeaderSize* = 12
+    ## magic (4) + version (2) + flags (2) + flags_ext (4). Version 6 always
+    ## carries `flags_ext`, so this is the one header length.
   FlagHasMcrFields*: uint16 = 1                  # bit 0
   FlagHasReplayLaunchFields*: uint16 = 2         # bit 1 — M-RLP-1 (spec §6A.5)
   FlagHasLayoutSnapshot*: uint16 = 4             # bit 2 — M-RLP-2 (spec §6B.7)
@@ -439,27 +392,12 @@ const
     FlagHasCorrelationIndex)
 
   FlagExtHasSourceReload*: uint32 = 1          # ext bit 0 (global bit 16)
-    ## GDH-M2 — when set, the execution stream is permitted to contain
-    ## step-event tag ``0x08`` (``TagSourceReload``), the source-version
-    ## transition marker of design §6.3.  Clear (and therefore absent,
-    ## since a clear extended word means a v4 header with no word at all)
-    ## means the container carries no reload markers and a reader must
-    ## REFUSE tag 0x08 rather than skip it.
-    ##
-    ## This is the first bit of the ``flags_ext`` u32 that
-    ## ``MetaDatVersionExtendedFlags`` introduces.  It is not additive at
-    ## the reader for exactly the reason bits 13-15 are not: the step
-    ## stream gains a record shape an older decoder cannot measure the
-    ## length of, so an older reader must refuse the container rather
-    ## than decode a shorter, plausible step stream.  The refusal it
-    ## actually performs is on the VERSION (``unsupported version 5``),
-    ## which is why widening was chosen over an escape bit there was no
-    ## room for.
-    ##
-    ## Like bits 13/14/15, no recorder sets it by default: the writer
-    ## sets it only when a ``TagSourceReload`` event was actually
-    ## emitted, so a container without a reload is byte-identical to one
-    ## produced before this constant existed.
+    ## A capability declared at open: the execution stream MAY contain
+    ## step-event tag ``0x08`` (``TagSourceReload``). A trace that declared it
+    ## and recorded no reload is well-formed; a writer refuses a reload in a
+    ## trace that did not declare it, and a reader refuses tag 0x08 in a
+    ## container that does not declare it (`internal-files.md` §"Extended
+    ## flags (`flags_ext`)", `trace-events.md` §"Source Reload Marker").
 
   KnownExtFlags*: uint32 = FlagExtHasSourceReload
     ## Every ``flags_ext`` bit this reader understands.  ``readMetaDat``
@@ -488,7 +426,6 @@ type
     workdir*: string
     args*: seq[string]
     recorderId*: string
-    paths*: seq[string]
     mcrFields*: Option[McrMetaFields]
     replayLaunchFields*: Option[ReplayLaunchFields]
     layoutSnapshotFields*: Option[LayoutSnapshotFields]
@@ -594,8 +531,8 @@ type
       ## addresses by convention.  Like bit 13 this bit is not additive
       ## for readers that predate it — see `FlagHasLineCountTable`.
     hasSourceReload*: bool
-      ## GDH-M2: True iff the header is at schema version 5 AND its
-      ## `flags_ext` word carries `FlagExtHasSourceReload`.  When set,
+      ## GDH-M2: True iff the `flags_ext` word carries
+      ## `FlagExtHasSourceReload`.  When set,
       ## the execution stream may contain step-event tag `0x08`
       ## (`TagSourceReload`) and a reader must pass
       ## `allowSourceReload = true` down to `decodeStepEvent`.  Clear
@@ -604,49 +541,191 @@ type
       ## payload varints as further events and the stream decodes
       ## shorter and plausibly.
     flagsExt*: uint32
-      ## The raw `flags_ext` word — 0 at schema version 4, where the
-      ## word is absent entirely.  Surfaced so a consumer can report
+      ## The raw `flags_ext` word.  Surfaced so a consumer can report
       ## what a container DECLARED, not only what this reader knows how
       ## to act on.
 
-proc writeRawBytes(
-    c: var Ctfs, f: var CtfsInternalFile,
+proc writeRawBytes(buf: var seq[byte],
     data: openArray[byte]): Result[void, string] =
-  c.writeToFile(f, data)
-
-proc writeU16LE(
-    c: var Ctfs, f: var CtfsInternalFile,
-    val: uint16): Result[void, string] =
-  let bytes = [byte(val and 0xFF), byte((val shr 8) and 0xFF)]
-  c.writeToFile(f, bytes)
-
-proc writeU32LE(
-    c: var Ctfs, f: var CtfsInternalFile,
-    val: uint32): Result[void, string] =
-  let bytes = [byte(val and 0xFF), byte((val shr 8) and 0xFF),
-               byte((val shr 16) and 0xFF), byte((val shr 24) and 0xFF)]
-  c.writeToFile(f, bytes)
-
-proc writeVarint(
-    c: var Ctfs, f: var CtfsInternalFile,
-    val: uint64): Result[void, string] =
-  var buf: seq[byte]
-  encodeVarint(val, buf)
-  c.writeToFile(f, buf)
-
-proc writeVarintString(
-    c: var Ctfs, f: var CtfsInternalFile,
-    s: string): Result[void, string] =
-  ? c.writeVarint(f, uint64(s.len))
-  if s.len > 0:
-    let bytes = cast[seq[byte]](s)
-    ? c.writeToFile(f, bytes)
+  buf.add(data)
   ok()
+
+proc writeU16LE(buf: var seq[byte], val: uint16): Result[void, string] =
+  buf.add([byte(val and 0xFF), byte((val shr 8) and 0xFF)])
+  ok()
+
+proc writeU32LE(buf: var seq[byte], val: uint32): Result[void, string] =
+  buf.add([byte(val and 0xFF), byte((val shr 8) and 0xFF),
+           byte((val shr 16) and 0xFF), byte((val shr 24) and 0xFF)])
+  ok()
+
+proc writeVarint(buf: var seq[byte], val: uint64): Result[void, string] =
+  encodeVarint(val, buf)
+  ok()
+
+proc writeVarintString(buf: var seq[byte], s: string): Result[void, string] =
+  ? buf.writeVarint(uint64(s.len))
+  buf.add(s.toOpenArrayByte(0, s.high))
+  ok()
+
+type
+  MetaDatFlagsInput* = object
+    ## Every flag and flag-gated block of a `meta.dat`, as a writer decides it
+    ## at open. Grouped so the CTFS-backed and the buffer-backed writer cannot
+    ## drift apart: both go through `encodeMetaDat`.
+    recorderId*: string
+    mcrFields*: Option[McrMetaFields]
+    replayLaunchFields*: Option[ReplayLaunchFields]
+    layoutSnapshotFields*: Option[LayoutSnapshotFields]
+    filterProvenance*: seq[FilterProvenance]
+    emitFilterProvenance*: bool
+    columnAwareSteps*: bool
+    alternateSourceViews*: bool
+    supportsColumnBreakpoints*: bool
+    supportsColumnMotions*: bool
+    hasCallStream*: bool
+    hasStepStream*: bool
+    hasValueStream*: bool
+    hasIoEventStream*: bool
+    hasInterningTables*: bool
+    hasSpanStream*: bool
+    hasLineCountTable*: bool
+    hasCorrelationIndex*: bool
+    hasSourceReload*: bool
+
+proc encodeMetaDat*(meta: TraceMetadata,
+    input: MetaDatFlagsInput): Result[seq[byte], string] =
+  ## Serialize a version 6 `meta.dat`.
+  ##
+  ## `filterProvenance` records the active trace-filter chain (TF-M7,
+  ## spec § 7).  The flag bit is set whenever `emitFilterProvenance` is
+  ## true OR `filterProvenance.len > 0`; an explicit
+  ## `emitFilterProvenance = true` with an empty sequence is the spec's
+  ## "recorder implements filters but the chain is empty" signal.
+
+  # Recording id must be present and syntactically valid (M-REC-1).
+  ? validateRecordingIdStr(meta.recordingId)
+
+  var buf: seq[byte]
+  ? buf.writeRawBytes(MetaDatMagic)
+  ? buf.writeU16LE(MetaDatVersion)
+
+  var extFlags: uint32 = 0
+  if input.hasSourceReload:
+    extFlags = extFlags or FlagExtHasSourceReload
+
+  var flags: uint16 = 0
+  if input.mcrFields.isSome:
+    flags = flags or FlagHasMcrFields
+  if input.replayLaunchFields.isSome:
+    flags = flags or FlagHasReplayLaunchFields
+  if input.layoutSnapshotFields.isSome:
+    flags = flags or FlagHasLayoutSnapshot
+  let emitProvenance = input.emitFilterProvenance or
+    input.filterProvenance.len > 0
+  if emitProvenance:
+    flags = flags or FlagHasTraceFilterProvenance
+  if input.columnAwareSteps:
+    flags = flags or FlagHasColumnAwareSteps
+  if input.alternateSourceViews:
+    flags = flags or FlagHasAlternateSourceViews
+  # Capability bits only make sense on top of the wire-format bit;
+  # silently dropping them when columnAwareSteps is false would be a
+  # misleading round-trip.
+  if (input.supportsColumnBreakpoints or input.supportsColumnMotions) and
+      not input.columnAwareSteps:
+    return err(
+      "meta.dat: capability flags (column breakpoints / motions) " &
+      "require columnAwareSteps to be enabled")
+  if input.supportsColumnBreakpoints:
+    flags = flags or FlagSupportsColumnBreakpoints
+  if input.supportsColumnMotions:
+    flags = flags or FlagSupportsColumnMotions
+  if input.hasCallStream:
+    flags = flags or FlagHasCallStream
+  if input.hasStepStream:
+    flags = flags or FlagHasStepStream
+  if input.hasValueStream:
+    flags = flags or FlagHasValueStream
+  if input.hasIoEventStream:
+    flags = flags or FlagHasIoEventStream
+  if input.hasInterningTables:
+    flags = flags or FlagHasInterningTables
+  if input.hasSpanStream:
+    flags = flags or FlagHasSpanStream
+  # A column-aware paths.dat record already carries `line_count` as the
+  # length of its per-line table, so bit 14 on top of bit 4 would declare
+  # the same field twice under two incompatible record layouts.
+  if input.hasLineCountTable and input.columnAwareSteps:
+    return err(
+      "meta.dat: hasLineCountTable and columnAwareSteps are mutually " &
+      "exclusive — a Layout A record already carries the file's " &
+      "line_count as the length of its per-line table")
+  if input.hasLineCountTable:
+    flags = flags or FlagHasLineCountTable
+  if input.hasCorrelationIndex:
+    flags = flags or FlagHasCorrelationIndex
+  ? buf.writeU16LE(flags)
+  ? buf.writeU32LE(extFlags)
+
+  ? buf.writeVarintString(meta.recordingId)
+  ? buf.writeVarintString(meta.program)
+  ? buf.writeVarint(uint64(meta.args.len))
+  for arg in meta.args:
+    ? buf.writeVarintString(arg)
+  ? buf.writeVarintString(meta.workdir)
+  ? buf.writeVarintString(input.recorderId)
+
+  # MCR fields
+  if input.mcrFields.isSome:
+    let mcr = input.mcrFields.get()
+    ? buf.writeVarint(uint64(ord(mcr.tickSource)))
+    ? buf.writeVarint(uint64(mcr.totalThreads))
+    ? buf.writeVarint(uint64(ord(mcr.atomicMode)))
+    ? buf.writeVarint(mcr.totalEvents)
+    ? buf.writeVarint(uint64(mcr.totalCheckpoints))
+    ? buf.writeVarint(mcr.startTimeUnixUs)
+    ? buf.writeVarintString(mcr.platform)
+    ? buf.writeVarintString(mcr.tickGranularity)
+    ? buf.writeVarintString(mcr.tickSourceStr)
+    ? buf.writeVarintString(mcr.atomicModeStr)
+    ? buf.writeVarintString(mcr.startTimeStr)
+    ? buf.writeVarintString(mcr.hookProfile)
+    ? buf.writeVarint(uint64(mcr.hookStrategies.len))
+    for st in mcr.hookStrategies:
+      ? buf.writeVarintString(st)
+
+  # Replay-launch fields (M-RLP-1, spec §6A.5).  One u8 flag.
+  if input.replayLaunchFields.isSome:
+    let rl = input.replayLaunchFields.get()
+    let aslrByte: array[1, byte] = [byte(if rl.aslrDisabled: 1 else: 0)]
+    ? buf.writeRawBytes(aslrByte)
+
+  # Layout snapshot (M-RLP-2, spec §6B.7).  u64 hash, varint len, bytes.
+  if input.layoutSnapshotFields.isSome:
+    let ls = input.layoutSnapshotFields.get()
+    var hashBytes: array[8, byte]
+    let h = ls.layoutHash
+    for i in 0 ..< 8:
+      hashBytes[i] = byte((h shr (i * 8)) and 0xFF'u64)
+    ? buf.writeRawBytes(hashBytes)
+    ? buf.writeVarint(uint64(ls.layoutFingerprint.len))
+    if ls.layoutFingerprint.len > 0:
+      ? buf.writeRawBytes(ls.layoutFingerprint)
+
+  # Trace filter provenance (TF-M7, spec §7).  varint count, then for
+  # each entry: (varint-length path string, 32 raw sha256 bytes).
+  if emitProvenance:
+    ? buf.writeVarint(uint64(input.filterProvenance.len))
+    for entry in input.filterProvenance:
+      ? buf.writeVarintString(entry.path)
+      ? buf.writeRawBytes(entry.sha256)
+
+  ok(buf)
 
 proc writeMetaDat*(
     c: var Ctfs, f: var CtfsInternalFile,
     meta: TraceMetadata,
-    paths: openArray[string],
     recorderId: string = "",
     mcrFields: Option[McrMetaFields] = none(McrMetaFields),
     replayLaunchFields: Option[ReplayLaunchFields] =
@@ -669,173 +748,24 @@ proc writeMetaDat*(
     hasCorrelationIndex: bool = false,
     hasSourceReload: bool = false,
 ): Result[void, string] =
-  ## Write binary meta.dat to a CTFS internal file.
-  ##
-  ## `filterProvenance` records the active trace-filter chain (TF-M7,
-  ## spec § 7).  The flag bit is set whenever `emitFilterProvenance` is
-  ## true OR `filterProvenance.len > 0`; an explicit
-  ## `emitFilterProvenance = true` with an empty sequence is the spec's
-  ## "recorder implements filters but the chain is empty" signal.
-
-  # Recording id must be present and syntactically valid.  Pre-1.0
-  # the spec forbids backcompat: a missing or malformed id is a write
-  # error here so that no caller can accidentally produce a v3 trace
-  # without the M-REC-1 spine.
-  ? validateRecordingIdStr(meta.recordingId)
-
-  # Magic
-  ? c.writeRawBytes(f, MetaDatMagic)
-
-  # Version.  GDH-M2: the schema version is decided by whether any
-  # EXTENDED flag is set, so it is computed here and written below,
-  # after the flag words are assembled.  A container with no extended
-  # flag stays at ``MetaDatVersion`` and its bytes are unchanged.
-  var extFlags: uint32 = 0
-  # FALSIFIER (``gdh2FalsifyAlwaysSetBit``, gdh2_no_reload_container_is_byte_identical):
-  # stamp the extended flag on every container instead of only on one
-  # that carries a marker.  This is the rollout hazard bit 13's own
-  # documentation warns about, and here it is worse than a spare bit
-  # would be: setting it also moves the header to schema version 5, so
-  # EVERY reader in the workspace refuses EVERY new recording, for a
-  # feature the recording does not use.
-  if hasSourceReload or gdh2Arm(gdh2FalsifyAlwaysSetBit):
-    extFlags = extFlags or FlagExtHasSourceReload
-  let schemaVersion =
-    if extFlags != 0: MetaDatVersionExtendedFlags else: MetaDatVersion
-  ? c.writeU16LE(f, schemaVersion)
-
-  # Flags
-  var flags: uint16 = 0
-  if mcrFields.isSome:
-    flags = flags or FlagHasMcrFields
-  if replayLaunchFields.isSome:
-    flags = flags or FlagHasReplayLaunchFields
-  if layoutSnapshotFields.isSome:
-    flags = flags or FlagHasLayoutSnapshot
-  let emitProvenance = emitFilterProvenance or filterProvenance.len > 0
-  if emitProvenance:
-    flags = flags or FlagHasTraceFilterProvenance
-  if columnAwareSteps:
-    flags = flags or FlagHasColumnAwareSteps
-  if alternateSourceViews:
-    flags = flags or FlagHasAlternateSourceViews
-  # Capability bits only make sense on top of the wire-format bit;
-  # silently dropping them when columnAwareSteps is false would be a
-  # misleading round-trip.  Surface the contract explicitly so an
-  # accidental misuse fails the write rather than producing a header
-  # that the reader's invariant check will later reject.
-  if (supportsColumnBreakpoints or supportsColumnMotions) and
-      not columnAwareSteps:
-    return err(
-      "meta.dat: capability flags (column breakpoints / motions) " &
-      "require columnAwareSteps to be enabled")
-  if supportsColumnBreakpoints:
-    flags = flags or FlagSupportsColumnBreakpoints
-  if supportsColumnMotions:
-    flags = flags or FlagSupportsColumnMotions
-  if hasCallStream:
-    flags = flags or FlagHasCallStream
-  if hasStepStream:
-    flags = flags or FlagHasStepStream
-  if hasValueStream:
-    flags = flags or FlagHasValueStream
-  if hasIoEventStream:
-    flags = flags or FlagHasIoEventStream
-  if hasInterningTables:
-    flags = flags or FlagHasInterningTables
-  if hasSpanStream:
-    flags = flags or FlagHasSpanStream
-  # A column-aware paths.dat record already carries `line_count` as the
-  # length of its per-line table, so bit 14 on top of bit 4 would declare
-  # the same field twice under two incompatible record layouts and leave
-  # the reader to pick one.  Refuse rather than write a header no reader
-  # can interpret unambiguously.
-  if hasLineCountTable and columnAwareSteps:
-    return err(
-      "meta.dat: hasLineCountTable and columnAwareSteps are mutually " &
-      "exclusive — a Layout A record already carries the file's " &
-      "line_count as the length of its per-line table")
-  if hasLineCountTable:
-    flags = flags or FlagHasLineCountTable
-  if hasCorrelationIndex:
-    flags = flags or FlagHasCorrelationIndex
-  ? c.writeU16LE(f, flags)
-
-  # Extended flags — schema version 5 only.  Absent at version 4, which
-  # is what keeps a no-reload container byte-identical.
-  if schemaVersion == MetaDatVersionExtendedFlags:
-    ? c.writeU32LE(f, extFlags)
-
-  # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.
-  ? c.writeVarintString(f, meta.recordingId)
-
-  # Program
-  ? c.writeVarintString(f, meta.program)
-
-  # Args
-  ? c.writeVarint(f, uint64(meta.args.len))
-  for arg in meta.args:
-    ? c.writeVarintString(f, arg)
-
-  # Workdir
-  ? c.writeVarintString(f, meta.workdir)
-
-  # Recorder ID
-  ? c.writeVarintString(f, recorderId)
-
-  # Paths
-  ? c.writeVarint(f, uint64(paths.len))
-  for p in paths:
-    ? c.writeVarintString(f, p)
-
-  # MCR fields
-  if mcrFields.isSome:
-    let mcr = mcrFields.get()
-    ? c.writeVarint(f, uint64(ord(mcr.tickSource)))
-    ? c.writeVarint(f, uint64(mcr.totalThreads))
-    ? c.writeVarint(f, uint64(ord(mcr.atomicMode)))
-    ? c.writeVarint(f, mcr.totalEvents)
-    ? c.writeVarint(f, uint64(mcr.totalCheckpoints))
-    ? c.writeVarint(f, mcr.startTimeUnixUs)
-    ? c.writeVarintString(f, mcr.platform)
-    ? c.writeVarintString(f, mcr.tickGranularity)
-    ? c.writeVarintString(f, mcr.tickSourceStr)
-    ? c.writeVarintString(f, mcr.atomicModeStr)
-    ? c.writeVarintString(f, mcr.startTimeStr)
-    ? c.writeVarintString(f, mcr.hookProfile)
-    ? c.writeVarint(f, uint64(mcr.hookStrategies.len))
-    for s in mcr.hookStrategies:
-      ? c.writeVarintString(f, s)
-
-  # Replay-launch fields (M-RLP-1, spec §6A.5).  One u8 flag.
-  if replayLaunchFields.isSome:
-    let rl = replayLaunchFields.get()
-    let aslrByte: array[1, byte] = [byte(if rl.aslrDisabled: 1 else: 0)]
-    ? c.writeRawBytes(f, aslrByte)
-
-  # Layout snapshot (M-RLP-2, spec §6B.7).  u64 hash, varint len, bytes.
-  if layoutSnapshotFields.isSome:
-    let ls = layoutSnapshotFields.get()
-    var hashBytes: array[8, byte]
-    let h = ls.layoutHash
-    for i in 0 ..< 8:
-      hashBytes[i] = byte((h shr (i * 8)) and 0xFF'u64)
-    ? c.writeRawBytes(f, hashBytes)
-    ? c.writeVarint(f, uint64(ls.layoutFingerprint.len))
-    if ls.layoutFingerprint.len > 0:
-      ? c.writeRawBytes(f, ls.layoutFingerprint)
-
-  # Trace filter provenance (TF-M7, spec §7).  varint count, then for
-  # each entry: (varint-length path string, 32 raw sha256 bytes).
-  if emitProvenance:
-    ? c.writeVarint(f, uint64(filterProvenance.len))
-    for entry in filterProvenance:
-      ? c.writeVarintString(f, entry.path)
-      var shaBytes = newSeq[byte](32)
-      for i in 0 ..< 32:
-        shaBytes[i] = entry.sha256[i]
-      ? c.writeRawBytes(f, shaBytes)
-
+  ## Write a version 6 `meta.dat` to a CTFS internal file, in one append.
+  let buf = ? encodeMetaDat(meta, MetaDatFlagsInput(
+    recorderId: recorderId, mcrFields: mcrFields,
+    replayLaunchFields: replayLaunchFields,
+    layoutSnapshotFields: layoutSnapshotFields,
+    filterProvenance: @filterProvenance,
+    emitFilterProvenance: emitFilterProvenance,
+    columnAwareSteps: columnAwareSteps,
+    alternateSourceViews: alternateSourceViews,
+    supportsColumnBreakpoints: supportsColumnBreakpoints,
+    supportsColumnMotions: supportsColumnMotions,
+    hasCallStream: hasCallStream, hasStepStream: hasStepStream,
+    hasValueStream: hasValueStream, hasIoEventStream: hasIoEventStream,
+    hasInterningTables: hasInterningTables, hasSpanStream: hasSpanStream,
+    hasLineCountTable: hasLineCountTable,
+    hasCorrelationIndex: hasCorrelationIndex,
+    hasSourceReload: hasSourceReload))
+  ? c.writeToFile(f, buf)
   ok()
 
 # ---------------------------------------------------------------------------
@@ -857,80 +787,37 @@ proc readString(data: openArray[byte], pos: var int): Result[string, string] =
   ok(s)
 
 proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
-  ## Parse binary meta.dat from raw bytes.
-  ## Validates magic and version, returns MetaDatContents or an error.
-  if data.len < 8:
-    return err("meta.dat too short: need at least 8 bytes, got " & $data.len)
-
-  # Check magic
-  if data[0] != MetaDatMagic[0] or data[1] != MetaDatMagic[1] or
-      data[2] != MetaDatMagic[2] or data[3] != MetaDatMagic[3]:
+  ## Parse a version 6 `meta.dat`.
+  ##
+  ## Every other version is refused, naming it (`internal-files.md`
+  ## §"Version History", v6): the bytes after `recorder_id` mean something
+  ## different in version 5 and below — a path list — and a reader that
+  ## guessed would read a path count as an MCR field. Versions 3 and below
+  ## also packed line-only step positions one line higher than version 4 on.
+  if data.len >= 4 and (data[0] != MetaDatMagic[0] or
+      data[1] != MetaDatMagic[1] or data[2] != MetaDatMagic[2] or
+      data[3] != MetaDatMagic[3]):
     return err("meta.dat: bad magic bytes")
+  if data.len < MetaDatHeaderSize:
+    return err("meta.dat too short: a version " & $MetaDatVersion &
+      " header is " & $MetaDatHeaderSize & " bytes, got " & $data.len)
 
   let version = readU16LE(data, 4)
-  if version <= LastShiftedGlobalIndexVersion:
-    # Refused by name, not by the generic version mismatch below, because
-    # the consequence of reading one anyway is not a parse failure — it is
-    # a plausible wrong answer at every step.  See the v4 note in the
-    # version history above.
-    # Phrased about the WRITER, not about this container's contents: the
-    # gate is on the schema version, so it also refuses a v3 container that
-    # holds no steps at all (a ct-mcr recording, say). Saying "its steps
-    # were packed as" would be a claim about such a trace that is not true.
-    return err("meta.dat: schema version " & $version &
-      " predates the global line index correction, and this trace cannot " &
-      "be read. Writers at that version packed a line-only step position " &
-      "as prefixSum[path_id] + line; version " & $MetaDatVersion &
-      " packs prefixSum[path_id] + (line - 1). Both land inside the " &
-      "trace's address space, so a step read under the current decode " &
-      "would come back one line high rather than fail, and the container " &
-      "records nothing else that tells the two apart. Re-record the trace " &
-      "with a current recorder. Spec: " &
-      "codetracer-trace-format-spec/internal-files.md \"Global Line Index\"")
-  var versionSupported = false
-  for v in SupportedMetaDatVersions:
-    if version == v:
-      versionSupported = true
-  if not versionSupported:
-    return err("meta.dat: unsupported version " & $version & ", expected " &
-      $MetaDatVersion & " or " & $MetaDatVersionExtendedFlags)
+  if version != MetaDatVersion:
+    return err("meta.dat: schema version " & $version & " is not supported; " &
+      "this reader reads version " & $MetaDatVersion & " only. Re-record " &
+      "the trace with a current recorder (internal-files.md \"Metadata " &
+      "(meta.dat)\", Version History)")
 
   let flags = readU16LE(data, 6)
 
-  # GDH-M2: the extended flag word.  Present at schema version 5 ONLY,
-  # immediately after the u16 flags, and absent at version 4 — the
-  # version field is the sole discriminator, exactly as it is for the
-  # v3/v4 global-index encode.  Every consumer that reads the u16 flags
-  # at offset 6 is therefore unaffected by the widening; only a consumer
-  # that reads PAST it must know the version.
-  var flagsExt: uint32 = 0
-  var headerEnd = 8
-  if version == MetaDatVersionExtendedFlags:
-    if data.len < 12:
-      return err("meta.dat: schema version " &
-        $MetaDatVersionExtendedFlags & " declares a flags_ext word but " &
-        "the header is only " & $data.len & " bytes")
-    flagsExt = uint32(data[8]) or (uint32(data[9]) shl 8) or
-      (uint32(data[10]) shl 16) or (uint32(data[11]) shl 24)
-    headerEnd = 12
-    let unknownExt = flagsExt and (not KnownExtFlags)
-    if unknownExt != 0:
-      return err("meta.dat: unknown extended flag bits set: 0x" &
-        toHex(BiggestInt(unknownExt), 8))
-    if flagsExt == 0:
-      # A v5 header whose extended word is zero is a container that
-      # spent a schema version on nothing.  Refused rather than
-      # accepted, because it is the shape a writer produces when it
-      # bumps the version unconditionally — the mutation GDH-G9's
-      # falsifier names — and accepting it would make "no reload" and
-      # "reload machinery present but silent" indistinguishable at the
-      # byte level.
-      return err("meta.dat: schema version " &
-        $MetaDatVersionExtendedFlags & " with an all-zero flags_ext " &
-        "word. Version " & $MetaDatVersionExtendedFlags & " exists to " &
-        "carry extended flags; a container with none must be written " &
-        "at version " & $MetaDatVersion & " so that it stays " &
-        "byte-identical to one produced before the word existed")
+  let flagsExt = uint32(data[8]) or (uint32(data[9]) shl 8) or
+    (uint32(data[10]) shl 16) or (uint32(data[11]) shl 24)
+  let unknownExt = flagsExt and (not KnownExtFlags)
+  if unknownExt != 0:
+    return err("meta.dat: flags_ext carries bits this reader does not " &
+      "implement: 0x" & toHex(BiggestInt(unknownExt), 8))
+  let headerEnd = MetaDatHeaderSize
 
   # P6.5: strict back-compat rejection.  Any flag bit outside this
   # reader's ``KnownFlags`` set causes the open to fail cleanly rather
@@ -1004,11 +891,6 @@ proc readMetaDat*(data: openArray[byte]): Result[MetaDatContents, string] =
 
   # Recorder ID
   contents.recorderId = ? readString(data, pos)
-
-  # Paths
-  let pathsCount = ? decodeVarint(data, pos)
-  for i in 0'u64 ..< pathsCount:
-    contents.paths.add(? readString(data, pos))
 
   # MCR fields
   if (flags and FlagHasMcrFields) != 0:
@@ -1118,7 +1000,6 @@ proc appendVarintStr(buf: var seq[byte], s: string) =
 
 proc writeMetaDatToBuffer*(
     meta: TraceMetadata,
-    paths: openArray[string],
     recorderId: string = "",
     mcrFields: Option[McrMetaFields] = none(McrMetaFields),
     replayLaunchFields: Option[ReplayLaunchFields] =
@@ -1138,145 +1019,30 @@ proc writeMetaDatToBuffer*(
     hasInterningTables: bool = false,
     hasSpanStream: bool = false,
     hasLineCountTable: bool = false,
+    hasCorrelationIndex: bool = false,
     hasSourceReload: bool = false,
 ): seq[byte] =
-  ## Serialize meta.dat to an in-memory byte buffer.
-  ## This is the same format as writeMetaDat but without needing a CTFS container.
+  ## Serialize meta.dat to an in-memory byte buffer — the same bytes
+  ## `writeMetaDat` writes, from the same `encodeMetaDat`.
   ##
-  ## A malformed `meta.recordingId` aborts via `doAssert`.  Callers
-  ## must pass a syntactically valid UUIDv7 (M-REC-1, spec §3); this
-  ## proc has no `Result` return type so we cannot surface a recoverable
-  ## error.  Use `writeMetaDat` (CTFS-based) when you need that.
-  doAssert validateRecordingIdStr(meta.recordingId).isOk,
-    "writeMetaDatToBuffer: meta.recordingId is not a canonical UUIDv7"
-
-  result = newSeq[byte]()
-
-  # Magic
-  for b in MetaDatMagic:
-    result.add(b)
-
-  # Version.  GDH-M2: version 5 iff an EXTENDED flag is set; see
-  # ``MetaDatVersionExtendedFlags``.
-  var extFlags: uint32 = 0
-  if hasSourceReload:
-    extFlags = extFlags or FlagExtHasSourceReload
-  let schemaVersion =
-    if extFlags != 0: MetaDatVersionExtendedFlags else: MetaDatVersion
-  result.appendU16LE(schemaVersion)
-
-  # Flags
-  var flags: uint16 = 0
-  if mcrFields.isSome:
-    flags = flags or FlagHasMcrFields
-  if replayLaunchFields.isSome:
-    flags = flags or FlagHasReplayLaunchFields
-  if layoutSnapshotFields.isSome:
-    flags = flags or FlagHasLayoutSnapshot
-  let emitProvenance = emitFilterProvenance or filterProvenance.len > 0
-  if emitProvenance:
-    flags = flags or FlagHasTraceFilterProvenance
-  if columnAwareSteps:
-    flags = flags or FlagHasColumnAwareSteps
-  if alternateSourceViews:
-    flags = flags or FlagHasAlternateSourceViews
-  # ``writeMetaDatToBuffer`` is the buffer-side mirror of
-  # ``writeMetaDat`` and has no Result return type — surface the
-  # capability/columnAwareSteps invariant via ``doAssert`` (already the
-  # convention used for the recordingId validation above) so the test
-  # suite catches the misuse loud and clear.
-  doAssert (not supportsColumnBreakpoints and not supportsColumnMotions) or
-      columnAwareSteps,
-    "writeMetaDatToBuffer: capability flags require columnAwareSteps"
-  if supportsColumnBreakpoints:
-    flags = flags or FlagSupportsColumnBreakpoints
-  if supportsColumnMotions:
-    flags = flags or FlagSupportsColumnMotions
-  if hasCallStream:
-    flags = flags or FlagHasCallStream
-  if hasStepStream:
-    flags = flags or FlagHasStepStream
-  if hasValueStream:
-    flags = flags or FlagHasValueStream
-  if hasIoEventStream:
-    flags = flags or FlagHasIoEventStream
-  if hasInterningTables:
-    flags = flags or FlagHasInterningTables
-  if hasSpanStream:
-    flags = flags or FlagHasSpanStream
-  # See writeMetaDat for why the two bits are mutually exclusive.  This
-  # entry point has no Result return, so the contract is a doAssert.
-  doAssert not (hasLineCountTable and columnAwareSteps),
-    "writeMetaDatToBuffer: hasLineCountTable and columnAwareSteps are " &
-    "mutually exclusive"
-  if hasLineCountTable:
-    flags = flags or FlagHasLineCountTable
-  result.appendU16LE(flags)
-
-  # Extended flags — schema version 5 only (absent at version 4).
-  if schemaVersion == MetaDatVersionExtendedFlags:
-    result.appendU32LE(extFlags)
-
-  # Recording id (UUIDv7, canonical 36-char form).  M-REC-1.
-  result.appendVarintStr(meta.recordingId)
-
-  # Program
-  result.appendVarintStr(meta.program)
-
-  # Args
-  encodeVarint(uint64(meta.args.len), result)
-  for arg in meta.args:
-    result.appendVarintStr(arg)
-
-  # Workdir
-  result.appendVarintStr(meta.workdir)
-
-  # Recorder ID
-  result.appendVarintStr(recorderId)
-
-  # Paths
-  encodeVarint(uint64(paths.len), result)
-  for p in paths:
-    result.appendVarintStr(p)
-
-  # MCR fields
-  if mcrFields.isSome:
-    let mcr = mcrFields.get()
-    encodeVarint(uint64(ord(mcr.tickSource)), result)
-    encodeVarint(uint64(mcr.totalThreads), result)
-    encodeVarint(uint64(ord(mcr.atomicMode)), result)
-    encodeVarint(mcr.totalEvents, result)
-    encodeVarint(uint64(mcr.totalCheckpoints), result)
-    encodeVarint(mcr.startTimeUnixUs, result)
-    result.appendVarintStr(mcr.platform)
-    result.appendVarintStr(mcr.tickGranularity)
-    result.appendVarintStr(mcr.tickSourceStr)
-    result.appendVarintStr(mcr.atomicModeStr)
-    result.appendVarintStr(mcr.startTimeStr)
-    result.appendVarintStr(mcr.hookProfile)
-    encodeVarint(uint64(mcr.hookStrategies.len), result)
-    for s in mcr.hookStrategies:
-      result.appendVarintStr(s)
-
-  # Replay-launch fields (M-RLP-1, spec §6A.5).  One u8 flag.
-  if replayLaunchFields.isSome:
-    let rl = replayLaunchFields.get()
-    result.add(byte(if rl.aslrDisabled: 1 else: 0))
-
-  # Layout snapshot (M-RLP-2, spec §6B.7).  u64 hash + varint len + bytes.
-  if layoutSnapshotFields.isSome:
-    let ls = layoutSnapshotFields.get()
-    let h = ls.layoutHash
-    for i in 0 ..< 8:
-      result.add(byte((h shr (i * 8)) and 0xFF'u64))
-    encodeVarint(uint64(ls.layoutFingerprint.len), result)
-    for b in ls.layoutFingerprint:
-      result.add(b)
-
-  # Trace filter provenance (TF-M7, spec §7).
-  if emitProvenance:
-    encodeVarint(uint64(filterProvenance.len), result)
-    for entry in filterProvenance:
-      result.appendVarintStr(entry.path)
-      for i in 0 ..< 32:
-        result.add(entry.sha256[i])
+  ## A malformed `meta.recordingId` or a contradictory flag set aborts via
+  ## `doAssert`: this proc has no `Result` return type. Use `encodeMetaDat`
+  ## when you need a recoverable error.
+  let res = encodeMetaDat(meta, MetaDatFlagsInput(
+    recorderId: recorderId, mcrFields: mcrFields,
+    replayLaunchFields: replayLaunchFields,
+    layoutSnapshotFields: layoutSnapshotFields,
+    filterProvenance: @filterProvenance,
+    emitFilterProvenance: emitFilterProvenance,
+    columnAwareSteps: columnAwareSteps,
+    alternateSourceViews: alternateSourceViews,
+    supportsColumnBreakpoints: supportsColumnBreakpoints,
+    supportsColumnMotions: supportsColumnMotions,
+    hasCallStream: hasCallStream, hasStepStream: hasStepStream,
+    hasValueStream: hasValueStream, hasIoEventStream: hasIoEventStream,
+    hasInterningTables: hasInterningTables, hasSpanStream: hasSpanStream,
+    hasLineCountTable: hasLineCountTable,
+    hasCorrelationIndex: hasCorrelationIndex,
+    hasSourceReload: hasSourceReload))
+  doAssert res.isOk, "writeMetaDatToBuffer: " & (if res.isErr: res.error else: "")
+  res.get()

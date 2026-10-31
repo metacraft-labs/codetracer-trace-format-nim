@@ -60,10 +60,13 @@ const
   FinalLine = 11'i64
 
 proc readFfiStr(buf: ptr uint8, length: csize_t): string =
-  if buf.isNil or length == 0.csize_t:
+  # Nil is a failed lookup; an empty name is a non-nil, zero-length buffer
+  # that still has to be freed.
+  if buf.isNil:
     return ""
   result = newString(int(length))
-  copyMem(addr result[0], buf, int(length))
+  if length > 0.csize_t:
+    copyMem(addr result[0], buf, int(length))
   ct_free_buffer(buf)
 
 proc lineOf(r: pointer, step: uint64): uint64 =

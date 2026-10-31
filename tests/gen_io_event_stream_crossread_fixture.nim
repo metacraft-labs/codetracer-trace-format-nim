@@ -11,8 +11,7 @@
 ## Sidecar line format (one per I/O event, in stream order):
 ##   ``kind=<u8>;step_id=<u64>;metadata=<hex>;content=<hex>``
 ## ``kind`` is the on-disk ``EventLogKind`` ordinal (what the Rust reader sees),
-## reconstructed from the decoded coarse ``IOEventKind`` via
-## ``ioEventKindToOrdinal`` (the mapping round-trips for every IOEventKind).
+## which the Nim reader reports exactly.
 ##
 ## The companion Rust test
 ## (`codetracer-trace-format/codetracer_trace_reader/tests/nim_io_event_stream_crossread.rs`)
@@ -72,8 +71,11 @@ proc main() {.raises: [].} =
 
   # Emit a generous interleaving of steps and I/O events so the I/O event stream
   # (default chunk size 64) crosses several chunk boundaries.  Cycle through all
-  # four IOEventKinds and vary metadata (incl. empty) + content (incl. binary).
-  const kinds = [ioStdout, ioStderr, ioFileOp, ioError]
+  # fourteen EventLogKinds and vary metadata (incl. empty) + content (incl.
+  # binary), so the Rust reader sees every kind byte the format assigns.
+  const kinds = [elkWrite, elkWriteFile, elkWriteOther, elkRead, elkReadFile,
+    elkReadOther, elkReadDir, elkOpenDir, elkCloseDir, elkSocket, elkOpen,
+    elkError, elkTraceLogEvent, elkEvmEvent]
   var ioCount = 0
   for ln in 1'u64 .. 250'u64:
     step(ln)
@@ -124,7 +126,7 @@ proc main() {.raises: [].} =
     let evRes = reader.ioEvent(i)
     if evRes.isErr: fail("ioEvent: " & evRes.error)
     let ev = evRes.get()
-    sidecar.add("kind=" & $ioEventKindToOrdinal(ev.kind) &
+    sidecar.add("kind=" & $ord(ev.kind) &
       ";step_id=" & $ev.stepId &
       ";metadata=" & toHex(ev.metadata) &
       ";content=" & toHex(ev.data) & "\n")

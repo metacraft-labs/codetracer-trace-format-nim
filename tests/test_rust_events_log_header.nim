@@ -74,7 +74,7 @@ const
   ## carries.  `meta.dat` and `events.log` are mandatory; the rest are copied
   ## when present so the reconstructed container is a faithful twin.
   mandatoryFiles = ["meta.dat", "events.log"]
-  optionalFiles = ["meta.json", "paths.json", "paths.dat"]
+  optionalFiles = ["meta.json", "paths.json", "paths.dat", "paths.off"]
 
 # ---------------------------------------------------------------------------
 # Fixture construction
@@ -85,6 +85,8 @@ proc buildPlainBundle(path: string) =
   ## stream header, which is what the Nim writer emits.
   removeFile(path)
   var w = newTraceWriter(path, "demo", @["--x"], "/wd").get()
+  # meta.dat is written once, before the first event.
+  doAssert w.writeMetaDat().isOk
   doAssert w.writePath("/wd/main.py").isOk
   doAssert w.writeFunction(0, 1, "main").isOk
   doAssert w.writeStep(0, 1).isOk
@@ -93,7 +95,6 @@ proc buildPlainBundle(path: string) =
   doAssert w.writeValue(0,
     ValueRecord(kind: vrkInt, intVal: 42, intTypeId: TypeId(0))).isOk
   doAssert w.writeReturn().isOk
-  doAssert w.writeMetaDat().isOk
   doAssert w.close().isOk
 
 proc buildHeaderBundle(srcPath, outPath: string) =

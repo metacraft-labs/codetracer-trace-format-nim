@@ -44,6 +44,13 @@ proc readInternalFileData(data: openArray[byte], name: string,
   if fileSize == 0 and mapBlock == 0:
     return @[]
   result = newSeq[byte](int(fileSize))
+  # A member of at most one block is stored direct: `MapBlock` is its only
+  # data block, tagged with bit 63 (`ctfs-container.md` §2).
+  if (mapBlock and (1'u64 shl 63)) != 0:
+    let blockOff = int(mapBlock and not (1'u64 shl 63)) * int(blockSize)
+    for i in 0 ..< int(fileSize):
+      result[i] = data[blockOff + i]
+    return
   let usable = uint64(blockSize) div 8 - 1
   var remaining = int(fileSize)
   var destPos = 0
@@ -126,7 +133,7 @@ proc test_ctfs_magic_version_blocksize() =
   doAssert data[4] == 0xE2'u8, "magic[4] mismatch"
 
   # Version 4, the value `ctfs-container.md` section 1 states.
-  doAssert data[5] == 4'u8, "version should be 4, got: " & $data[5]
+  doAssert data[5] == 5'u8, "version should be 5, got: " & $data[5]
 
   # V4 layout: byte 6 = encryption, byte 7 = max_shards.
   #
@@ -218,7 +225,8 @@ proc test_events_fmt_split_binary() =
 # ---------------------------------------------------------------------------
 
 proc test_meta_dat_structure() =
-  ## The Rust reader takes program / args / workdir / paths from `meta.dat`.
+  ## The Rust reader takes program / args / workdir from `meta.dat` and the
+  ## source paths from `paths.dat` (`meta.dat` version 6 carries none).
   ## The legacy `meta.json` + `paths.json` sidecars this pair of tests used to
   ## assert are retired, so the cross-language contract now rests on the
   ## binary document alone.
@@ -252,10 +260,9 @@ proc test_meta_dat_structure() =
   doAssert meta.program == "cross_program", "program mismatch: " & meta.program
   doAssert meta.args.len == 2, "args length mismatch"
   doAssert meta.workdir == "/w", "workdir mismatch: " & meta.workdir
-  doAssert meta.paths.len == 2, "paths count mismatch: " & $meta.paths.len
-  for i in 0 ..< 2:
-    doAssert meta.paths[i] == testPaths[i],
-      "path mismatch at " & $i & ": " & meta.paths[i]
+  let pathsDat = readInternalFileStr(data, "paths.dat")
+  doAssert pathsDat == testPaths[0] & testPaths[1],
+    "paths.dat does not hold the paths in id order: " & pathsDat
   doAssert meta.recordingId.len > 0, "meta.dat carries no recording_id"
 
   cleanupFile(path)
@@ -615,7 +622,7 @@ proc test_full_ct_file_structure() =
 
   # 1. Magic + version
   doAssert hasCtfsMagic(data)
-  doAssert data[5] == 4'u8
+  doAssert data[5] == 5'u8
 
   # 2. All internal files present
   for name in ["events.log", "events.fmt", "meta.dat"]:
@@ -631,16 +638,14 @@ proc test_full_ct_file_structure() =
   # 3. events.fmt
   doAssert readInternalFileStr(data, "events.fmt") == "split-binary"
 
-  # 4. meta.dat carries the metadata and the paths
+  # 4. meta.dat carries the metadata; paths.dat the paths
   let metaParsed = readMetaDat(readInternalFileData(data, "meta.dat"))
   doAssert metaParsed.isOk, "meta.dat did not parse: " & metaParsed.error
   let meta = metaParsed.get()
   doAssert meta.program == "cross_compat_test"
   doAssert meta.args.len == 2
   doAssert meta.workdir == "/workspace"
-  doAssert meta.paths.len == 2
-  doAssert meta.paths[0] == "/src/main.rs"
-  doAssert meta.paths[1] == "/src/lib.rs"
+  doAssert readInternalFileStr(data, "paths.dat") == "/src/main.rs/src/lib.rs"
 
   # 6. events.log has valid chunk(s)
   let eventsData = readInternalFileData(data, "events.log")
