@@ -50,6 +50,10 @@ task test, "Run all tests":
   # unstated-namespace, creating and unclaimed pages kept, and a live writer
   # in another time namespace kept (Linux; elsewhere it skips).
   exec "nim c -r -d:release -p:src tests/test_live_page_sweep.nim"
+  # A live writer owned by another user: its start time reads, a slot naming
+  # it is alive, the same pid with another start time is dead, and a reaped
+  # pid and a zombie are gone (macOS; elsewhere it skips).
+  exec "nim c -r -d:release -p:src tests/test_live_page_other_user.nim"
   # The in-guest writer: no thread, its heartbeat stored only at its seals,
   # judged alive by pid and start time; a quiet guest is followed, not
   # reaped; the file-only form hosts no page. Arms: a heartbeat thread

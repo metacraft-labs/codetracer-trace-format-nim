@@ -306,31 +306,28 @@ elif defined(macosx):
   proc mach_timebase_info(info: ptr MachTimebase): cint {.importc,
     header: "<mach/mach_time.h>".}
   import std/posix
-  when defined(ios):
-    # The iOS SDKs ship no `<libproc.h>`: `proc_pidinfo` is not public API
-    # there.  `sysctl(KERN_PROC_PID)` is, and its `kinfo_proc` carries the same
-    # kernel creation time (`p_starttime`) that `proc_bsdinfo.pbi_start_*`
-    # reports on macOS, so a slot's start time reads the same either way.
-    # `ios_build.sh` builds with `--os:macosx -d:ios`, which is why this sits
-    # inside the `macosx` arm.  The struct layouts come from the SDK headers.
-    type
-      ExternProc {.importc: "struct extern_proc", header: "<sys/proc.h>",
-                   bycopy.} = object
-        p_starttime {.importc: "p_starttime".}: Timeval
-        p_stat {.importc: "p_stat".}: cchar
-      KinfoProc {.importc: "struct kinfo_proc", header: "<sys/sysctl.h>",
-                  bycopy.} = object
-        kp_proc {.importc: "kp_proc".}: ExternProc
-    var CTL_KERN {.importc, header: "<sys/sysctl.h>".}: cint
-    var KERN_PROC {.importc, header: "<sys/sysctl.h>".}: cint
-    var KERN_PROC_PID {.importc, header: "<sys/sysctl.h>".}: cint
-    var SZOMB {.importc, header: "<sys/proc.h>".}: cint
-    proc c_sysctl(name: ptr cint, namelen: cuint, oldp: pointer,
-                  oldlenp: ptr csize_t, newp: pointer, newlen: csize_t): cint
-      {.importc: "sysctl", header: "<sys/sysctl.h>".}
-  else:
-    proc proc_pidinfo(pid: cint, flavor: cint, arg: uint64, buffer: pointer,
-                      size: cint): cint {.importc, header: "<libproc.h>".}
+  # A process's start time comes from `sysctl(KERN_PROC_PID)`, on every Apple
+  # platform.  `proc_pidinfo` answers EPERM for another user's process, which
+  # would judge a live writer that joined under `sudo` dead, and the iOS SDKs
+  # ship no `<libproc.h>` at all.  `sysctl` reads any user's process, so a
+  # writer records the same `sec*1e6+usec+1` that a reader of any user reads.
+  # iOS builds use `--os:macosx -d:ios`, so this arm covers them too.  The
+  # struct layouts come from the SDK headers.
+  type
+    ExternProc {.importc: "struct extern_proc", header: "<sys/proc.h>",
+                 bycopy.} = object
+      p_starttime {.importc: "p_starttime".}: Timeval
+      p_stat {.importc: "p_stat".}: cchar
+    KinfoProc {.importc: "struct kinfo_proc", header: "<sys/sysctl.h>",
+                bycopy.} = object
+      kp_proc {.importc: "kp_proc".}: ExternProc
+  var CTL_KERN {.importc, header: "<sys/sysctl.h>".}: cint
+  var KERN_PROC {.importc, header: "<sys/sysctl.h>".}: cint
+  var KERN_PROC_PID {.importc, header: "<sys/sysctl.h>".}: cint
+  var SZOMB {.importc, header: "<sys/proc.h>".}: cint
+  proc c_sysctl(name: ptr cint, namelen: cuint, oldp: pointer,
+                oldlenp: ptr csize_t, newp: pointer, newlen: csize_t): cint
+    {.importc: "sysctl", header: "<sys/sysctl.h>".}
 else:
   import std/posix
 
@@ -386,7 +383,7 @@ proc processStartTime*(pid: uint64): uint64 =
     discard closeHandleW(h)
     if okCode == 0 or okTimes == 0 or code != StillActive: return 0
     c
-  elif defined(ios):
+  elif defined(macosx):
     # A pid that names no process answers with an empty buffer, not an error.
     var mib = [CTL_KERN, KERN_PROC, KERN_PROC_PID, cint(pid)]
     var info: KinfoProc
@@ -397,19 +394,6 @@ proc processStartTime*(pid: uint64): uint64 =
     if cint(info.kp_proc.p_stat) == SZOMB: return 0
     let tv = info.kp_proc.p_starttime
     uint64(tv.tv_sec) * 1_000_000'u64 + uint64(tv.tv_usec) + 1
-  elif defined(macosx):
-    # struct proc_bsdinfo: pbi_status at 4, pbi_start_tvsec at 120,
-    # pbi_start_tvusec at 128; 136 bytes (PROC_PIDTBSDINFO = 3).
-    var buf: array[136, byte]
-    let n = proc_pidinfo(cint(pid), 3, 0, addr buf[0], cint(buf.len))
-    if n != cint(buf.len): return 0
-    var status: uint32
-    copyMem(addr status, addr buf[4], 4)
-    if status == 5: return 0  # SZOMB
-    var sec, usec: uint64
-    copyMem(addr sec, addr buf[120], 8)
-    copyMem(addr usec, addr buf[128], 8)
-    sec * 1_000_000'u64 + usec + 1
   else:
     var f: File
     try:
