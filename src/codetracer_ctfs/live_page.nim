@@ -295,9 +295,32 @@ elif defined(macosx):
   proc mach_continuous_time(): uint64 {.importc, header: "<mach/mach_time.h>".}
   proc mach_timebase_info(info: ptr MachTimebase): cint {.importc,
     header: "<mach/mach_time.h>".}
-  proc proc_pidinfo(pid: cint, flavor: cint, arg: uint64, buffer: pointer,
-                    size: cint): cint {.importc, header: "<libproc.h>".}
   import std/posix
+  when defined(ios):
+    # The iOS SDKs ship no `<libproc.h>`: `proc_pidinfo` is not public API
+    # there.  `sysctl(KERN_PROC_PID)` is, and its `kinfo_proc` carries the same
+    # kernel creation time (`p_starttime`) that `proc_bsdinfo.pbi_start_*`
+    # reports on macOS, so a slot's start time reads the same either way.
+    # `ios_build.sh` builds with `--os:macosx -d:ios`, which is why this sits
+    # inside the `macosx` arm.  The struct layouts come from the SDK headers.
+    type
+      ExternProc {.importc: "struct extern_proc", header: "<sys/proc.h>",
+                   bycopy.} = object
+        p_starttime {.importc: "p_starttime".}: Timeval
+        p_stat {.importc: "p_stat".}: cchar
+      KinfoProc {.importc: "struct kinfo_proc", header: "<sys/sysctl.h>",
+                  bycopy.} = object
+        kp_proc {.importc: "kp_proc".}: ExternProc
+    var CTL_KERN {.importc, header: "<sys/sysctl.h>".}: cint
+    var KERN_PROC {.importc, header: "<sys/sysctl.h>".}: cint
+    var KERN_PROC_PID {.importc, header: "<sys/sysctl.h>".}: cint
+    var SZOMB {.importc, header: "<sys/proc.h>".}: cint
+    proc c_sysctl(name: ptr cint, namelen: cuint, oldp: pointer,
+                  oldlenp: ptr csize_t, newp: pointer, newlen: csize_t): cint
+      {.importc: "sysctl", header: "<sys/sysctl.h>".}
+  else:
+    proc proc_pidinfo(pid: cint, flavor: cint, arg: uint64, buffer: pointer,
+                      size: cint): cint {.importc, header: "<libproc.h>".}
 else:
   import std/posix
 
@@ -353,6 +376,17 @@ proc processStartTime*(pid: uint64): uint64 =
     discard closeHandleW(h)
     if okCode == 0 or okTimes == 0 or code != StillActive: return 0
     c
+  elif defined(ios):
+    # A pid that names no process answers with an empty buffer, not an error.
+    var mib = [CTL_KERN, KERN_PROC, KERN_PROC_PID, cint(pid)]
+    var info: KinfoProc
+    var size = csize_t(sizeof(KinfoProc))
+    if c_sysctl(addr mib[0], cuint(mib.len), addr info, addr size, nil, 0) != 0 or
+        size != csize_t(sizeof(KinfoProc)):
+      return 0
+    if cint(info.kp_proc.p_stat) == SZOMB: return 0
+    let tv = info.kp_proc.p_starttime
+    uint64(tv.tv_sec) * 1_000_000'u64 + uint64(tv.tv_usec) + 1
   elif defined(macosx):
     # struct proc_bsdinfo: pbi_status at 4, pbi_start_tvsec at 120,
     # pbi_start_tvusec at 128; 136 bytes (PROC_PIDTBSDINFO = 3).

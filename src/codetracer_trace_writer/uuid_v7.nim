@@ -88,11 +88,24 @@ when defined(macosx) or defined(ios) or defined(freebsd) or defined(openbsd) or
   # is the one that needs it: `std/sysrand` there is a WASI `random_get`
   # import, and an import is exactly what that build exists to avoid, so
   # `wasm/standalone/trace_writer_host_stub.c` supplies `getentropy` instead.
-  proc c_getentropy(buf: pointer, n: csize_t): cint
-    {.importc: "getentropy", header: "<sys/random.h>".}
-  proc urandom(dest: var openArray[byte]): bool =
-    if dest.len == 0: return true
-    c_getentropy(addr dest[0], csize_t(dest.len)) == 0
+  when defined(ios):
+    # The iOS SDKs ship no `<sys/random.h>`: `getentropy` is not public API
+    # there.  `arc4random_buf(3)` is (`<stdlib.h>`, iOS 4.3+), lives in
+    # libSystem like `getentropy` does — so no framework closure — and is the
+    # kernel-seeded CSPRNG.  It cannot fail, which is why there is no status.
+    # (`ios_build.sh` builds with `--os:macosx -d:ios`, so this test must come
+    # before any `macosx`-only assumption.)
+    proc c_arc4random_buf(buf: pointer, n: csize_t)
+      {.importc: "arc4random_buf", header: "<stdlib.h>".}
+    proc urandom(dest: var openArray[byte]): bool =
+      if dest.len > 0: c_arc4random_buf(addr dest[0], csize_t(dest.len))
+      true
+  else:
+    proc c_getentropy(buf: pointer, n: csize_t): cint
+      {.importc: "getentropy", header: "<sys/random.h>".}
+    proc urandom(dest: var openArray[byte]): bool =
+      if dest.len == 0: return true
+      c_getentropy(addr dest[0], csize_t(dest.len)) == 0
 else:
   # Linux/Windows: `std/sysrand` is `getrandom(2)` / `BCryptGenRandom`, neither
   # of which drags a framework closure behind it.
