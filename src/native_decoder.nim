@@ -55,6 +55,12 @@
 ##   would duplicate the native replayer's domain knowledge).
 ## * `eventlog.dat` is decoded into structured OS-event records (one entry
 ##   per write/read/open/close/...) using the writer's serializer format.
+## * The document is produced as a header plus a stream of events
+##   (`decodeNativeDocument`, `forEachNativeEvent`), so ct-print writes it
+##   through `streamed_json` without holding the tree or its rendering; the
+##   decoded records are held (bounded by the container), the per-event
+##   `JsonNode`s are not. `buildNativeFullDocument` is the whole tree, for
+##   in-process callers, built from the same two.
 ## * The output document is byte-deterministic given the same input bytes:
 ##   thread streams are emitted in ascending CtTid order, OS events in their
 ##   stored order, and counts are computed up front.
@@ -74,6 +80,7 @@ import codetracer_ctfs/types
 import codetracer_ctfs/zstd_bindings
 import codetracer_trace_writer/meta_dat
 import codetracer_trace_writer/interning_table
+import codetracer_trace_writer/streamed_json
 
 proc readContainerImage*(filePath: string): Result[seq[byte], string] =
   ## Probes and direct-member views inspect the same reconstructed image as
@@ -357,7 +364,18 @@ proc decodeThreadEvents(threadId: uint32, stream: seq[byte]):
   ## Walk a per-thread stream, slicing on the size field of each event header.
   ## Any header whose `size` would overrun the buffer is treated as a hard
   ## decode error — we never silently skip past corrupt regions.
-  var events: seq[NativeEvent] = @[]
+  # Count first, so the records are allocated once at their final size: a
+  # seq grown by doubling holds up to three times its contents while it
+  # reallocates, which on a large bundle is most of the decoder's peak.
+  var total = 0
+  var probe = 0
+  while probe + EventHeaderSize <= stream.len:
+    let size = int(readU32LE(stream, probe + 2))
+    if size < EventHeaderSize:
+      break
+    inc total
+    probe += size
+  var events = newSeqOfCap[NativeEvent](total)
   var pos = 0
   while pos < stream.len:
     if pos + EventHeaderSize > stream.len:
@@ -640,10 +658,23 @@ proc payloadJson(payload: seq[byte]): JsonNode =
     node["text"] = newJString(bytesToUtf8(payload))
   return node
 
-proc buildNativeFullDocument*(data: openArray[byte], opts: NativeOpts):
-    Result[JsonNode, string] =
-  ## Decode a native MCR bundle and produce the same shape document the v4
-  ## `--full` mode emits, with per-thread events interleaved by (geid, tid).
+type NativeDocument* = object
+  ## A decoded native bundle, ready to be printed without being held whole:
+  ## ``header`` is every key of the ``--full`` document except ``events``,
+  ## in order, and the decoded records are kept to produce the events one at
+  ## a time (``forEachNativeEvent``). The records are bounded by the
+  ## container's decompressed contents; the ``JsonNode`` per event, at
+  ## several times that, is not held. See ``streamed_json``.
+  header*: JsonNode
+  threadEvents: seq[seq[NativeEvent]]  ## per thread stream, in stream order
+  order: seq[(int, int)]               ## (thread, position), geid-ordered
+  osEvents: seq[OsEventLogEntry]   ## stored order
+
+proc decodeNativeDocument*(data: openArray[byte], opts: NativeOpts):
+    Result[NativeDocument, string] =
+  ## Decode a native MCR bundle into the header of the same shape document
+  ## the v4 `--full` mode emits, and the records its events are made from,
+  ## with per-thread events interleaved by (geid, tid).
   let infoR = detectNativeBundle(data)
   if infoR.isErr:
     return err(infoR.error)
@@ -736,20 +767,33 @@ proc buildNativeFullDocument*(data: openArray[byte], opts: NativeOpts):
   root["types"] = newJArray()
 
   # ----- decode each thread stream into events -----
-  var allEvents: seq[NativeEvent] = @[]
+  var perThread: seq[seq[NativeEvent]]
+  var eventTotal = 0
   for (tid, name) in info.threadStreams:
-    let streamR = readThreadStream(data, info.blockSize, info.maxRoot, name)
-    if streamR.isErr:
-      return err(streamR.error)
-    let evR = decodeThreadEvents(tid, streamR.get())
+    var evR: Result[seq[NativeEvent], string]
+    block:
+      # The stream bytes are dropped as soon as they are decoded.
+      let streamR = readThreadStream(data, info.blockSize, info.maxRoot, name)
+      if streamR.isErr:
+        return err(streamR.error)
+      evR = decodeThreadEvents(tid, streamR.get())
     if evR.isErr:
       return err(evR.error)
-    for ev in evR.get():
-      allEvents.add(ev)
-
+    perThread.add(move evR.get())
+    eventTotal += perThread[^1].len
   # Stable interleave: by (geid, threadId, streamOffset). geid is the
   # global event ID assigned at recording time, so this matches replay order.
-  allEvents.sort(proc(a, b: NativeEvent): int =
+  # The records stay where each thread's decode put them, and an order over
+  # (thread, position) pairs is sorted: merging them into one sequence, or
+  # sorting the records themselves, held or copied every record twice.
+  var order = newSeqOfCap[(int, int)](eventTotal)
+  for t in 0 ..< perThread.len:
+    for i in 0 ..< perThread[t].len:
+      order.add((t, i))
+  let evp = addr perThread
+  order.sort(proc(x, y: (int, int)): int =
+    let a = addr evp[][x[0]][x[1]]
+    let b = addr evp[][y[0]][y[1]]
     if a.geid != b.geid:
       cmp(a.geid, b.geid)
     elif a.threadId != b.threadId:
@@ -773,7 +817,7 @@ proc buildNativeFullDocument*(data: openArray[byte], opts: NativeOpts):
   counts["calls"] = newJInt(0)
   counts["values"] = newJInt(0)
   counts["io_events"] = newJInt(int64(osEvents.len))
-  counts["thread_events"] = newJInt(int64(allEvents.len))
+  counts["thread_events"] = newJInt(int64(eventTotal))
   counts["thread_streams"] = newJInt(int64(info.threadStreams.len))
   root["counts"] = counts
 
@@ -786,9 +830,15 @@ proc buildNativeFullDocument*(data: openArray[byte], opts: NativeOpts):
     threadsArr.add(tObj)
   root["threads"] = threadsArr
 
-  # ----- events: thread_event records first (geid-ordered), then os events -----
-  var eventsArr = newJArray()
-  for ev in allEvents:
+  ok(NativeDocument(header: root, threadEvents: move perThread,
+    order: move order, osEvents: osEvents))
+
+proc forEachNativeEvent*(doc: NativeDocument, emit: EventSink) =
+  ## The ``events`` of the native ``--full`` document, in order, handed to
+  ## ``emit`` one at a time: thread_event records first (geid-ordered), then
+  ## the OS events in their stored order.
+  for (t, i) in doc.order:
+    template ev: untyped = doc.threadEvents[t][i]
     var obj = newJObject()
     obj["kind"] = newJString("thread_event")
     obj["thread_id"] = newJInt(int64(ev.threadId))
@@ -799,9 +849,9 @@ proc buildNativeFullDocument*(data: openArray[byte], opts: NativeOpts):
     obj["ct_tid"] = newJInt(int64(ev.ctTid))
     obj["size"] = newJInt(int64(ev.size))
     obj["payload"] = payloadJson(ev.payload)
-    eventsArr.add(obj)
+    emit(obj)
 
-  for e in osEvents:
+  for e in doc.osEvents:
     var obj = newJObject()
     obj["kind"] = newJString("os_event")
     obj["os_kind"] = newJString(osEventKindName(e.kind))
@@ -816,15 +866,34 @@ proc buildNativeFullDocument*(data: openArray[byte], opts: NativeOpts):
     obj["content_b64"] = newJString(base64.encode(e.content))
     if e.content.len > 0 and isPrintable(e.content):
       obj["content_text"] = newJString(bytesToUtf8(e.content))
-    eventsArr.add(obj)
+    emit(obj)
 
+proc buildNativeFullDocument*(data: openArray[byte], opts: NativeOpts):
+    Result[JsonNode, string] =
+  ## The whole native ``--full`` document as one tree: the header plus the
+  ## collected events. For in-process callers on bundles small enough to
+  ## afford it; ``ct-print`` streams ``decodeNativeDocument`` instead.
+  let doc = ?decodeNativeDocument(data, opts)
+  var eventsArr = newJArray()
+  doc.forEachNativeEvent(proc(event: JsonNode) {.raises: [].} =
+    eventsArr.add(event))
+  let root = doc.header
   root["events"] = eventsArr
   ok(root)
 
 proc decodeNativeFromFile*(path: string, opts: NativeOpts):
     Result[JsonNode, string] =
-  ## Convenience wrapper used by the CLI: read the file, then decode.
+  ## Read the file, then build the whole document (``buildNativeFullDocument``).
   let dataR = readContainerImage(path)
   if dataR.isErr:
     return err(dataR.error)
   buildNativeFullDocument(dataR.get(), opts)
+
+proc decodeNativeDocumentFromFile*(path: string, opts: NativeOpts):
+    Result[NativeDocument, string] =
+  ## Read the file, then decode it for streaming (``decodeNativeDocument``);
+  ## what the CLI uses.
+  let dataR = readContainerImage(path)
+  if dataR.isErr:
+    return err(dataR.error)
+  decodeNativeDocument(dataR.get(), opts)

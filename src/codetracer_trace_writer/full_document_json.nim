@@ -30,7 +30,7 @@ when defined(nimPreviewSlimSystem):
 ## ``FullOpts.stripPaths`` substitutes ``<workdir>`` and ``<tmp>`` placeholders
 ## for cross-machine snapshots.
 
-import std/[json, strutils, base64, algorithm]
+import std/[json, strutils, base64, algorithm, options]
 import results
 import ./new_trace_reader
 import ./meta_dat
@@ -44,9 +44,10 @@ import ./global_line_index
 import ./multi_stream_writer
 import ./cbor
 import ./unsigned_json
+import ./streamed_json
 import ../codetracer_trace_types
 
-export json, results, unsigned_json
+export json, results, unsigned_json, streamed_json
 
 # ---------------------------------------------------------------------------
 # Global line index resolution for v4 traces
@@ -438,15 +439,44 @@ proc ioEventJson(ev: IOEvent, idx: uint64): JsonNode =
   addEventMetadata(ioObj, ev.metadata)
   return ioObj
 
-proc buildFullDocument*(reader: var NewTraceReader,
-    opts: FullOpts): JsonNode =
-  ## Build the deterministic JSON document for `--full` and `--events` modes.
-  ## The shape is:
-  ##   { metadata, paths, functions, varnames, types,
-  ##     events: [ {kind: "...", ...}, ... ] }
-  ## All variable values and call args/returns are decoded from CBOR into
-  ## structured JSON objects matching the ValueRecord variant layout.
-  let gli = reader.globalPositionSpace()
+# ---------------------------------------------------------------------------
+# Streaming the document
+# ---------------------------------------------------------------------------
+#
+# The document is produced in two parts, a header and a stream of events,
+# so that no consumer has to hold it whole. `ct-print --full` on an 11 MB
+# Python trace (~310 K exec records, ~37 K calls) used to build every event
+# into one `JsonNode` tree and then render that tree into one more string the
+# size of the whole output: about 32 GB, and ~20 minutes, because the
+# assembly also scanned every call record twice and every IO event once per
+# step (codetracer-pm
+# `issues/2026-10-31-ct-print-full-uses-32-gb-to-decode-an-11-mb-python-trace.md`).
+#
+# * `buildFullHeader` — every key but `events`, in the document's order.
+# * `forEachFullEvent` — the events, in the document's order, handed to a
+#   callback one at a time; only the event being emitted is alive.
+# * `buildFullDocument` — header plus collected events, for the in-process
+#   callers that want the tree (the test corpus); it is a thin wrapper, so
+#   the tree and the stream cannot disagree.
+# * `writeFullDocument` / `writeEventsJsonl` — the `--full` and `--events`
+#   texts, written incrementally, byte-identical to `pretty(root, indent = 2)`
+#   and to `$header` plus one `$event` per line. The layout is written by
+#   `streamed_json`, the one writer every ct-print JSON mode uses, for
+#   split-stream and native containers alike.
+#
+# Memory is proportional to the trace: one copy of each call record and IO
+# event (needed to order them), one 8-byte position per exec record, the
+# reader's call index (24 bytes per call, see `enclosingCallKey`), and the
+# reader's bounded chunk caches. Time is O(N log N) in the records: the
+# per-step scans of every call and IO event, and the per-step walk back over
+# returned siblings that attributed a step to its call, were each
+# O(records x calls).
+
+proc buildFullHeader*(reader: var NewTraceReader, opts: FullOpts): JsonNode =
+  ## Every key of the ``--full`` document except ``events``, in the order the
+  ## document carries them: ``metadata``, ``paths``, ``path_versions``,
+  ## ``functions``, ``varnames``, ``types``, ``source_views``, ``counts``.
+  ## This is also the ``--events`` header line.
   var root = newJObject()
 
   # ----- metadata -----
@@ -605,26 +635,94 @@ proc buildFullDocument*(reader: var NewTraceReader,
   let srR = reader.sourceReloadCount()
   counts["source_reloads"] = if srR.isOk: unsignedJson(srR.get()) else: newJInt(-1)
   root["counts"] = counts
+  return root
 
-  # ----- events (interleaved, source-order) -----
-  # Collection helpers: pre-load IO events and call entries indexed by step.
-  var ioByStep: seq[(uint64, IOEvent, uint64)]
-  let icRes = reader.ioEventCount()
-  if icRes.isOk:
-    for i in 0'u64 ..< icRes.get():
-      let ev = reader.ioEvent(i)
-      if ev.isOk:
-        ioByStep.add((ev.get().stepId, ev.get(), i))
+proc callEntryJson(reader: var NewTraceReader, rec: v4calls.CallRecord,
+    callKey: uint64, synthesizedAt: Option[uint64]): JsonNode =
+  ## One ``call_entry`` event. ``synthesizedAt`` is set for the post-loop
+  ## drain (see ``forEachFullEvent``), and lands before ``args``.
+  result = newJObject()
+  result["kind"] = newJString("call_entry")
+  result["call_key"] = unsignedJson(callKey)
+  result["function_id"] = unsignedJson(rec.functionId)
+  let fn = reader.function(rec.functionId)
+  if fn.isOk:
+    result["function"] = newJString(fn.get())
+  result["entry_step"] = unsignedJson(rec.entryStep)
+  result["exit_step"] = unsignedJson(rec.exitStep)
+  result["depth"] = newJInt(int64(rec.depth))
+  result["parent_call_key"] = newJInt(rec.parentCallKey)
+  if synthesizedAt.isSome:
+    # Flag synthesized entries so downstream consumers can spot the
+    # writer-close drain case (entry at last-step, exit already past).
+    result["synthesized_at_step"] = unsignedJson(synthesizedAt.get())
+  var argsJson = newJArray()
+  for arg in rec.args:
+    var argObj = newJObject()
+    argObj["varname_id"] = unsignedJson(arg.varnameId)
+    let argVn = reader.varname(arg.varnameId)
+    if argVn.isOk:
+      argObj["varname"] = newJString(argVn.get())
+    argObj["value"] = decodeValueBytesToJson(arg.value)
+    argsJson.add(argObj)
+  result["args"] = argsJson
+  var childrenJson = newJArray()
+  for c in rec.children:
+    childrenJson.add(unsignedJson(c))
+  result["children"] = childrenJson
 
-  var callsByEntry: seq[(uint64, v4calls.CallRecord, uint64)]
-  var callsByExit: seq[(uint64, v4calls.CallRecord, uint64)]
+proc callExitJson(reader: var NewTraceReader, rec: v4calls.CallRecord,
+    callKey: uint64): JsonNode =
+  ## One ``call_exit`` event.
+  result = newJObject()
+  result["kind"] = newJString("call_exit")
+  result["call_key"] = unsignedJson(callKey)
+  result["function_id"] = unsignedJson(rec.functionId)
+  let fn = reader.function(rec.functionId)
+  if fn.isOk:
+    result["function"] = newJString(fn.get())
+  result["exit_step"] = unsignedJson(rec.exitStep)
+  result["depth"] = newJInt(int64(rec.depth))
+  result["return_value"] = decodeValueBytesToJson(rec.returnValue)
+  if rec.exception.len > 0:
+    result["exception"] = decodeValueBytesToJson(rec.exception)
+
+type
+  CallTable = object
+    ## Every call record that decoded, ONCE, with the orders the event
+    ## stream needs as index permutations rather than as further copies.
+    records: seq[v4calls.CallRecord]  ## call_key ascending
+    keys: seq[uint64]                 ## records[i]'s call_key
+    byEntry: seq[int]                 ## (entryStep ASC, call_key ASC)
+    byExit: seq[int]                  ## (exitStep ASC, call_key DESC)
+    complete: bool
+      ## Every call_key decoded, so ``records[k]`` IS call_key ``k`` and the
+      ## enclosing call of a step can be looked up here instead of being
+      ## decoded again from the call stream.
+
+proc loadCallTable(reader: var NewTraceReader): CallTable =
   let ccRes = reader.callCount()
   if ccRes.isOk:
     for i in 0'u64 ..< ccRes.get():
       let c = reader.call(i)
       if c.isOk:
-        callsByEntry.add((c.get().entryStep, c.get(), i))
-        callsByExit.add((c.get().exitStep, c.get(), i))
+        result.records.add(c.get())
+        result.keys.add(i)
+  let n = result.records.len
+  result.complete = ccRes.isOk and uint64(n) == ccRes.get()
+  result.byEntry = newSeq[int](n)
+  result.byExit = newSeq[int](n)
+  for i in 0 ..< n:
+    result.byEntry[i] = i
+    result.byExit[i] = i
+  # Records are in call_key order, so comparing positions compares keys.
+  let recs = addr result.records
+  result.byEntry.sort(proc(a, b: int): int =
+    let ea = recs[][a].entryStep
+    let eb = recs[][b].entryStep
+    if ea < eb: -1
+    elif ea > eb: 1
+    else: cmp(a, b))
   # call_exit ordering: at the same exit_step, LIFO (innermost frame
   # closes first).  The natural iteration order is call_key ASC (i.e.
   # the order calls were registered), which is FIFO — wrong when the
@@ -632,191 +730,228 @@ proc buildFullDocument*(reader: var NewTraceReader,
   # exitStep (parent has no post-recursion body step, so both share
   # the last step).  Sort by (exitStep ASC, call_key DESC) so the
   # innermost call's exit comes first in events at any shared step.
-  callsByExit.sort(proc(a, b: (uint64, v4calls.CallRecord, uint64)): int =
-    if a[0] < b[0]: -1
-    elif a[0] > b[0]: 1
-    elif a[2] > b[2]: -1
-    elif a[2] < b[2]: 1
-    else: 0)
+  result.byExit.sort(proc(a, b: int): int =
+    let ea = recs[][a].exitStep
+    let eb = recs[][b].exitStep
+    if ea < eb: -1
+    elif ea > eb: 1
+    else: cmp(b, a))
 
-  var eventsArr = newJArray()
+proc execRecordJson(reader: var NewTraceReader, gli: GlobalLineIndex,
+    opts: FullOpts, stepIdx, stepGli: uint64, calls: CallTable): JsonNode =
+  ## The event for exec record ``stepIdx``, or nil when it has none.
+  ##
+  ## ``sekDeltaColumn`` events are column-only NUDGES on the preceding
+  ## real step (Column-Aware-Tracing spec), not standalone logical
+  ## steps.  ``logicalStepCount`` (new_trace_reader.nim:766-773)
+  ## excludes them from ``counts.steps`` for exactly this reason, so we
+  ## must mirror that exclusion here: a DeltaColumn nudge must NOT be
+  ## materialized as a ``kind="step"`` entry, otherwise ``events[]``
+  ## step entries would be inconsistent with ``counts.steps`` (and
+  ## inflated relative to the true logical-step count).  Column-aware
+  ## REAL steps (TagStepWithColumn ⇒ AbsoluteStep/DeltaStep events)
+  ## are counted by ``logicalStepCount`` and therefore stay.  We still
+  ## walk the raw index so call/IO correlation (keyed on the raw step
+  ## index) is unaffected.
+  let stepEv = reader.step(stepIdx)
+  let isDeltaColumnNudge = stepEv.isOk and stepEv.get().kind == sekDeltaColumn
+  # GDH-M2 / design §7.3: the reload marker is a timeline ANNOTATION,
+  # not a step.  It has no source location, so rendering it as a
+  # `kind="step"` entry would attach it to whatever position the
+  # running absolute address happened to hold — the previous step's —
+  # and invite a consumer to navigate to it.  It gets its own kind,
+  # and `counts.steps` (logicalStepCount) excludes it, so the two
+  # stay consistent.
+  if stepEv.isOk and stepEv.get().kind == sekSourceReload:
+    return sourceReloadEventJson(stepEv.get(), stepIdx)
+  # A raise, a catch and the thread records occupy an exec record but
+  # are not steps (`trace-events.md` §"Which exec records are steps"), so
+  # each gets its own kind and carries no position: `counts.steps` and
+  # the `kind="step"` entries count the same records.
+  if stepEv.isOk and stepEv.get().kind in
+      {sekRaise, sekCatch, sekThreadSwitch, sekThreadStart, sekThreadExit}:
+    return nonStepRecordJson(stepEv.get(), stepIdx)
+  # A record that could not be DECODED gets its own kind, and never
+  # falls through into the `kind="step"` branch below.  Both checks
+  # above are `isOk and ...`, so without this arm a failed decode
+  # reads as "not a nudge and not a marker" and is rendered as an
+  # ordinary step — at whatever position the running absolute address
+  # happens to hold, i.e. the PREVIOUS step's.  That is exactly the
+  # mis-attribution the marker branch above exists to prevent, and it
+  # is reachable by the refusal this milestone added: a container
+  # carrying tag 0x08 without declaring it fails HERE, and would
+  # otherwise be dumped as a plausible step stream with no error in it
+  # anywhere.
+  if stepEv.isErr:
+    var errObj = newJObject()
+    errObj["kind"] = newJString("step_error")
+    errObj["step_index"] = unsignedJson(stepIdx)
+    errObj["error"] = newJString(stepEv.error)
+    return errObj
+  if isDeltaColumnNudge:
+    return nil
+
+  var stepObj = newJObject()
+  stepObj["kind"] = newJString("step")
+  stepObj["step_index"] = unsignedJson(stepIdx)
+  block emitStep:
+    let loc = resolveStepLocation(reader, gli, stepGli)
+    if loc.isErr:
+      stepObj["position_error"] = newJString(loc.error)
+      break emitStep
+    let (pathId, line) = loc.get()
+    stepObj["path_id"] = newJInt(int64(pathId))
+    stepObj["line"] = unsignedJson(line)
+    # GDH-M1 — which VERSION of that file the step ran in: the
+    # 0-based ordinal of `path_id` among the paths.dat entries
+    # carrying its string. Always emitted, including the `0`
+    # every legacy trace answers with, because a consumer must be
+    # able to tell "this file was never reloaded" from "this
+    # ct-print predates versioned paths" — a key that appears only
+    # when a version exists makes a scan for it pass on a trace
+    # that has none AND on a build that cannot see one.
+    let vOrd = reader.pathVersionOrdinal(uint64(pathId))
+    stepObj["path_version_ordinal"] =
+      if vOrd.isOk: unsignedJson(vOrd.get()) else: newJInt(-1)
+    let pStr = reader.path(uint64(pathId))
+    if pStr.isOk:
+      stepObj["path"] = newJString(
+        normalizePath(pStr.get(), reader.meta.workdir, opts.stripPaths))
+    # Column-aware traces: surface the step's column by decoding the
+    # absolute global_position_index per the spec.  Pre-extension
+    # traces leave the field absent so the JSON output stays
+    # bit-for-bit compatible with pre-column-aware consumers.
+    if reader.meta.hasColumnAwareSteps:
+      let posRes = reader.decodeGlobalPositionIndex(stepGli)
+      if posRes.isOk:
+        stepObj["column"] = newJInt(int64(posRes.get().column))
+  stepObj["step_kind"] = newJString($stepEv.get().kind)
+  # The step's innermost enclosing call: `NewTraceReader.callForStep`'s
+  # answer, split so its record comes from the table already held rather
+  # than from a second decode on a call stream that keeps one chunk.
+  let encKey = reader.enclosingCallKey(stepIdx)
+  if encKey.isOk:
+    var functionId: uint64
+    var depth: uint32
+    var found = false
+    if calls.complete:
+      let i = int(encKey.get())
+      functionId = calls.records[i].functionId
+      depth = calls.records[i].depth
+      found = true
+    else:
+      let rec = reader.call(encKey.get())
+      if rec.isOk:
+        functionId = rec.get().functionId
+        depth = rec.get().depth
+        found = true
+    if found:
+      stepObj["function_id"] = unsignedJson(functionId)
+      let fn = reader.function(functionId)
+      if fn.isOk:
+        stepObj["function"] = newJString(fn.get())
+      stepObj["depth"] = newJInt(int64(depth))
+  # Variable values (decoded)
+  var valsArr = newJArray()
+  let vals = reader.valuesForStep(stepIdx)
+  if vals.isOk:
+    for v in vals.get():
+      var vObj = newJObject()
+      vObj["varname_id"] = unsignedJson(v.varnameId)
+      let vn = reader.varname(v.varnameId)
+      if vn.isOk:
+        vObj["varname"] = newJString(vn.get())
+      vObj["type_id"] = unsignedJson(v.typeId)
+      let tn = reader.typeName(v.typeId)
+      if tn.isOk:
+        vObj["type_name"] = newJString(tn.get())
+      vObj["value"] = decodeValueBytesToJson(v.data)
+      valsArr.add(vObj)
+  stepObj["vars"] = valsArr
+  stepObj
+
+type FullEventSink* = EventSink
+  ## Receives the events of the ``--full`` document one at a time, in order
+  ## (``streamed_json.EventSink``: it cannot raise, and the producer does not
+  ## use a node after handing it over).
+
+proc forEachFullEvent*(reader: var NewTraceReader, opts: FullOpts,
+    emit: FullEventSink) =
+  ## Produce the ``events`` of the ``--full`` document, in its order, handing
+  ## each to ``emit`` as soon as it is built (interleaved, source order):
+  ##
+  ## For each exec record, in index order:
+  ##   1. the ``call_entry`` of every call entered at it, call_key ascending;
+  ##   2. the record's own event (``step``, ``source_reload``, ``raise``,
+  ##      ``catch``, a thread record or ``step_error``; none for a column
+  ##      nudge);
+  ##   3. the ``io`` events whose ``step_id`` is the record, index ascending;
+  ##   4. the ``call_exit`` of every call that exits at it, call_key
+  ##      DESCENDING (innermost first).
+  ## Then, when there were exec records, a ``call_entry`` carrying
+  ## ``synthesized_at_step`` for each call entered past the last one, by
+  ## (entry step, call_key); and last, in index order, every IO event whose
+  ## ``step_id`` lies past the last exec record — all of them when the step
+  ## list is empty or could not be read.
+  ##
+  ## Each of those orders is a sorted index walked by a cursor as the exec
+  ## record advances, so the whole stream is O(N log N): the per-record scan
+  ## of every call and IO event this replaced was O(records x calls).
+  let gli = reader.globalPositionSpace()
+
+  # IO events in index order, and their positions by (step_id, index).
+  var ios: seq[(uint64, IOEvent)]  # (io index, event)
+  let icRes = reader.ioEventCount()
+  if icRes.isOk:
+    for i in 0'u64 ..< icRes.get():
+      let ev = reader.ioEvent(i)
+      if ev.isOk:
+        ios.add((i, ev.get()))
+  var ioByStep = newSeq[int](ios.len)
+  for i in 0 ..< ios.len:
+    ioByStep[i] = i
+  let iosAddr = addr ios
+  ioByStep.sort(proc(a, b: int): int =
+    let sa = iosAddr[][a][1].stepId
+    let sb = iosAddr[][b][1].stepId
+    if sa < sb: -1
+    elif sa > sb: 1
+    else: cmp(a, b))
+
+  let calls = loadCallTable(reader)
 
   # Pre-fetch all step GLIs in one O(N) pass — calling
   # stepAbsoluteGlobalLineIndex per step inside the loop is O(N²).
   let allGlis = precomputeStepGlis(reader)
-  if allGlis.len > 0:
-    for stepIdx in 0'u64 ..< uint64(allGlis.len):
-      let stepGli = allGlis[int(stepIdx)]
-      # 1. Emit call entry events at this step (deterministic depth-asc order).
-      for (es, rec, ck) in callsByEntry:
-        if es == stepIdx:
-          var callObj = newJObject()
-          callObj["kind"] = newJString("call_entry")
-          callObj["call_key"] = unsignedJson(ck)
-          callObj["function_id"] = unsignedJson(rec.functionId)
-          let fn = reader.function(rec.functionId)
-          if fn.isOk:
-            callObj["function"] = newJString(fn.get())
-          callObj["entry_step"] = unsignedJson(rec.entryStep)
-          callObj["exit_step"] = unsignedJson(rec.exitStep)
-          callObj["depth"] = newJInt(int64(rec.depth))
-          callObj["parent_call_key"] = newJInt(rec.parentCallKey)
-          var argsJson = newJArray()
-          for arg in rec.args:
-            var argObj = newJObject()
-            argObj["varname_id"] = unsignedJson(arg.varnameId)
-            let argVn = reader.varname(arg.varnameId)
-            if argVn.isOk:
-              argObj["varname"] = newJString(argVn.get())
-            argObj["value"] = decodeValueBytesToJson(arg.value)
-            argsJson.add(argObj)
-          callObj["args"] = argsJson
-          var childrenJson = newJArray()
-          for c in rec.children:
-            childrenJson.add(unsignedJson(c))
-          callObj["children"] = childrenJson
-          eventsArr.add(callObj)
+  let stepTotal = uint64(allGlis.len)
+  var entryCur, exitCur, ioCur = 0
+  for stepIdx in 0'u64 ..< stepTotal:
+    # Every cursor's remaining items lie at or after `stepIdx`, so the items
+    # AT it are a prefix of what remains.
+    while entryCur < calls.byEntry.len and
+        calls.records[calls.byEntry[entryCur]].entryStep == stepIdx:
+      let i = calls.byEntry[entryCur]
+      emit(callEntryJson(reader, calls.records[i], calls.keys[i],
+        none(uint64)))
+      inc entryCur
 
-      # 2. Emit the step event itself.
-      #
-      # ``sekDeltaColumn`` events are column-only NUDGES on the preceding
-      # real step (Column-Aware-Tracing spec), not standalone logical
-      # steps.  ``logicalStepCount`` (new_trace_reader.nim:766-773)
-      # excludes them from ``counts.steps`` for exactly this reason, so we
-      # must mirror that exclusion here: a DeltaColumn nudge must NOT be
-      # materialized as a ``kind="step"`` entry, otherwise ``events[]``
-      # step entries would be inconsistent with ``counts.steps`` (and
-      # inflated relative to the true logical-step count).  Column-aware
-      # REAL steps (TagStepWithColumn ⇒ AbsoluteStep/DeltaStep events)
-      # are counted by ``logicalStepCount`` and therefore stay.  We still
-      # walk the raw index so call/IO correlation (keyed on the raw step
-      # index) is unaffected.
-      let stepEv = reader.step(stepIdx)
-      let isDeltaColumnNudge = stepEv.isOk and stepEv.get().kind == sekDeltaColumn
-      # GDH-M2 / design §7.3: the reload marker is a timeline ANNOTATION,
-      # not a step.  It has no source location, so rendering it as a
-      # `kind="step"` entry would attach it to whatever position the
-      # running absolute address happened to hold — the previous step's —
-      # and invite a consumer to navigate to it.  It gets its own kind,
-      # and `counts.steps` (logicalStepCount) excludes it, so the two
-      # stay consistent.
-      let isSourceReload = stepEv.isOk and stepEv.get().kind == sekSourceReload
-      if isSourceReload:
-        eventsArr.add(sourceReloadEventJson(stepEv.get(), stepIdx))
-      # A raise, a catch and the thread records occupy an exec record but
-      # are not steps (`trace-events.md` §"Which exec records are steps"), so
-      # each gets its own kind and carries no position: `counts.steps` and
-      # the `kind="step"` entries count the same records.
-      let isOtherRecord = stepEv.isOk and stepEv.get().kind in
-        {sekRaise, sekCatch, sekThreadSwitch, sekThreadStart, sekThreadExit}
-      if isOtherRecord:
-        eventsArr.add(nonStepRecordJson(stepEv.get(), stepIdx))
-      # A record that could not be DECODED gets its own kind, and never
-      # falls through into the `kind="step"` branch below.  Both booleans
-      # above are `isOk and ...`, so without this arm a failed decode
-      # reads as "not a nudge and not a marker" and is rendered as an
-      # ordinary step — at whatever position the running absolute address
-      # happens to hold, i.e. the PREVIOUS step's.  That is exactly the
-      # mis-attribution the marker branch above exists to prevent, and it
-      # is reachable by the refusal this milestone added: a container
-      # carrying tag 0x08 without declaring it fails HERE, and would
-      # otherwise be dumped as a plausible step stream with no error in it
-      # anywhere.
-      let isUnreadable = stepEv.isErr
-      if isUnreadable:
-        var errObj = newJObject()
-        errObj["kind"] = newJString("step_error")
-        errObj["step_index"] = unsignedJson(stepIdx)
-        errObj["error"] = newJString(stepEv.error)
-        eventsArr.add(errObj)
-      if not isDeltaColumnNudge and not isSourceReload and not isOtherRecord and
-          not isUnreadable:
-        var stepObj = newJObject()
-        stepObj["kind"] = newJString("step")
-        stepObj["step_index"] = unsignedJson(stepIdx)
-        block emitStep:
-          let loc = resolveStepLocation(reader, gli, stepGli)
-          if loc.isErr:
-            stepObj["position_error"] = newJString(loc.error)
-            break emitStep
-          let (pathId, line) = loc.get()
-          stepObj["path_id"] = newJInt(int64(pathId))
-          stepObj["line"] = unsignedJson(line)
-          # GDH-M1 — which VERSION of that file the step ran in: the
-          # 0-based ordinal of `path_id` among the paths.dat entries
-          # carrying its string. Always emitted, including the `0`
-          # every legacy trace answers with, because a consumer must be
-          # able to tell "this file was never reloaded" from "this
-          # ct-print predates versioned paths" — a key that appears only
-          # when a version exists makes a scan for it pass on a trace
-          # that has none AND on a build that cannot see one.
-          let vOrd = reader.pathVersionOrdinal(uint64(pathId))
-          stepObj["path_version_ordinal"] =
-            if vOrd.isOk: unsignedJson(vOrd.get()) else: newJInt(-1)
-          let pStr = reader.path(uint64(pathId))
-          if pStr.isOk:
-            stepObj["path"] = newJString(
-              normalizePath(pStr.get(), reader.meta.workdir, opts.stripPaths))
-          # Column-aware traces: surface the step's column by decoding the
-          # absolute global_position_index per the spec.  Pre-extension
-          # traces leave the field absent so the JSON output stays
-          # bit-for-bit compatible with pre-column-aware consumers.
-          if reader.meta.hasColumnAwareSteps:
-            let posRes = reader.decodeGlobalPositionIndex(stepGli)
-            if posRes.isOk:
-              stepObj["column"] = newJInt(int64(posRes.get().column))
-        if stepEv.isOk:
-          let se = stepEv.get()
-          stepObj["step_kind"] = newJString($se.kind)
-        let callForStep = reader.callForStep(stepIdx)
-        if callForStep.isOk:
-          let cs = callForStep.get()
-          stepObj["function_id"] = unsignedJson(cs.functionId)
-          let fn = reader.function(cs.functionId)
-          if fn.isOk:
-            stepObj["function"] = newJString(fn.get())
-          stepObj["depth"] = newJInt(int64(cs.depth))
-        # Variable values (decoded)
-        var valsArr = newJArray()
-        let vals = reader.valuesForStep(stepIdx)
-        if vals.isOk:
-          for v in vals.get():
-            var vObj = newJObject()
-            vObj["varname_id"] = unsignedJson(v.varnameId)
-            let vn = reader.varname(v.varnameId)
-            if vn.isOk:
-              vObj["varname"] = newJString(vn.get())
-            vObj["type_id"] = unsignedJson(v.typeId)
-            let tn = reader.typeName(v.typeId)
-            if tn.isOk:
-              vObj["type_name"] = newJString(tn.get())
-            vObj["value"] = decodeValueBytesToJson(v.data)
-            valsArr.add(vObj)
-        stepObj["vars"] = valsArr
-        eventsArr.add(stepObj)
+    let recordEvent = execRecordJson(reader, gli, opts, stepIdx,
+      allGlis[int(stepIdx)], calls)
+    if recordEvent != nil:
+      emit(recordEvent)
 
-      # 3. Emit IO events at this step.
-      for (sid, ev, idx) in ioByStep:
-        if sid == stepIdx:
-          eventsArr.add(ioEventJson(ev, idx))
+    while ioCur < ioByStep.len and ios[ioByStep[ioCur]][1].stepId == stepIdx:
+      let (idx, ev) = ios[ioByStep[ioCur]]
+      emit(ioEventJson(ev, idx))
+      inc ioCur
 
-      # 4. Emit call exit events at this step.
-      for (es, rec, ck) in callsByExit:
-        if es == stepIdx:
-          var exitObj = newJObject()
-          exitObj["kind"] = newJString("call_exit")
-          exitObj["call_key"] = unsignedJson(ck)
-          exitObj["function_id"] = unsignedJson(rec.functionId)
-          let fn = reader.function(rec.functionId)
-          if fn.isOk:
-            exitObj["function"] = newJString(fn.get())
-          exitObj["exit_step"] = unsignedJson(rec.exitStep)
-          exitObj["depth"] = newJInt(int64(rec.depth))
-          exitObj["return_value"] = decodeValueBytesToJson(rec.returnValue)
-          if rec.exception.len > 0:
-            exitObj["exception"] = decodeValueBytesToJson(rec.exception)
-          eventsArr.add(exitObj)
+    while exitCur < calls.byExit.len and
+        calls.records[calls.byExit[exitCur]].exitStep == stepIdx:
+      let i = calls.byExit[exitCur]
+      emit(callExitJson(reader, calls.records[i], calls.keys[i]))
+      inc exitCur
 
+  if stepTotal > 0:
     # Post-loop drain: synthesize missing call_entry events for records
     # whose entryStep landed past the last step (entryStep >= allGlis.len).
     # This happens when the writer's close() drain finalizes still-open
@@ -828,62 +963,68 @@ proc buildFullDocument*(reader: var NewTraceReader,
     #
     # We anchor the synthesized entry on the last step (entry_step is
     # preserved as the original — possibly out-of-range — value so the
-    # CallRecord round-trips faithfully). Records are scanned in
-    # entryStep-ascending, then call_key (storage) order so deeper
-    # frames synthesized in close() appear after their parents.
-    let lastStep = uint64(allGlis.len) - 1
-    var pending: seq[(uint64, v4calls.CallRecord, uint64)]
-    for entry in callsByEntry:
-      if entry[0] >= uint64(allGlis.len):
-        pending.add(entry)
-    # Stable-sort by entryStep so parent-before-child holds (call_key
-    # order is already the entry order for ties).
-    pending.sort(proc(a, b: (uint64, v4calls.CallRecord, uint64)): int =
-      if a[0] < b[0]: -1
-      elif a[0] > b[0]: 1
-      elif a[2] < b[2]: -1
-      elif a[2] > b[2]: 1
-      else: 0)
-    for (es, rec, ck) in pending:
-      var callObj = newJObject()
-      callObj["kind"] = newJString("call_entry")
-      callObj["call_key"] = unsignedJson(ck)
-      callObj["function_id"] = unsignedJson(rec.functionId)
-      let fn = reader.function(rec.functionId)
-      if fn.isOk:
-        callObj["function"] = newJString(fn.get())
-      callObj["entry_step"] = unsignedJson(rec.entryStep)
-      callObj["exit_step"] = unsignedJson(rec.exitStep)
-      callObj["depth"] = newJInt(int64(rec.depth))
-      callObj["parent_call_key"] = newJInt(rec.parentCallKey)
-      # Flag synthesized entries so downstream consumers can spot the
-      # writer-close drain case (entry at last-step, exit already past).
-      callObj["synthesized_at_step"] = unsignedJson(lastStep)
-      var argsJson = newJArray()
-      for arg in rec.args:
-        var argObj = newJObject()
-        argObj["varname_id"] = unsignedJson(arg.varnameId)
-        let argVn = reader.varname(arg.varnameId)
-        if argVn.isOk:
-          argObj["varname"] = newJString(argVn.get())
-        argObj["value"] = decodeValueBytesToJson(arg.value)
-        argsJson.add(argObj)
-      callObj["args"] = argsJson
-      var childrenJson = newJArray()
-      for c in rec.children:
-        childrenJson.add(unsignedJson(c))
-      callObj["children"] = childrenJson
-      eventsArr.add(callObj)
+    # CallRecord round-trips faithfully). What the entry cursor has not
+    # reached is exactly those records, already in (entryStep, call_key)
+    # order, so deeper frames synthesized in close() appear after their
+    # parents.
+    let lastStep = stepTotal - 1
+    while entryCur < calls.byEntry.len:
+      let i = calls.byEntry[entryCur]
+      emit(callEntryJson(reader, calls.records[i], calls.keys[i],
+        some(lastStep)))
+      inc entryCur
 
   # Markers registered before the first step use coordinate 0 to mean resume
   # from the start. If no step ever arrives, the IO payload still exists and
   # must remain visible. The same drain preserves explicitly supplied buffered
   # coordinates beyond the emitted steps, without inventing a step or changing
-  # the coordinate that the correlation index reports.
-  for (sid, ev, idx) in ioByStep:
-    if sid >= uint64(allGlis.len):
-      eventsArr.add(ioEventJson(ev, idx))
+  # the coordinate that the correlation index reports. Index order, as the
+  # events are stored.
+  for (idx, ev) in ios:
+    if ev.stepId >= stepTotal:
+      emit(ioEventJson(ev, idx))
 
-  root["events"] = eventsArr
-  return root
+proc buildFullDocument*(reader: var NewTraceReader,
+    opts: FullOpts): JsonNode =
+  ## Build the deterministic JSON document for `--full` and `--events` modes.
+  ## The shape is:
+  ##   { metadata, paths, path_versions, functions, varnames, types,
+  ##     source_views, counts, events: [ {kind: "...", ...}, ... ] }
+  ## All variable values and call args/returns are decoded from CBOR into
+  ## structured JSON objects matching the ValueRecord variant layout.
+  ##
+  ## The whole document as one tree, which costs hundreds of bytes per
+  ## decoded value: for in-process callers on traces small enough to afford
+  ## it. ``ct-print`` streams through ``writeFullDocument`` /
+  ## ``writeEventsJsonl`` instead; all of them share ``buildFullHeader`` and
+  ## ``forEachFullEvent``.
+  result = buildFullHeader(reader, opts)
+  var eventsArr = newJArray()
+  reader.forEachFullEvent(opts, proc(event: JsonNode) {.raises: [].} =
+    eventsArr.add(event))
+  result["events"] = eventsArr
 
+# ---------------------------------------------------------------------------
+# Writing the document incrementally
+# ---------------------------------------------------------------------------
+
+proc writeFullDocument*(reader: var NewTraceReader, opts: FullOpts,
+    output: File) =
+  ## Write ``pretty(buildFullDocument(reader, opts), indent = 2)`` and a
+  ## newline to ``output``, byte for byte, without building the document:
+  ## the header's values and each event are rendered and written on their
+  ## own, by ``streamed_json``'s one writer.
+  var members = membersOf(buildFullHeader(reader, opts))
+  let rp = addr reader
+  members.add(streamedArray("events", proc(emit: EventSink) =
+    rp[].forEachFullEvent(opts, emit)))
+  writePrettyDocument(output, members)
+
+proc writeEventsJsonl*(reader: var NewTraceReader, opts: FullOpts,
+    output: File) =
+  ## Write the ``--events`` text: the header (every key but ``events``) as
+  ## one compact JSON line, then one compact line per event, streamed.
+  let header = buildFullHeader(reader, opts)
+  let rp = addr reader
+  writeJsonLines(output, header, proc(emit: EventSink) =
+    rp[].forEachFullEvent(opts, emit))

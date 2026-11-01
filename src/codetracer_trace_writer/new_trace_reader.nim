@@ -46,6 +46,21 @@ when ctHasFilesystem:
   import std/os
 
 type
+  CallIndexState = enum
+    cisUnbuilt       ## no query yet, or the call stream changed
+    cisBuilt         ## `entrySteps` / `exitMax` describe `count` calls
+    cisUnavailable   ## a record of the `count` did not decode
+
+  CallStepIndex = object
+    ## What `enclosingCallKey` needs of every call record, held so a query
+    ## costs O(log calls) without decoding records (see
+    ## `buildCallStepIndex`).
+    state: CallIndexState
+    count: uint64
+    size: int                 ## leaves in `exitMax`, a power of two
+    entrySteps: seq[uint64]   ## by call_key
+    exitMax: seq[uint64]      ## max-segment-tree over exit steps, root at 1
+
   SourceView* = object
     ## Decoded shape of one ``source_views.dat`` record.  See
     ## ``codetracer-trace-format-spec/internal-files.md`` §
@@ -148,6 +163,9 @@ type
     valueReader: ValueStreamReader
     callReader: CallStreamReader
     ioEventReader: IOEventStreamReader
+    callIndex: CallStepIndex
+      ## Built on the first `enclosingCallKey` / `callForStep`; a `refresh`
+      ## starts a fresh reader, and a grown call count rebuilds it.
 
     # Flags for lazy initialization
     execLoaded: bool
@@ -1667,8 +1685,98 @@ proc callCount*(r: var NewTraceReader): Result[uint64, string] =
   r.ensureCallReader()
   ok(r.callReader.count())
 
-proc callForStep*(r: var NewTraceReader, stepId: uint64): Result[CallRecord, string] =
-  ## Find the innermost enclosing call record for the given step.
+template lastEnteredBy(totalCalls, stepId: uint64,
+    entryStepAt: untyped): int64 =
+  ## Part 1 of ``enclosingCallKey``'s definition, shared by the indexed and
+  ## the walking form so both make the same probes: the largest index whose
+  ## entry step is ``<= stepId``, by binary search over ``entryStepAt(i)``
+  ## for ``totalCalls > 0`` records, or -1. ``entryStepAt`` may ``return``
+  ## from the caller (``?`` on a record that does not decode).
+  var lo: uint64 = 0
+  var hi: uint64 = totalCalls - 1
+  var k: int64 = -1
+  while lo <= hi:
+    let mid = lo + (hi - lo) div 2
+    if entryStepAt(mid) <= stepId:
+      k = int64(mid)
+      if mid == high(uint64):  # defensive, can't happen with reasonable trace
+        break
+      lo = mid + 1
+    else:
+      if mid == 0:
+        break
+      hi = mid - 1
+  k
+
+proc enclosingCallKeyByWalk(r: var NewTraceReader,
+    stepId: uint64): Result[uint64, string] =
+  ## ``enclosingCallKey`` read straight off the call stream, for a stream
+  ## the index could not be built over (a record that does not decode).
+  ## It probes exactly the records the definition names, in the same order,
+  ## so a damaged record produces the same refusal it always did, and only
+  ## where a query reaches it. Each query costs a walk back over every
+  ## sibling that already returned — the O(calls) per step this replaced.
+  let totalCalls = r.callReader.count()
+  template entryStepAt(i: uint64): uint64 =
+    (?r.callReader.readCall(i)).entryStep
+  let k = lastEnteredBy(totalCalls, stepId, entryStepAt)
+  if k < 0:
+    return err("step " & $stepId & " not found in any call")
+  var i = uint64(k)
+  while true:
+    let c = ?r.callReader.readCall(i)
+    if c.exitStep >= stepId:
+      return ok(i)
+    if i == 0:
+      break
+    i -= 1
+  err("step " & $stepId & " not found in any call")
+
+proc buildCallStepIndex(r: var NewTraceReader) =
+  ## Read every call record once and keep what ``enclosingCallKey`` asks of
+  ## it: each record's ``entryStep``, and a max-segment-tree over the
+  ## ``exitStep``s. 24 bytes per call, built on the first query and rebuilt
+  ## when a followed container's call stream has grown. A record that does
+  ## not decode leaves the index unavailable, and queries take the walk.
+  let n = r.callReader.count()
+  r.callIndex = CallStepIndex(state: cisUnavailable, count: n)
+  var entries = newSeq[uint64](n)
+  var size = 1
+  while uint64(size) < n:
+    size *= 2
+  var tree = newSeq[uint64](2 * size)
+  for i in 0'u64 ..< n:
+    let c = r.callReader.readCall(i)
+    if c.isErr:
+      return
+    entries[i] = c.get().entryStep
+    tree[size + int(i)] = c.get().exitStep
+  for node in countdown(size - 1, 1):
+    tree[node] = max(tree[2 * node], tree[2 * node + 1])
+  r.callIndex = CallStepIndex(state: cisBuilt, count: n, size: size,
+    entrySteps: move entries, exitMax: move tree)
+
+proc rightmostExitAtLeast(tree: seq[uint64], node, lo, hi, last: int,
+    stepId: uint64): int =
+  ## The largest leaf index ``<= last`` in ``[lo, hi)`` (the range ``node``
+  ## covers) whose exit step is ``>= stepId``, or -1. A subtree whose
+  ## maximum is below ``stepId``, or that starts past ``last``, is skipped
+  ## whole; the right child is tried first. O(log calls): along the path to
+  ## ``last`` each level enters at most one subtree that does not answer.
+  if lo > last or tree[node] < stepId:
+    return -1
+  if hi - lo == 1:
+    return lo
+  let mid = (lo + hi) div 2
+  let right = rightmostExitAtLeast(tree, 2 * node + 1, mid, hi, last, stepId)
+  if right >= 0:
+    return right
+  rightmostExitAtLeast(tree, 2 * node, lo, mid, last, stepId)
+
+proc enclosingCallKey*(r: var NewTraceReader,
+    stepId: uint64): Result[uint64, string] =
+  ## The call_key of the innermost call enclosing ``stepId`` — the record
+  ## ``callForStep`` returns — without decoding that record.
   ##
   ## Call records are sorted by `entryStep` ascending (= entry order, which
   ## also matches call_key allocation order after CTFS-M-CallKeyOrder).
@@ -1676,18 +1784,35 @@ proc callForStep*(r: var NewTraceReader, stepId: uint64): Result[CallRecord, str
   ## parent's `exitStep` is far larger than any of its children's: child
   ## ranges `[entryStep, exitStep]` are strictly contained in the parent's.
   ##
-  ## Strategy (correct for arbitrary nesting):
-  ##   1. Binary-search for the largest index `k` with
+  ## The answer is defined as:
+  ##   1. `k`, the result of a binary search for the largest index with
   ##      `calls[k].entryStep <= stepId`. All calls at index > k were
   ##      entered after `stepId` and cannot contain it.
-  ##   2. Walk back from `k` and return the FIRST call whose
-  ##      `exitStep >= stepId`. That call is, by construction, the
+  ##   2. The LARGEST index `i <= k` whose `exitStep >= stepId`: the
   ##      most-recently-entered frame still open at `stepId`, hence the
-  ##      deepest enclosing call. Earlier indices in the walk are either
-  ##      siblings that already returned (their parent eventually has
-  ##      `exitStep >= stepId`) or the matching parent itself.
+  ##      deepest enclosing call. A drained entry past the last step
+  ##      (`entryStep = step_count`, `exitStep = step_count - 1`) is
+  ##      never `<= stepId` for a step of the trace, and frames finalized
+  ##      at close share an exit step without changing which is largest.
+  ## Refusals: `no call records` on an empty stream, and `step N not found
+  ## in any call` when either part finds nothing.
   ##
-  ## CTFS-M-FunctionAttrTemplate: the previous implementation interleaved
+  ## Part 2 used to be a walk back from `k` over every call entered before
+  ## the step — every already-returned sibling — reading each from a call
+  ## stream that keeps one inflated chunk. On a module body that calls
+  ## thousands of functions (a recorded `import`) that is O(calls) per
+  ## step, and ct-print queries every step. It is now one query on a
+  ## max-segment-tree over the exit steps (`buildCallStepIndex`): the
+  ## rightmost leaf `<= k` whose exit is `>= stepId`. Part 1 runs the same
+  ## binary search over the index's entry steps, so a stream whose entry
+  ## steps are out of order answers as it always did. Both parts take
+  ## O(log calls), and the answer is the definition's for every stream —
+  ## the walk's, not an approximation that holds only where calls nest
+  ## (`tests/test_call_for_step_matches_reference.nim`). Following
+  ## `parentCallKey` up from `k` gives the same answer where ranges nest,
+  ## but trusts a field the definition does not read.
+  ##
+  ## CTFS-M-FunctionAttrTemplate: an earlier implementation interleaved
   ## an interpolation search with an early-exit on `stepId > hi.exitStep`
   ## and used the lo/hi-contains shortcut to record matches. Both pieces
   ## broke for steps that sit in a caller's body AFTER a nested call
@@ -1703,42 +1828,29 @@ proc callForStep*(r: var NewTraceReader, stepId: uint64): Result[CallRecord, str
   let totalCalls = r.callReader.count()
   if totalCalls == 0:
     return err("no call records")
+  if r.callIndex.state == cisUnbuilt or r.callIndex.count != totalCalls:
+    r.buildCallStepIndex()
+  if r.callIndex.state != cisBuilt:
+    return r.enclosingCallKeyByWalk(stepId)
 
-  # Step 1: binary search for largest index k with entryStep <= stepId.
-  # If no such index exists (stepId precedes the first call), bail out.
-  var lo: uint64 = 0
-  var hi: uint64 = totalCalls - 1
-  var k: int64 = -1
-  while lo <= hi:
-    let mid = lo + (hi - lo) div 2
-    let midCall = ?r.callReader.readCall(mid)
-    if midCall.entryStep <= stepId:
-      k = int64(mid)
-      if mid == high(uint64):  # defensive, can't happen with reasonable trace
-        break
-      lo = mid + 1
-    else:
-      if mid == 0:
-        break
-      hi = mid - 1
+  # Part 1, over the index: the same probes `enclosingCallKeyByWalk` makes.
+  template entryStepAt(i: uint64): uint64 = r.callIndex.entrySteps[i]
+  let k = lastEnteredBy(totalCalls, stepId, entryStepAt)
   if k < 0:
     return err("step " & $stepId & " not found in any call")
+  # Part 2: the rightmost index <= k whose exit step reaches the step.
+  let i = rightmostExitAtLeast(r.callIndex.exitMax, 1, 0, r.callIndex.size,
+    int(k), stepId)
+  if i < 0:
+    return err("step " & $stepId & " not found in any call")
+  ok(uint64(i))
 
-  # Step 2: walk backwards looking for the first enclosing call. The
-  # walk traverses sibling subtrees that already returned; their parent
-  # (or grandparent, etc.) is the answer. Worst case is O(N) but the
-  # expected cost on well-formed traces is O(call-depth-at-stepId)
-  # because each backward hop skips at most one returned subtree before
-  # landing on the enclosing frame.
-  var i = uint64(k)
-  while true:
-    let c = ?r.callReader.readCall(i)
-    if c.exitStep >= stepId:
-      return ok(c)
-    if i == 0:
-      break
-    i -= 1
-  err("step " & $stepId & " not found in any call")
+proc callForStep*(r: var NewTraceReader, stepId: uint64): Result[CallRecord, string] =
+  ## The innermost call record enclosing the given step: the record at
+  ## ``enclosingCallKey(stepId)`` (see there for the definition, its cost
+  ## and its refusals).
+  let key = ?r.enclosingCallKey(stepId)
+  r.callReader.readCall(key)
 
 iterator callRange*(r: var NewTraceReader, start, count: uint64): CallRecord =
   ## Yields call records in [start, start+count).

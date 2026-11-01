@@ -364,6 +364,21 @@ task test, "Run all tests":
   # whole dump with RangeDefect; below 2^63 each stays an ordinary integer.
   # Builds ct-print through `tests/ct_print_binary.nim`, hence `-p:tests`.
   exec "nim c -r -d:release -p:src -p:tests tests/test_ct_print_full_large_unsigned.nim"
+  # `ct-print --full` / `--events` / `--json` / `--json-events`, on
+  # split-stream and native containers, stream their output in memory
+  # proportional to the trace and finish in seconds on a Python-shaped
+  # container (~280 K exec records, ~37 K calls), byte-identical to the
+  # in-process rendering.
+  # They used to hold the whole document twice and scan every call per step:
+  # 32 GB and ~20 minutes on an 11 MB trace. Builds ct-print through
+  # `tests/ct_print_binary.nim`, hence `-p:tests`.
+  exec "nim c -r -d:release -p:src -p:tests tests/test_ct_print_full_streams.nim"
+  # `NewTraceReader.callForStep` / `enclosingCallKey` answer exactly their
+  # definition on every step of a deep and wide call tree (shared exit steps
+  # at close, a drained entry past the last step, stepless callees), checked
+  # against a brute-force reading of it. The answer now comes from an index
+  # instead of a walk back over every returned sibling.
+  exec "nim c -r -d:release -p:src tests/test_call_for_step_matches_reference.nim"
   # A step count is the number of step records: raise, catch and thread
   # records are exec records but not steps, in the reader, the C ABI and
   # every ct-print view.

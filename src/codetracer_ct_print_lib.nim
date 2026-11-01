@@ -15,7 +15,13 @@
 ##   - `valueRecordToJson(v)` — render a decoded ValueRecord as JsonNode.
 ##   - `decodeValueBytesToJson(bytes)` — decode CBOR + render to JsonNode.
 ##   - `FullOpts` and `buildFullDocument(reader, opts)` — the full
-##     content-faithful dump used by `ct-print --full` and `--events`.
+##     content-faithful dump used by `ct-print --full` and `--events`, as one
+##     tree. The binary never builds it: it streams the same document through
+##     `buildFullHeader` (every key but `events`), `forEachFullEvent` (the
+##     events, one at a time) and `writeFullDocument` / `writeEventsJsonl`;
+##     `buildFullDocument` is a thin wrapper over the first two.
+##   - `streamed_json` (re-exported): the one writer of every streamed JSON
+##     mode, byte-identical to `pretty` / `$` of the whole tree.
 ##   - `resolveGli` — the line-only global-position-index inverse. It REFUSES
 ##     an index the trace's address space cannot hold rather than answering
 ##     with a plausible `(path, line)`; the emitted event then carries

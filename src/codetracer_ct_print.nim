@@ -245,9 +245,14 @@ proc printMetaJsonV4(reader: var NewTraceReader) =
 # ---------------------------------------------------------------------------
 
 proc printJsonV4(reader: var NewTraceReader) =
+  ## The legacy `--json` document: `metadata`, `paths`, `functions`, then
+  ## `steps`, `calls`, `values` and `ioEvents`, one entry per record.
+  ##
+  ## Streamed: the four per-record arrays are produced one element at a
+  ## time and written as they come (`streamed_json`), so neither the tree
+  ## nor its rendering is held; the text is byte-identical to
+  ## `pretty(root)` of the tree this used to build.
   let gli = reader.globalPositionSpace()
-
-  var root = newJObject()
 
   # Metadata
   var meta = newJObject()
@@ -257,7 +262,6 @@ proc printJsonV4(reader: var NewTraceReader) =
     argsArr.add(newJString(arg))
   meta["args"] = argsArr
   meta["workdir"] = newJString(reader.meta.workdir)
-  root["metadata"] = meta
 
   # Paths
   var pathsArr = newJArray()
@@ -265,7 +269,6 @@ proc printJsonV4(reader: var NewTraceReader) =
     let p = reader.path(i)
     if p.isOk: pathsArr.add(newJString(p.get()))
     else: pathsArr.add(newJString("(error)"))
-  root["paths"] = pathsArr
 
   # Functions
   var funcsArr = newJArray()
@@ -273,14 +276,17 @@ proc printJsonV4(reader: var NewTraceReader) =
     let f = reader.function(i)
     if f.isOk: funcsArr.add(newJString(f.get()))
     else: funcsArr.add(newJString("(error)"))
-  root["functions"] = funcsArr
+
+  let rp = addr reader
+  var members = @[held("metadata", meta), held("paths", pathsArr),
+                  held("functions", funcsArr)]
 
   # Steps — pre-fetch all GLIs in one O(N) bulk pass so the per-step
   # loop is a flat seq lookup; using stepAbsoluteGlobalLineIndex(i)
   # in the loop is O(N^2) per call (and O(N^3) end-to-end).
-  var stepsArr = newJArray()
-  let allGlis = precomputeStepGlis(reader)
-  if allGlis.len > 0:
+  members.add(streamedArray("steps", proc(emit: EventSink) =
+    template reader: untyped = rp[]
+    let allGlis = precomputeStepGlis(reader)
     for i in 0'u64 ..< uint64(allGlis.len):
       var stepObj = newJObject()
       stepObj["index"] = unsignedJson(i)
@@ -300,72 +306,68 @@ proc printJsonV4(reader: var NewTraceReader) =
       let ev = reader.step(i)
       if ev.isOk:
         stepObj["kind"] = newJString($ev.get().kind)
-      stepsArr.add(stepObj)
-  root["steps"] = stepsArr
+      emit(stepObj)))
 
   # Calls
-  var callsArr = newJArray()
-  let cc = reader.callCount()
-  if cc.isOk:
-    for i in 0'u64 ..< cc.get():
-      let c = reader.call(i)
-      if c.isOk:
-        let rec = c.get()
-        var callObj = newJObject()
-        callObj["call_key"] = unsignedJson(i)
-        callObj["function_id"] = unsignedJson(rec.functionId)
-        let fn = reader.function(rec.functionId)
-        if fn.isOk:
-          callObj["function"] = newJString(fn.get())
-        callObj["entry_step"] = unsignedJson(rec.entryStep)
-        callObj["exit_step"] = unsignedJson(rec.exitStep)
-        callObj["depth"] = newJInt(int64(rec.depth))
-        callObj["arg_count"] = newJInt(int64(rec.args.len))
-        callObj["children_count"] = newJInt(int64(rec.children.len))
-        callsArr.add(callObj)
-  root["calls"] = callsArr
+  members.add(streamedArray("calls", proc(emit: EventSink) =
+    template reader: untyped = rp[]
+    let cc = reader.callCount()
+    if cc.isOk:
+      for i in 0'u64 ..< cc.get():
+        let c = reader.call(i)
+        if c.isOk:
+          let rec = c.get()
+          var callObj = newJObject()
+          callObj["call_key"] = unsignedJson(i)
+          callObj["function_id"] = unsignedJson(rec.functionId)
+          let fn = reader.function(rec.functionId)
+          if fn.isOk:
+            callObj["function"] = newJString(fn.get())
+          callObj["entry_step"] = unsignedJson(rec.entryStep)
+          callObj["exit_step"] = unsignedJson(rec.exitStep)
+          callObj["depth"] = newJInt(int64(rec.depth))
+          callObj["arg_count"] = newJInt(int64(rec.args.len))
+          callObj["children_count"] = newJInt(int64(rec.children.len))
+          emit(callObj)))
 
   # Values (per step)
-  var valuesArr = newJArray()
-  let scForValues = reader.stepCount()
-  if scForValues.isOk:
-    for i in 0'u64 ..< scForValues.get():
-      let vals = reader.valuesForStep(i)
-      if vals.isOk:
-        for v in vals.get():
-          var valObj = newJObject()
-          valObj["step"] = unsignedJson(i)
-          valObj["varname_id"] = unsignedJson(v.varnameId)
-          let vn = reader.varname(v.varnameId)
-          if vn.isOk:
-            valObj["varname"] = newJString(vn.get())
-          valObj["type_id"] = unsignedJson(v.typeId)
-          let tn = reader.typeName(v.typeId)
-          if tn.isOk:
-            valObj["type"] = newJString(tn.get())
-          valuesArr.add(valObj)
-  root["values"] = valuesArr
+  members.add(streamedArray("values", proc(emit: EventSink) =
+    template reader: untyped = rp[]
+    let scForValues = reader.stepCount()
+    if scForValues.isOk:
+      for i in 0'u64 ..< scForValues.get():
+        let vals = reader.valuesForStep(i)
+        if vals.isOk:
+          for v in vals.get():
+            var valObj = newJObject()
+            valObj["step"] = unsignedJson(i)
+            valObj["varname_id"] = unsignedJson(v.varnameId)
+            let vn = reader.varname(v.varnameId)
+            if vn.isOk:
+              valObj["varname"] = newJString(vn.get())
+            valObj["type_id"] = unsignedJson(v.typeId)
+            let tn = reader.typeName(v.typeId)
+            if tn.isOk:
+              valObj["type"] = newJString(tn.get())
+            emit(valObj)))
 
   # IO Events
-  var ioArr = newJArray()
-  let ic = reader.ioEventCount()
-  if ic.isOk:
-    for i in 0'u64 ..< ic.get():
-      let ev = reader.ioEvent(i)
-      if ev.isOk:
-        let e = ev.get()
-        var ioObj = newJObject()
-        ioObj["index"] = unsignedJson(i)
-        ioObj["kind"] = newJString($e.kind)
-        ioObj["step_id"] = unsignedJson(e.stepId)
-        ioObj["data"] = newJString(bytesToUtf8(e.data))
-        ioArr.add(ioObj)
-  root["ioEvents"] = ioArr
+  members.add(streamedArray("ioEvents", proc(emit: EventSink) =
+    template reader: untyped = rp[]
+    let ic = reader.ioEventCount()
+    if ic.isOk:
+      for i in 0'u64 ..< ic.get():
+        let ev = reader.ioEvent(i)
+        if ev.isOk:
+          let e = ev.get()
+          var ioObj = newJObject()
+          ioObj["index"] = unsignedJson(i)
+          ioObj["kind"] = newJString($e.kind)
+          ioObj["step_id"] = unsignedJson(e.stepId)
+          ioObj["data"] = newJString(bytesToUtf8(e.data))
+          emit(ioObj)))
 
-  try:
-    echo pretty(root)
-  except ValueError:
-    echo $root
+  writePrettyDocument(stdout, members)
 
 # ---------------------------------------------------------------------------
 # V4 JSON events (legacy, interleaved by step, no full values)
@@ -473,120 +475,141 @@ proc stepEventToJson(reader: var NewTraceReader, gli: GlobalLineIndex,
   nodes
 
 proc printJsonEventsV4(reader: var NewTraceReader) =
+  ## The legacy `--json-events` array: declaration events for every path,
+  ## function, varname and type, then per exec record its call entries
+  ## (call_key ascending), the step, its values and its IO events. Calls
+  ## entered, and IO events placed, past the last record are not printed
+  ## (unlike `--full`, which drains them).
+  ##
+  ## Streamed (`streamed_json`), byte-identical to `pretty(eventsArr)` of the
+  ## array this used to build. The call entries and IO events at each
+  ## record come from indexes sorted once and walked by cursors; the
+  ## per-record scan of every call and every IO event this replaced was
+  ## O(records x calls).
   let gli = reader.globalPositionSpace()
 
-  # Pre-load all IO events indexed by stepId for quick lookup
-  var ioByStep: seq[(uint64, IOEvent, uint64)]  # (stepId, event, index)
+  # IO events in index order, and positions into them by (stepId, index).
+  var ios: seq[(uint64, IOEvent)]  # (index, event)
   let ic = reader.ioEventCount()
   if ic.isOk:
     for i in 0'u64 ..< ic.get():
       let ev = reader.ioEvent(i)
       if ev.isOk:
-        ioByStep.add((ev.get().stepId, ev.get(), i))
+        ios.add((i, ev.get()))
+  var ioByStep = newSeq[int](ios.len)
+  for i in 0 ..< ios.len: ioByStep[i] = i
+  ioByStep.sort(proc(a, b: int): int =
+    let sa = ios[a][1].stepId
+    let sb = ios[b][1].stepId
+    if sa < sb: -1 elif sa > sb: 1 else: cmp(a, b))
 
-  # Also emit call events at their entry steps
-  var callEntries: seq[(uint64, v4calls.CallRecord, uint64)]  # (entryStep, record, callKey)
+  # Call records in call_key order, and positions by (entryStep, call_key).
+  var calls: seq[(uint64, v4calls.CallRecord)]  # (callKey, record)
   let cc = reader.callCount()
   if cc.isOk:
     for i in 0'u64 ..< cc.get():
       let c = reader.call(i)
       if c.isOk:
-        callEntries.add((c.get().entryStep, c.get(), i))
+        calls.add((i, c.get()))
+  var byEntry = newSeq[int](calls.len)
+  for i in 0 ..< calls.len: byEntry[i] = i
+  byEntry.sort(proc(a, b: int): int =
+    let ea = calls[a][1].entryStep
+    let eb = calls[b][1].entryStep
+    if ea < eb: -1 elif ea > eb: 1 else: cmp(a, b))
 
-  var eventsArr = newJArray()
+  let rp = addr reader
+  writePrettyArray(stdout, proc(emit: EventSink) =
+    template reader: untyped = rp[]
+    # Declaration events for paths / functions / varnames / types.  These
+    # are emitted up-front so consumers (e.g. ruby's recorder-comparison
+    # test) can observe every interned identifier the .ct file carries, in
+    # the same order the writer assigned IDs.  Without these,
+    # `--json-events` only emits steps/calls/values/io and the consumer has
+    # to reverse-engineer the interning tables from inlined name strings —
+    # which loses information when the same name is re-used at multiple
+    # sites.
+    for i in 0'u64 ..< reader.pathCount():
+      var obj = newJObject()
+      obj["type"] = newJString("path")
+      obj["path_id"] = unsignedJson(i)
+      let p = reader.path(i)
+      if p.isOk:
+        obj["name"] = newJString(p.get())
+      emit(obj)
 
-  # Declaration events for paths / functions / varnames / types.  These are
-  # emitted up-front so consumers (e.g. ruby's recorder-comparison test) can
-  # observe every interned identifier the .ct file carries, in the same
-  # order the writer assigned IDs.  Without these, `--json-events` only
-  # emits steps/calls/values/io and the consumer has to reverse-engineer
-  # the interning tables from inlined name strings — which loses information
-  # when the same name is re-used at multiple sites.
-  for i in 0'u64 ..< reader.pathCount():
-    var obj = newJObject()
-    obj["type"] = newJString("path")
-    obj["path_id"] = unsignedJson(i)
-    let p = reader.path(i)
-    if p.isOk:
-      obj["name"] = newJString(p.get())
-    eventsArr.add(obj)
+    for i in 0'u64 ..< reader.functionCount():
+      var obj = newJObject()
+      obj["type"] = newJString("function")
+      obj["function_id"] = unsignedJson(i)
+      let f = reader.function(i)
+      if f.isOk:
+        obj["name"] = newJString(f.get())
+      emit(obj)
 
-  for i in 0'u64 ..< reader.functionCount():
-    var obj = newJObject()
-    obj["type"] = newJString("function")
-    obj["function_id"] = unsignedJson(i)
-    let f = reader.function(i)
-    if f.isOk:
-      obj["name"] = newJString(f.get())
-    eventsArr.add(obj)
+    for i in 0'u64 ..< reader.varnameCount():
+      var obj = newJObject()
+      obj["type"] = newJString("varname")
+      obj["varname_id"] = unsignedJson(i)
+      let v = reader.varname(i)
+      if v.isOk:
+        obj["name"] = newJString(v.get())
+      emit(obj)
 
-  for i in 0'u64 ..< reader.varnameCount():
-    var obj = newJObject()
-    obj["type"] = newJString("varname")
-    obj["varname_id"] = unsignedJson(i)
-    let v = reader.varname(i)
-    if v.isOk:
-      obj["name"] = newJString(v.get())
-    eventsArr.add(obj)
+    for i in 0'u64 ..< reader.typeCount():
+      var obj = newJObject()
+      obj["type"] = newJString("type")
+      obj["type_id"] = unsignedJson(i)
+      let t = reader.typeName(i)
+      if t.isOk:
+        obj["name"] = newJString(t.get())
+      emit(obj)
 
-  for i in 0'u64 ..< reader.typeCount():
-    var obj = newJObject()
-    obj["type"] = newJString("type")
-    obj["type_id"] = unsignedJson(i)
-    let t = reader.typeName(i)
-    if t.isOk:
-      obj["name"] = newJString(t.get())
-    eventsArr.add(obj)
-
-  # Pre-fetch all step GLIs in one O(N) pass so the per-step loop
-  # below stays linear instead of calling stepAbsoluteGlobalLineIndex
-  # per step (which is O(N) each ⇒ O(N²) total).
-  let allGlis = precomputeStepGlis(reader)
-  if allGlis.len > 0:
+    # Pre-fetch all step GLIs in one O(N) pass so the per-step loop
+    # below stays linear instead of calling stepAbsoluteGlobalLineIndex
+    # per step (which is O(N) each ⇒ O(N²) total).
+    let allGlis = precomputeStepGlis(reader)
+    var entryCur, ioCur = 0
     for stepIdx in 0'u64 ..< uint64(allGlis.len):
-      # Collect IO events for this step
+      # Every cursor's remaining items lie at or after `stepIdx`, so the
+      # items AT it are a prefix of what remains.
       var stepIo: seq[IOEvent]
       var stepIoIndices: seq[uint64]
-      for (sid, ev, idx) in ioByStep:
-        if sid == stepIdx:
-          stepIo.add(ev)
-          stepIoIndices.add(idx)
+      while ioCur < ioByStep.len and ios[ioByStep[ioCur]][1].stepId == stepIdx:
+        stepIo.add(ios[ioByStep[ioCur]][1])
+        stepIoIndices.add(ios[ioByStep[ioCur]][0])
+        inc ioCur
 
       # Emit call entry events at this step
-      for (es, rec, ck) in callEntries:
-        if es == stepIdx:
-          var callObj = newJObject()
-          callObj["type"] = newJString("call")
-          callObj["call_key"] = unsignedJson(ck)
-          callObj["function_id"] = unsignedJson(rec.functionId)
-          let fn = reader.function(rec.functionId)
-          if fn.isOk:
-            callObj["function"] = newJString(fn.get())
-          callObj["entry_step"] = unsignedJson(rec.entryStep)
-          callObj["exit_step"] = unsignedJson(rec.exitStep)
-          callObj["depth"] = newJInt(int64(rec.depth))
-          eventsArr.add(callObj)
+      while entryCur < byEntry.len and
+          calls[byEntry[entryCur]][1].entryStep == stepIdx:
+        let (ck, rec) = calls[byEntry[entryCur]]
+        inc entryCur
+        var callObj = newJObject()
+        callObj["type"] = newJString("call")
+        callObj["call_key"] = unsignedJson(ck)
+        callObj["function_id"] = unsignedJson(rec.functionId)
+        let fn = reader.function(rec.functionId)
+        if fn.isOk:
+          callObj["function"] = newJString(fn.get())
+        callObj["entry_step"] = unsignedJson(rec.entryStep)
+        callObj["exit_step"] = unsignedJson(rec.exitStep)
+        callObj["depth"] = newJInt(int64(rec.depth))
+        emit(callObj)
 
-      let nodes = stepEventToJson(reader, gli, stepIdx, allGlis[int(stepIdx)],
-        stepIo, stepIoIndices)
-      for n in nodes:
-        eventsArr.add(n)
-
-  try:
-    echo pretty(eventsArr)
-  except ValueError:
-    echo $eventsArr
+      for n in stepEventToJson(reader, gli, stepIdx, allGlis[int(stepIdx)],
+          stepIo, stepIoIndices):
+        emit(n))
 
 # ---------------------------------------------------------------------------
 # V4 FULL: complete content-faithful JSON dump (with decoded values).
 # ---------------------------------------------------------------------------
 
 proc printFullV4(reader: var NewTraceReader, opts: FullOpts) =
-  let root = buildFullDocument(reader, opts)
-  try:
-    echo pretty(root, indent = 2)
-  except ValueError:
-    echo $root
+  ## Streamed: the document is never held whole, in either form — see
+  ## `full_document_json`'s "Streaming the document" section for why, and for
+  ## the byte-identity with `pretty(buildFullDocument(...), indent = 2)`.
+  writeFullDocument(reader, opts, stdout)
 
 proc printMarkersV4(reader: var NewTraceReader, opts: FullOpts) =
   ## List the correlation markers a trace carries.
@@ -601,13 +624,11 @@ proc printMarkersV4(reader: var NewTraceReader, opts: FullOpts) =
   ##
   ## Without a view like this the failure is silent: the debugger simply
   ## reports a chain that stops early, with nothing to say why.
-  let root = buildFullDocument(reader, opts)
-  let events = root{"events"}
+  # Filtered as the events stream past, so only the markers are kept.
   var markers: seq[JsonNode] = @[]
-  if events != nil and events.kind == JArray:
-    for ev in events.elems:
-      if ev.kind == JObject and ev.hasKey("correlation_marker"):
-        markers.add(ev)
+  reader.forEachFullEvent(opts, proc(ev: JsonNode) =
+    if isCorrelationMarker(ev):
+      markers.add(ev))
 
   if opts.jsonOut:
     var arr = newJArray()
@@ -869,20 +890,9 @@ proc printSpans(filePath: string, jsonOut: bool) =
 
 proc printEventsJsonlV4(reader: var NewTraceReader, opts: FullOpts) =
   ## Emit one JSON object per line. The first line is the header
-  ## (metadata + interning tables). Subsequent lines are one event each.
-  let root = buildFullDocument(reader, opts)
-
-  # Header line: everything except `events`
-  var header = newJObject()
-  for k, v in root.pairs:
-    if k != "events":
-      header[k] = v
-  echo $header
-
-  let events = root["events"]
-  if events.kind == JArray:
-    for ev in events.elems:
-      echo $ev
+  ## (metadata + interning tables). Subsequent lines are one event each,
+  ## written as each is produced.
+  writeEventsJsonl(reader, opts, stdout)
 
 # ---------------------------------------------------------------------------
 # V4 text output (human-readable)
@@ -1222,27 +1232,24 @@ proc emitNativeFull(filePath: string, format: string, stripPaths: bool) =
   ## layout written by `codetracer-native-recorder/ct_recorder/trace_writer`).
   ## On any decode failure we `quit` with a specific error so callers see
   ## what the decoder didn't understand — never a silent empty document.
-  let docRes = decodeNativeFromFile(filePath,
+  ##
+  ## Streamed like the split-stream modes: the decoded records are held, the
+  ## document and its rendering are not (`native_decoder.NativeDocument`,
+  ## `streamed_json`). The text is byte-identical to `pretty` / `$` of
+  ## `buildNativeFullDocument`'s tree.
+  var docRes = decodeNativeDocumentFromFile(filePath,
     NativeOpts(stripPaths: stripPaths))
   if docRes.isErr:
     quit("ct-print: native decode failed: " & docRes.error)
-  let doc = docRes.get()
+  let dp = addr docRes
+  let produce = proc(emit: EventSink) = dp[].get().forEachNativeEvent(emit)
   case format
   of "events":
-    var header = newJObject()
-    for k, v in doc.pairs:
-      if k != "events":
-        header[k] = v
-    echo $header
-    let events = doc{"events"}
-    if events != nil and events.kind == JArray:
-      for ev in events.elems:
-        echo $ev
+    writeJsonLines(stdout, docRes.get().header, produce)
   else:
-    try:
-      echo pretty(doc, indent = 2)
-    except ValueError:
-      echo $doc
+    var members = membersOf(docRes.get().header)
+    members.add(streamedArray("events", produce))
+    writePrettyDocument(stdout, members)
 
 type
   AutoDetectKind = enum
