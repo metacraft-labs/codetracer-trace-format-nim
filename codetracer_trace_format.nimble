@@ -45,6 +45,11 @@ task test, "Run all tests":
   # a killed writer's page reaped, another file's identity refused).
   exec "nim c -r -d:release -p:src tests/test_live_page_torn.nim"
   exec "nim c -r -d:release -p:src tests/test_live_page_lifetime.nim"
+  # The sweep of pages no process opens: a killed writer's page removed
+  # without opening its container; live, other-pid- or time-namespace,
+  # unstated-namespace, creating and unclaimed pages kept, and a live writer
+  # in another time namespace kept (Linux; elsewhere it skips).
+  exec "nim c -r -d:release -p:src tests/test_live_page_sweep.nim"
   # The in-guest writer: no thread, its heartbeat stored only at its seals,
   # judged alive by pid and start time; a quiet guest is followed, not
   # reaped; the file-only form hosts no page. Arms: a heartbeat thread

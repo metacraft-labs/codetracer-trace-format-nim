@@ -24,7 +24,7 @@ when defined(nimPreviewSlimSystem):
 ## | 48 | state: 0 creating, 1 live, 2 closed, 3 abandoned |
 ## | 56 | `seal_epoch` (every writer's seals) |
 ## | 64 | `overflowed` (mirror allocations refused) |
-## | 128 + 64·w | writer slot w (0..15): pid, start time, heartbeat, `seal_epoch`, state, liveness |
+## | 128 + 64·w | writer slot w (0..15): pid, start time, heartbeat, `seal_epoch`, state, liveness, pid namespace, time namespace |
 ## | 1152 | `NextFreeBlock` |
 ## | 1160 + 8·f | family counter f (0..15) |
 ## | 1288 | `mirror_bump` |
@@ -87,6 +87,16 @@ const
     ## its pid no longer names a process with its start time.
   OffSlotLiveness* = 40
     ## The liveness word's offset inside a writer slot.
+  OffSlotPidNs* = 48
+    ## Writer slot `+48`, the writer's pid namespace (§6, "Claiming a writer
+    ## slot"): on Linux the inode behind `/proc/self/ns/pid`; `0` (unstated)
+    ## elsewhere, or when the writer cannot place itself (`currentNamespaces`).
+    ## Only a sweeper reads it (§6, "A page no process opens").
+  OffSlotTimeNs* = 56
+    ## Writer slot `+56`, the writer's time namespace: on Linux the inode
+    ## behind `/proc/self/ns/time`, `0` on a kernel without time namespaces.
+    ## The start time a process reads for a pid is in its own time namespace,
+    ## so a sweeper compares start times only with writers in its own.
 
   OffIdentity* = 8
   OffCapacity* = 40
@@ -434,6 +444,50 @@ proc processStartTime*(pid: uint64): uint64 =
       if ch notin {'0'..'9'}: return 0
       v = v * 10 + uint64(ord(ch) - ord('0'))
     v + 1
+
+type SlotNamespaces* = object
+  ## The namespaces a writer slot states (§6, "Claiming a writer slot"): the
+  ## ones in which its pid and start time mean something. `pid == 0` is
+  ## "unstated": such a slot is never judged by a sweeper.
+  pid*: uint64   ## slot `+48`
+  time*: uint64  ## slot `+56`
+
+proc currentNamespaces*(): SlotNamespaces =
+  ## This process's namespaces, as a writer slot states them and as a sweeper
+  ## compares them. On Linux: the inode numbers behind `/proc/self/ns/pid` and
+  ## `/proc/self/ns/time` (`time` is `0` on a kernel without time
+  ## namespaces). `pid` is `0`, and so the whole answer unstated:
+  ##
+  ## - on every other platform;
+  ## - when either cannot be read;
+  ## - when `/proc` is not a /proc of this process's pid namespace (its
+  ##   `/proc/self` does not name `getpid()`): a process in a child pid
+  ##   namespace that still sees its parent's /proc reads another process's
+  ##   start time for its own pid, so its pid and start time prove nothing to
+  ##   anyone.
+  ##
+  ## It is read anew on every call, never cached: a child created into a new
+  ## pid namespace (`clone(CLONE_NEWPID)`, or `fork` after
+  ## `unshare(CLONE_NEWPID)`) would inherit a cached answer that names its
+  ## parent's namespace.
+  when defined(linux):
+    var link: array[32, char]
+    let n = readlink("/proc/self", cast[cstring](addr link[0]), link.len)
+    if n <= 0 or n >= link.len: return
+    var self = newString(n)
+    copyMem(addr self[0], addr link[0], n)
+    if self != $getpid(): return
+    var st: Stat
+    if stat("/proc/self/ns/pid", st) != 0: return
+    let pidNs = uint64(st.st_ino)
+    var timeNs = 0'u64
+    if stat("/proc/self/ns/time", st) == 0:
+      timeNs = uint64(st.st_ino)
+    elif errno != ENOENT:
+      return
+    SlotNamespaces(pid: pidNs, time: timeNs)
+  else:
+    SlotNamespaces()
 
 # ---------------------------------------------------------------------------
 # Identity and name
@@ -891,14 +945,18 @@ proc stopHeartbeat(p: LivePage) =
 
 proc claimWriterSlot(p: LivePage): Result[int, string] =
   ## A compare-exchange of a slot's state from 0 to 1, tried on slots 0 to 15
-  ## in order (a bounded scan), then the slot's liveness, pid, start time and
-  ## heartbeat, the heartbeat stored with release. A slot is never reused
-  ## within a page's life.
+  ## in order (a bounded scan), then the slot's liveness, namespaces, pid,
+  ## start time and heartbeat, the heartbeat stored with release. A slot is
+  ## never reused within a page's life. A sweeper that sees the slot `live`
+  ## before its pid namespace is stored reads `0` there and keeps the page.
   let pid = currentPid()
+  let ns = currentNamespaces()
   for i in 0 ..< PageWriterSlots:
     let b = OffWriters + i * WriterSlotSize
     if p.view.casWord(b + 32, WriterSlotFree, WriterSlotLive):
       p.view.storeRelaxed(b + OffSlotLiveness, p.liveness)
+      p.view.storeRelaxed(b + OffSlotTimeNs, ns.time)
+      p.view.storeRelaxed(b + OffSlotPidNs, ns.pid)
       p.view.storeRelaxed(b, pid)
       p.view.storeRelaxed(b + 8, processStartTime(pid))
       p.view.store(b + 16, monotonicNs())
@@ -1255,3 +1313,106 @@ proc reapAbandonedPage*(f: File): tuple[found, reaped: bool] =
   shmUnmap(v, h)
   shmUnlink(name)
   (true, true)
+
+# ---------------------------------------------------------------------------
+# The sweeper's side: pages no process opens (Linux)
+# ---------------------------------------------------------------------------
+
+when defined(linux):
+  type PageSweepVerdict* = enum
+    ## What a page says about its writers, for a sweeper that has no
+    ## container in hand (§6, "A page no process opens"). Only `psDead` lets
+    ## the page be removed.
+    psNotAPage = "not a live coordination page (too small, or an unknown magic or version)"
+    psCreating = "the page is still being created"
+    psNoWriter = "no writer slot was ever claimed"
+    psUnstated = "a live writer slot states no pid namespace, or the sweeper cannot place itself"
+    psOtherNamespace = "a live writer slot is in another pid or time namespace"
+    psAlive = "a writer is alive, or cannot be proven dead"
+    psDead = "every writer is proven dead: the page is stale"
+
+  proc pageSweepVerdict*(v: PageView, own: SlotNamespaces): PageSweepVerdict =
+    ## The sweeper's judgement of the page mapped as `v`, for a sweeper in the
+    ## namespaces `own` (`currentNamespaces`): strictly narrower than a
+    ## reader's (`liveWriters`). Every slot whose state is `live` must state
+    ## the sweeper's own pid namespace (non-zero) and time namespace, and its
+    ## pid must no longer name a process with its recorded start time. The
+    ## heartbeat plays no part: it would also judge a writer in another
+    ## namespace, whose pid means nothing here, and a quiet in-guest writer.
+    ## A slot whose pid or start time is 0 cannot be compared, so it keeps
+    ## the page.
+    if v.base == nil or v.len < OffWriters + PageWriterSlots * WriterSlotSize or
+        v.load(0) != PageMagicVersion:
+      return psNotAPage
+    if v.load(OffState) == PageStateCreating:
+      return psCreating
+    var claimed = false
+    for i in 0 ..< PageWriterSlots:
+      let b = OffWriters + i * WriterSlotSize
+      let slotState = v.load(b + 32)
+      if slotState == WriterSlotFree: continue
+      claimed = true
+      if slotState != WriterSlotLive: continue
+      let pidNs = v.loadRelaxed(b + OffSlotPidNs)
+      if pidNs == 0 or own.pid == 0: return psUnstated
+      if pidNs != own.pid or v.loadRelaxed(b + OffSlotTimeNs) != own.time:
+        return psOtherNamespace
+      let pid = v.loadRelaxed(b)
+      let start = v.loadRelaxed(b + 8)
+      if pid == 0 or start == 0 or processStartTime(pid) == start:
+        return psAlive
+    if not claimed: psNoWriter else: psDead
+
+  proc sweepAbandonedPages*(): int {.discardable.} =
+    ## §6, "A page no process opens": walk `/dev/shm/ctfs.*` and, for each page
+    ## this process can open read-write whose verdict is `psDead`, set
+    ## `state = abandoned` and remove its name, as "Every writer dies" does.
+    ## Returns the count removed. Anything that cannot be read or proven is
+    ## left alone: a leak is a cost someone can name later; a deleted live
+    ## page breaks a recording now.
+    ##
+    ## Before removing the name it checks that the name still names the
+    ## object it inspected (the same device and inode), so a page recreated
+    ## under that name before the check is not removed. POSIX has no
+    ## conditional unlink, so a recreation between that check and the
+    ## `shm_unlink` (a window of two system calls, and only for a container
+    ## whose own page was dead) is not excluded; a reader's reap
+    ## (`reapAbandonedPage`) and `createLivePage`'s replacement of an
+    ## abandoned page have the same window.
+    let own = currentNamespaces()
+    if own.pid == 0:
+      return 0
+    let d = opendir("/dev/shm")
+    if d == nil:
+      return 0
+    while true:
+      let e = readdir(d)
+      if e == nil: break
+      let base = $cast[cstring](addr e.d_name[0])
+      # `ctfs.` and 24 lowercase hexadecimal digits (`pageName`).
+      if base.len != 29 or base[0 .. 4] != "ctfs.": continue
+      var hex = true
+      for ch in base[5 .. ^1]:
+        if ch notin {'0'..'9', 'a'..'f'}:
+          hex = false
+          break
+      if not hex: continue
+      let fd = shm_open(cstring(shmPath(base)), O_RDWR, Mode(0))
+      if fd < 0: continue
+      var st: Stat
+      if fstat(fd, st) != 0 or int(st.st_size) < 4096:
+        discard close(fd)
+        continue
+      let p = mmap(nil, 4096, PROT_READ or PROT_WRITE, MAP_SHARED, fd, 0)
+      discard close(fd)
+      if p == MAP_FAILED: continue
+      let v = PageView(base: p, len: 4096)
+      if pageSweepVerdict(v, own) == psDead:
+        v.store(OffState, PageStateAbandoned)
+        var now: Stat
+        if stat(cstring("/dev/shm/" & base), now) == 0 and
+            now.st_dev == st.st_dev and now.st_ino == st.st_ino:
+          if shm_unlink(cstring(shmPath(base))) == 0:
+            inc result
+      discard munmap(p, 4096)
+    discard closedir(d)
