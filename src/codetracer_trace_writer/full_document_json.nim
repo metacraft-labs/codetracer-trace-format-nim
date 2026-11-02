@@ -870,6 +870,28 @@ proc execRecordJson(reader: var NewTraceReader, gli: GlobalLineIndex,
   stepObj["vars"] = valsArr
   stepObj
 
+proc loadIoEvents(reader: var NewTraceReader,
+    stepTotal: uint64): seq[(uint64, IOEvent)] =
+  ## Every readable IO event as ``(io index, event)``, in the order the
+  ## ``--full`` document emits them against ``stepTotal`` exec records:
+  ## first those whose ``step_id`` is a record, by (step_id, index), then
+  ## the drain of the rest in index order. The ONE statement of that order,
+  ## shared by ``forEachFullEvent`` and ``forEachMarkerEvent``.
+  let icRes = reader.ioEventCount()
+  if icRes.isOk:
+    for i in 0'u64 ..< icRes.get():
+      let ev = reader.ioEvent(i)
+      if ev.isOk:
+        result.add((i, ev.get()))
+  # Stable on the index, which `result` is already sorted by, so the drain
+  # keeps index order whatever its step ids are.
+  result.sort(proc(a, b: (uint64, IOEvent)): int =
+    let ka = (if a[1].stepId < stepTotal: a[1].stepId else: stepTotal)
+    let kb = (if b[1].stepId < stepTotal: b[1].stepId else: stepTotal)
+    if ka < kb: -1
+    elif ka > kb: 1
+    else: cmp(a[0], b[0]))
+
 type FullEventSink* = EventSink
   ## Receives the events of the ``--full`` document one at a time, in order
   ## (``streamed_json.EventSink``: it cannot raise, and the producer does not
@@ -899,31 +921,13 @@ proc forEachFullEvent*(reader: var NewTraceReader, opts: FullOpts,
   ## of every call and IO event this replaced was O(records x calls).
   let gli = reader.globalPositionSpace()
 
-  # IO events in index order, and their positions by (step_id, index).
-  var ios: seq[(uint64, IOEvent)]  # (io index, event)
-  let icRes = reader.ioEventCount()
-  if icRes.isOk:
-    for i in 0'u64 ..< icRes.get():
-      let ev = reader.ioEvent(i)
-      if ev.isOk:
-        ios.add((i, ev.get()))
-  var ioByStep = newSeq[int](ios.len)
-  for i in 0 ..< ios.len:
-    ioByStep[i] = i
-  let iosAddr = addr ios
-  ioByStep.sort(proc(a, b: int): int =
-    let sa = iosAddr[][a][1].stepId
-    let sb = iosAddr[][b][1].stepId
-    if sa < sb: -1
-    elif sa > sb: 1
-    else: cmp(a, b))
-
   let calls = loadCallTable(reader)
 
   # Pre-fetch all step GLIs in one O(N) pass — calling
   # stepAbsoluteGlobalLineIndex per step inside the loop is O(N²).
   let allGlis = precomputeStepGlis(reader)
   let stepTotal = uint64(allGlis.len)
+  let ios = loadIoEvents(reader, stepTotal)
   var entryCur, exitCur, ioCur = 0
   for stepIdx in 0'u64 ..< stepTotal:
     # Every cursor's remaining items lie at or after `stepIdx`, so the items
@@ -940,8 +944,8 @@ proc forEachFullEvent*(reader: var NewTraceReader, opts: FullOpts,
     if recordEvent != nil:
       emit(recordEvent)
 
-    while ioCur < ioByStep.len and ios[ioByStep[ioCur]][1].stepId == stepIdx:
-      let (idx, ev) = ios[ioByStep[ioCur]]
+    while ioCur < ios.len and ios[ioCur][1].stepId == stepIdx:
+      let (idx, ev) = ios[ioCur]
       emit(ioEventJson(ev, idx))
       inc ioCur
 
@@ -979,10 +983,36 @@ proc forEachFullEvent*(reader: var NewTraceReader, opts: FullOpts,
   # must remain visible. The same drain preserves explicitly supplied buffered
   # coordinates beyond the emitted steps, without inventing a step or changing
   # the coordinate that the correlation index reports. Index order, as the
-  # events are stored.
-  for (idx, ev) in ios:
-    if ev.stepId >= stepTotal:
-      emit(ioEventJson(ev, idx))
+  # events are stored: `loadIoEvents` left them as the tail of `ios`, which
+  # is exactly what the cursor has not reached.
+  while ioCur < ios.len:
+    let (idx, ev) = ios[ioCur]
+    emit(ioEventJson(ev, idx))
+    inc ioCur
+
+proc forEachMarkerEvent*(reader: var NewTraceReader, opts: FullOpts,
+    emit: FullEventSink) =
+  ## The correlation-marker events of the ``--full`` document — exactly the
+  ## events of ``forEachFullEvent`` for which ``isCorrelationMarker`` holds,
+  ## in the same order — without building any other event.
+  ##
+  ## Only an IO event can be a marker (``addEventMetadata`` is called by the
+  ## IO event builder alone), and ``loadIoEvents`` is the order in which
+  ## ``forEachFullEvent`` emits the IO events. Filtering the full stream
+  ## instead decodes every step's variables to throw them away: on an 11 MB
+  ## Python trace that is ~12 GB of JSON built and dropped, to look for
+  ## markers among its IO events. ``opts`` is accepted so that a marker
+  ## carries what the same option would give it in the document; the IO
+  ## event rendering does not consult it today.
+  discard opts
+  # The same step total `forEachFullEvent` places IO events against: the
+  # length of the position walk, which is empty when that walk fails. It
+  # decodes the exec records' positions only, not their values.
+  let stepTotal = uint64(precomputeStepGlis(reader).len)
+  for (idx, ev) in loadIoEvents(reader, stepTotal):
+    let node = ioEventJson(ev, idx)
+    if isCorrelationMarker(node):
+      emit(node)
 
 proc buildFullDocument*(reader: var NewTraceReader,
     opts: FullOpts): JsonNode =

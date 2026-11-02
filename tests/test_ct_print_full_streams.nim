@@ -60,6 +60,17 @@
 ##    (`enclosingCallKey`) and its record from the table it already holds,
 ##    and this checks the two halves still meet. `callForStep` itself is held
 ##    to its definition by `test_call_for_step_matches_reference.nim`.
+## 5. **Markers alone.** `--markers` builds only the marker events
+##    (`forEachMarkerEvent`), which is exactly the full stream filtered by
+##    `isCorrelationMarker` (`checkMarkerPassAgrees`, on every fixture and the
+##    large container), and on the large container it runs in under a quarter
+##    of `--full`'s time. Filtering the whole stream, as `--markers` first did
+##    once it streamed, costs about what `--full` costs: on the real `import
+##    black` trace a debug `ct print --filter markers` built that way had not
+##    finished after 16 minutes. The fixtures' markers are stored in an
+##    order other than the one they are printed in: in the Python-shaped
+##    fixtures one is buffered past the last step, and in the container
+##    without steps one has a lower step id than the IO event before it.
 ##
 ## Peak RSS is read with `wait4` on the one child, not `getrusage(
 ## RUSAGE_CHILDREN)`: the latter is the maximum over every child this process
@@ -84,6 +95,11 @@
 ## `forEachFullEvent`; it fails `checkOrder`, which holds the document to a
 ## brute-force reading of the order `trace-events.md` specifies (checked by
 ## breaking the `call_exit` tie-break to `call_key` ascending).
+## Making `--markers` filter `forEachFullEvent` again fails (5) on time;
+## walking the IO events in storage order in `forEachMarkerEvent` fails
+## the `--markers` byte-identity check on the small container; ordering the
+## drain past the last step by step id instead of index (dropping the clamp
+## in `loadIoEvents`) fails `checkOrder` on the container without steps.
 ##
 ## The memory cap (`runCtPrintMeasured`) kills a child that passes twice the
 ## bound: it protects a shared host from the defect this test guards against,
@@ -333,10 +349,14 @@ proc writePythonShaped(path: string, calls, stepsPerCall, chunkSize: int):
         doAssert w.registerCatch(tExc).isOk
     doAssert w.registerReturn(ret(i)).isOk
 
-  # Tail: two IO events, one of them a correlation marker, then frames left
-  # open at close.
+  # Tail: IO events, two of them correlation markers, then frames left open
+  # at close. The first marker is buffered past the last step, so it is
+  # stored BEFORE the second but printed after it, in the drain: a marker
+  # pass that walked the IO events in storage order would swap them.
   doAssert w.registerStep(pMod, 60, vars(calls, 0)).isOk
   inc result.steps
+  doAssert w.registerCorrelationMarker("recv", "edge", "k-0",
+    stepId = some(uint64(bufferedStepId))).isOk
   doAssert w.registerIOEvent(elkWriteOther, toBytes("warning\n")).isOk
   doAssert w.registerCorrelationMarker("send", "edge", "k-1",
     showValue = "42").isOk
@@ -353,7 +373,10 @@ proc writePythonShaped(path: string, calls, stepsPerCall, chunkSize: int):
 
 proc writeNoSteps(path: string) =
   ## A container whose exec stream is empty but which carries IO events: the
-  ## assembler then has no step loop, and must still print every IO event.
+  ## assembler then has no step loop, and must still print every IO event,
+  ## in index order. The last one is a correlation marker whose step id is
+  ## lower than the one stored before it, so a drain ordered by step id
+  ## instead of index prints it one place early.
   var w = initMultiStreamWriter(path, "empty", chunkSize = 4).get()
   w.metadata.workdir = "/wd"
   discard w.registerPath("/wd/main.py").get()
@@ -361,6 +384,8 @@ proc writeNoSteps(path: string) =
   doAssert w.registerIOEvent(elkWrite, toBytes("before any step\n")).isOk
   doAssert w.registerIOEvent(elkWrite, toBytes("later\n"),
     stepId = some(7'u64)).isOk
+  doAssert w.registerCorrelationMarker("send", "edge", "k-nosteps",
+    stepId = some(3'u64)).isOk
   doAssert w.close().isOk
   doAssert w.closeCtfs().isOk
 
@@ -509,6 +534,23 @@ proc kinds(doc: JsonNode): seq[string] =
 # Tests
 # ---------------------------------------------------------------------------
 
+proc checkMarkerPassAgrees(path, what: string) =
+  ## `forEachMarkerEvent` is exactly `forEachFullEvent` filtered by
+  ## `isCorrelationMarker`, event for event and in order — the property that
+  ## lets `--markers` skip the other events. Both streamed, so this holds on
+  ## the large container without holding its document.
+  var filtered, direct: seq[string]
+  var r1 = openNewTrace(path).get()
+  r1.forEachFullEvent(FullOpts(), proc(ev: JsonNode) =
+    if isCorrelationMarker(ev): filtered.add($ev))
+  var r2 = openNewTrace(path).get()
+  r2.forEachMarkerEvent(FullOpts(), proc(ev: JsonNode) = direct.add($ev))
+  # Two empty lists agree whatever either pass does.
+  doAssert filtered.len > 0, what & " carries no correlation marker"
+  doAssert direct == filtered,
+    "forEachMarkerEvent disagrees with the filtered document on " & what &
+    ": " & $direct.len & " markers against " & $filtered.len
+
 proc test_output_is_byte_identical_to_the_in_process_rendering(dir: string) =
   let bundle = dir / "small.ct"
   discard writePythonShaped(bundle, smallCalls, smallStepsPerCall, chunkSize = 16)
@@ -534,7 +576,7 @@ proc test_output_is_byte_identical_to_the_in_process_rendering(dir: string) =
       of "io":
         if ev["step_id"].getBiggestInt() == bufferedStepId: inc ioPast
       else: discard
-    doAssert synthesized == 1 and ioPast == 1 and sharedExitSteps > 0,
+    doAssert synthesized == 1 and ioPast == 2 and sharedExitSteps > 0,
       "fixture lost a shape: synthesized=" & $synthesized & " ioPast=" &
       $ioPast & " shared=" & $sharedExitSteps
 
@@ -549,6 +591,7 @@ proc test_output_is_byte_identical_to_the_in_process_rendering(dir: string) =
       checkBinaryMatches(dir, bundle, ["--markers", "--json-out"],
         expectedMarkers(doc), "the small container")
       checkAttribution(bundle, doc)
+      checkMarkerPassAgrees(bundle, "the small container")
     checkOrder(bundle, doc, "the small container")
   echo "PASS: --full, --events and --markers are byte-identical to the " &
     "in-process rendering"
@@ -557,14 +600,17 @@ proc test_a_container_without_steps_prints_its_io(dir: string) =
   let bundle = dir / "nosteps.ct"
   writeNoSteps(bundle)
   let doc = inProcessDocument(bundle, FullOpts())
-  doAssert kinds(doc) == @["io", "io"],
+  doAssert kinds(doc) == @["io", "io", "io"],
     "every IO event of a container without steps must be printed: " &
     $kinds(doc)
   checkOrder(bundle, doc, "a container without steps")
+  checkMarkerPassAgrees(bundle, "a container without steps")
   checkBinaryMatches(dir, bundle, ["--full"], expectedFull(doc),
     "a container without steps")
   checkBinaryMatches(dir, bundle, ["--events"], expectedEvents(doc),
     "a container without steps")
+  checkBinaryMatches(dir, bundle, ["--markers", "--json-out"],
+    expectedMarkers(doc), "a container without steps")
   echo "PASS: a container without steps prints its IO events, byte-identically"
 
 proc countKinds(path: string): tuple[steps, entries, exits: int] =
@@ -631,7 +677,7 @@ proc test_a_large_trace_streams_in_bounded_memory(dir: string) =
   let what = "a " & mib(containerBytes) & " container (" & $expected.steps &
     " steps, " & $expected.entries & " calls)"
 
-  discard checkStreamed(dir, bundle, ["--full"], bound, 4, what)
+  let fullRun = checkStreamed(dir, bundle, ["--full"], bound, 4, what)
   let got = countKinds(dir / "streamed.out")
   doAssert got.steps == expected.steps and got.entries == expected.entries and
       got.exits == expected.entries,
@@ -642,6 +688,31 @@ proc test_a_large_trace_streams_in_bounded_memory(dir: string) =
     discard checkStreamed(dir, bundle, args, bound, 4, what)
   removeFile(dir / "streamed.out")
   echo "PASS: a Python-shaped trace streams in memory proportional to the trace"
+
+  # `--markers` builds the marker events only. Filtering the whole stream
+  # instead costs about what `--full` costs, because every step's variables
+  # are decoded and built only to be dropped: on the 11 MB `import black`
+  # trace that was minutes spent finding a handful of IO events. A ratio of
+  # two runs of the same binary on the same container, minutes apart at
+  # most, rather than an absolute clock. Measured here, the marker pass
+  # takes 0.03 s against `--full`'s 4.8 s, and the filtering pass 1.9 s
+  # against 4.6 s (2.4x), so 4x separates them with room on both sides.
+  let outPath = dir / "markers.out"
+  let errPath = dir / "markers.err"
+  let markersRun = runCtPrintMeasured(["--markers", "--json-out", bundle],
+    outPath, errPath, memoryCap = 2 * bound)
+  echo "  ct-print --markers --json-out on " & what & ": " & describe(markersRun)
+  doAssert markersRun.exitCode == 0,
+    "--markers failed: " & describe(markersRun) & "\n" & readFile(errPath)
+  doAssert parseJson(readFile(outPath)).len == 2,
+    "--markers did not find the fixture's two markers: " & readFile(outPath)
+  doAssert markersRun.seconds * 4.0 < fullRun.seconds,
+    "--markers took " & $markersRun.seconds & " s against --full's " &
+    $fullRun.seconds & " s on " & what & ": it is building every event " &
+    "to find the markers"
+  removeFile(outPath)
+  checkMarkerPassAgrees(bundle, what)
+  echo "PASS: --markers builds only the marker events"
 
 proc test_legacy_json_modes_keep_their_layout(dir: string) =
   ## `--json` and `--json-events` have no in-process builder to compare
@@ -672,7 +743,7 @@ proc test_legacy_json_modes_keep_their_layout(dir: string) =
       firstDifference(text, pretty(doc) & "\n")
     if args[0] == "--json":
       doAssert doc["calls"].len == smallCalls * 5 div 4 + 3 and
-          doc["values"].len == 3 * steps and doc["ioEvents"].len == 4,
+          doc["values"].len == 3 * steps and doc["ioEvents"].len == 5,
         "--json is missing records: " & $doc["calls"].len & " calls, " &
         $doc["values"].len & " values, " & $doc["ioEvents"].len & " IO"
     else:

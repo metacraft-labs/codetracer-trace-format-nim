@@ -20,6 +20,8 @@
 ##     `buildFullHeader` (every key but `events`), `forEachFullEvent` (the
 ##     events, one at a time) and `writeFullDocument` / `writeEventsJsonl`;
 ##     `buildFullDocument` is a thin wrapper over the first two.
+##   - `forEachMarkerEvent` — the correlation-marker events of that document
+##     alone, in its order, without building the others (`--markers`).
 ##   - `streamed_json` (re-exported): the one writer of every streamed JSON
 ##     mode, byte-identical to `pretty` / `$` of the whole tree.
 ##   - `resolveGli` — the line-only global-position-index inverse. It REFUSES

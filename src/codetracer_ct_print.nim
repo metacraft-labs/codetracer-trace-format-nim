@@ -624,11 +624,11 @@ proc printMarkersV4(reader: var NewTraceReader, opts: FullOpts) =
   ##
   ## Without a view like this the failure is silent: the debugger simply
   ## reports a chain that stops early, with nothing to say why.
-  # Filtered as the events stream past, so only the markers are kept.
+  # Only the marker events are built: filtering the whole stream decodes
+  # every step's variables just to drop them.
   var markers: seq[JsonNode] = @[]
-  reader.forEachFullEvent(opts, proc(ev: JsonNode) =
-    if isCorrelationMarker(ev):
-      markers.add(ev))
+  reader.forEachMarkerEvent(opts, proc(ev: JsonNode) =
+    markers.add(ev))
 
   if opts.jsonOut:
     var arr = newJArray()
