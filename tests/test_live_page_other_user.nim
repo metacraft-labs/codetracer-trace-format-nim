@@ -76,7 +76,8 @@ else:
     SlotStart = 8
     SlotHeartbeat = 16
     SlotState = 32
-    LivenessRules = [WriterLivenessHeartbeat, WriterLivenessProcess]
+    LivenessRules = [WriterLivenessHeartbeat, WriterLivenessProcess,
+                     WriterLivenessMachineHeartbeat]
 
   var failures: seq[string]
   proc expect(cond: bool, what: string) =

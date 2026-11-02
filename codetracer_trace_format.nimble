@@ -50,6 +50,12 @@ task test, "Run all tests":
   # unstated-namespace, creating and unclaimed pages kept, and a live writer
   # in another time namespace kept (Linux; elsewhere it skips).
   exec "nim c -r -d:release -p:src tests/test_live_page_sweep.nim"
+  # A reader in another time namespace than its writer: a live hosted writer
+  # whose boot clock is ahead, or whose monotonic clock is behind, and a quiet
+  # in-guest one are not reaped; a killed one is reaped once its heartbeat
+  # (on the machine clock) is 10 s old. Arms: start times compared across
+  # time namespaces; the heartbeat on the raw clock (Linux; elsewhere it skips).
+  exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_live_page_timens.nim"
   # A live writer owned by another user: its start time reads, a slot naming
   # it is alive, the same pid with another start time is dead, and a reaped
   # pid and a zombie are gone (macOS; elsewhere it skips).

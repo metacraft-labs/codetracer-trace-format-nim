@@ -43,17 +43,26 @@ when defined(nimPreviewSlimSystem):
 ## and accepts only when the two loads agree and are even.
 ##
 ## Two kinds of writer (§6, "How a writer's liveness is judged"). A **hosted**
-## writer (the default) runs a heartbeat thread that stores the monotonic
-## clock into its slot every 200 ms, and is dead once that heartbeat is 10 s
-## old. An **in-guest** writer runs inside a process another tool records
+## writer (the default) runs a heartbeat thread that stores the machine's
+## monotonic clock (`machineMonotonicNs`) into its slot every 200 ms, and is
+## dead once that heartbeat is 10 s old. An **in-guest** writer runs inside
+## a process another tool records
 ## (the macOS recorder's injected and cooperative writers): it creates no
 ## thread, and after the container's creation it touches the page only with
 ## memory stores and clock reads inside the seals it already makes. It stores
 ## its heartbeat there, marks its slot `liveness = process`, and is judged
 ## alive by its pid and start time alone, so a guest that is quiet for
 ## minutes is not reaped.
+##
+## Time namespaces (Linux). A process reads another's start time, and its own
+## `CLOCK_MONOTONIC`, shifted into its own time namespace. So a reader compares
+## a slot's start time only when the slot states the reader's own time
+## namespace (`+56`); for a writer in another one it applies the heartbeat
+## alone (hosted) or keeps the writer alive (in-guest). The heartbeat is
+## stored on the machine clock, `CLOCK_MONOTONIC` less the writer's time
+## namespace's monotonic offset, which reads the same in every namespace.
 
-import std/widestrs
+import std/[widestrs, strutils]
 import results
 import ./sha256
 import ./mutation_arms
@@ -80,23 +89,27 @@ const
     ## dies"), when its slot's liveness is `heartbeat`.
   WriterLivenessHeartbeat* = 0'u64
     ## Writer slot `+40`, the slot's liveness rule (§6, "How a writer's
-    ## liveness is judged"): `0`, dead when its pid no longer names a process
-    ## with its start time or its heartbeat is 10 s old.
+    ## liveness is judged"): legacy `0`, whose heartbeat uses the writer's
+    ## raw monotonic clock, comparable only within one time namespace.
   WriterLivenessProcess* = 1'u64
     ## `1`: an in-guest writer, which runs no heartbeat thread; dead only when
     ## its pid no longer names a process with its start time.
+  WriterLivenessMachineHeartbeat* = 2'u64
+    ## Hosted writers store a machine-clock heartbeat, comparable across
+    ## time namespaces.
   OffSlotLiveness* = 40
     ## The liveness word's offset inside a writer slot.
   OffSlotPidNs* = 48
     ## Writer slot `+48`, the writer's pid namespace (§6, "Claiming a writer
     ## slot"): on Linux the inode behind `/proc/self/ns/pid`; `0` (unstated)
     ## elsewhere, or when the writer cannot place itself (`currentNamespaces`).
-    ## Only a sweeper reads it (§6, "A page no process opens").
+    ## Readers and sweepers use it to decide whether the pid is comparable.
   OffSlotTimeNs* = 56
     ## Writer slot `+56`, the writer's time namespace: on Linux the inode
     ## behind `/proc/self/ns/time`, `0` on a kernel without time namespaces.
     ## The start time a process reads for a pid is in its own time namespace,
-    ## so a sweeper compares start times only with writers in its own.
+    ## so a reader and a sweeper compare start times only with writers in
+    ## their own (§6, "How a writer's liveness is judged").
 
   OffIdentity* = 8
   OffCapacity* = 40
@@ -113,6 +126,17 @@ const
   RootMirrorSlotSize* = 32
   ExtentSize* = 48
   ExtentTableBytes* = 12288
+
+type MachineClock* = object
+  ## The machine's monotonic clock as this process derives it (§6, "The
+  ## heartbeat"): `CLOCK_MONOTONIC` less the monotonic offset of the
+  ## process's own time namespace, so that it reads the same in every time
+  ## namespace on the machine (the initial namespace's clock). `known` is
+  ## false when the process cannot learn its offset; then the process cannot
+  ## derive a machine-clock value and neither stores nor judges a heartbeat
+  ## by it.
+  known*: bool
+  offset*: int64  ## nanoseconds the process's monotonic clock runs ahead
 
 type
   LivePageMode* = enum
@@ -144,6 +168,7 @@ type
   HeartbeatCtl = object
     page: pointer
     slotOff: int
+    clockOffset: int64  ## the writer's monotonic offset (`MachineClock`)
     stop: int64
     when defined(windows):
       thread: int
@@ -161,8 +186,12 @@ type
     tap*: PageTap
     closed*: bool
     liveness*: uint64
-      ## This writer's slot liveness: `WriterLivenessHeartbeat` (a heartbeat
-      ## thread runs) or `WriterLivenessProcess` (in-guest: none does).
+      ## This writer's slot liveness: `WriterLivenessMachineHeartbeat` (a
+      ## heartbeat thread runs) or `WriterLivenessProcess` (in-guest, or a writer that
+      ## cannot learn its monotonic offset: no reader judges its heartbeat).
+    clock*: MachineClock
+      ## The writer's monotonic offset, read at its slot claim: every
+      ## heartbeat it stores is on the machine clock.
     hb: ptr HeartbeatCtl
     when defined(windows):
       handle: int
@@ -335,8 +364,10 @@ when defined(macosx):
   var machNumer, machDenom: uint32
 
 proc monotonicNs*(): uint64 {.stackTrace: off.} =
-  ## Nanoseconds of the machine's monotonic clock, which every process on the
-  ## machine shares (§6, "The heartbeat").
+  ## Nanoseconds of the monotonic clock as this process reads it. On Linux
+  ## that is `CLOCK_MONOTONIC` in the process's own time namespace, which a
+  ## monotonic offset may shift; the heartbeat is stored on the machine clock
+  ## instead (`machineMonotonicNs`, §6, "The heartbeat").
   when defined(windows):
     var c, f: int64
     discard queryPerformanceCounter(addr c)
@@ -472,6 +503,58 @@ proc currentNamespaces*(): SlotNamespaces =
     SlotNamespaces(pid: pidNs, time: timeNs)
   else:
     SlotNamespaces()
+
+proc currentMachineClock*(): MachineClock =
+  ## This process's monotonic offset, read anew on every call (never cached:
+  ## a child forked into a new time namespace would inherit a cached answer).
+  ## On Linux it is the `monotonic` line of `/proc/self/timens_offsets`
+  ## (https://man7.org/linux/man-pages/man7/time_namespaces.7.html). That file
+  ## shows the namespace the process's CHILDREN get, so it is the process's
+  ## own only when `/proc/self/ns/time` and `/proc/self/ns/time_for_children`
+  ## are the same namespace; after `unshare(CLONE_NEWTIME)` they differ and
+  ## the offset is unknown. It is unknown too when `/proc` is not this
+  ## process's (`currentNamespaces` unstated). A kernel without time
+  ## namespaces has no `/proc/self/ns/time`: offset 0. Elsewhere: offset 0.
+  when defined(linux):
+    if mutated("heartbeat-raw-clock"):
+      return MachineClock(known: true)
+    if currentNamespaces().pid == 0: return
+    var own, children: Stat
+    if stat("/proc/self/ns/time", own) != 0:
+      if errno == ENOENT: return MachineClock(known: true)
+      return
+    if stat("/proc/self/ns/time_for_children", children) != 0 or
+        own.st_ino != children.st_ino:
+      return
+    var text = ""
+    try:
+      text = readFile("/proc/self/timens_offsets")
+    except IOError, OSError:
+      return
+    for line in text.splitLines():
+      let parts = line.splitWhitespace()
+      if parts.len == 3 and parts[0] == "monotonic":
+        try:
+          let secs = parseBiggestInt(parts[1])
+          let nsecs = parseBiggestInt(parts[2])
+          return MachineClock(known: true,
+            offset: int64(secs) * 1_000_000_000'i64 + int64(nsecs))
+        except ValueError:
+          return
+    MachineClock()
+  else:
+    MachineClock(known: true)
+
+proc nowOn*(c: MachineClock): uint64 {.inline, stackTrace: off.} =
+  ## The machine clock now, for a process whose offset is `c` (only
+  ## arithmetic after the clock read: an in-guest seal calls it).
+  uint64(int64(monotonicNs()) - c.offset)
+
+proc machineMonotonicNs*(): tuple[known: bool, ns: uint64] =
+  ## The machine clock now, as this process reads it; `known` as in
+  ## `MachineClock`.
+  let c = currentMachineClock()
+  (c.known, if c.known: c.nowOn() else: 0'u64)
 
 # ---------------------------------------------------------------------------
 # Identity and name
@@ -745,30 +828,70 @@ proc identityOf(v: PageView): PageIdentity =
     let w = v.loadRelaxed(OffIdentity + 8 * i)
     for j in 0 ..< 8: result[8 * i + j] = byte((w shr (8 * j)) and 0xff)
 
-proc writerAlive*(v: PageView, slot: int, nowNs: uint64): bool =
-  ## Writer slot `slot` is live (§6, "How a writer's liveness is judged"):
-  ## claimed, and its pid names a process with its recorded start time; for
-  ## a slot of heartbeat liveness, also its heartbeat is younger than 10
-  ## seconds. A slot of process liveness (an in-guest writer) has no
-  ## heartbeat requirement.
+proc writerAlive*(v: PageView, slot: int, nowNs: uint64,
+                  own = currentNamespaces(),
+                  clockKnown = currentMachineClock().known): bool =
+  ## Writer slot `slot` is live (§6, "How a writer's liveness is judged"),
+  ## for a reader in the namespaces `own` whose machine clock reads `nowNs`
+  ## (`clockKnown` false: the reader cannot place its clock). The slot must
+  ## be claimed, and:
+  ##
+  ## - when it states the reader's own pid and time namespaces (`+48`, `+56`), its pid names
+  ##   a process with its recorded start time. A slot in another time
+  ##   namespace recorded its start time on another clock (Linux shifts the
+  ##   start time it reports into the reader's time namespace), so it is not
+  ##   compared;
+  ## - for a machine-heartbeat slot, its heartbeat (on the machine clock)
+  ##   is younger than 10 seconds, when the reader knows its clock. A slot of
+  ##   process liveness (an in-guest writer) has no heartbeat requirement, so
+  ##   one in another time namespace is kept alive. Legacy heartbeat slots
+  ##   use their writer's local clock, compared only in that time namespace;
+  ##   a reader that cannot place it keeps the writer alive.
   let b = OffWriters + slot * WriterSlotSize
   if v.load(b + 32) != WriterSlotLive: return false
   let pid = v.loadRelaxed(b)
   let start = v.loadRelaxed(b + 8)
   let liveness = v.loadRelaxed(b + OffSlotLiveness)
+  let timeNs = v.loadRelaxed(b + OffSlotTimeNs)
   let hb = v.load(b + 16)
-  if start == 0 or processStartTime(pid) != start: return false
+  if start == 0: return false
+  let comparable =
+    when defined(linux):
+      own.pid != 0 and v.loadRelaxed(b + OffSlotPidNs) == own.pid and
+        timeNs == own.time
+    else:
+      true
+  if comparable or mutated("timens-start-time-compared"):
+    if processStartTime(pid) != start: return false
   if liveness == WriterLivenessProcess: return true
-  nowNs < hb or nowNs - hb < HeartbeatDeadNs
+  if not clockKnown: return true
+  var machineHb = hb
+  if liveness == WriterLivenessHeartbeat:
+    # Existing pages used the writer's raw CLOCK_MONOTONIC. Only a reader
+    # in that time namespace knows how to put that value on the machine
+    # clock. A cross-namespace reader keeps it instead of inventing an age.
+    when defined(linux):
+      if own.pid == 0 or v.loadRelaxed(b + OffSlotPidNs) == 0 or
+          timeNs != own.time:
+        return true
+    let c = currentMachineClock()
+    if not c.known: return true
+    machineHb = uint64(int64(hb) - c.offset)
+  elif liveness != WriterLivenessMachineHeartbeat:
+    return true  # A future liveness rule cannot prove death to this reader.
+  nowNs < machineHb or nowNs - machineHb < HeartbeatDeadNs
 
-proc liveWritersAt*(v: PageView, nowNs: uint64): seq[int] =
-  ## The live writer slots as judged at clock value `nowNs` (a test passes a
-  ## time past the heartbeat's limit).
+proc liveWritersAt*(v: PageView, nowNs: uint64,
+                    own = currentNamespaces(),
+                    clockKnown = currentMachineClock().known): seq[int] =
+  ## The live writer slots as judged at machine clock value `nowNs` (a test
+  ## passes a time past the heartbeat's limit).
   for i in 0 ..< PageWriterSlots:
-    if writerAlive(v, i, nowNs): result.add i
+    if writerAlive(v, i, nowNs, own, clockKnown): result.add i
 
 proc liveWriters*(v: PageView): seq[int] =
-  liveWritersAt(v, monotonicNs())
+  let clock = machineMonotonicNs()
+  liveWritersAt(v, clock.ns, currentNamespaces(), clock.known)
 
 # ---------------------------------------------------------------------------
 # The writer's side
@@ -806,7 +929,7 @@ proc publishWordsOrdered*(p: LivePage, seqOff: int, words: openArray[uint64],
 
 proc heartbeat*(p: LivePage) =
   if p == nil or p.closed: return
-  p.view.store(OffWriters + p.writerSlot * WriterSlotSize + 16, monotonicNs())
+  p.view.store(OffWriters + p.writerSlot * WriterSlotSize + 16, p.clock.nowOn())
 
 proc publishRoot*(p: LivePage, entry: int, size, mapBlock, name: uint64) =
   ## The root mirror of entry `entry`: `seq` odd, then `Name`, `MapBlock` and
@@ -864,7 +987,7 @@ proc sealDone*(p: LivePage) =
   let w = OffWriters + p.writerSlot * WriterSlotSize
   discard p.view.fetchAdd(w + 24, 1)
   discard p.view.fetchAdd(OffSealEpoch, 1)
-  p.view.store(w + 16, monotonicNs())
+  p.view.store(w + 16, p.clock.nowOn())
   if p.tap != nil:
     p.tap(ptStore, w + 24, [p.view.load(w + 24)])
     p.tap(ptStore, OffSealEpoch, [p.view.load(OffSealEpoch)])
@@ -893,7 +1016,8 @@ when defined(windows):
       gcsafe.} =
     let ctl = cast[ptr HeartbeatCtl](arg)
     while PageView(base: addr ctl.stop, len: 8).load(0) == 0:
-      PageView(base: ctl.page).store(ctl.slotOff, monotonicNs())
+      PageView(base: ctl.page).store(ctl.slotOff,
+        uint64(int64(monotonicNs()) - ctl.clockOffset))
       sleepMs(200)
     0
 else:
@@ -901,7 +1025,8 @@ else:
       gcsafe.} =
     let ctl = cast[ptr HeartbeatCtl](arg)
     while PageView(base: addr ctl.stop, len: 8).load(0) == 0:
-      PageView(base: ctl.page).store(ctl.slotOff, monotonicNs())
+      PageView(base: ctl.page).store(ctl.slotOff,
+        uint64(int64(monotonicNs()) - ctl.clockOffset))
       var ts = Timespec(tv_sec: posix.Time(0), tv_nsec: 200_000_000)
       var rem: Timespec
       discard nanosleep(ts, rem)
@@ -911,6 +1036,7 @@ proc startHeartbeat(p: LivePage) =
   let ctl = cast[ptr HeartbeatCtl](allocShared0(sizeof(HeartbeatCtl)))
   ctl.page = p.view.base
   ctl.slotOff = OffWriters + p.writerSlot * WriterSlotSize + 16
+  ctl.clockOffset = p.clock.offset
   when defined(windows):
     ctl.thread = createThreadW(nil, 0, cast[pointer](heartbeatMain),
       cast[pointer](ctl), 0, nil)
@@ -943,8 +1069,16 @@ proc claimWriterSlot(p: LivePage): Result[int, string] =
   ## start time and heartbeat, the heartbeat stored with release. A slot is
   ## never reused within a page's life. A sweeper that sees the slot `live`
   ## before its pid namespace is stored reads `0` there and keeps the page.
+  ##
+  ## The heartbeat is on the machine clock (`currentMachineClock`, read here,
+  ## at each claim). A writer that cannot learn its monotonic offset marks its
+  ## slot `process`: no reader can judge a heartbeat it would store, so it is
+  ## judged by its pid and start time alone, as an in-guest writer is.
   let pid = currentPid()
   let ns = currentNamespaces()
+  p.clock = currentMachineClock()
+  if not p.clock.known:
+    p.liveness = WriterLivenessProcess
   for i in 0 ..< PageWriterSlots:
     let b = OffWriters + i * WriterSlotSize
     if p.view.casWord(b + 32, WriterSlotFree, WriterSlotLive):
@@ -953,7 +1087,7 @@ proc claimWriterSlot(p: LivePage): Result[int, string] =
       p.view.storeRelaxed(b + OffSlotPidNs, ns.pid)
       p.view.storeRelaxed(b, pid)
       p.view.storeRelaxed(b + 8, processStartTime(pid))
-      p.view.store(b + 16, monotonicNs())
+      p.view.store(b + 16, p.clock.nowOn())
       return ok(i)
   err("live coordination page " & p.name & ": all " & $PageWriterSlots &
     " writer slots are taken (a page has 16, so at most 15 producer " &
@@ -968,7 +1102,7 @@ proc slotLiveness(mode: LivePageMode): uint64 =
   if mode == lpmInGuest and not mutated("inguest-heartbeat-liveness"):
     WriterLivenessProcess
   else:
-    WriterLivenessHeartbeat
+    WriterLivenessMachineHeartbeat
 
 proc startHeartbeatFor(p: LivePage, mode: LivePageMode) =
   ## A hosted writer's heartbeat thread. An in-guest writer starts none (§6,
@@ -1153,20 +1287,22 @@ proc joinLivePage*(f: File, rootEntries: int,
 
 proc settleDeadWriters*(p: LivePage): seq[int] =
   ## A surviving writer's duty under W2 (§6, "A writer that dies"): every
-  ## writer slot whose writer is dead (its pid no longer names a process with
-  ## its start time, or, for a slot of heartbeat liveness, its heartbeat is
-  ## older than 10 seconds) is marked dead,
+  ## writer slot whose writer is dead (`writerAlive`: its pid no longer names
+  ## a process with its start time, compared only for a writer in this
+  ## process's time namespace, or, for a slot of heartbeat liveness, its
+  ## heartbeat is older than 10 seconds on the machine clock) is marked dead,
   ## and every root mirror slot left odd is settled. A root entry is
   ## prefix-valid (`MapBlock` before `Size`), so the settled value is the
   ## page's payload: its `seq` is made even. A record slot left odd is left to
   ## its readers, which retry a bounded number of times and then read the
   ## record from the file: the crash rule's value for a record kind that is
   ## not prefix-valid. Returns the slots marked dead.
-  let now = monotonicNs()
+  let clock = machineMonotonicNs()
+  let own = currentNamespaces()
   for i in 0 ..< PageWriterSlots:
     let b = OffWriters + i * WriterSlotSize
     if p.view.load(b + 32) == WriterSlotLive and i != p.writerSlot and
-        not writerAlive(p.view, i, now):
+        not writerAlive(p.view, i, clock.ns, own, clock.known):
       p.view.store(b + 32, WriterSlotDead)
       result.add i
   if result.len > 0:

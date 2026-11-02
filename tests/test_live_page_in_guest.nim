@@ -298,7 +298,8 @@ when isMainModule:
     removeFile(hpath)
     var h = createCtfsStreaming(hpath).get()
     expect(h.page.view.load(OffWriters + h.page.writerSlot * WriterSlotSize +
-      OffSlotLiveness) == WriterLivenessHeartbeat, "a hosted slot's liveness is not heartbeat")
+      OffSlotLiveness) == WriterLivenessMachineHeartbeat,
+      "a hosted slot's liveness is not machine-clock heartbeat")
     expect(h.page.writerSlot notin liveWritersAt(h.page.view, later),
       "a hosted writer whose heartbeat is 60 s old was judged alive")
     doAssert h.closeCtfs().isOk
