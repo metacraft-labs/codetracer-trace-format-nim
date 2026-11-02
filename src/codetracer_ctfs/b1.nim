@@ -472,14 +472,27 @@ proc descend(b: var B1Reader, r: var LiveReader, key: uint64,
   ## key is at or above the leaf's `high`. For a key held once this reads at
   ## most one node more than §5.8.3's descent, and only when the key is a
   ## separator; the bytes it reads are the same.
+  ##
+  ## A link past the node member's `Size` as last read (the header's root, a
+  ## `right`, a child) may only mean that a seal published the linked node
+  ## after the reader read that `Size`: phase A's `Size` write returns before
+  ## phase B writes any link to the new nodes. So the reader re-reads the
+  ## member's entry *after* it read the link, and follows the link when the
+  ## `Size` it now holds covers it. Only a link still past it is stale
+  ## (§5.8.3, "Lookup"). Re-reading the entry before the header and the links
+  ## a second descent reads, instead, loses to a seal that lands in between,
+  ## and a writer that seals continuously makes that happen.
   let h = ? b.readHeader(r)
   if h.empty: return ok(doFound)
-  let visible = r.memberSize(b.nodSlot) div uint64(NodeSize)
+  var visible = r.memberSize(b.nodSlot) div uint64(NodeSize)
   var n = h.root
   var visits = 0'u64
   while true:
     if n >= visible:
-      return ok(doStale)
+      ? r.refresh()
+      visible = r.memberSize(b.nodSlot) div uint64(NodeSize)
+      if n >= visible:
+        return ok(doStale)
     inc visits
     if visits > visible:
       return ok(doStale)
@@ -509,10 +522,10 @@ proc descend(b: var B1Reader, r: var LiveReader, key: uint64,
 proc candidates*(b: var B1Reader, r: var LiveReader, key: uint64):
     Result[seq[uint64], string] =
   ## The references B1 holds under `key`, to be confirmed against their
-  ## records. A descent that reaches a node past the node member's `Size` as
-  ## last read, or visits more nodes than it holds, may only be a stale view:
-  ## the reader refreshes and descends again, and only a second such descent is
-  ## damage (§5.8.3, "Lookup").
+  ## records. A descent that reaches a node past the node member's `Size` even
+  ## as re-read after the link (`descend`), or visits more nodes than it holds,
+  ## may only be a stale view: the reader refreshes and descends again, and
+  ## only a second such descent is damage (§5.8.3, "Lookup").
   var cands: seq[uint64]
   for attempt in 0 ..< 2:
     cands.setLen(0)

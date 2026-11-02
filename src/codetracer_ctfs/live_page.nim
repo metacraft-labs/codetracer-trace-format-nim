@@ -1208,8 +1208,14 @@ proc attachLivePage*(f: File, rootEntries: int,
   r.name = name
   when defined(windows): r.handle = h
   template refuse(msg: string) =
+    # The message is evaluated BEFORE the page is unmapped: a template's
+    # argument is substituted, not evaluated at the call, and a message that
+    # reads the page (the state it found) would otherwise read it after
+    # `munmap` -- a SIGSEGV for a reader that meets a page whose state is not
+    # `live`, such as one whose creator was killed while creating it.
+    let refusal = msg
     shmUnmap(r.view, h)
-    return err(msg)
+    return err(refusal)
   if v.len < r.slotsOff:
     refuse("live coordination page " & name & " is too small")
   if v.load(0) != PageMagicVersion:

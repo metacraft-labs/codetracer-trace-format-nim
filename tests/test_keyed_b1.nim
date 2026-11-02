@@ -20,6 +20,11 @@
 ## - `size-before-record` (a member's Size published before the records it
 ##   covers): a record below a published Size is not its final bytes.
 ##
+## The race scenario (`raceScenario`) has its own null predictions, driven by
+## the image reader's read tap rather than by an arm: a file-only follower of
+## a writer that seals continuously, the writer's next seal applied between
+## two chosen reads of the follower.
+##
 ## The production build must pass every check at every write prefix, in both
 ## reader modes. A test that would pass on the base (which has no keyed
 ## member) is not evidence: the base has no `createB1`, so this file does not
@@ -364,6 +369,197 @@ proc roundTrip(n: int, streaming: bool) =
     ": ", f.b1.nodeCount, " nodes, ", w.sealEnd.len, " seals"
 
 # ---------------------------------------------------------------------------
+# A file-only follower racing a writer that seals continuously, made
+# deterministic: the image reader's read tap applies the writer's next seal
+# between two chosen reads of the follower
+# ---------------------------------------------------------------------------
+
+type
+  RaceMode = enum
+    rmTearOpen
+      ## The first root read pair of the reader's open straddles a seal.
+    rmTearRefresh
+      ## The first root read pair after arming (a refresh a stale link
+      ## caused) straddles a seal.
+    rmSealAfterRefresh
+      ## A seal lands right after the first root read pair after arming,
+      ## before the reader's next read (the second descent's header read, in
+      ## a reader that re-reads `Size` before the header).
+
+  Racer = ref object
+    rep: Replay
+    rootOff: uint64
+    rootLen: int
+    armed: bool
+    rootReads: int
+    target: int        ## the seal the tap applies through
+    fired: int
+
+proc applyThrough(rep: var Replay, k: int) =
+  while not rep.atEnd and rep.sealsDone < k: rep.applyNext()
+
+proc raceTap(ra: Racer, mode: RaceMode): proc (off: uint64, n: int) {.closure,
+    gcsafe, raises: [].} =
+  result = proc (off: uint64, n: int) {.closure, gcsafe, raises: [].} =
+    if not ra.armed: return
+    let root = off == ra.rootOff and n == ra.rootLen
+    if root: inc ra.rootReads
+    let fire =
+      case mode
+      of rmTearOpen, rmTearRefresh: root and ra.rootReads == 2
+      of rmSealAfterRefresh: not root and ra.rootReads >= 2
+    if fire:
+      ra.armed = false
+      inc ra.fired
+      ra.rep.applyThrough(ra.target)
+
+proc descentPath(image: ref seq[byte], key: uint64): seq[uint64] =
+  ## The nodes a descent for `key` visits in `image`, a quiescent container
+  ## (every link below the node member's `Size`): `descend`'s moves, without
+  ## its stale-view checks.
+  var rd = openImageReader(image).get()
+  var br = openB1Reader(rd, "kb")
+  let h = br.readHeader(rd).get()
+  if h.empty: return
+  var n = h.root
+  while true:
+    result.add n
+    let node = br.readNode(rd, n).get()
+    if key > node.high and node.right != 0'u64:
+      n = node.right - 1
+      continue
+    if node.kind == 1'u8:
+      if key >= node.high and node.right != 0'u64:
+        n = node.right - 1
+        continue
+      return
+    var found = false
+    var best = 0'u64
+    var child = node.first
+    for j in 0 ..< node.count:
+      let e = node.slotOf(j)
+      if e.key < key and e.key < node.high and (not found or e.key > best):
+        found = true
+        best = e.key
+        child = e.refv
+    n = child
+
+proc raceScenario(): seq[string] =
+  ## A file-only reader of the container as seal k left it; then the writer's
+  ## seal k + 1; then a lookup while the tap applies seal k + 2 at the moment
+  ## the mode names (`rmTearOpen`: seal k + 1, during the open, and every key
+  ## of seals 1..k is checked). The lookups are of keys of seals 1..k chosen so
+  ## that the race matters: the key's descent after seal k + 1 visits a node
+  ## seal k + 1 created (so the reader's `Size` from seal k is stale for it),
+  ## and, for `rmSealAfterRefresh`, its descent after seal k + 2 visits a node
+  ## seal k + 2 created; for `rmTearRefresh`, seal k + 2 grows the node member
+  ## (so its root slot differs between the two reads). Every key must be
+  ## found, with nothing but its records. Returns each mode's first failure.
+  ##
+  ## Null predictions (each measured against the reader without the rule):
+  ##
+  ## - a refresh that reads the root pair once (a slot whose two reads differ
+  ##   keeps its stale `Size`, or stays absent before its first acceptance):
+  ##   `rmTearOpen` finds no records;
+  ## - a descent that, on a link past `Size`, re-reads `Size` and then reads
+  ##   the header and links again (instead of re-reading `Size` after the link
+  ##   and following it): `rmSealAfterRefresh` reaches a node past the node
+  ##   member's `Size` twice;
+  ## - both at once (the reader before 2026-11-02): `rmTearRefresh` does too.
+  ##   With either rule alone it passes: one torn refresh is absorbed by the
+  ##   lookup's second descent or by the next pair of reads.
+  let path = tmpPath("race")
+  removeFile(path)
+  var c = createCtfsStreaming(path, maxRootEntries = 0).get()
+  var f = createFam(c)
+  let w = makeWorkload(0xACE'u64, 6000, 60, 300)
+  let log = installTaps(c)
+  runWriter(c, f, w, onSeal = proc (k: int) = log.markSeal())
+  c.removeTaps()
+  discard c.closeCtfs()
+  removeFile(path)
+  let o = initOracle(w)
+  let seals = w.sealEnd.len
+  # The image and node count after every seal.
+  var images = newSeq[ref seq[byte]](seals + 1)
+  var nodes = newSeq[uint64](seals + 1)
+  block:
+    var r2 = initReplay(log, false)
+    for k in 1 .. seals:
+      r2.applyThrough(k)
+      new(images[k])
+      images[k][] = r2.file[]
+      let rd = openImageReader(images[k]).get()
+      nodes[k] = rd.memberSize(rd.findSlot("kb.nod")) div 4096
+  var rootOff = 0'u64
+  var rootLen = 0
+  block:
+    let rd = openImageReader(images[seals]).get()
+    rootOff = uint64(rd.headerSize)
+    rootLen = rd.slots * FileEntrySize
+  var rng = initRand(5)
+  var fired, cases: array[RaceMode, int]
+  for mode in RaceMode:
+    try:
+      for k in 1 .. seals - 2:
+        var keys: seq[int]
+        if mode != rmTearOpen:
+          if mode == rmTearRefresh and nodes[k + 2] == nodes[k + 1]: continue
+          for r in 0 ..< w.sealEnd[k - 1]:
+            let key = w.keys[r]
+            let p1 = descentPath(images[k + 1], key)
+            if p1.len == 0 or max(p1) < nodes[k]: continue
+            if mode == rmSealAfterRefresh:
+              let p2 = descentPath(images[k + 2], key)
+              if p2.len == 0 or max(p2) < nodes[k + 1]: continue
+            keys.add r
+            if keys.len >= 4: break
+          if keys.len == 0: continue
+        for i in 0 ..< max(keys.len, 1):
+          let ra = Racer(rep: initReplay(log, false), rootOff: rootOff,
+                         rootLen: rootLen, target: k + 2)
+          ra.rep.applyThrough(k)
+          if mode == rmTearOpen:
+            ra.target = k + 1
+            ra.armed = true
+          let rd0 = openImageReader(ra.rep.file, readTap = raceTap(ra, mode))
+          if rd0.isErr: fail($mode & " seal " & $k & ": open: " & rd0.error)
+          var rd = rd0.get()
+          let label = $mode & " after seal " & $k
+          if mode == rmTearOpen:
+            checkReader(rd, o, k, CheckScope(keySample: w.sealEnd[k - 1], live: true),
+              rng, label)
+          else:
+            ra.rep.applyThrough(k + 1)
+            ra.armed = true
+            let r = keys[i]
+            let key = w.keys[r]
+            let recSlot = rd.findSlot("kb.rec")
+            var br = openB1Reader(rd, "kb")
+            var recRef = addr rd
+            let hits = br.lookup(rd, key, proc (refv: uint64): Result[bool, string] =
+              let cnt = recordCount(RecSize, recRef[].memberSize(recSlot))
+              if refv >= cnt: return ok(false)
+              let b = ? recRef[].readMember(recSlot, recordOffset(RecSize, refv), RecSize)
+              ok(readU64LE(b, 0) == key))
+            if hits.isErr: fail(label & ": lookup of record " & $r & "'s key: " & hits.error)
+            if uint64(r) notin hits.get():
+              fail(label & ": key " & $key & " of record " & $r & " is not found")
+            for x in hits.get():
+              if (key, x) notin o.pairs:
+                fail(label & ": key " & $key & " answered record " & $x &
+                  ", which holds another key")
+          inc cases[mode]
+          fired[mode] += ra.fired
+    except CheckFailure as e:
+      result.add e.msg
+      continue
+    echo "  race ", mode, ": ", cases[mode], " lookups over ", seals,
+      " seals, the tap fired ", fired[mode], " times"
+    # The control: each mode's seal really landed where it names.
+    if fired[mode] == 0: result.add $mode & ": the tap never fired"
+
+# ---------------------------------------------------------------------------
 # Real processes: a writer killed at random, and a concurrent follower
 # ---------------------------------------------------------------------------
 
@@ -553,6 +749,9 @@ when isMainModule:
     for arm in ["b1-count-first", "b1-shrink-count-first", "size-before-record"]:
       if not runArm(arm):
         failures.add "mutation arm " & arm & " was not caught (or did not fire)"
+  if part("race"):
+    echo "a file-only follower racing a writer, deterministically"
+    for ra in raceScenario(): failures.add "race: " & ra
   if part("kill"):
     echo "kills at random"
     let k = killScenario(200)

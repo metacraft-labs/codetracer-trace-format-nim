@@ -5,7 +5,8 @@
 ## next opener (an explicit reap, or a reader's open, which does not attach
 ## to it), and a new writer of the same file then creates its page; a
 ## live writer's page refuses a second creator; a page that carries another
-## file's identity is refused; a reader that cannot attach follows the file.
+## file's identity is refused; a page whose creator died while creating it is
+## refused, not faulted on; a reader that cannot attach follows the file.
 ##
 ## Null prediction (the mutation arm): a reader that skips the identity check
 ## (`attachLivePage(..., skipIdentityCheck = true)`) attaches to the page that
@@ -219,6 +220,49 @@ when isMainModule:
     discard ca.closeCtfs()
     discard cb.closeCtfs()
     removeFile(a); removeFile(b)
+
+  # 4. A page whose creator was killed while creating it: `initFresh` has
+  #    stored the identity, `state = creating` and then the magic, and the
+  #    creator died before it claimed a writer slot and stored `state = live`.
+  #    A reader does not attach to it, and refuses it with a message -- it
+  #    does not fault. (The page bytes are made in this process, not by a
+  #    killed child, so that the state is the one at that kill point every
+  #    time; a reader in another process reads the same bytes.)
+  #
+  #    Null prediction: a reader whose refusal reads the page after unmapping
+  #    it (the message names the state it found) dies with SIGSEGV here; that
+  #    was `test_keyed_b1`'s intermittent crash in its kill-at-random section.
+  block:
+    let path = tmp("creating")
+    removeFile(path)
+    var c = createCtfsStreaming(path).get()
+    var f = c.addFile("x.dat").get()
+    doAssert c.writeToFile(f, [4'u8, 5, 6]).isOk
+    c.publish()
+    let w0 = OffWriters + c.page.writerSlot * WriterSlotSize
+    var slot: array[WriterSlotSize div 8, uint64]
+    for i in 0 ..< slot.len: slot[i] = c.page.view.load(w0 + 8 * i)
+    for i in 0 ..< slot.len: c.page.view.store(w0 + 8 * i, 0)
+    c.page.view.store(OffState, PageStateCreating)
+    var fr: File
+    doAssert open(fr, path, fmRead)
+    let direct = attachLivePage(fr, 31)
+    expect(direct.isErr and "not live (state 0)" in direct.error,
+      "a page still being created was not refused by its state: " &
+      (if direct.isErr: direct.error else: "attached"))
+    close(fr)
+    var r = openLiveReader(path).get()
+    expect(not r.attached, "a reader attached to a page still being created")
+    expect("not live (state 0)" in r.attachRefusal,
+      "the refusal does not name the creating state: " & r.attachRefusal)
+    expect(r.memberSize(r.findSlot("x.dat")) == 3,
+      "the file-only reader's x.dat size beside a page still being created")
+    r.close()
+    # Put back what the writer holds, so that it closes as it would have.
+    for i in 0 ..< slot.len: c.page.view.store(w0 + 8 * i, slot[i])
+    c.page.view.store(OffState, PageStateLive)
+    doAssert c.closeCtfs().isOk
+    removeFile(path)
 
   if failures.len > 0: quit(1)
   echo "PASS test_live_page_lifetime"

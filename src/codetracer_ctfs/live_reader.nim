@@ -57,6 +57,12 @@ type
     refreshes*: int
     attachRefusal*: string
       ## Why the reader is not attached, when it tried.
+    imageReadTap*: proc (off: uint64, n: int) {.closure, gcsafe, raises: [].}
+      ## A test's seam on an image reader (`openImageReader`) only: called
+      ## before each read of the image, so that the test can apply a writer's
+      ## next writes to the image between any two of the reader's reads (a
+      ## reader in another process sees exactly that). Never consulted for a
+      ## reader of a file.
 
 const
   RootReadRetries* = 8
@@ -66,6 +72,7 @@ proc readRaw*(r: var LiveReader, off: uint64, n: int): Result[seq[byte], string]
   var b = newSeq[byte](n)
   if n == 0: return ok(b)
   if r.image != nil:
+    if r.imageReadTap != nil: r.imageReadTap(off, n)
     if off + uint64(n) > uint64(r.image[].len):
       return err("container " & r.path & ": " & $n & " bytes at offset " &
         $off & " are past its end")
@@ -108,21 +115,37 @@ proc parseHeader(r: var LiveReader): Result[void, string] =
 proc slotName*(r: LiveReader, i: int): string = base40Decode(r.entries[i].name)
 
 proc readRootFromFile(r: var LiveReader): Result[seq[tuple[ok: bool, e: RootSlot]], string] =
-  ## Every root slot read twice from the file; a slot whose two reads differ
-  ## is not accepted this time.
+  ## Every root slot read twice from the file, under the torn-read rule
+  ## (`ctfs-container.md` §6, "Reading"): a slot is accepted from a pair of
+  ## reads that agree on it. A slot whose two reads differ was written between
+  ## them -- a seal published it -- so the pair is read again, up to
+  ## `RootReadRetries` times, for the slots not yet accepted. A slot that never
+  ## reads the same twice is not accepted this time.
+  ##
+  ## The retry is what keeps a follower of a writer that seals continuously
+  ## from keeping a stale `Size` (or, before its first acceptance, from seeing
+  ## no member at all): each root entry is published in one write per seal,
+  ## so two pairs in a row disagree only when two seals publish the same slot
+  ## inside the two pairs' few microseconds.
   let n = r.slots * FileEntrySize
-  let a = ? r.readRaw(uint64(r.headerSize), n)
-  let b = ? r.readRaw(uint64(r.headerSize), n)
   var res = newSeq[tuple[ok: bool, e: RootSlot]](r.slots)
-  for i in 0 ..< r.slots:
-    let o = i * FileEntrySize
-    var same = true
-    for k in 0 ..< FileEntrySize:
-      if a[o + k] != b[o + k]:
-        same = false
-        break
-    res[i] = (ok: same, e: RootSlot(size: readU64LE(a, o),
-      mapBlock: readU64LE(a, o + 8), name: readU64LE(a, o + 16)))
+  var pending = r.slots
+  for _ in 0 ..< RootReadRetries:
+    let a = ? r.readRaw(uint64(r.headerSize), n)
+    let b = ? r.readRaw(uint64(r.headerSize), n)
+    for i in 0 ..< r.slots:
+      if res[i].ok: continue
+      let o = i * FileEntrySize
+      var same = true
+      for k in 0 ..< FileEntrySize:
+        if a[o + k] != b[o + k]:
+          same = false
+          break
+      if same:
+        res[i] = (ok: true, e: RootSlot(size: readU64LE(a, o),
+          mapBlock: readU64LE(a, o + 8), name: readU64LE(a, o + 16)))
+        dec pending
+    if pending == 0: break
   ok(res)
 
 proc refresh*(r: var LiveReader): Result[void, string] =
@@ -198,10 +221,14 @@ proc openLiveReader*(path: string, attach = true,
   ok(r)
 
 proc openImageReader*(image: ref seq[byte], page: ref seq[byte] = nil,
-                      name = "<image>"): Result[LiveReader, string] =
+                      name = "<image>",
+                      readTap: proc (off: uint64, n: int) {.closure, gcsafe,
+                        raises: [].} = nil): Result[LiveReader, string] =
   ## A reader of a test's image of a container file, attached to `page` (a
-  ## buffer laid out as the page) when given.
-  var r = LiveReader(path: name, image: image, pageBuf: page)
+  ## buffer laid out as the page) when given. `readTap`, when given, is the
+  ## reader's `imageReadTap` from its first read on.
+  var r = LiveReader(path: name, image: image, pageBuf: page,
+                     imageReadTap: readTap)
   ? r.parseHeader()
   if page != nil and page[].len >= slotsOffset(r.slots):
     r.page = pageReaderOfView(PageView(base: addr page[][0], len: page[].len),
