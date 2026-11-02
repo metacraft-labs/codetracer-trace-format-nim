@@ -2,17 +2,33 @@
 ## "Reading"), against the hostile injector of `CKF-2`'s KF-R: a writer that
 ## stores every payload word as single bytes, in random order, with pauses
 ## between them, while reader threads read the slot under its sequence
-## counter.
+## counter. A second phase runs the natural writer (aligned word stores, no
+## pauses), as KF-R does.
 ##
 ## Every payload the writer publishes is `(v, v * K1, v * K2)`; a payload is
 ## torn when its three words are not of one `v`.
 ##
-## Null prediction (the mutation arm): a reader that skips the second `seq`
-## load (`readSlotSkippingSecondSeq`) accepts torn payloads, so the arm's
-## count must be above zero. If it were zero the injector would not be
-## producing tears, and the zero of the protocol's reader would mean nothing.
+## Null predictions (the mutation arms), one per writer mode, each the
+## control KF-R found to see tears in that mode (tracing-formats-benchmarks
+## `results/ctfs_keyed/REPORT.md` §12.1):
+##
+## - hostile writer: a reader that loads no `seq` at all
+##   (`readSlotIgnoringSeq`) accepts torn payloads, so its count must be
+##   above zero. If it were zero the injector would not be producing tears,
+##   and the zero of the protocol's reader would mean nothing.
+## - natural writer: a reader that skips the second `seq` load
+##   (`readSlotSkippingSecondSeq`) accepts torn payloads, so its count must
+##   be above zero. If it were zero the second load would be untested.
+##
+## The skip-second-seq reader is not the hostile mode's control: it tears
+## only when the writer starts an update in the few nanoseconds between its
+## `seq` load and its payload loads, which happens once per update at most,
+## and a hostile update takes microseconds. On macOS arm64 under load, as
+## the only arm of this test's earlier four-second form, it tore 0 or 1
+## times; here it tears a few times per hostile phase, too few to rely on.
+## Both readers run in both phases and their counts are printed.
 
-import std/[atomics, random, times, os]
+import std/[atomics, random, os]
 import codetracer_ctfs/live_page
 
 const
@@ -20,17 +36,30 @@ const
   K2 = 0xC2B2AE3D27D4EB4F'u64
   SlotOff = 64
   Words = 3
+  PhaseMs = 3000
+
+type
+  ReaderKind = enum
+    rkProtocol = "the protocol's reader"
+    rkSkipSecondSeq = "the arm that skips the second seq load"
+    rkIgnoreSeq = "the arm that loads no seq"
+
+  ReaderResult = object
+    accepted, torn: int
 
 var buf: array[256, uint64]
 var stop: Atomic[bool]
 var published: Atomic[int]
+var results: array[ReaderKind, ReaderResult]
 
 proc view(): PageView = PageView(base: addr buf[0], len: sizeof(buf))
+
+proc payloadOf(x: uint64): array[Words, uint64] = [x, x * K1, x * K2]
 
 proc storeByte(p: pointer, b: uint8) {.inline.} =
   atomicStoreN(cast[ptr uint8](p), b, ATOMIC_RELAXED)
 
-proc writer() {.thread.} =
+proc hostileWriter() {.thread.} =
   ## The hostile writer: `seq` odd; each payload byte stored alone, in random
   ## order, with random pauses; `seq` even.
   var rng = initRand(11)
@@ -38,7 +67,7 @@ proc writer() {.thread.} =
   var x = 1'u64
   while not stop.load():
     inc x
-    let payload = [x, x * K1, x * K2]
+    let payload = payloadOf(x)
     let s = v.loadRelaxed(SlotOff)
     v.storeRelaxed(SlotOff, s + 1)
     atomicThreadFence(ATOMIC_RELEASE)
@@ -56,47 +85,74 @@ proc writer() {.thread.} =
     v.store(SlotOff, s + 2)
     published.atomicInc()
 
-type ReaderResult = object
-  accepted, torn: int
+proc naturalWriter() {.thread.} =
+  ## The natural writer: `seq` odd; the payload as aligned word stores, with
+  ## no pauses; `seq` even. Updates follow each other as fast as it can go,
+  ## so a reader's first `seq` load is often followed by the next update.
+  let v = view()
+  var x = 1'u64
+  while not stop.load():
+    inc x
+    let payload = payloadOf(x)
+    let s = v.loadRelaxed(SlotOff)
+    v.storeRelaxed(SlotOff, s + 1)
+    atomicThreadFence(ATOMIC_RELEASE)
+    for w in 0 ..< Words:
+      v.storeRelaxed(SlotOff + 8 + 8 * w, payload[w])
+    v.store(SlotOff, s + 2)
+    published.atomicInc()
 
-var protocolResult, skippingResult: ReaderResult
-
-proc readerLoop(skip: bool): ReaderResult =
+proc reader(kind: ReaderKind) {.thread.} =
   let v = view()
   var w: array[Words, uint64]
+  var r: ReaderResult
   while not stop.load():
-    let r =
-      if skip: readSlotSkippingSecondSeq(v, SlotOff, w)
-      else: readSlot(v, SlotOff, w)
-    if r == srOk:
-      inc result.accepted
+    let state =
+      case kind
+      of rkProtocol: readSlot(v, SlotOff, w)
+      of rkSkipSecondSeq: readSlotSkippingSecondSeq(v, SlotOff, w)
+      of rkIgnoreSeq: readSlotIgnoringSeq(v, SlotOff, w)
+    if state == srOk:
+      inc r.accepted
       if w[1] != w[0] * K1 or w[2] != w[0] * K2:
-        inc result.torn
+        inc r.torn
+  results[kind] = r
 
-proc protocolReader() {.thread.} = protocolResult = readerLoop(false)
-proc skippingReader() {.thread.} = skippingResult = readerLoop(true)
+proc runPhase(hostile: bool): bool =
+  ## One writer mode against all three readers for `PhaseMs`; prints the
+  ## counts and returns false when a check fails.
+  let mode = if hostile: "hostile" else: "natural"
+  # A published first value, so a reader never sees seq 0.
+  let first = payloadOf(1)
+  for i in 0 ..< Words: view().store(SlotOff + 8 + 8 * i, first[i])
+  view().store(SlotOff, 2)
+  stop.store(false)
+  published.store(0)
+  var tw: Thread[void]
+  var tr: array[ReaderKind, Thread[ReaderKind]]
+  createThread(tw, if hostile: hostileWriter else: naturalWriter)
+  for k in ReaderKind: createThread(tr[k], reader, k)
+  sleep(PhaseMs)
+  stop.store(true)
+  joinThread(tw)
+  for k in ReaderKind: joinThread(tr[k])
+  echo mode, " writer: published ", published.load(), " payloads"
+  for k in ReaderKind:
+    echo "  ", k, " accepted ", results[k].accepted, " (", results[k].torn, " torn)"
+  result = true
+  if published.load() < 1000 or results[rkProtocol].accepted < 1000:
+    echo "FAIL (", mode, "): too little traffic to judge"; result = false
+  if results[rkProtocol].torn != 0:
+    echo "FAIL (", mode, "): the attached reader accepted ",
+      results[rkProtocol].torn, " torn values"; result = false
+  let control = if hostile: rkIgnoreSeq else: rkSkipSecondSeq
+  if results[control].torn == 0:
+    echo "FAIL (", mode, "): ", control, " accepted no torn value: ",
+      (if hostile: "the injector tore nothing" else: "the second seq load is untested")
+    result = false
 
 when isMainModule:
-  # A published first value, so a reader never sees seq 0.
-  view().store(SlotOff + 8, 1); view().store(SlotOff + 16, K1)
-  view().store(SlotOff + 24, K2); view().store(SlotOff, 2)
-  var tw, tr1, tr2: Thread[void]
-  createThread(tw, writer)
-  createThread(tr1, protocolReader)
-  createThread(tr2, skippingReader)
-  sleep(4000)
-  stop.store(true)
-  joinThreads(tw, tr1, tr2)
-  echo "published ", published.load(), " payloads; the protocol's reader accepted ",
-    protocolResult.accepted, " (", protocolResult.torn, " torn); the arm that skips ",
-    "the second seq load accepted ", skippingResult.accepted, " (",
-    skippingResult.torn, " torn)"
-  var bad = false
-  if published.load() < 1000 or protocolResult.accepted < 1000:
-    echo "FAIL: too little traffic to judge"; bad = true
-  if protocolResult.torn != 0:
-    echo "FAIL: the attached reader accepted ", protocolResult.torn, " torn values"; bad = true
-  if skippingResult.torn == 0:
-    echo "FAIL: the mutation arm accepted no torn value: the injector tore nothing"; bad = true
-  if bad: quit(1)
+  let hostileOk = runPhase(hostile = true)
+  let naturalOk = runPhase(hostile = false)
+  if not (hostileOk and naturalOk): quit(1)
   echo "PASS test_live_page_torn"

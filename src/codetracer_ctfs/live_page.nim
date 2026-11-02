@@ -730,6 +730,16 @@ proc readSlotSkippingSecondSeq*(v: PageView, seqOff: int,
     words[i] = v.loadRelaxed(seqOff + 8 + 8 * i)
   srOk
 
+proc readSlotIgnoringSeq*(v: PageView, seqOff: int,
+                          words: var openArray[uint64]): SlotRead =
+  ## The no-seq control of `test_live_page_torn`: it loads no `seq` word at
+  ## all, so it accepts whatever bytes the payload holds, including those of
+  ## a writer that is between its odd and even stores. It shows that the
+  ## hostile injector really tears the payload. Never used by a reader.
+  for i in 0 ..< words.len:
+    words[i] = v.loadRelaxed(seqOff + 8 + 8 * i)
+  srOk
+
 proc identityOf(v: PageView): PageIdentity =
   for i in 0 ..< 4:
     let w = v.loadRelaxed(OffIdentity + 8 * i)
