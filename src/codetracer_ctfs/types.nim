@@ -202,6 +202,11 @@ type
       ## Blocks written since the last `publish` (deferred mode).
     dirtyMark*: seq[bool]
       ## Indexed by block number: already in `dirtyBlocks`.
+    rootPublicationOrder*: seq[uint64]
+      ## Optional encoded member names whose changed root entries publish
+      ## first, in this order, before all other changed entries. Set through
+      ## `setRootPublicationOrder`: publication order is independent of member
+      ## creation order and persists through every sync/publication call.
     rootGrowthLimit*: uint32
       ## The largest `maxRootEntries` `growRootDirectory` may reach; 0 (the
       ## default) is no limit beyond the u32 field.  A FAULT-INJECTION seam for
@@ -233,6 +238,10 @@ type
       ## API: `nil` unless a test or an armed recorder registered one.
     inClose*: bool
       ## Set while `closeCtfs` runs its final seal.
+    failedObservedSeal*: bool
+      ## An ordered root publication failed after its observer's intent was
+      ## emitted. The writer is terminal: retrying would emit a second intent
+      ## for the same ordinal, so later publishes/close never republish it.
     sealOrdinal*: uint64
       ## This writer's seals on this container (`ctfs-container.md` §6, "What
       ## counts as a seal"), the ordinal the observer reports.

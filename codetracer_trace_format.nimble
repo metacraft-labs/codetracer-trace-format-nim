@@ -65,6 +65,9 @@ task test, "Run all tests":
   # reaped; the file-only form hosts no page. Arms: a heartbeat thread
   # started anyway; the in-guest slot left on the heartbeat rule.
   exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_live_page_in_guest.nim"
+  # Explicit publication dependencies precede dependent members at every
+  # file/live-page write prefix, including real kills and write failures.
+  exec "nim c -r -d:release -p:src tests/test_root_publication_order.nim"
   # A publication writes the entries that changed, never the header again.
   # The keyed tests carry their mutation arms, so they build with them.
   exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_root_publication_writes_changed_entries.nim"

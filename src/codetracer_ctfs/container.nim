@@ -111,6 +111,8 @@ proc growRootDirectory*(c: var Ctfs): Result[void, string] =
   # rewrites only the root's MapBlocks and the mapping blocks it knows, so a
   # keyed member's stored block numbers (a keyed stream's MapBlock) would name
   # blocks that moved. Refused, naming the member.
+  if c.rootPublicationOrder.len > 0:
+    return err("the root directory cannot grow while a root publication order is active")
   if c.sealObserver != nil:
     return err("the root directory of " & c.streamPath & " cannot grow while a " &
       "seal observer is registered: the per-seal log has no item for a growth " &
@@ -574,6 +576,44 @@ proc changedEntries*(c: Ctfs): seq[int] =
     if c.entryChanged(i):
       result.add i
 
+proc setRootPublicationOrder*(c: var Ctfs, names: openArray[string]):
+    Result[void, string] =
+  ## Publish changed entries of these members first, in the given order,
+  ## then every other changed entry in slot order. Missing/unchanged members
+  ## make no write. The policy applies to every `publish`/`syncEntry` call,
+  ## including a publication invoked by a caller's preparation hook; an empty
+  ## list restores slot order. Member handles and stored root slots do not
+  ## move. A failed prerequisite write stops the publication before a later
+  ## entry can become visible, in either the file or its live page. If a
+  ## beforeSeal observer already saw its intent, that failed seal is terminal:
+  ## publish/close never retry it, and the policy cannot be reset to bypass it.
+  ## A payload failure before an intent, or a writer without an intent
+  ## observer, can retry the pending writes normally.
+  if c.failedObservedSeal:
+    return err("cannot change publication order after an observed seal failed")
+  var order: seq[uint64]
+  for name in names:
+    let refusal = base40Refusal(name)
+    if refusal.len > 0: return err(refusal)
+    let encoded = base40Encode(name)
+    if encoded in order:
+      return err("duplicate root publication member " & name)
+    order.add encoded
+  c.rootPublicationOrder = order
+  ok()
+
+proc orderedChangedEntries(c: Ctfs): seq[int] =
+  let changed = c.changedEntries()
+  if c.rootPublicationOrder.len == 0: return changed
+  var ranks = initTable[uint64, int]()
+  for rank, name in c.rootPublicationOrder: ranks[name] = rank
+  var ranked: seq[tuple[rank, slot: int]]
+  for slot in changed:
+    let name = readU64LE(c.data, c.fileEntryOffset(slot) + 16)
+    ranked.add (ranks.getOrDefault(name, c.rootPublicationOrder.len), slot)
+  ranked.sort()
+  for item in ranked: result.add item.slot
+
 proc entryItem*(c: Ctfs, i: int, withBytes: bool): SealItem =
   ## The `entry` item (`CTFS-Binary-Format.md` §2.15.4) of publishing slot
   ## `i` as it stands in the image.
@@ -692,15 +732,20 @@ proc publish*(c: var Ctfs) =
   ## seal"): it increments nothing and the observer does not see it. A write
   ## that fails is retried by the next publication, and `closeCtfs` reports it
   ## (`ioFailure`).
-  if not c.streaming:
+  if not c.streaming or c.failedObservedSeal:
     return
   c.flushDirtyData()
+  if c.rootPublicationOrder.len > 0 and c.dirtyBlocks.len > 0:
+    return
   if c.rootLayoutChanged():
+    if c.rootPublicationOrder.len > 0:
+      c.ioFailure = "cannot publish a changed root layout while a root publication order is active"
+      return
     c.beginSeal(@[])
     if c.publishRootLayout():
       c.endSeal()
     return
-  let changed = c.changedEntries()
+  let changed = c.orderedChangedEntries()
   if changed.len == 0:
     if c.sealObserver != nil and mutated("observer-empty-seal"):
       # Mutation arm: a publication that changes nothing fires the observer.
@@ -723,6 +768,12 @@ proc publish*(c: var Ctfs) =
   for i in changed:
     if c.publishEntry(i):
       any = true
+    elif c.rootPublicationOrder.len > 0:
+      # A later entry may refer to this prerequisite. Leave the seal pending
+      # rather than claiming a completed publication of only its prefix.
+      if c.sealObserver != nil and c.sealObserver.beforeSeal != nil:
+        c.failedObservedSeal = true
+      return
   if any:
     c.endSeal()
 
@@ -750,6 +801,33 @@ proc syncRootBlock*(c: var Ctfs) =
   ## trace it has just written — reads the pre-close image back.
   c.publish()
 
+proc releaseContainerResources(c: var Ctfs): Result[void, string] =
+  ## One teardown for close and nonpublishing abort. Observers are registered
+  ## by path as well as on the container object; release both registrations.
+  # A closed object no longer owns this registration: another writer may
+  # already have reused its path before an idempotent abort is called again.
+  if c.sealObserver != nil and c.streamPath in observedPaths:
+    var kept: seq[string]
+    for p in observedPaths:
+      if p != c.streamPath: kept.add p
+    observedPaths = kept
+  c.sealObserver = nil
+  if c.page != nil:
+    closeLivePage(c.page)
+    c.page = nil
+  let closed = c.streamFile.closeChecked()
+  c.streaming = false
+  c.inClose = false
+  closed
+
+proc abortCtfs*(c: var Ctfs): Result[void, string] =
+  ## Release this writer without publishing staged members or retrying an
+  ## incomplete seal. The file keeps exactly its already-written prefix.
+  ## The result describes teardown only; `ioFailure` retains the original
+  ## failure. This also releases an initializer's file/page acquired before
+  ## its streaming flag was enabled.
+  c.releaseContainerResources()
+
 proc closeCtfs*(c: var Ctfs): Result[void, string] {.discardable.} =
   ## Close the container. When streaming: the final seal (`publish`: every
   ## block not yet handed over, then every entry that changed), then the live
@@ -770,6 +848,10 @@ proc closeCtfs*(c: var Ctfs): Result[void, string] {.discardable.} =
   ## is what the caller gets back.
   let refusal = interningSetRefusal(c)
   if not c.streaming:
+    let released = c.releaseContainerResources()
+    if released.isErr: return released
+    if c.failedObservedSeal:
+      return err("cannot finalize CTFS container: an observed seal failed")
     if refusal.len > 0:
       return err(refusal)
     return ok()
@@ -780,22 +862,13 @@ proc closeCtfs*(c: var Ctfs): Result[void, string] {.discardable.} =
   c.inClose = true
   c.publish()
   c.inClose = false
-  if c.streamPath in observedPaths:
-    var kept: seq[string]
-    for p in observedPaths:
-      if p != c.streamPath: kept.add p
-    observedPaths = kept
   var failure = c.ioFailure
   if failure.len == 0 and (c.dirtyBlocks.len > 0 or c.changedEntries().len > 0):
     failure = "the final seal left blocks or entries unwritten" &
       (if earlier.len > 0: " (earlier: " & earlier & ")" else: "")
-  if c.page != nil:
-    closeLivePage(c.page)
-    c.page = nil
-  let closed = c.streamFile.closeChecked()
+  let closed = c.releaseContainerResources()
   if failure.len == 0 and closed.isErr:
     failure = closed.error
-  c.streaming = false
   if failure.len > 0:
     return err("failed to finalize CTFS container " & c.streamPath & ": " &
       failure)
