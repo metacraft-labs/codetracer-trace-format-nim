@@ -319,6 +319,15 @@ jobs:
         # Materialises the `test` collection.
         run: dev-exec repro test ${{ runner.os != 'Windows' && '--tool-provisioning=nix' || '' }}
 
+      - name: Sibling ct-print consumer contract (no ambient compiler or zstd)
+        # A recipe that calls `build_writer_artifacts.buildCtPrint` the way
+        # the recorders do must build ct-print from what the graph declares,
+        # with no compiler or zstd in its environment, and one that leaves
+        # `zstd-dev` out of `uses:` must be refused by name. POSIX only: the
+        # Windows constructors take zstd through explicit paths.
+        if: runner.os != 'Windows'
+        run: dev-exec just test-native-tool-contract
+
       - name: Inspect the original Windows compiler header boundary on failure
         if: failure() && runner.os == 'Windows'
         shell: pwsh

@@ -52,6 +52,14 @@ test-nim:
 test-managed-sender-ci-routes:
     nim c -r -d:release -p:src -o:build/test-bin/test_managed_sender_ci_routes tests/test_managed_sender_ci_routes.nim
 
+# The native tool contract of `build_writer_artifacts` (POSIX): a sibling
+# recipe that calls `buildCtPrint` with the documented `uses:` builds ct-print
+# through `repro build` in an environment with no C compiler and no zstd, and
+# one that omits `zstd-dev` is refused by name. Not in `test`: it provisions
+# its tools through Nix and takes minutes. CI's reprobuild lane runs it.
+test-native-tool-contract:
+    bash tests/native_tool_contract/run.sh
+
 # The C-FFI smoke test: build the static library, compile `tests/test_ffi.c`
 # against it and run it.
 test-ffi:
