@@ -142,4 +142,3 @@ proc selectProfile*(full: openArray[byte], threshold: uint64):
     ok((cpCompact, ? encodeCompactContainer(members), raw))
   else:
     ok((cpFull, @full, raw))
-

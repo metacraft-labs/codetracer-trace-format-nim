@@ -327,4 +327,3 @@ proc compressImage*(image: openArray[byte], level = 3):
     return err("whole-file zstd compression failed: " & $ZSTD_getErrorName(n))
   stored.setLen(V6HeaderSize + int(n))
   ok(stored)
-

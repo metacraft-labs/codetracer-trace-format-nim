@@ -301,7 +301,7 @@ TBL
               SELF_REPO_URL="https://github.com/acme/self" \
               WORKFLOW_DIR="$dir" "$@" "$0" 2>&1); rc=$?
     if { [ "$expect" = pass ] && [ $rc -eq 0 ]; } || \
-       { [ "$expect" = fail ] && [ $rc -ne 0 ]; }; then
+        { [ "$expect" = fail ] && [ $rc -ne 0 ]; }; then
       printf '  ok   %s\n' "$desc"; pass=$((pass + 1))
     else
       printf '  FAIL %s (rc=%d, expected %s)\n%s\n' "$desc" "$rc" "$expect" "$out"

@@ -7,24 +7,24 @@ session can name.  It serves the routes as codetracer-ci documents them
 (codetracer-ci rewrite-docs/04-apis-events/http-api.md §4.4.1):
 
   POST /api/v1/tenants/{t}/traces/upload-session
-       answers sessionId, s3KeyPrefix (traces/{t}/{s}/slices/), no storage
-       pool, and `sliceUploadMethod` (--method; `absent` leaves the field out,
-       as a codetracer-ci from before the field did);
+        answers sessionId, s3KeyPrefix (traces/{t}/{s}/slices/), no storage
+        pool, and `sliceUploadMethod` (--method; `absent` leaves the field out,
+        as a codetracer-ci from before the field did);
   POST /api/v1/traces/{s}/slice-upload-url
-       builds the key {s3KeyPrefix}{fileName} and answers a presigned PUT URL
-       for it on the MinIO (AWS Signature Version 4, query form:
-       https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html),
-       or on the local store a file:// path, as codetracer-ci's local file
-       system provider does;
+        builds the key {s3KeyPrefix}{fileName} and answers a presigned PUT URL
+        for it on the MinIO (AWS Signature Version 4, query form:
+        https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html),
+        or on the local store a file:// path, as codetracer-ci's local file
+        system provider does;
   PUT  /api/v1/observability/storage-policy/tenants/{t}/local-storage/objects/{key}
-       writes the object into the local store; on the S3 store it answers
-       403 storage_policy_access_denied, as codetracer-ci does for a tenant
-       with no recorder storage credential (http-api.md §4.4.1);
+        writes the object into the local store; on the S3 store it answers
+        403 storage_policy_access_denied, as codetracer-ci does for a tenant
+        with no recorder storage credential (http-api.md §4.4.1);
   POST /api/v1/traces/{s}/finalize
-       reads every slice the manifest names back from the store (MinIO
-       through a presigned GET) and answers 204 only when each object's
-       length and SHA-256 are the manifest's, 409 slice_content_mismatch
-       otherwise, as codetracer-ci's finalize checks them.
+        reads every slice the manifest names back from the store (MinIO
+        through a presigned GET) and answers 204 only when each object's
+        length and SHA-256 are the manifest's, 409 slice_content_mismatch
+        otherwise, as codetracer-ci's finalize checks them.
 
 --fail-upload-urls N answers the first N slice-upload-url calls
 503 upload_session_busy (a transient refusal the sender retries).
@@ -268,7 +268,7 @@ def make_handler(store: Store):
                 if store.args.wrong_key:
                     key = session["prefix"] + "other-" + name
                 url = (store.s3_url("PUT", key) if store.args.method == "presigned-url"
-                       else Path(store.args.local_root, key).as_uri())
+                        else Path(store.args.local_root, key).as_uri())
                 if "store" in store.redirects:
                     url = f"http://127.0.0.1:{self.server.server_address[1]}/_store/{key}"
                 if store.args.bad_signature:

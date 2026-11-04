@@ -33,7 +33,7 @@ static int make_scratch_dir(void) {
     len = strlen(tmp);
     while (len > 1 && tmp[len - 1] == '/') len--;
     if (snprintf(scratch_dir, sizeof scratch_dir, "%.*s/ct_test_ffi-XXXXXX",
-                 (int)len, tmp) >= (int)sizeof scratch_dir) {
+                  (int)len, tmp) >= (int)sizeof scratch_dir) {
         return -1;
     }
     return mkdtemp(scratch_dir) != NULL ? 0 : -1;
@@ -418,7 +418,7 @@ int main(void) {
             fseek(f, 0, SEEK_SET);
             uint8_t* bytes = malloc((size_t)n);
             ASSERT(bytes != NULL && fread(bytes, 1, (size_t)n, f) == (size_t)n,
-                   "read ms_test.ct");
+                    "read ms_test.ct");
             fclose(f);
             ct_reader_t from_bytes = ct_reader_open_bytes(bytes, (size_t)n);
             memset(bytes, 0xFF, (size_t)n);
@@ -426,15 +426,15 @@ int main(void) {
             ASSERT(from_bytes != NULL, "ct_reader_open_bytes");
             uint64_t steps = ct_reader_step_count(from_bytes);
             ASSERT(steps > 0 && steps == ct_reader_step_count(from_path),
-                   "the two handles count the same steps");
+                    "the two handles count the same steps");
             uint64_t p0 = 0, l0 = 0, p1 = 0, l1 = 0;
             ASSERT(ct_reader_step_location(from_bytes, 0, &p0, &l0) == 0 &&
-                   ct_reader_step_location(from_path, 0, &p1, &l1) == 0 &&
-                   p0 == p1 && l0 == l1, "the two handles locate step 0 alike");
+                    ct_reader_step_location(from_path, 0, &p1, &l1) == 0 &&
+                    p0 == p1 && l0 == l1, "the two handles locate step 0 alike");
             size_t len = 0;
             uint8_t* prog = ct_reader_program(from_bytes, &len);
             ASSERT(prog != NULL && len == strlen("ms_test") &&
-                   memcmp(prog, "ms_test", len) == 0, "ct_reader_program");
+                    memcmp(prog, "ms_test", len) == 0, "ct_reader_program");
             ct_free_buffer(prog);
             ct_reader_close(from_bytes);
             ct_reader_close(from_path);
@@ -563,8 +563,8 @@ int main(void) {
 
             /* A container that is not a container. */
             ASSERT(ct_container_append_files(SCRATCH(path_buf, "ct_container_append_test.missing"),
-                                             names, contents, lengths, 1) != 0,
-                   "appending to a nonexistent container must fail");
+                                              names, contents, lengths, 1) != 0,
+                    "appending to a nonexistent container must fail");
             printf("[OK] container: append refuses a nonexistent container\n");
         }
         remove(path);

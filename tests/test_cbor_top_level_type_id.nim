@@ -100,4 +100,3 @@ suite "a value's top-level type id, read without decoding it":
       check VariableValue(varnameId: 1, data: encode(v)).typeId ==
         topLevelTypeId(v)
     check VariableValue(varnameId: 1).typeId == 0
-
