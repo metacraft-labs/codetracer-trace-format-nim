@@ -100,9 +100,14 @@ choice the sibling Nim repos `io-mon`, `nim-stackable-hooks` and
   published by a single rewrite of block 0, which is what makes a
   half-attached set of streams unobservable.
 - `src/codetracer_trace_types.nim` — the shared record/value types.
-- `src/codetracer_trace_writer.nim` — the multi-stream production writer
-  (`steps.dat`, `values.dat`, `calls.dat`, `events.dat`, line-hit and
-  mem-write builders).
+- `src/codetracer_trace_writer/multi_stream_writer.nim` — the production
+  writer (`steps.dat`, `values.dat`, `calls.dat`, `events.dat`, the interning
+  tables and `meta.dat`), delegating the encoding to the per-stream modules
+  beside it (`exec_stream`, `value_stream`, `call_stream`,
+  `io_event_stream`, ...); the line-hit and mem-write builders are there too.
+  The single-stream writer that was `src/codetracer_trace_writer.nim` is
+  gone, and every reader refuses the `events.log` / `events.fmt` members it
+  wrote.
 - `src/codetracer_trace_reader.nim` — the reader side.
 - `src/codetracer_trace_writer_ffi.nim` — the C FFI surface; compiled to
   `libcodetracer_trace_writer.a`. Its entry points are declared with
