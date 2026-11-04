@@ -173,6 +173,9 @@ const
 #     never fail. ``test_golden_fixtures`` is the test that reads them.
 #   * benchmarks (``tests/bench_*.nim``), see ``debugOnly``.
 const testSpecs: seq[TestSpec] = @[
+  TestSpec(source: "tests/test_recorded_entry_identity.nim", binary: "build/test-bin/test_recorded_entry_identity", mm: "arc"),
+  TestSpec(source: "tests/test_recorded_entry_sealed.nim", binary: "build/test-bin/test_recorded_entry_sealed", mm: "arc"),
+  TestSpec(source: "tests/test_recorded_entry_hierarchy.nim", binary: "build/test-bin/test_recorded_entry_hierarchy", mm: "arc"),
   TestSpec(source: "tests/test_base40.nim", binary: "build/test-bin/test_base40"),
   TestSpec(source: "tests/test_container.nim", binary: "build/test-bin/test_container"),
   TestSpec(source: "tests/test_ctfs_v5_member_forms.nim", binary: "build/test-bin/test_ctfs_v5_member_forms"),

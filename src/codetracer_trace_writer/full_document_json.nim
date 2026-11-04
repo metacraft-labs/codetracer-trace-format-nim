@@ -533,6 +533,11 @@ proc buildFullHeader*(reader: var NewTraceReader, opts: FullOpts): JsonNode =
     traceFilterObj["filters"] = filtersArr
     meta["trace_filter"] = traceFilterObj
 
+  let entry = reader.recordedEntryIdentity()
+  if entry.isSome:
+    let identity = entry.get()
+    meta["entry"] = %* {"call_key": identity.callKey,
+      "function_id": identity.functionId, "entry_step": identity.entryStep}
   root["metadata"] = meta
 
   # ----- paths -----
