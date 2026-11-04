@@ -4956,30 +4956,20 @@ proc ct_reader_open_bytes(data: ptr uint8,
 proc ct_reader_refresh_bytes(h: pointer, data: ptr uint8,
     len: csize_t): cint {.exportc, cdecl, dynlib, ffiGuard.} =
   ## Replace the reader `h` with one over the `len` bytes at `data` (a newer
-  ## image of the same growing container). The candidate is parsed
-  ## completely before the handle changes, so on failure (non-zero, the
-  ## reason in `trace_writer_last_error`) `h` still reads the image it read
-  ## before. 0 on success.
+  ## image of the same growing container). The candidate is opened exactly as
+  ## `ct_reader_open_bytes` opens one, and completely, before the handle
+  ## changes, so on failure (non-zero, the reason in
+  ## `trace_writer_last_error`) `h` still reads the image it read before.
+  ## 0 on success.
   if h.isNil:
     setError("NULL reader handle")
     return 1
-  if len == 0:
-    setError("Empty CTFS image")
-    return 1
-  if len > csize_t(high(int)):
-    setError("CTFS image length exceeds native index domain")
-    return 1
-  if data.isNil:
-    setError("NULL data with a non-zero length")
-    return 1
-  var bytes = newSeq[byte](int(len))
-  copyMem(addr bytes[0], data, int(len))
-  var res = openNewTraceFromBytes(move bytes)
-  if res.isErr:
-    setError(res.error)
-    return 1
-  cast[TraceReaderHandle](h)[] = move res.get()
-  return 0
+  let candidate = ct_reader_open_bytes(data, len)
+  if candidate.isNil: return 1
+  let replacement = cast[TraceReaderHandle](candidate)
+  cast[TraceReaderHandle](h)[] = move replacement[]
+  dealloc(replacement)
+  0.cint
 
 proc ct_reader_close(h: pointer) {.exportc, cdecl, dynlib, ffiGuard.} =
   ## Close and free a reader handle. Passing NULL is a no-op.

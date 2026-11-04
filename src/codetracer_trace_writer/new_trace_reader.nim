@@ -558,13 +558,6 @@ proc computePathVersionOrdinals(r: var NewTraceReader): Result[void, string] =
 # Opening
 # ---------------------------------------------------------------------------
 
-proc validateRecordedEntry*(r: var NewTraceReader,
-    entry: RecordedEntryIdentity): Result[void, string] {.gcsafe.}
-
-proc recordedEntryIdentity*(r: NewTraceReader): Option[RecordedEntryIdentity] =
-  ## Only open's checked same-image identity is exposed.
-  r.entryIdentity
-
 proc decodeSourceView(raw: openArray[byte], v: var SourceView,
     why: var string): bool =
   ## One `source_views.dat` record (`internal-files.md` §"Alternate Source
@@ -642,6 +635,13 @@ proc loadTable(image: ContainerImage, name: string, blockSize: uint32,
     dest = move tr.get()
   ok()
 
+proc validateRecordedEntry*(r: var NewTraceReader,
+    entry: RecordedEntryIdentity): Result[void, string] {.gcsafe.}
+
+proc recordedEntryIdentity*(r: NewTraceReader): Option[RecordedEntryIdentity] =
+  ## Only the checked identity from the reader's own image is exposed.
+  r.entryIdentity
+
 proc openNewTraceFromImage(image: ContainerImage, blockSize: uint32,
     maxEntries: uint32, assumeColumnAwarePaths: bool):
     Result[NewTraceReader, string] =
@@ -651,19 +651,21 @@ proc openNewTraceFromImage(image: ContainerImage, blockSize: uint32,
   # `entry.dat` is optional finalized metadata. Its structural presence is
   # counted over exactly the root directory the header declares,
   # independently of table decoding and of the caller's `maxEntries`: a
-  # larger caller count would read data blocks as entries, and a member's
-  # bytes could then count as a second `entry.dat`. A duplicate is refused
-  # rather than resolved to either copy. A compact container's directory
-  # refuses duplicate names when it is read.
-  if not isCompactContainer(image.bytes):
-    let layout = rootDirectoryLayout(image.bytes)
-    if layout.error.len > 0:
-      return err(layout.error)
-    var entryMembers = 0
-    let entryName = base40Encode("entry.dat")
-    for i in 0 ..< int(layout.entryCount):
-      let off = layout.entryStart + i * FileEntrySize
-      if readU64LE(image.bytes, off + 16) == entryName: inc entryMembers
+  # smaller caller count would hide a member, and a larger one would read
+  # data blocks as entries, so a member's bytes could count as a second
+  # `entry.dat`. A duplicate is refused rather than resolved to either copy.
+  # Compact directory parsing already refuses duplicate names.
+  let entrySlots = headerRootEntryCount(image.bytes)
+  var entryMembers = 0
+  if isCompactContainer(image.bytes):
+    if hasInternalFile(image.bytes, "entry.dat", entrySlots): entryMembers = 1
+  else:
+    let base = containerHeaderSize(image.bytes)
+    let encoded = base40Encode("entry.dat")
+    for i in 0 ..< int(entrySlots):
+      let offset = base + i * FileEntrySize
+      if offset + FileEntrySize > image.bytes.len: break
+      if readU64LE(image.bytes, offset + 16) == encoded: inc entryMembers
     if entryMembers > 1: return err("entry.dat: duplicate member")
 
   var reader: NewTraceReader
@@ -799,12 +801,12 @@ proc openNewTraceFromImage(image: ContainerImage, blockSize: uint32,
 
   reader.posSpace = positionSpace(reader.lineLengths, reader.lineCounts,
     int(reader.pathReader.count()), reader.meta.hasColumnAwareSteps)
-  # Optional finalized metadata is read from this same image. A member that
-  # is present and does not read, decode or validate fails the open: a
-  # failed lookup is never an absence.
-  if hasInternalFile(reader.image.bytes, "entry.dat", maxEntries):
-    let entryView = ? viewMember(reader.image, "entry.dat", blockSize, maxEntries)
-    let entry = ? decodeEntryIdentity(? entryView.contents())
+  if entryMembers == 1:
+    let member = viewMember(reader.image, "entry.dat", blockSize, entrySlots)
+    if member.isErr: return err("entry.dat: " & member.error)
+    let raw = member.get().contents()
+    if raw.isErr: return err("entry.dat: " & raw.error)
+    let entry = ? decodeEntryIdentity(raw.get())
     ? reader.validateRecordedEntry(entry)
     reader.entryIdentity = some(entry)
   ok(reader)
