@@ -85,17 +85,16 @@ lint: lint-nim lint-nix
 
 # Nim has no separate linter; `nim check` is the type/semantic pass. Run it
 # over the library entry points that everything else imports.
+#
+# One command per line, so `just` stops at the first failing check, and no
+# shebang: `nix flake check` runs this recipe in the build sandbox, which has
+# no `/usr/bin/env` (`tests/test_flake_check_lint_hook.sh`).
 lint-nim:
-    #!/usr/bin/env bash
-    # `-e` so ANY failing check fails the recipe rather than only the last.
-    set -euo pipefail
-    for m in src/codetracer_ctfs.nim \
-             src/codetracer_trace_types.nim \
-             src/codetracer_profile_writer.nim \
-             src/codetracer_trace_reader.nim \
-             src/codetracer_ct_print_lib.nim; do
-      nim check --hints:off --warnings:off -p:src "$m"
-    done
+    nim check --hints:off --warnings:off -p:src src/codetracer_ctfs.nim
+    nim check --hints:off --warnings:off -p:src src/codetracer_trace_types.nim
+    nim check --hints:off --warnings:off -p:src src/codetracer_profile_writer.nim
+    nim check --hints:off --warnings:off -p:src src/codetracer_trace_reader.nim
+    nim check --hints:off --warnings:off -p:src src/codetracer_ct_print_lib.nim
 
 lint-nix:
     nixfmt --check flake.nix
@@ -122,6 +121,11 @@ nix-build:
 # `test`, which runs inside the shell.
 test-dev-shell:
     bash tests/test_dev_shell_writes_nothing_elsewhere.sh
+
+# `nix flake check`'s pre-commit check runs the `lint` hook in the build
+# sandbox and passes it. Builds the check, so it is not part of `test`.
+test-flake-check-lint-hook:
+    bash tests/test_flake_check_lint_hook.sh
 
 # Check refs with hermetic scanner controls before the network observation.
 check-ci-refs:

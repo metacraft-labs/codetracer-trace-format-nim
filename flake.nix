@@ -156,6 +156,29 @@
             lib = pkgs.lib;
             src = inputs.standard-hooks-src;
           };
+          # The flake check's `lint` hook carries its own tools. The check runs
+          # in the Nix build sandbox, where nothing puts `just`, `nim`, the Nim
+          # dependencies or `nixfmt` on PATH, so a bare `just lint` entry
+          # failed to start at all ("No such file or directory"). The
+          # dependencies are the dev shell's `NIMBLE_DIR` seed, read in place:
+          # `nim check` only reads `pkgs2/`. The installed git hook keeps
+          # running `just lint` from the committed `.pre-commit-config.yaml`
+          # with the dev shell's tools. `tests/test_flake_check_lint_hook.sh`.
+          lintHook = pkgs.writeShellApplication {
+            name = "trace-format-nim-lint";
+            runtimeInputs = [
+              pkgs.just
+              pkgs.bash
+              pkgs.coreutils
+              nim
+              pkgs.nixfmt-rfc-style
+            ];
+            text = ''
+              export NIMBLE_DIR=${nimbleSeed}
+              exec just lint
+            '';
+          };
+
           preCommit = inputs.pre-commit-hooks.lib.${system}.run {
             src = ./.;
             package = pkgs.prek;
@@ -167,7 +190,7 @@
               lint = {
                 enable = true;
                 name = "Lint";
-                entry = "just lint";
+                entry = pkgs.lib.getExe lintHook;
                 language = "system";
                 pass_filenames = false;
                 stages = [ "pre-commit" ];

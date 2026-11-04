@@ -35,6 +35,11 @@ nix develop             # or just `cd` in with direnv active
 - `packages.default` — `ct-print`, built with a bare `nim c` against the
   pinned dependency sources (no network inside the sandbox).
 - `checks.pre-commit-check` — the `git-hooks.nix` hook set (`just lint`).
+  It runs in the Nix build sandbox, which has none of the dev shell's tools,
+  so its `lint` hook is a wrapper that carries `just`, `nim`, `nixfmt` and the
+  seeded Nim dependencies itself, and `just lint` uses no shebang recipe (the
+  sandbox has no `/usr/bin/env`). `just test-flake-check-lint-hook` builds the
+  check and asserts the hook passes.
 
 ### Nim dependencies
 
@@ -74,6 +79,7 @@ point `CODETRACER_TRACE_FORMAT_DIR` at it.
 | `just format` (alias `fmt`) | `nixfmt flake.nix`                                                    |
 | `just bench`                | `nimble bench` — machine-dependent, deliberately not part of `test`   |
 | `just nix-build`            | `nix build .#default`                                                 |
+| `just test-flake-check-lint-hook` | Builds `checks.pre-commit-check`; its `lint` hook must pass in the sandbox |
 
 `repro.nim` expresses the same graph natively for `reprobuild` (per-test
 build + execute edges); keep the two in sync — see
