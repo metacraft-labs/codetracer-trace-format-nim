@@ -217,6 +217,7 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_live_page_timens.nim", binary: "build/test-bin/test_live_page_timens", defines: @["ctfsKeyedMutation"]),
   TestSpec(source: "tests/test_live_page_other_user.nim", binary: "build/test-bin/test_live_page_other_user"),
   TestSpec(source: "tests/test_live_page_in_guest.nim", binary: "build/test-bin/test_live_page_in_guest", defines: @["ctfsKeyedMutation"]),
+  TestSpec(source: "tests/test_live_page_heartbeat_blocks_signals.nim", binary: "build/test-bin/test_live_page_heartbeat_blocks_signals"),
   TestSpec(source: "tests/test_root_publication_order.nim", binary: "build/test-bin/test_root_publication_order"),
   TestSpec(source: "tests/test_root_publication_writes_changed_entries.nim", binary: "build/test-bin/test_root_publication_writes_changed_entries", defines: @["ctfsKeyedMutation"]),
   TestSpec(source: "tests/test_keyed_b1.nim", binary: "build/test-bin/test_keyed_b1", defines: @["ctfsKeyedMutation"]),

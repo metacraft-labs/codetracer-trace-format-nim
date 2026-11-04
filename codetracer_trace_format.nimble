@@ -70,6 +70,9 @@ task test, "Run all tests":
   # reaped; the file-only form hosts no page. Arms: a heartbeat thread
   # started anyway; the in-guest slot left on the heartbeat rule.
   exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_live_page_in_guest.nim"
+  # The hosted writer's heartbeat thread blocks every signal, so a host's
+  # process-directed stop signal never runs on it (POSIX; Windows skips).
+  exec "nim c -r -d:release -p:src tests/test_live_page_heartbeat_blocks_signals.nim"
   # Explicit publication dependencies precede dependent members at every
   # file/live-page write prefix, including real kills and write failures.
   exec "nim c -r -d:release -p:src tests/test_root_publication_order.nim"

@@ -1003,7 +1003,10 @@ proc setNextFreeBlock*(p: LivePage, n: uint64) =
   p.tapStore(OffNextFreeBlock, n)
 
 # The heartbeat thread: a native thread that touches no Nim-managed memory,
-# so it is safe under every memory manager a consumer builds with.
+# so it is safe under every memory manager a consumer builds with. On POSIX
+# it blocks every signal (see `startHeartbeat`); Windows delivers no signal to
+# an arbitrary thread (a console control handler runs on a thread of its
+# own), so there is nothing to block there.
 
 when defined(windows):
   proc createThreadW(attrs: pointer, stack: uint, start: pointer, arg: pointer,
@@ -1044,8 +1047,33 @@ proc startHeartbeat(p: LivePage) =
       deallocShared(ctl)
       return
   else:
+    # The heartbeat thread runs inside a host process (php-fpm, a Ruby or
+    # Python interpreter, ...) that owns its signal handling. A
+    # process-directed signal is delivered to any one thread that does not
+    # block it (`signal(7)`, "Signal mask and pending signals":
+    # https://man7.org/linux/man-pages/man7/signal.7.html), so a thread that
+    # blocks nothing can receive the host's SIGTERM or SIGQUIT, and the
+    # host's handler then runs on it while another thread may be closing the
+    # container. The heartbeat thread handles no signal, so it blocks them
+    # all. A new thread inherits its creator's mask (`pthread_sigmask(3)`:
+    # https://man7.org/linux/man-pages/man3/pthread_sigmask.3.html), so the
+    # creating thread blocks every signal around `pthread_create` and then
+    # restores its own mask, on every path. SIGKILL and SIGSTOP cannot be
+    # blocked and are left out silently; a synchronous fault (SIGSEGV, ...)
+    # raised by the thread itself still terminates the process.
+    var all, old: Sigset
+    if sigfillset(all) != 0 or pthread_sigmask(SIG_SETMASK, all, old) != 0:
+      # Without a blocked mask the thread would take the host's signals:
+      # start none, as when `pthread_create` fails.
+      deallocShared(ctl)
+      return
     var t: Pthread
-    if pthread_create(addr t, nil, heartbeatMain, cast[pointer](ctl)) != 0:
+    let created = pthread_create(addr t, nil, heartbeatMain,
+                                 cast[pointer](ctl))
+    # Restoring the mask this thread had a moment ago cannot fail: SIG_SETMASK
+    # is valid and `old` was filled by the call above.
+    discard pthread_sigmask(SIG_SETMASK, old, all)
+    if created != 0:
       deallocShared(ctl)
       return
     ctl.thread = cast[uint](t)
