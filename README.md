@@ -48,6 +48,45 @@ The format is documented in [codetracer-trace-format-spec](https://github.com/me
 nimble test
 ```
 
+For the typed Reprobuild graph, enter the owning shell:
+
+```sh
+nix develop --command repro test
+```
+
+The shell selects a JSON tool-path manifest through the `toolPathsFile`
+variant. Both the selection and the file's contents invalidate cached graphs.
+Re-entering the shell replaces its previous selection and preserves unrelated
+variants. Override it after shell activation with
+`repro test --variant toolPathsFile=/absolute/path/paths.json`.
+
+The manifest has this shape on Linux and macOS:
+
+```json
+{
+  "schema": 1,
+  "paths": {
+    "CT_ZSTD_INCLUDE_DIR": "/absolute/zstd/include",
+    "CT_ZSTD_LIB_DIR": "/absolute/zstd/lib",
+    "CT_PCRE_LIB_DIR": "/absolute/pcre/lib",
+    "CT_NIM_STEW_SRC": "/absolute/stew",
+    "CT_NIM_RESULTS_SRC": "/absolute/results",
+    "CT_NIM_UNITTEST2_SRC": "/absolute/unittest2"
+  }
+}
+```
+
+Windows prerequisite binders accumulate the same source fields and Zstd include
+directory, with `CT_ZSTD_LIBRARY_FILE` instead of the two POSIX library-directory
+fields. Windows may also supply an optional `CT_PCRE_LIB_DIR` linker search directory.
+Paths inside JSON may contain spaces or commas; the manifest's own path
+must contain neither commas nor newlines because variants are comma-delimited.
+The typed graph requires these fields and does not fall back to ambient `CT_*`
+variables. Those exports remain available to native Nim and Nimble commands.
+
+`just test-repro-tool-paths` exercises shell re-entry, both warm graph caches,
+manifest edits and selection changes against the real recipe and compiler.
+
 ## License
 
 MIT

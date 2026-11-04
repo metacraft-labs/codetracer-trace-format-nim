@@ -109,6 +109,22 @@
             "${inputs.nim-unittest2}"
           ];
 
+          # One tracked variant selects this manifest, rather than baking
+          # ambient shell exports into a reusable provider graph.
+          reproToolPaths = pkgs.writeText "trace-format-nim-tool-paths.json" (
+            builtins.toJSON {
+              schema = 1;
+              paths = {
+                CT_NIM_STEW_SRC = "${inputs.nim-stew}";
+                CT_NIM_RESULTS_SRC = "${inputs.nim-results}";
+                CT_NIM_UNITTEST2_SRC = "${inputs.nim-unittest2}";
+                CT_ZSTD_INCLUDE_DIR = "${pkgs.zstd.dev}/include";
+                CT_ZSTD_LIB_DIR = "${pkgs.zstd.out}/lib";
+                CT_PCRE_LIB_DIR = "${pkgs.pcre.out}/lib";
+              };
+            }
+          );
+
           # A ready-made `NIMBLE_DIR` payload.  nimble accepts any
           # `pkgs2/<name>-<version>-<40 hex chars>` directory that carries the
           # package's `.nimble`; the checksum component is not verified when
@@ -233,6 +249,7 @@
             # repository has at its top level; elsewhere it is skipped and
             # nothing is written. `tests/test_dev_shell_writes_nothing_elsewhere.sh`.
             shellHook = ''
+              source ${./scripts/select-repro-tool-paths.sh} ${reproToolPaths} || exit $?
               ct_tfn_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
               if [ -n "$ct_tfn_root" ] \
                 && [ -f "$ct_tfn_root/codetracer_trace_format.nimble" ] \

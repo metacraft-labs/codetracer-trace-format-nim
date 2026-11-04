@@ -63,11 +63,9 @@
 ## ``LD_LIBRARY_PATH``, so instead of a fragile runtime search this edge
 ## links pcre directly (``--dynlibOverride:pcre --passL:-L<dir> -lpcre``);
 ## the nix ``ld`` wrapper bakes pcre's rpath into the binary, so it runs
-## hermetically with no ``LD_LIBRARY_PATH``. The pcre lib dir is threaded in
-## via the ``CT_PCRE_LIB_DIR`` env var the outer dev-shell nesting exports;
-## when unset the edge falls back to a plain ``--passL:-lpcre`` (the nix C
-## toolchain's ``NIX_LDFLAGS`` may still resolve it) so the recipe stays
-## portable on hosts that put libpcre on the default search path.
+## hermetically with no ``LD_LIBRARY_PATH``. The pcre library directory comes
+## from ``CT_PCRE_LIB_DIR`` in the JSON manifest selected by ``toolPathsFile``.
+## Both its selection and its contents participate in graph invalidation.
 
 import repro_project_dsl
 import repro_dsl_stdlib/foreign_env
@@ -77,8 +75,29 @@ import repro_dsl_stdlib/foreign_env
 # edge). It re-exports ``repro_project_dsl``.
 import ct_test_nim_unittest
 
-import std/os
+import std/[os, json]
 import build_writer_artifacts
+
+# The variant selects a tool-path manifest, and its contents are evaluation
+# inputs too. Changing a selection or editing a selected manifest invalidates
+# provider snapshots and lowered graphs before a cached edge is served.
+proc declaredToolPaths(path: string): JsonNode =
+  doAssert path.isAbsolute and fileExists(path),
+    "owning builds require --variant toolPathsFile=<absolute JSON manifest>"
+  when defined(reproProviderMode):
+    result = parseJson(readDevEnvFile(path))
+  else:
+    result = parseFile(path)
+  doAssert result.kind == JObject and result.hasKey("schema") and
+    result["schema"].kind == JInt and result["schema"].getInt == 1 and
+    result.hasKey("paths") and result["paths"].kind == JObject,
+    "invalid owning tool-path manifest schema"
+  result = result["paths"]
+
+proc declaredToolPath(paths: JsonNode; key: string): string =
+  doAssert paths.hasKey(key) and paths[key].kind == JString and
+    paths[key].getStr.len > 0, "owning tool-path manifest requires " & key
+  paths[key].getStr
 
 type
   TestSpec = object
@@ -415,6 +434,9 @@ const testSpecs: seq[TestSpec] = @[
 package codetracer_trace_format_nim:
   defaultToolProvisioning "path"
 
+  config:
+    toolPathsFile: variant string = ""
+
   uses:
     # Toolchain floor — mirrors the nimble file's ``requires "nim >=
     # 2.2.0"``. ``nimble`` ships alongside so downstream consumers that
@@ -459,9 +481,10 @@ package codetracer_trace_format_nim:
     # edge comes from ``build_writer_artifacts.buildCtPrint``, the same
     # constructor the recorder recipes import so that their test graphs
     # build this prerequisite; the flags are written down once, there.
-    let zstdIncludeDir = getEnv("CT_ZSTD_INCLUDE_DIR")
-    let zstdLibraryFile = (when defined(windows): getEnv("CT_ZSTD_LIBRARY_FILE") else: "")
-    let zstdLibDir = (when defined(windows): "" else: getEnv("CT_ZSTD_LIB_DIR"))
+    let toolPaths = declaredToolPaths(toolPathsFile.value)
+    let zstdIncludeDir = declaredToolPath(toolPaths, "CT_ZSTD_INCLUDE_DIR")
+    let zstdLibraryFile = (when defined(windows): declaredToolPath(toolPaths, "CT_ZSTD_LIBRARY_FILE") else: "")
+    let zstdLibDir = (when defined(windows): "" else: declaredToolPath(toolPaths, "CT_ZSTD_LIB_DIR"))
     when defined(windows):
       doAssert zstdIncludeDir.isAbsolute and dirExists(zstdIncludeDir) and
         fileExists(zstdIncludeDir / "zstd.h") and
@@ -474,7 +497,7 @@ package codetracer_trace_format_nim:
                      else: @[zstdIncludeDir / "zstd.h", zstdLibDir])
     var nimDependencyDirs: seq[string] = @[]
     for key in ["CT_NIM_STEW_SRC", "CT_NIM_RESULTS_SRC", "CT_NIM_UNITTEST2_SRC"]:
-      let dependencyDir = getEnv(key)
+      let dependencyDir = declaredToolPath(toolPaths, key)
       doAssert dependencyDir.isAbsolute and dirExists(dependencyDir),
         "owning builds require complete declared Nim source dependency: " & key
       nimDependencyDirs.add(dependencyDir)
@@ -499,9 +522,15 @@ package codetracer_trace_format_nim:
     discard ctPrintPool
 
     # Provider construction runs before its own dev environment is active.
-    # Bind the owning shell PCRE prefix and the same Zstd metadata output
+    # Bind the owning manifest's PCRE prefix and the same Zstd metadata output
     # explicitly rather than depending on the caller compiler search path.
-    let pcreLibDir = getEnv("CT_PCRE_LIB_DIR")
+    let pcreLibDir =
+      when defined(windows):
+        if toolPaths.hasKey("CT_PCRE_LIB_DIR"):
+          declaredToolPath(toolPaths, "CT_PCRE_LIB_DIR")
+        else: ""
+      else:
+        declaredToolPath(toolPaths, "CT_PCRE_LIB_DIR")
     let zstdPkgConfigDir = (when defined(windows): ""
                            else: zstdIncludeDir.parentDir / "lib" / "pkgconfig")
     when not defined(windows):
@@ -534,8 +563,7 @@ package codetracer_trace_format_nim:
       # ``test_path_filter`` links libpcre directly so Nim's ``re`` dynlib
       # ``dlopen`` resolves against the already-loaded library — no runtime
       # ``LD_LIBRARY_PATH`` needed (the nix ``ld`` wrapper bakes the rpath
-      # in). ``-L<pcreLibDir>`` comes from ``CT_PCRE_LIB_DIR``; without it
-      # a bare ``-lpcre`` relies on the C toolchain's default search path.
+      # in). ``-L<pcreLibDir>`` comes from the manifest's ``CT_PCRE_LIB_DIR``.
       var extraPassC: seq[string] = @[]
       var extraPassL: seq[string] = @[]
       when defined(windows):

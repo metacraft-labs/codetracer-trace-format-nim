@@ -225,6 +225,7 @@ jobs:
             done
             printf "CT_ZSTD_INCLUDE_DIR=%s\nCT_ZSTD_LIB_DIR=%s\nCT_PCRE_LIB_DIR=%s\nPKG_CONFIG_PATH=%s\n" \
               "$CT_ZSTD_INCLUDE_DIR" "$CT_ZSTD_LIB_DIR" "$CT_PCRE_LIB_DIR" "$pkg_config_dir" >> "$GITHUB_ENV"
+            printf "REPRO_VARIANTS=%s\n" "$REPRO_VARIANTS" >> "$GITHUB_ENV"
           '
 
       - name: Acquire complete locked Nim source dependencies (Windows)
@@ -327,6 +328,14 @@ jobs:
         # Windows constructors take zstd through explicit paths.
         if: runner.os != 'Windows'
         run: dev-exec just test-native-tool-contract
+
+      - name: Tool paths invalidate both warm recipe graph caches
+        if: runner.os != 'Windows'
+        run: dev-exec just test-repro-tool-paths
+
+      - name: Windows tool-path manifest accumulation and selection
+        if: runner.os == 'Windows'
+        run: dev-exec just test-repro-tool-path-transport
 
       - name: Inspect the original Windows compiler header boundary on failure
         if: failure() && runner.os == 'Windows'

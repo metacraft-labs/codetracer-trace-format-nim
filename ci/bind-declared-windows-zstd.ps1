@@ -65,6 +65,11 @@ try {
   Add-Content -LiteralPath $env:GITHUB_ENV -Value "CT_ZSTD_INCLUDE_DIR=$physicalRoot\include"
   Add-Content -LiteralPath $env:GITHUB_ENV -Value "CT_ZSTD_LIBRARY_FILE=$physicalRoot\static\libzstd_static.lib"
   Add-Content -LiteralPath $env:GITHUB_PATH -Value $physicalRoot
+  . (Join-Path $PSScriptRoot 'repro-tool-paths.ps1')
+  Set-TraceReproToolPaths -Bindings @{
+    CT_ZSTD_INCLUDE_DIR = "$physicalRoot\include"
+    CT_ZSTD_LIBRARY_FILE = "$physicalRoot\static\libzstd_static.lib"
+  }
 } finally {
   foreach ($stream in $held) { $stream.Dispose() }
 }

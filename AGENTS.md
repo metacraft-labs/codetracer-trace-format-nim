@@ -70,6 +70,7 @@ point `CODETRACER_TRACE_FORMAT_DIR` at it.
 | `just test-nim`             | Only `nimble test`                                                    |
 | `just test-ffi`             | `nimble testFfi` — compiles `tests/test_ffi.c` against the static lib |
 | `just lint`                 | `nim check` over the library entry points + `nixfmt --check`          |
+| `just test-repro-tool-paths` | Real provider compilation and warm graph invalidation for shell input paths (POSIX) |
 | `just format` (alias `fmt`) | `nixfmt flake.nix`                                                    |
 | `just bench`                | `nimble bench` — machine-dependent, deliberately not part of `test`   |
 | `just nix-build`            | `nix build .#default`                                                 |
@@ -77,6 +78,16 @@ point `CODETRACER_TRACE_FORMAT_DIR` at it.
 `repro.nim` expresses the same graph natively for `reprobuild` (per-test
 build + execute edges); keep the two in sync — see
 `codetracer-specs/Repo-Requirements.md` §2.8.1.
+
+The owning shell and Windows prerequisite binders select a schema-1 JSON
+manifest (`schema: 1`, `paths: {CT_*: absolute-path}`) through the tracked
+`toolPathsFile` variant. Re-entry replaces an inherited owning selection and
+preserves unrelated variants. Override it after activation with
+`repro test --variant toolPathsFile=/absolute/path/paths.json`; the required
+platform fields are documented in `README.md`. The graph reads the manifest
+as an evaluation input and has no ambient `CT_*` fallback. Run
+`just test-repro-tool-paths` on POSIX when changing this boundary; Windows'
+pure binder contract is `just test-repro-tool-path-transport`.
 
 Nim has no formatter this repo trusts unattended (`nimpretty` reflows
 `when`/`case` bodies), so `just format` covers the Nix sources only — the same

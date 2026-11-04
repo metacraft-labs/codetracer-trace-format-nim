@@ -60,6 +60,14 @@ test-managed-sender-ci-routes:
 test-native-tool-contract:
     bash tests/native_tool_contract/run.sh
 
+# Real provider compilation and warm graph-cache invalidation; no test corpus
+# execution. Kept separate because the cold provider compile takes minutes.
+test-repro-tool-paths:
+    python3 tests/repro_tool_paths.py
+
+test-repro-tool-path-transport:
+    pwsh -NoProfile -File tests/repro_tool_paths_transport.ps1
+
 # The C-FFI smoke test: build the static library, compile `tests/test_ffi.c`
 # against it and run it.
 test-ffi:
