@@ -10,21 +10,12 @@
 ## It lives here for the reason `meta_flags_json` and `full_document_json` do:
 ## one job with two implementations is two jobs.
 
-import std/[os, osproc, strutils, times, compilesettings, tempfiles]
+import std/[os, strutils, times, tempfiles]
+import runtime_nim_compile
 
 const
   repoRoot* = currentSourcePath().parentDir.parentDir
   ctPrintSrc* = repoRoot / "src" / "codetracer_ct_print.nim"
-  RuntimeNimCompiler = getCurrentCompilerExe()
-  RuntimeNimLib = querySetting(SingleValueSetting.libPath)
-  RuntimeSearchPaths = querySettingSeq(MultipleValueSetting.searchPaths)
-  RuntimeLazyPaths = querySettingSeq(MultipleValueSetting.lazyPaths)
-  RuntimeNimblePaths = querySettingSeq(MultipleValueSetting.nimblePaths)
-
-when defined(windows):
-  const
-    ctZstdIncludeDir {.strdefine.} = getEnv("CT_ZSTD_INCLUDE_DIR")
-    ctZstdLibraryFile {.strdefine.} = getEnv("CT_ZSTD_LIBRARY_FILE")
 
 let
   ctPrintBuildDir = createTempDir("trace-nim-ctprint-", "")
@@ -55,43 +46,7 @@ proc ensureCtPrint*(): string {.discardable.} =
      getLastModificationTime(ctPrintBin) >= newestSourceTime():
     return ctPrintBin
   createDir(ctPrintBin.parentDir)
-  var zstdFlags = ""
-  when defined(windows):
-    doAssert ctZstdIncludeDir.isAbsolute and dirExists(ctZstdIncludeDir) and
-      fileExists(ctZstdIncludeDir / "zstd.h") and
-      ctZstdLibraryFile.isAbsolute and fileExists(ctZstdLibraryFile),
-      "runtime ct-print requires its original compiler declared Zstd inputs"
-    zstdFlags = "-d:ctZstdIncludeDir=" & quoteShell(ctZstdIncludeDir) & " " &
-      "-d:ctZstdLibraryFile=" & quoteShell(ctZstdLibraryFile) & " "
-  else:
-    let (cflags, c1) = execCmdEx("pkg-config --cflags libzstd")
-    let (lflags, c2) = execCmdEx("pkg-config --libs libzstd")
-    doAssert c1 == 0 and c2 == 0, "pkg-config libzstd failed"
-    # One `--passC:` / `--passL:` per flag. pkg-config answers with a LIST
-    # whenever libzstd is not already on the compiler's default search path,
-    # and folding a list into a single quoted argument hands the C compiler
-    # one token it cannot parse. Where libzstd is on the default path the
-    # answer is a single flag and both spellings work, which is why the folded
-    # form survived: it was only ever exercised where it could not fail.
-    for f in cflags.strip().splitWhitespace():
-      zstdFlags.add("--passC:" & quoteShell(f) & " ")
-    for f in lflags.strip().splitWhitespace():
-      zstdFlags.add("--passL:" & quoteShell(f) & " ")
-  # Preserve the actual compiler's public source-search roles for both
-  # native Nimble/Just and typed callers, rather than requiring new ambient
-  # environment variables. Typed callers declare those same locked trees.
-  var dependencyFlags = ""
-  let sourcePaths = RuntimeSearchPaths & RuntimeLazyPaths
-  for i in countdown(sourcePaths.high, 0):
-    dependencyFlags.add("--path:" & quoteShell(sourcePaths[i]) & " ")
-  for i in countdown(RuntimeNimblePaths.high, 0):
-    dependencyFlags.add("--nimblePath:" & quoteShell(RuntimeNimblePaths[i]) & " ")
-  let cmd = quoteShell(RuntimeNimCompiler) &
-    " c -d:release --mm:arc -p:src " & dependencyFlags & zstdFlags &
-    "--lib:" & quoteShell(RuntimeNimLib) & " " &
-    "--nimcache:" & quoteShell(ctPrintBuildDir / "nimcache") & " " &
-    "--hints:off --warnings:off " &
-    "-o:" & quoteShell(ctPrintBin) & " " & quoteShell(ctPrintSrc)
-  let (output, code) = execCmdEx(cmd)
+  let (output, code) = compileWithTestToolchain(ctPrintSrc, ctPrintBin,
+    ctPrintBuildDir / "nimcache", flags = "-d:release --mm:arc")
   doAssert code == 0, "failed to build ct-print:\n" & output
   ctPrintBin

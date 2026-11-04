@@ -60,10 +60,15 @@ test (`cargo test -p codetracer_trace_reader …` in
 canonical reader. Those tests contain a source-level SKIP arm for
 environments that have neither `cargo` nor `direnv`. Shipping the Rust
 toolchain in this shell is what keeps the cross-read proof actually running
-instead of silently skipping. **Never** "fix" a cross-read failure by
-removing the toolchain so the SKIP arm engages. To cross-check against a Rust
-checkout that is not the sibling (a worktree on the branch being ported),
-point `CODETRACER_TRACE_FORMAT_DIR` at it.
+instead of silently skipping. The two runners that declare these tests, the
+`repro.nim` execute edges and the nimble `test` task, set
+`CT_CROSSREAD_REQUIRED=1`, and there a missing Rust repo or toolchain fails
+the test rather than skipping it (`tests/crossread_prerequisite.nim`); the
+`repro.nim` edges get `cargo`, `rustc` and `capnp` through `uses:`. Only an
+ad-hoc run outside both still skips. **Never** "fix" a cross-read failure by
+removing the toolchain or the variable so the SKIP arm engages. To
+cross-check against a Rust checkout that is not the sibling (a worktree on the
+branch being ported), point `CODETRACER_TRACE_FORMAT_DIR` at it.
 
 ## Commands
 

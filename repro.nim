@@ -51,12 +51,18 @@
 ## prove a Nim-written production ``.ct`` bundle is byte-compatible with the
 ## canonical RUST reader: each writes a bundle, then invokes the sibling
 ## ``../codetracer-trace-format`` Rust integration test via ``cargo test``.
-## The dev shell puts ``cargo`` on ``PATH`` (from the same Rust flake), so
-## the test's ``haveCargo`` branch runs ``cargo`` DIRECTLY — it never enters
-## the ``direnv exec`` fallback. The real cross-check runs; nothing is
-## skipped. Because all four drive ``cargo test`` against the SAME sibling
-## Rust target directory, they are sequenced through a capacity-1 build pool
-## so their concurrent ``cargo`` runs do not race the shared target lock.
+## Their execute edges declare what that needs: ``cargo``, ``rustc`` and
+## ``capnp`` from ``uses:`` on ``PATH``, the Rust crates the reader builds
+## from as inputs, and ``CT_CROSSREAD_REQUIRED=1``, which makes a missing
+## Rust repo or toolchain FAIL the test instead of taking its SKIP arm
+## (``tests/crossread_prerequisite.nim``). Without it the edge would record a
+## pass for a proof it never made. The three stream cross-reads also compile
+## a fixture generator at runtime, with the toolchain they were compiled with
+## (``tests/runtime_nim_compile.nim``), so they read ``src`` and the Nim
+## source dependencies when they run. Because all four drive ``cargo test``
+## against the SAME sibling Rust target directory, they are sequenced through
+## a capacity-1 build pool so their concurrent ``cargo`` runs do not race the
+## shared target lock.
 ##
 ## **``test_path_filter``** uses ``std/re`` (Nim's PCRE binding), which
 ## ``dlopen``s ``libpcre.so`` at runtime. The dev shell does not put pcre on
@@ -75,7 +81,7 @@ import repro_dsl_stdlib/foreign_env
 # edge). It re-exports ``repro_project_dsl``.
 import ct_test_nim_unittest
 
-import std/[os, json]
+import std/[os, json, strutils]
 import build_writer_artifacts
 
 # The variant selects a tool-path manifest, and its contents are evaluation
@@ -455,6 +461,13 @@ package codetracer_trace_format_nim:
       "vccexe"
       "cl"
       "link"
+    # The four cross-read tests run the sibling Rust reader through `cargo
+    # test` (see the module doc), the same tools and floor the sibling's own
+    # recipe declares: `rustc`, `cargo`, and `capnp` for
+    # `codetracer_trace_format_capnp`'s build.rs.
+    "rustc >=1.85"
+    "cargo >=1.85"
+    "capnp"
 
   devEnv:
     when not defined(windows):
@@ -550,6 +563,20 @@ package codetracer_trace_format_nim:
     let traceStorageFixtures =
       "../codetracer-trace-format/codetracer_ctfs/tests/fixtures/trace_storage"
 
+    # The cross-read tests (``CrossReadPool``) run ``cargo test -p
+    # codetracer_trace_reader`` in that same sibling, so its workspace manifest,
+    # lock and the crates the reader builds from are inputs of their execute
+    # edges, and the Rust tools from ``uses:`` are on their ``PATH``.
+    # ``CT_CROSSREAD_REQUIRED=1`` tells the test that this edge declared it:
+    # a missing Rust repo or toolchain then fails it instead of skipping
+    # (``tests/crossread_prerequisite.nim``).
+    const rustSibling = "../codetracer-trace-format"
+    var crossReadInputs = @[rustSibling / "Cargo.toml", rustSibling / "Cargo.lock"]
+    for crate in ["codetracer_trace_reader", "codetracer_ctfs",
+        "codetracer_trace_writer", "codetracer_trace_types",
+        "codetracer_trace_format_capnp", "codetracer_trace_format_cbor_zstd"]:
+      crossReadInputs.add(rustSibling / crate)
+
     var testBuildActions: seq[BuildActionDef] = @[]
     var testExecuteActions: seq[BuildActionDef] = @[]
 
@@ -611,23 +638,40 @@ package codetracer_trace_format_nim:
       testBuildActions.add(edge.action)
 
       # The tests that compile ct-print at runtime (``CtPrintPool``, through
-      # ``tests/ct_print_binary.nim``) read the library sources and the Nim
+      # ``tests/ct_print_binary.nim``), and the cross-reads, which compile
+      # their fixture generators, read the library sources and the Nim
       # source dependencies when they run, not only when they are built.
       let compilesCtPrint = spec.pool == CtPrintPool
+      let crossReads = spec.pool == CrossReadPool
+      # The three stream cross-reads compile their fixture generator at runtime
+      # (``tests/runtime_nim_compile.nim``); the step-map one writes in-process.
+      # Named rather than probed with ``fileExists``, so a renamed generator
+      # is not silently dropped from the inputs.
+      let fixtureGenInputs =
+        if crossReads and stem != "test_nim_step_map_crossread":
+          @["tests/gen_" & stem.replace("test_nim_", "") & "_fixture.nim"]
+        else: newSeq[string]()
       let testExecuteInputs = executeInputs &
         (if stem == "test_trace_storage_config": @[traceStorageFixtures]
          else: newSeq[string]()) &
         (if compilesCtPrint:
-          @["src", "nim.cfg", "tests/ct_print_binary.nim"] & nimDependencyDirs
+          @["src", "nim.cfg", "tests/ct_print_binary.nim",
+            "tests/runtime_nim_compile.nim"] & nimDependencyDirs
+         else: newSeq[string]()) &
+        (if crossReads:
+          crossReadInputs & @["src", "nim.cfg", "tests/runtime_nim_compile.nim"] &
+            nimDependencyDirs & fixtureGenInputs
          else: newSeq[string]())
       let executeEdge = edge.testBinary.run(
         actionId = "codetracer-trace-format-nim.test_execute." & stem,
         pool = spec.pool,
-        extraEnv = executeEnvironment,
+        extraEnv = executeEnvironment &
+          (if crossReads: @[("CT_CROSSREAD_REQUIRED", "1")]
+           else: newSeq[(string, string)]()),
         extraInputs = testExecuteInputs,
         registerImplicitName = false)
       when defined(windows):
-        if compilesCtPrint:
+        if compilesCtPrint or crossReads:
           appendRegisteredActionToolIdentityRefs(executeEdge.id, ["nim", "gcc", "zstd"])
       else:
         appendRegisteredActionToolIdentityRefs(executeEdge.id, ["pkg-config", "nim"])
@@ -635,6 +679,9 @@ package codetracer_trace_format_nim:
           appendRegisteredActionToolIdentityRefs(executeEdge.id, ["clang"])
         else:
           appendRegisteredActionToolIdentityRefs(executeEdge.id, ["gcc"])
+      if crossReads:
+        appendRegisteredActionToolIdentityRefs(executeEdge.id,
+          ["cargo", "rustc", "capnp"])
       testExecuteActions.add(executeEdge)
 
     discard collect("test", testExecuteActions)

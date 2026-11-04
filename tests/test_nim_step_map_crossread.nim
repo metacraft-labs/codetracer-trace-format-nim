@@ -17,11 +17,14 @@
 ##
 ## The Rust repo is `../codetracer-trace-format`, or the checkout
 ## `CODETRACER_TRACE_FORMAT_DIR` names. Without it, or without `cargo`, the
-## cross-read is skipped with a message; the Nim half still runs.
+## cross-read is skipped with a message and the Nim half still runs, unless a
+## declaring runner set `CT_CROSSREAD_REQUIRED=1`: then the test fails
+## (`tests/crossread_prerequisite.nim`).
 ##
 ## No mocks: the production writer and both production readers.
 
 import std/[os, osproc, strutils, strtabs, streams]
+import crossread_prerequisite
 import results
 import codetracer_ctfs/container
 import codetracer_trace_writer/multi_stream_writer
@@ -95,9 +98,9 @@ proc main() =
   let rustRepo = absolutePath(getEnv("CODETRACER_TRACE_FORMAT_DIR",
     "../codetracer-trace-format"))
   if not dirExists(rustRepo):
-    echo "SKIP: no Rust repo at " & rustRepo & " to cross-read with"
+    crossReadUnavailable("no Rust repo at " & rustRepo & " to cross-read with")
   elif findExe("cargo").len == 0 and findExe("direnv").len == 0:
-    echo "SKIP: neither cargo nor direnv on PATH"
+    crossReadUnavailable("neither cargo nor direnv on PATH")
   else:
     let cargoArgs = @["test", "-p", "codetracer_trace_reader",
       "--test", "nim_step_map_crossread", "--", "--nocapture"]

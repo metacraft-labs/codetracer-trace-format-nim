@@ -14,10 +14,14 @@
 ##
 ## The Rust repo is the sibling `../codetracer-trace-format` checkout. If it is
 ## absent, or `cargo` is unavailable, the test skips with a clear message
-## (the cross-read can only be exercised when both repos are present). When the
-## repo IS present, a non-zero `cargo test` exit fails this test.
+## (the cross-read can only be exercised when both repos are present), unless a
+## declaring runner set `CT_CROSSREAD_REQUIRED=1`: then it fails
+## (`tests/crossread_prerequisite.nim`). When the repo IS present, a non-zero
+## `cargo test` exit fails this test.
 
-import std/[os, osproc, strutils, strtabs, streams]
+import std/[os, osproc, strtabs, streams]
+import crossread_prerequisite
+import runtime_nim_compile
 
 const
   FixtureGen = "tests/gen_step_stream_crossread_fixture.nim"
@@ -51,18 +55,15 @@ proc main() =
   # a worktree of the Rust repo on the branch being cross-checked.
   let rustRepo = absolutePath(getEnv("CODETRACER_TRACE_FORMAT_DIR", RustRepoRel))
   if not dirExists(rustRepo):
-    echo "SKIP: sibling Rust repo not found at " & rustRepo &
-      " (cross-read needs both checkouts)"
-    return
-  if not which("nim"):
-    echo "SKIP: nim not on PATH"
+    crossReadUnavailable("sibling Rust repo not found at " & rustRepo &
+      " (cross-read needs both checkouts)")
     return
   # cargo is provided by the sibling Rust repo's nix dev shell, not the Nim
   # one, so we invoke it through `direnv exec <rust-repo> ...`. Require direnv.
   let haveDirenv = which("direnv")
   let haveCargo = which("cargo")
   if not haveCargo and not haveDirenv:
-    echo "SKIP: neither cargo nor direnv on PATH (cross-read needs the Rust toolchain)"
+    crossReadUnavailable("neither cargo nor direnv on PATH (cross-read needs the Rust toolchain)")
     return
 
   # 1. Build the fixture generator.
@@ -70,22 +71,13 @@ proc main() =
   try:
     createDir(tmp)
   except OSError, IOError:
-    echo "SKIP: cannot create temp dir " & tmp
+    crossReadUnavailable("cannot create temp dir " & tmp)
     return
   let genBin = tmp / "gen"
-  # The standalone `nim c` needs libzstd's include/lib dirs (the dev shell
-  # exposes them via pkg-config, not CPATH on macOS homebrew).
-  var nimArgs = @["c", "-d:release", "-p:src", "--hints:off", "-o:" & genBin]
-  let incRes = run("pkg-config", @["--variable=includedir", "libzstd"])
-  if incRes.code == 0 and incRes.output.strip().len > 0:
-    nimArgs.add("--passC:-I" & incRes.output.strip())
-  when not defined(windows):
-    let libRes = run("pkg-config", @["--variable=libdir", "libzstd"])
-    if libRes.code == 0 and libRes.output.strip().len > 0:
-      nimArgs.add("--passL:-L" & libRes.output.strip())
-  nimArgs.add(FixtureGen)
-  let buildRes = run("nim", nimArgs, workdir = repoRoot)
-  doAssert buildRes.code == 0,
+  # With the toolchain this test was compiled with, not the ambient `nim`
+  # (`tests/runtime_nim_compile.nim`).
+  let buildRes = compileWithTestToolchain(FixtureGen, genBin, tmp / "nimcache")
+  doAssert buildRes.exitCode == 0,
     "fixture generator build failed:\n" & buildRes.output
 
   # 2. Produce the bundle + sidecar.
