@@ -15,6 +15,7 @@ import ../codetracer_ctfs/variable_record_table
 import ../codetracer_ctfs/member_view
 import ../codetracer_ctfs/base40
 import ./meta_dat
+import ./entry_identity
 import ./interning_table
 import ./exec_stream
 import ./value_stream
@@ -85,6 +86,7 @@ type
 
     # Metadata
     meta*: MetaDatContents
+    entryIdentity: Option[RecordedEntryIdentity]
 
     # Interning tables (loaded at startup)
     pathReader: InterningTableReader
@@ -556,6 +558,13 @@ proc computePathVersionOrdinals(r: var NewTraceReader): Result[void, string] =
 # Opening
 # ---------------------------------------------------------------------------
 
+proc validateRecordedEntry*(r: var NewTraceReader,
+    entry: RecordedEntryIdentity): Result[void, string] {.gcsafe.}
+
+proc recordedEntryIdentity*(r: NewTraceReader): Option[RecordedEntryIdentity] =
+  ## Only open's checked same-image identity is exposed.
+  r.entryIdentity
+
 proc decodeSourceView(raw: openArray[byte], v: var SourceView,
     why: var string): bool =
   ## One `source_views.dat` record (`internal-files.md` §"Alternate Source
@@ -639,6 +648,24 @@ proc openNewTraceFromImage(image: ContainerImage, blockSize: uint32,
   ## The reader over a container image whose header has been checked
   ## (`checkReadableContainer`): held whole, or read from its file as it is
   ## used (`openFileImage`).
+  # `entry.dat` is optional finalized metadata. Its structural presence is
+  # counted over exactly the root directory the header declares,
+  # independently of table decoding and of the caller's `maxEntries`: a
+  # larger caller count would read data blocks as entries, and a member's
+  # bytes could then count as a second `entry.dat`. A duplicate is refused
+  # rather than resolved to either copy. A compact container's directory
+  # refuses duplicate names when it is read.
+  if not isCompactContainer(image.bytes):
+    let layout = rootDirectoryLayout(image.bytes)
+    if layout.error.len > 0:
+      return err(layout.error)
+    var entryMembers = 0
+    let entryName = base40Encode("entry.dat")
+    for i in 0 ..< int(layout.entryCount):
+      let off = layout.entryStart + i * FileEntrySize
+      if readU64LE(image.bytes, off + 16) == entryName: inc entryMembers
+    if entryMembers > 1: return err("entry.dat: duplicate member")
+
   var reader: NewTraceReader
   reader.image = image
   reader.blockSize = blockSize
@@ -772,6 +799,14 @@ proc openNewTraceFromImage(image: ContainerImage, blockSize: uint32,
 
   reader.posSpace = positionSpace(reader.lineLengths, reader.lineCounts,
     int(reader.pathReader.count()), reader.meta.hasColumnAwareSteps)
+  # Optional finalized metadata is read from this same image. A member that
+  # is present and does not read, decode or validate fails the open: a
+  # failed lookup is never an absence.
+  if hasInternalFile(reader.image.bytes, "entry.dat", maxEntries):
+    let entryView = ? viewMember(reader.image, "entry.dat", blockSize, maxEntries)
+    let entry = ? decodeEntryIdentity(? entryView.contents())
+    ? reader.validateRecordedEntry(entry)
+    reader.entryIdentity = some(entry)
   ok(reader)
 
 proc openNewTraceFromBytes*(data: sink seq[byte],
@@ -1851,6 +1886,52 @@ proc callForStep*(r: var NewTraceReader, stepId: uint64): Result[CallRecord, str
   ## and its refusals).
   let key = ?r.enclosingCallKey(stepId)
   r.callReader.readCall(key)
+
+proc validateRecordedEntry*(r: var NewTraceReader,
+    entry: RecordedEntryIdentity): Result[void, string] =
+  let calls = ? r.callCount()
+  let steps = ? r.stepCount()
+  if entry.callKey >= calls: return err("entry.dat: call key out of range")
+  if entry.functionId >= r.functionCount(): return err("entry.dat: function id out of range")
+  if entry.entryStep >= steps: return err("entry.dat: entry step out of range")
+  discard ? r.functionRecord(entry.functionId)
+  let target = ? r.call(entry.callKey)
+  if target.functionId != entry.functionId: return err("entry.dat: function binding mismatch")
+  if target.entryStep != entry.entryStep: return err("entry.dat: entry step binding mismatch")
+  let event = ? r.step(entry.entryStep)
+  if event.kind notin {sekAbsoluteStep, sekDeltaStep, sekDeltaColumn}:
+    return err("entry.dat: entry is not a source step")
+  # Resolve the actual latest entered enclosing frame, retaining its key.
+  var owner = none(uint64)
+  for key in 0'u64 ..< calls:
+    let c = ? r.call(key)
+    if c.entryStep <= entry.entryStep and c.exitStep >= entry.entryStep:
+      owner = some(key)
+  if owner.isNone or owner.get() != entry.callKey:
+    return err("entry.dat: source step belongs to another call")
+  var key = entry.callKey
+  var child = target
+  while child.parentCallKey >= 0:
+    let parentKey = uint64(child.parentCallKey)
+    if parentKey >= key or parentKey >= calls:
+      return err("entry.dat: invalid or cyclic parent chain")
+    let parent = ? r.call(parentKey)
+    if parent.depth == high(uint32) or parent.depth + 1 != child.depth:
+      return err("entry.dat: parent depth mismatch")
+    if parent.entryStep > child.entryStep or parent.exitStep < child.exitStep:
+      return err("entry.dat: child range outside parent")
+    var memberships = 0
+    for childKey in parent.children:
+      if childKey == key: inc memberships
+    if memberships != 1: return err("entry.dat: parent child-link mismatch")
+    child = parent
+    key = parentKey
+  if child.parentCallKey != -1 or child.depth != 0:
+    return err("entry.dat: invalid outermost frame")
+  if r.functionCount() > 0 and (? r.function(0)) == "<toplevel>":
+    if key != 0 or child.functionId != 0:
+      return err("entry.dat: parent chain does not terminate at literal root")
+  ok()
 
 iterator callRange*(r: var NewTraceReader, start, count: uint64): CallRecord =
   ## Yields call records in [start, start+count).

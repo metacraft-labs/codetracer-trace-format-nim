@@ -67,9 +67,10 @@ proc tryGet*[K, V](cache: var LruCache[K, V], key: K): ptr V =
   if node.isNil:
     cache.misses += 1
     return nil
-  # Promote to MRU (head of list)
-  cache.order.remove(node)
-  cache.order.prepend(node)
+  # A hit already at the MRU head needs no reference/link mutation.
+  if cache.order.head != node:
+    cache.order.remove(node)
+    cache.order.prepend(node)
   cache.hits += 1
   addr node.value.value
 

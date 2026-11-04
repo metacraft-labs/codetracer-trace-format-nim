@@ -101,4 +101,3 @@ suite "memwrites CoW namespace builder":
       let allRes = decodeCowMemwritesNamespace(image)
       require allRes.isOk
       check allRes.get().len == n
-

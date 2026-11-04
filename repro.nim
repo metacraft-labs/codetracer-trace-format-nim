@@ -39,10 +39,12 @@
 ## --cflags/--libs libzstd``; the dev shell's ``PKG_CONFIG_PATH`` satisfies
 ## both. On Windows the binding names the zstd archive directly: adding MSYS2's
 ## whole library directory would let it replace the selected MinGW toolchain's
-## implicit CRT and pthread archives. All three build into the SAME cached
-## binary and nimcache (``.nimcache/test-ct-print/ct-print``), which the
-## nimble task never races because it runs them one after another. Here their
-## EXECUTE edges share a capacity-1 pool for the same reason.
+## implicit CRT and pthread archives. Each test process compiles its own
+## ct-print into a temporary directory it alone owns, with the compiler, Nim
+## library and search paths it was itself compiled with, so no warm binary or
+## shared nimcache can stand in for the tree under test. Their EXECUTE edges
+## still share a capacity-1 pool (``CtPrintPool``) so that the full release
+## compiles of ct-print run one at a time, as the nimble task runs them.
 ##
 ## **The four cross-read tests** (``test_nim_{step,value,io_event}_stream_crossread``
 ## and ``test_nim_step_map_crossread``)
@@ -90,7 +92,8 @@ type
     ##   * ``pool`` — run the EXECUTE edge in this capacity-1 pool: the
     ##     cross-read tests share the sibling Rust target dir
     ##     (``CrossReadPool``), and the tests that compile ct-print at runtime
-    ##     share its cached binary (``CtPrintPool``). Empty runs unpooled.
+    ##     run those compiles one at a time (``CtPrintPool``). Empty runs
+    ##     unpooled.
     ##   * ``debugOnly`` — compile WITHOUT ``-d:release``. Matches the flags
     ##     the nimble ``test`` task uses for that file.
     ##     ``test_chunked_compressed_table`` is kept debug-only because that is
@@ -173,6 +176,9 @@ const
 #     never fail. ``test_golden_fixtures`` is the test that reads them.
 #   * benchmarks (``tests/bench_*.nim``), see ``debugOnly``.
 const testSpecs: seq[TestSpec] = @[
+  TestSpec(source: "tests/test_recorded_entry_identity.nim", binary: "build/test-bin/test_recorded_entry_identity"),
+  TestSpec(source: "tests/test_recorded_entry_sealed.nim", binary: "build/test-bin/test_recorded_entry_sealed"),
+  TestSpec(source: "tests/test_recorded_entry_hierarchy.nim", binary: "build/test-bin/test_recorded_entry_hierarchy"),
   TestSpec(source: "tests/test_base40.nim", binary: "build/test-bin/test_base40"),
   TestSpec(source: "tests/test_container.nim", binary: "build/test-bin/test_container"),
   TestSpec(source: "tests/test_ctfs_v5_member_forms.nim", binary: "build/test-bin/test_ctfs_v5_member_forms"),
@@ -199,6 +205,7 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_ctfs_append_null_data_block.nim", binary: "build/test-bin/test_ctfs_append_null_data_block"),
   TestSpec(source: "tests/test_ctfs_duplicate_name.nim", binary: "build/test-bin/test_ctfs_duplicate_name"),
   TestSpec(source: "tests/test_container_append.nim", binary: "build/test-bin/test_container_append"),
+  TestSpec(source: "tests/test_sharded_root_layout.nim", binary: "build/test-bin/test_sharded_root_layout"),
   TestSpec(source: "tests/test_container_append_ordering.nim", binary: "build/test-bin/test_container_append_ordering", defines: @["ctfsAppendFaultInjection"]),
   TestSpec(source: "tests/test_partial_tail_bounds.nim", binary: "build/test-bin/test_partial_tail_bounds"),
   TestSpec(source: "tests/test_write_null_data_block.nim", binary: "build/test-bin/test_write_null_data_block"),
@@ -414,7 +421,17 @@ package codetracer_trace_format_nim:
     # back-end ``nim c`` shells out to.
     "nim >=2.2 <3.0"
     "nimble"
-    "gcc >=12"
+    when not defined(windows):
+      "pkg-config"
+    when defined(macosx):
+      "clang"
+    else:
+      "gcc >=12"
+    when defined(windows):
+      "zstd >=1.5.6 <1.5.7"
+      "vccexe"
+      "cl"
+      "link"
 
   devEnv:
     when not defined(windows):
@@ -441,28 +458,67 @@ package codetracer_trace_format_nim:
     # edge comes from ``build_writer_artifacts.buildCtPrint``, the same
     # constructor the recorder recipes import so that their test graphs
     # build this prerequisite; the flags are written down once, there.
-    let ctPrintBuild = buildCtPrint(".")
+    let zstdIncludeDir = getEnv("CT_ZSTD_INCLUDE_DIR")
+    let zstdLibraryFile = (when defined(windows): getEnv("CT_ZSTD_LIBRARY_FILE") else: "")
+    let zstdLibDir = (when defined(windows): "" else: getEnv("CT_ZSTD_LIB_DIR"))
+    when defined(windows):
+      doAssert zstdIncludeDir.isAbsolute and dirExists(zstdIncludeDir) and
+        fileExists(zstdIncludeDir / "zstd.h") and
+        zstdLibraryFile.isAbsolute and fileExists(zstdLibraryFile),
+        "owning Windows builds require the declared Zstd header tree and library file"
+    else:
+      doAssert zstdIncludeDir.isAbsolute and zstdLibDir.isAbsolute,
+        "owning typed builds require declared Zstd include/library paths"
+    let zstdInputs = (when defined(windows): @[zstdIncludeDir, zstdLibraryFile]
+                     else: @[zstdIncludeDir / "zstd.h", zstdLibDir])
+    var nimDependencyDirs: seq[string] = @[]
+    for key in ["CT_NIM_STEW_SRC", "CT_NIM_RESULTS_SRC", "CT_NIM_UNITTEST2_SRC"]:
+      let dependencyDir = getEnv(key)
+      doAssert dependencyDir.isAbsolute and dirExists(dependencyDir),
+        "owning builds require complete declared Nim source dependency: " & key
+      nimDependencyDirs.add(dependencyDir)
+    let ctPrintBuild = buildCtPrint(".", nativeIncludeDir = zstdIncludeDir,
+      nativeLibDir = zstdLibDir, nimDependencyDirs = nimDependencyDirs, nativeLibraryFile = zstdLibraryFile)
 
     discard collect("default", @[ctPrintBuild])
+
+    # Opt-in owning producer; no shipping/default or test corpus expansion.
+    discard collect("sharedLib", @[buildSharedLib(".", nativeIncludeDir = zstdIncludeDir, nativeLibDir = zstdLibDir, nimDependencyDirs = nimDependencyDirs, nativeLibraryFile = zstdLibraryFile)])
 
     # ---- Test corpus (the `test` / `test-builds` collections) --------
     #
     # Two-edge template per file: a compile-only BUILD edge collected into
     # ``test-builds`` + an EXECUTE edge collected into ``test``. Two
-    # capacity-1 pools sequence the EXECUTE edges that share a mutable
-    # resource: the cross-reads' ``cargo test`` runs against the sibling Rust
-    # target dir, and the runtime ct-print build's cached binary and nimcache
-    # (see module doc).
+    # capacity-1 pools sequence EXECUTE edges: the cross-reads' ``cargo
+    # test`` runs share the sibling Rust target dir, and the runtime ct-print
+    # compiles run one at a time (see module doc).
     let crossReadPool = buildPool(CrossReadPool, 1'u32)
     discard crossReadPool
     let ctPrintPool = buildPool(CtPrintPool, 1'u32)
     discard ctPrintPool
 
-    # pcre lib dir for ``test_path_filter`` (see module doc). Threaded in
-    # by the outer dev-shell nesting via ``CT_PCRE_LIB_DIR``; when unset
-    # the edge links a bare ``-lpcre`` and relies on the C toolchain's
-    # default search path.
+    # Provider construction runs before its own dev environment is active.
+    # Bind the owning shell PCRE prefix and the same Zstd metadata output
+    # explicitly rather than depending on the caller compiler search path.
     let pcreLibDir = getEnv("CT_PCRE_LIB_DIR")
+    let zstdPkgConfigDir = (when defined(windows): ""
+                           else: zstdIncludeDir.parentDir / "lib" / "pkgconfig")
+    when not defined(windows):
+      doAssert pcreLibDir.isAbsolute and dirExists(pcreLibDir),
+        "owning typed builds require the declared PCRE library path"
+      doAssert fileExists(zstdPkgConfigDir / "libzstd.pc"),
+        "owning typed tests require the declared Zstd pkg-config input"
+    let executeEnvironment = (when defined(windows): @[( "CT_ZSTD_INCLUDE_DIR", zstdIncludeDir),
+        ("CT_ZSTD_LIBRARY_FILE", zstdLibraryFile)]
+                              else: @[("PKG_CONFIG_PATH", zstdPkgConfigDir)])
+    let executeInputs = (when defined(windows): zstdInputs
+                        else: @[zstdPkgConfigDir / "libzstd.pc"])
+
+    # Shared producer data is provisioned at the explicit published revision in
+    # .github/sibling-repos. Declare the runtime tree as an action input too:
+    # fixturePath walks the real workspace sibling; assertions stay unchanged.
+    let traceStorageFixtures =
+      "../codetracer-trace-format/codetracer_ctfs/tests/fixtures/trace_storage"
 
     var testBuildActions: seq[BuildActionDef] = @[]
     var testExecuteActions: seq[BuildActionDef] = @[]
@@ -479,10 +535,20 @@ package codetracer_trace_format_nim:
       # ``LD_LIBRARY_PATH`` needed (the nix ``ld`` wrapper bakes the rpath
       # in). ``-L<pcreLibDir>`` comes from ``CT_PCRE_LIB_DIR``; without it
       # a bare ``-lpcre`` relies on the C toolchain's default search path.
+      var extraPassC: seq[string] = @[]
       var extraPassL: seq[string] = @[]
+      when defined(windows):
+        extraPassC.add("-I" & quoteShell(zstdIncludeDir))
+        extraPassL.add(quoteShell(zstdLibraryFile))
+      else:
+        extraPassC.add("-I" & zstdIncludeDir)
+        extraPassL.add("-L" & zstdLibDir)
+        extraPassL.add("-Wl,-rpath," & zstdLibDir)
       if spec.pcre:
         if pcreLibDir.len > 0:
           extraPassL.add("-L" & pcreLibDir)
+          when not defined(windows):
+            extraPassL.add("-Wl,-rpath," & pcreLibDir)
         extraPassL.add("-lpcre")
 
       # Compile ``-d:release`` EXCEPT for ``debugOnly`` files, which the
@@ -491,25 +557,55 @@ package codetracer_trace_format_nim:
       # Per-file defines the nimble task also passes (see ``defines`` doc).
       for d in spec.defines:
         buildDefines.add(d)
+      when defined(windows):
+        buildDefines.add("ctZstdIncludeDir=" & zstdIncludeDir)
+        buildDefines.add("ctZstdLibraryFile=" & zstdLibraryFile)
 
       let edge = buildNimUnittest.build(
         source = spec.source,
         binary = spec.binary,
         defines = buildDefines,
-        paths = @["src"] & spec.extraPaths,
+        paths = @["src"] & spec.extraPaths & nimDependencyDirs,
         mm = spec.mm,
+        extraPassC = extraPassC,
         extraPassL = extraPassL,
         # ``tests/config.nims`` decides the C-ABI tests' ``--nimMainPrefix``
         # (see ``TestSpec``), so it is an input of every test compile.
         extraInputs = @["src", "codetracer_trace_format.nimble", "nim.cfg",
-                        "tests/config.nims"],
+                        "tests/config.nims"] & zstdInputs & nimDependencyDirs &
+          (if spec.pcre and pcreLibDir.len > 0: @[pcreLibDir] else: newSeq[string]()),
         actionId = "codetracer-trace-format-nim.test_build." & stem)
+      when defined(macosx):
+        appendRegisteredActionToolIdentityRefs(edge.action.id, ["clang"])
+      else:
+        appendRegisteredActionToolIdentityRefs(edge.action.id, ["gcc"])
       testBuildActions.add(edge.action)
 
+      # The tests that compile ct-print at runtime (``CtPrintPool``, through
+      # ``tests/ct_print_binary.nim``) read the library sources and the Nim
+      # source dependencies when they run, not only when they are built.
+      let compilesCtPrint = spec.pool == CtPrintPool
+      let testExecuteInputs = executeInputs &
+        (if stem == "test_trace_storage_config": @[traceStorageFixtures]
+         else: newSeq[string]()) &
+        (if compilesCtPrint:
+          @["src", "nim.cfg", "tests/ct_print_binary.nim"] & nimDependencyDirs
+         else: newSeq[string]())
       let executeEdge = edge.testBinary.run(
         actionId = "codetracer-trace-format-nim.test_execute." & stem,
         pool = spec.pool,
+        extraEnv = executeEnvironment,
+        extraInputs = testExecuteInputs,
         registerImplicitName = false)
+      when defined(windows):
+        if compilesCtPrint:
+          appendRegisteredActionToolIdentityRefs(executeEdge.id, ["nim", "gcc", "zstd"])
+      else:
+        appendRegisteredActionToolIdentityRefs(executeEdge.id, ["pkg-config", "nim"])
+        when defined(macosx):
+          appendRegisteredActionToolIdentityRefs(executeEdge.id, ["clang"])
+        else:
+          appendRegisteredActionToolIdentityRefs(executeEdge.id, ["gcc"])
       testExecuteActions.add(executeEdge)
 
     discard collect("test", testExecuteActions)

@@ -1,0 +1,26 @@
+--- a/src/nimblepkg/downloadnim.nim
++++ b/src/nimblepkg/downloadnim.nim
+@@ -264,2 +264 @@
+-    return
+-      url.replace("https://api.github.com", "https://" & ghtoken & "@api.github.com")
++    return url
+@@ -543,0 +543,6 @@
++  let parsed = parseUri(url)
++  if parsed.username.len > 0 or parsed.password.len > 0:
++    raise newException(NimbleError, "HTTP URL userinfo is not supported")
++  let token = getEnv("GITHUB_TOKEN")
++  let authenticate = token.len > 0 and parsed.scheme == "https" and
++    parsed.hostname == "api.github.com" and parsed.port in ["", "443"]
+@@ -545 +550,11 @@
+-  var client = newHttpClient(proxy = getProxy(), userAgent = userAgent)
++  # Keep the credential on the exact API authority. The selected HTTP
++  # client may preserve sensitive headers on subdomain/downgrade redirects.
++  var client = newHttpClient(proxy = getProxy(), userAgent = userAgent,
++    maxRedirects = (if authenticate: 0 else: 5))
++  defer: client.close()
++  if authenticate:
++    client.headers["Authorization"] = "Bearer " & token
++    let response = client.get(url)
++    if response.code != Http200:
++      raise newException(HttpRequestError, "Unexpected authenticated GitHub API status: " & $response.code)
++    return response.body

@@ -953,9 +953,23 @@ proc findFileEntryKey*(data: openArray[byte], encoded: uint64,
   ## root of `ctfs-container.md` §1 ("Auto-fill"): the slots that fill the
   ## rest of block 0 after this image's own header, never none.
   let base = containerHeaderSize(data)
-  let slots =
+  var slots =
     if maxEntries != 0'u32 or data.len < base: maxEntries
     else: rootEntryCount(readU32LE(data, 8), 0'u32, base)
+  # Never past the root directory the header declares, whatever the caller
+  # allows: the slots after it lie in data blocks, whose bytes can carry any
+  # name word, so a member's contents would otherwise answer as a member
+  # (`tests/test_sharded_root_layout.nim`, the data-name collision).
+  if data.len >= HeaderSize + ExtHeaderSize:
+    slots = min(slots, headerRootEntryCount(data))
+    # An image this library cannot read has no entry array it can name: a
+    # lookup in it finds nothing, rather than reading a foreign layout as
+    # this one.
+    for k in 0 ..< CtfsMagic.len:
+      if data[k] != CtfsMagic[k]:
+        return CtfsEntryLookup(found: false)
+    if ctfsReadableVersionError(data).len > 0:
+      return CtfsEntryLookup(found: false)
   for i in 0 ..< int(slots):
     let off = base + i * FileEntrySize
     if off + FileEntrySize > data.len:
@@ -1025,6 +1039,12 @@ proc memberRuns*(data: openArray[byte], name: string,
   ## header and entry array and reads it back as the stream.
   if blockSize == 0'u32:
     return err("zero block size")
+  # Every block number below is scaled by `blockSize`, so it must be the one
+  # the container declares; a caller's different size would address other
+  # bytes than the ones the mapping names.
+  if data.len >= HeaderSize + ExtHeaderSize and readU32LE(data, 8) != blockSize:
+    return err("internal file " & name & ": member block size " & $blockSize &
+      " differs from the CTFS header's " & $readU32LE(data, 8))
   # floor, never `+ blockSize - 1`: rounding up would make the incomplete
   # final block addressable, which is the one arithmetic §5d forbids.
   let wholeBlocks = uint64(data.len div int(blockSize))
@@ -1640,8 +1660,10 @@ proc hasInternalFile*(data: openArray[byte], name: string,
   ## container this library cannot read carries nothing it can name.
   let body = containerBody(data)
   if body.isErr:
-    # The version-5 answer did not depend on the version byte; keep it so for
-    # every container that is not version 6.
+    # A container whose body is refused is still answered from its entry
+    # array unless it is version 6, whose body `containerBody` decides;
+    # `findFileEntry` itself finds nothing in an image whose magic or
+    # version this library does not read (versions 2-4 answer false).
     return data.len > 5 and data[5] != CtfsVersionV6 and
       findFileEntry(data, name, maxEntries).found
   case body.get()

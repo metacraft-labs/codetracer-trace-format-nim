@@ -12,25 +12,25 @@
 -- Fully deterministic: fixed inputs, fixed control flow, fixed result.
 
 local function add(a, b)
-	local sum = a + b
-	return sum
+  local sum = a + b
+  return sum
 end
 
 local function scale(x)
-	local factor = 3
-	local scaled = x * factor
-	return scaled
+  local factor = 3
+  local scaled = x * factor
+  return scaled
 end
 
 local function greet(name)
-	local prefix = "hi "
-	local msg = prefix .. name
-	return msg
+  local prefix = "hi "
+  local msg = prefix .. name
+  return msg
 end
 
 local total = 0
 for i = 1, 3 do
-	total = add(total, i)
+  total = add(total, i)
 end
 
 local ratio = 1.5

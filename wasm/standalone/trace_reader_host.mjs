@@ -26,10 +26,17 @@ import { readFileSync } from "node:fs";
 
 const [modulePath, corpusPath, legacyPath, misframedPath, expectedPath] =
   process.argv.slice(2);
-if (!modulePath || !corpusPath || !legacyPath || !misframedPath || !expectedPath) {
+if (
+  !modulePath ||
+  !corpusPath ||
+  !legacyPath ||
+  !misframedPath ||
+  !expectedPath
+) {
   console.error(
     "usage: trace_reader_host.mjs <module.wasm> <corpus.ct> <legacy.ct>" +
-    " <misframed.ct> <corpus.json>");
+      " <misframed.ct> <corpus.json>",
+  );
   process.exit(2);
 }
 
@@ -48,7 +55,10 @@ const check = (name, actual, want) => {
   return ok;
 };
 
-const { instance } = await WebAssembly.instantiate(readFileSync(modulePath), {});
+const { instance } = await WebAssembly.instantiate(
+  readFileSync(modulePath),
+  {},
+);
 const x = instance.exports;
 const mem = () => new Uint8Array(x.memory.buffer);
 
@@ -56,26 +66,57 @@ x.ct_init();
 
 // `ct_num` kinds — must stay in step with the table in trace_reader_abi.nim.
 const NUM = {
-  sourceViewCount: 0, sourceViewPath: 1, sourceViewKind: 2,
-  viewsForPathCount: 3, viewsForPathAt: 4,
-  ioCount: 5, ioKind: 6, ioStep: 7, ioDecodes: 8,
-  spanRecordCount: 9, spanSettledCount: 10, spanId: 11, spanParent: 12,
-  spanIsOpen: 13, spanIsExternal: 14, spanStatus: 15, spanStartStep: 16,
-  spanEndStep: 17, spanStructural: 18,
-  spanTypeEntryCount: 19, spanTypeIdCount: 20, spanTypeIdAt: 21,
-  linehitPositionCount: 22, linehitPresent: 23, linehitCount: 24,
-  linehitAt: 25, linehitSum: 26,
-  valueCount: 27, valueByte: 28,
-  hasSourceViewsFlag: 29, hasSpanStreamFlag: 30,
-  hasStepStreamFlag: 31, hasValueStreamFlag: 32, hasIoStreamFlag: 33,
+  sourceViewCount: 0,
+  sourceViewPath: 1,
+  sourceViewKind: 2,
+  viewsForPathCount: 3,
+  viewsForPathAt: 4,
+  ioCount: 5,
+  ioKind: 6,
+  ioStep: 7,
+  ioDecodes: 8,
+  spanRecordCount: 9,
+  spanSettledCount: 10,
+  spanId: 11,
+  spanParent: 12,
+  spanIsOpen: 13,
+  spanIsExternal: 14,
+  spanStatus: 15,
+  spanStartStep: 16,
+  spanEndStep: 17,
+  spanStructural: 18,
+  spanTypeEntryCount: 19,
+  spanTypeIdCount: 20,
+  spanTypeIdAt: 21,
+  linehitPositionCount: 22,
+  linehitPresent: 23,
+  linehitCount: 24,
+  linehitAt: 25,
+  linehitSum: 26,
+  valueCount: 27,
+  valueByte: 28,
+  hasSourceViewsFlag: 29,
+  hasSpanStreamFlag: 30,
+  hasStepStreamFlag: 31,
+  hasValueStreamFlag: 32,
+  hasIoStreamFlag: 33,
 };
 
 const STR = {
-  path: 0, func: 1, type: 2, varname: 3,
-  viewName: 4, viewContent: 5, viewMap: 6,
-  ioData: 7, ioMeta: 8,
-  spanLabel: 9, spanType: 10, spanMetadata: 11,
-  spanExternalRecording: 12, spanExternalPath: 13,
+  path: 0,
+  func: 1,
+  type: 2,
+  varname: 3,
+  viewName: 4,
+  viewContent: 5,
+  viewMap: 6,
+  ioData: 7,
+  ioMeta: 8,
+  spanLabel: 9,
+  spanType: 10,
+  spanMetadata: 11,
+  spanExternalRecording: 12,
+  spanExternalPath: 13,
   spanTypeName: 14,
 };
 
@@ -104,7 +145,9 @@ const readHex = (kind, id) => {
 const load = (bytes, label) => {
   const dst = x.ct_input_alloc(bytes.length);
   if (dst === 0) {
-    console.error(`    FAIL ct_input_alloc returned a null pointer for ${label}`);
+    console.error(
+      `    FAIL ct_input_alloc returned a null pointer for ${label}`,
+    );
     process.exit(1);
   }
   mem().set(bytes, dst);
@@ -131,9 +174,13 @@ check("ct_varname_count", x.ct_varname_count(), expected.varnames.length);
 check("ct_call_count", x.ct_call_count(), 1);
 
 expected.paths.forEach((s, i) => check(`path[${i}]`, readStr(STR.path, i), s));
-expected.functions.forEach((s, i) => check(`function[${i}]`, readStr(STR.func, i), s));
+expected.functions.forEach((s, i) =>
+  check(`function[${i}]`, readStr(STR.func, i), s),
+);
 expected.types.forEach((s, i) => check(`type[${i}]`, readStr(STR.type, i), s));
-expected.varnames.forEach((s, i) => check(`varname[${i}]`, readStr(STR.varname, i), s));
+expected.varnames.forEach((s, i) =>
+  check(`varname[${i}]`, readStr(STR.varname, i), s),
+);
 
 for (const p of expected.probes) {
   const pos = x.ct_step_position(BigInt(p.index));
@@ -159,11 +206,18 @@ expected.views.forEach((v, i) => {
 // An index past the table must refuse, not wrap onto a real record.
 check("view[out of range]", num(NUM.sourceViewPath, expected.views.length), -2);
 expected.viewsForPath.forEach((idx, pathId) => {
-  check(`viewsForPath[${pathId}].count`,
-    num(NUM.viewsForPathCount, pathId), idx.length);
+  check(
+    `viewsForPath[${pathId}].count`,
+    num(NUM.viewsForPathCount, pathId),
+    idx.length,
+  );
   idx.forEach((want, k) =>
-    check(`viewsForPath[${pathId}][${k}]`,
-      num(NUM.viewsForPathAt, pathId, k), want));
+    check(
+      `viewsForPath[${pathId}][${k}]`,
+      num(NUM.viewsForPathAt, pathId, k),
+      want,
+    ),
+  );
 });
 check("viewsForPath[unknown path]", num(NUM.viewsForPathCount, 99), 0);
 
@@ -175,8 +229,11 @@ expected.ioEvents.forEach((e, i) => {
   check(`io[${i}].data`, readHex(STR.ioData, i), e.dataHex);
   check(`io[${i}].metadata`, readHex(STR.ioMeta, i), e.metaHex);
 });
-check("io[out of range] refuses",
-  num(NUM.ioDecodes, expected.ioEvents.length), 0);
+check(
+  "io[out of range] refuses",
+  num(NUM.ioDecodes, expected.ioEvents.length),
+  0,
+);
 
 // --- spans -----------------------------------------------------------------
 check("meta.has_span_stream", num(NUM.hasSpanStreamFlag), 0);
@@ -196,10 +253,16 @@ expected.spans.forEach((s, i) => {
   // Metadata order is part of the contract; this comparison is order-sensitive
   // because the flattened form preserves the sequence.
   check(`span[${i}].metadata`, readStr(STR.spanMetadata, i), s.metadata);
-  check(`span[${i}].externalRecording`,
-    readStr(STR.spanExternalRecording, i), s.externalRecording);
-  check(`span[${i}].externalPath`,
-    readStr(STR.spanExternalPath, i), s.externalPath);
+  check(
+    `span[${i}].externalRecording`,
+    readStr(STR.spanExternalRecording, i),
+    s.externalRecording,
+  );
+  check(
+    `span[${i}].externalPath`,
+    readStr(STR.spanExternalPath, i),
+    s.externalPath,
+  );
 });
 // `spantype.ns`: the interned span-type index, read out by name so the check
 // does not depend on interning order.
@@ -217,28 +280,46 @@ for (const t of expected.spanTypes) {
   }
   check(`spanType[${t.name}].count`, num(NUM.spanTypeIdCount, i), t.ids.length);
   t.ids.forEach((want, k) =>
-    check(`spanType[${t.name}][${k}]`, num(NUM.spanTypeIdAt, i, k), want));
+    check(`spanType[${t.name}][${k}]`, num(NUM.spanTypeIdAt, i, k), want),
+  );
 }
 
 // --- line hits -------------------------------------------------------------
-check("linehitPositionCount",
-  num(NUM.linehitPositionCount), expected.linehitPositions);
+check(
+  "linehitPositionCount",
+  num(NUM.linehitPositionCount),
+  expected.linehitPositions,
+);
 for (const p of expected.linehitProbes) {
-  check(`linehits[${p.position}].present`,
-    num(NUM.linehitPresent, p.position), 1);
-  check(`linehits[${p.position}].count`,
-    num(NUM.linehitCount, p.position), p.count);
-  check(`linehits[${p.position}].first`,
-    num(NUM.linehitAt, p.position, 0), p.first);
-  check(`linehits[${p.position}].last`,
-    num(NUM.linehitAt, p.position, p.count - 1), p.last);
+  check(
+    `linehits[${p.position}].present`,
+    num(NUM.linehitPresent, p.position),
+    1,
+  );
+  check(
+    `linehits[${p.position}].count`,
+    num(NUM.linehitCount, p.position),
+    p.count,
+  );
+  check(
+    `linehits[${p.position}].first`,
+    num(NUM.linehitAt, p.position, 0),
+    p.first,
+  );
+  check(
+    `linehits[${p.position}].last`,
+    num(NUM.linehitAt, p.position, p.count - 1),
+    p.last,
+  );
   // The sum is what separates "the right number of step ids" from "the right
   // step ids": a shifted or duplicated list keeps the count and moves this.
-  check(`linehits[${p.position}].sum`,
-    num(NUM.linehitSum, p.position), p.sum);
+  check(`linehits[${p.position}].sum`, num(NUM.linehitSum, p.position), p.sum);
 }
-check("linehits[unexecuted position] absent",
-  num(NUM.linehitPresent, expected.linehitAbsent), 0);
+check(
+  "linehits[unexecuted position] absent",
+  num(NUM.linehitPresent, expected.linehitAbsent),
+  0,
+);
 
 // ===========================================================================
 // 2. A container in the retired record-table layout
@@ -267,7 +348,9 @@ check("ct_probe_misframed", bits, expected.misframedBits);
 // `trace_reader_only_standalone.wasm` links no writer, so this half is absent
 // there by design rather than by omission.
 if (typeof x.ct_build !== "function") {
-  console.log("    (reader-only module: no writer linked, round trip not applicable)");
+  console.log(
+    "    (reader-only module: no writer linked, round trip not applicable)",
+  );
 } else {
   check("ct_build", x.ct_build(), 0);
   const wasmLen = x.ct_len();
@@ -275,12 +358,19 @@ if (typeof x.ct_build !== "function") {
   const wasmBytes = mem().slice(x.ct_ptr(), x.ct_ptr() + wasmLen);
   let firstDiff = -1;
   for (let i = 0; i < Math.min(wasmLen, corpus.length); i++) {
-    if (wasmBytes[i] !== corpus[i]) { firstDiff = i; break; }
+    if (wasmBytes[i] !== corpus[i]) {
+      firstDiff = i;
+      break;
+    }
   }
   if (firstDiff >= 0) {
-    console.log(`    note: wasm-written and host-written containers first differ at byte ${firstDiff}`);
+    console.log(
+      `    note: wasm-written and host-written containers first differ at byte ${firstDiff}`,
+    );
   } else if (wasmLen === corpus.length) {
-    console.log("    wasm-written container is byte-identical to the host-written one");
+    console.log(
+      "    wasm-written container is byte-identical to the host-written one",
+    );
   }
 }
 

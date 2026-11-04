@@ -1431,6 +1431,22 @@ proc trace_writer_register_call(
   handle.pendingCallArgs.setLen(0)
   return
 
+proc trace_writer_mark_current_call_as_entry(handle: TraceWriterHandle): cint
+    {.exportc, cdecl, dynlib, ffiGuard.} =
+  ## Checked actual active-call capture, never caller-provided identity.
+  trace_writer_clear_last_error()
+  if handle.isNil:
+    setError("entry.dat: NULL writer handle")
+    return 1.cint
+  if not handle.msWriterReady:
+    setError("entry.dat: active multi-stream writer required")
+    return 1.cint
+  let res = handle.msWriter.markCurrentCallAsEntry()
+  if res.isErr:
+    setError(res.error)
+    return 1.cint
+  0.cint
+
 proc trace_writer_register_return(handle: TraceWriterHandle) {.exportc, cdecl, dynlib, ffiGuard.} =
   ## Register a function return with no explicit return value.
   if handle.isNil:
@@ -4913,16 +4929,22 @@ proc ct_reader_open_bytes(data: ptr uint8,
   ## Open a container that is already in memory: the `len` bytes at `data`.
   ## The bytes are copied, so the caller may free them as soon as this
   ## returns. Returns an opaque reader handle, or nil on failure with the
-  ## reason in `trace_writer_last_error`.
+  ## reason in `trace_writer_last_error`. An empty image (`len` 0, NULL or
+  ## not) is refused before it is parsed.
   ##
   ## The one way to open a reader on a target without a filesystem, such as
   ## a browser's wasm32 module, which is handed bytes and has no path.
-  if data.isNil and len > 0:
+  if len == 0:
+    setError("Empty CTFS image")
+    return nil
+  if len > csize_t(high(int)):
+    setError("CTFS image length exceeds native index domain")
+    return nil
+  if data.isNil:
     setError("NULL data with a non-zero length")
     return nil
   var bytes = newSeq[byte](int(len))
-  if len > 0:
-    copyMem(addr bytes[0], data, int(len))
+  copyMem(addr bytes[0], data, int(len))
   var res = openNewTraceFromBytes(move bytes)
   if res.isErr:
     setError(res.error)
@@ -4930,6 +4952,34 @@ proc ct_reader_open_bytes(data: ptr uint8,
   let h = cast[TraceReaderHandle](alloc0(sizeof(NewTraceReader)))
   h[] = move res.get()
   return cast[pointer](h)
+
+proc ct_reader_refresh_bytes(h: pointer, data: ptr uint8,
+    len: csize_t): cint {.exportc, cdecl, dynlib, ffiGuard.} =
+  ## Replace the reader `h` with one over the `len` bytes at `data` (a newer
+  ## image of the same growing container). The candidate is parsed
+  ## completely before the handle changes, so on failure (non-zero, the
+  ## reason in `trace_writer_last_error`) `h` still reads the image it read
+  ## before. 0 on success.
+  if h.isNil:
+    setError("NULL reader handle")
+    return 1
+  if len == 0:
+    setError("Empty CTFS image")
+    return 1
+  if len > csize_t(high(int)):
+    setError("CTFS image length exceeds native index domain")
+    return 1
+  if data.isNil:
+    setError("NULL data with a non-zero length")
+    return 1
+  var bytes = newSeq[byte](int(len))
+  copyMem(addr bytes[0], data, int(len))
+  var res = openNewTraceFromBytes(move bytes)
+  if res.isErr:
+    setError(res.error)
+    return 1
+  cast[TraceReaderHandle](h)[] = move res.get()
+  return 0
 
 proc ct_reader_close(h: pointer) {.exportc, cdecl, dynlib, ffiGuard.} =
   ## Close and free a reader handle. Passing NULL is a no-op.
@@ -4945,6 +4995,21 @@ proc ct_reader_close(h: pointer) {.exportc, cdecl, dynlib, ffiGuard.} =
 # ---------------------------------------------------------------------------
 # Counts
 # ---------------------------------------------------------------------------
+
+proc ct_reader_recorded_entry(h: pointer, callKey, functionId,
+    entryStep: ptr uint64): cint {.exportc, cdecl, dynlib, ffiGuardFail(-1.cint).} =
+  trace_writer_clear_last_error()
+  if h.isNil or callKey.isNil or functionId.isNil or entryStep.isNil:
+    setError("entry.dat: NULL reader or output pointer")
+    return -1
+  let rh = cast[TraceReaderHandle](h)
+  let entry = rh[].recordedEntryIdentity()
+  if entry.isNone:
+    return 0
+  callKey[] = entry.get().callKey
+  functionId[] = entry.get().functionId
+  entryStep[] = entry.get().entryStep
+  return 1
 
 proc ct_reader_step_count(h: pointer): uint64 {.exportc, cdecl, dynlib, ffiGuard.} =
   if h.isNil: return 0

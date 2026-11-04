@@ -137,11 +137,14 @@ proc analyzeCtfs*(data: openArray[byte],
   if versionErr.len > 0:
     return err(versionErr)
 
-  # Read max root entries from extended header, a declared `0` as the
-  # auto-filled root (`ctfs-container.md` §1, "Auto-fill").
-  var maxEntries = int(DefaultMaxRootEntries)
-  if data.len >= HeaderSize + ExtHeaderSize:
-    maxEntries = int(headerRootEntryCount(data))
+  # Root traversal follows the header (`rootDirectoryLayout`: the entries
+  # start right after it, and a declared `0` is the auto-filled root,
+  # `ctfs-container.md` §1); the public blockSize parameter still controls the
+  # analyzer's block accounting exactly as before.
+  let layout = rootDirectoryLayout(data)
+  if layout.error.len > 0: return err(layout.error)
+  let maxEntries = int(layout.entryCount)
+  let entryStart = layout.entryStart
 
   var report: SpaceReport
   report.totalBytes = uint64(data.len)
@@ -150,7 +153,7 @@ proc analyzeCtfs*(data: openArray[byte],
   report.fileEntryBytes = maxEntries * FileEntrySize
 
   for i in 0 ..< maxEntries:
-    let off = HeaderSize + ExtHeaderSize + i * FileEntrySize
+    let off = entryStart + i * FileEntrySize
     if off + FileEntrySize > data.len:
       break
 

@@ -409,3 +409,34 @@ proc ctfsVersionError*(data: openArray[byte]): string =
       "reader reads version " & $CtfsVersion & " only (older containers are " &
       "re-recorded; ctfs-container.md §2, \"Older versions are refused\")"
   ""
+
+proc rootDirectoryLayout*(data: openArray[byte]): tuple[entryStart: int, entryCount: uint32, error: string] =
+  ## The root directory a full-profile container image declares, validated
+  ## from its header before any entry is traversed: the entries start right
+  ## after the header (`containerHeaderSize`; there is no free list root area,
+  ## `ctfs-container.md` §1, "The free list root area is removed
+  ## (2026-10-08)"), and there are `rootEntryCount` of them (a declared `0` is
+  ## the auto-filled rest of block 0). `error` is non-empty for an image whose
+  ## magic or version is not one a member can be read out of, a compact
+  ## container (which has no entry array), or one too short to hold the
+  ## declared entry array.
+  if data.len < HeaderSize + ExtHeaderSize:
+    return (0, 0'u32, "CTFS container too short for root layout")
+  for i in 0 ..< CtfsMagic.len:
+    if data[i] != CtfsMagic[i]: return (0, 0'u32, "invalid CTFS magic")
+  let versionErr = ctfsReadableVersionError(data)
+  if versionErr.len > 0: return (0, 0'u32, versionErr)
+  if data[5] == CtfsVersionV6 and
+      (data.len <= V6ProfileOffset or data[V6ProfileOffset] != uint8(ord(cpFull))):
+    return (0, 0'u32, "CTFS container has no full-profile root directory")
+  let headerSize = containerHeaderSize(data)
+  if data.len < headerSize:
+    return (0, 0'u32, "CTFS container too short for root layout")
+  let blockSize = readU32LE(data, 8)
+  let declared = readU32LE(data, 12)
+  if blockSize == 0 or (declared == 0 and uint64(blockSize) <= uint64(headerSize)):
+    return (0, 0'u32, "unusable CTFS auto-fill root layout")
+  let count = rootEntryCount(blockSize, declared, headerSize)
+  if uint64(headerSize) + uint64(count) * uint64(FileEntrySize) > uint64(data.len):
+    return (0, 0'u32, "truncated CTFS root directory")
+  (headerSize, count, "")

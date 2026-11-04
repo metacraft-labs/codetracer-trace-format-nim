@@ -1,0 +1,18 @@
+{
+  "sdkRevision": "064daf5b154ea6a0758ddb2dcbcbc07685216e44",
+  "archiveSha256": "7b4eff6719990e38aca93a4844c2e86a1935090625c4611f7e89675e999c56cc",
+  "files": [
+    {
+      "path": "include/zstd.h",
+      "sha256": "4fab9cf39160cd15fbd9fbc2fd637ee300002fa70e307f85e8a7e45c1e057906"
+    },
+    {
+      "path": "static/libzstd_static.lib",
+      "sha256": "9b5247fe7a6fe0177cb731ebe5f9d6dd90e5ec6a26c1c72f796471ef7feb4295"
+    },
+    {
+      "path": "zstd.exe",
+      "sha256": "6b5c50dde7062909b69b618fae228c72090596dc254efe498fb426f5f430a1f9"
+    }
+  ]
+}

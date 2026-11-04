@@ -312,8 +312,8 @@ int trace_writer_enable_line_count_table(trace_writer_t handle);
  * Returns 0 on success, non-zero on failure (see trace_writer_last_error).
  */
 int trace_writer_register_path_with_line_count(trace_writer_t handle,
-                                               const char* path,
-                                               uint64_t line_count);
+                                                const char* path,
+                                                uint64_t line_count);
 
 /*
  * The failure return of the two uint64_t-returning path entry points below.
@@ -401,7 +401,7 @@ uint64_t trace_writer_register_path(trace_writer_t handle, const char* path);
  * buffer is cleared on entry.
  */
 uint64_t trace_writer_register_variable_name(trace_writer_t handle,
-                                             const char* name);
+                                              const char* name);
 
 /* --------------------------------------------------------------------------
  * Source-reload markers (GDH-M6 — design §6.3)
@@ -505,6 +505,11 @@ size_t trace_writer_ensure_type_id(trace_writer_t handle,
     int kind, const char* lang_type);
 
 void trace_writer_register_call(trace_writer_t handle, size_t function_id);
+
+/* Mark the actual current active call as entry. No ids are supplied.
+ * Returns 0 on success, nonzero on named/latching failure. Optional entry.dat
+ * is appended last at close; unchanged callers emit no new member. */
+int trace_writer_mark_current_call_as_entry(trace_writer_t handle);
 void trace_writer_register_return(trace_writer_t handle);
 
 void trace_writer_register_return_int(trace_writer_t handle,
@@ -545,18 +550,18 @@ void trace_writer_register_variable_raw(trace_writer_t handle,
  * registration indistinguishable from a successful one.
  */
 void trace_writer_register_return_int_by_type_id(trace_writer_t handle,
-                                                 int64_t value,
-                                                 size_t type_id);
+                                                  int64_t value,
+                                                  size_t type_id);
 
 void trace_writer_register_variable_int_by_type_id(trace_writer_t handle,
-                                                   const char* name,
-                                                   int64_t value,
-                                                   size_t type_id);
+                                                    const char* name,
+                                                    int64_t value,
+                                                    size_t type_id);
 
 void trace_writer_register_variable_raw_by_type_id(trace_writer_t handle,
-                                                   const char* name,
-                                                   const char* value_repr,
-                                                   size_t type_id);
+                                                    const char* name,
+                                                    const char* value_repr,
+                                                    size_t type_id);
 
 void trace_writer_register_variable_cbor(trace_writer_t handle,
     const char* name,
@@ -1148,12 +1153,23 @@ ct_reader_t ct_reader_open(const char* path);
  * guess: on a trace whose records are not Layout A the open fails. */
 ct_reader_t ct_reader_open_assume_column_aware_paths(const char* path);
 /* Open a container held in memory.  The `len` bytes at `data` are copied,
- * so the caller may free them as soon as this returns.  NULL on failure. */
+ * so the caller may free them as soon as this returns.  NULL on failure;
+ * an empty image (`len` 0) is refused before it is parsed. */
 ct_reader_t ct_reader_open_bytes(const uint8_t* data, size_t len);
 /* Re-read a growing container at `path` into `h`.  0 on success. */
 int ct_reader_refresh(ct_reader_t h, const char* path);
+/* Replace `h` with a reader over the `len` bytes at `data`, copied.  The
+ * candidate is parsed completely first, so on failure (non-zero) `h` still
+ * reads the image it read before.  0 on success. */
+int ct_reader_refresh_bytes(ct_reader_t h, const uint8_t* data, size_t len);
 /* Close and free a handle.  NULL is a no-op. */
 void ct_reader_close(ct_reader_t h);
+
+/* The recorded entry identity (entry.dat), checked against this image when
+ * it was opened: 1 present (the three outputs written), 0 absent, -1 error.
+ * Every output pointer must be non-NULL. */
+int ct_reader_recorded_entry(ct_reader_t h, uint64_t* call_key,
+                             uint64_t* function_id, uint64_t* entry_step);
 
 /* Counts.  0 on failure. */
 uint64_t ct_reader_step_count(ct_reader_t h);

@@ -60,6 +60,20 @@ proc exportcNames(): seq[string] =
       result.add last
       last = ""
 
+proc hasCIdentifier(text, name: string): bool =
+  ## Export names are complete C identifiers: byte API suffixes cannot prove
+  ## that a filesystem-only opener survived a freestanding compilation.
+  var offset = 0
+  while offset < text.len:
+    let found = text.find(name, offset)
+    if found < 0: return false
+    let after = found + name.len
+    let left = found == 0 or not (text[found-1].isAlphaNumeric or text[found-1] == '_')
+    let right = after == text.len or not (text[after].isAlphaNumeric or text[after] == '_')
+    if left and right: return true
+    offset = after
+  false
+
 suite "freestanding writer surface":
 
   test "the native build keeps the filesystem entry points":
@@ -71,6 +85,11 @@ suite "freestanding writer surface":
     check r.isErr
 
   test "the C ABI compiles for --os:any and loses exactly the path openers":
+    # These strings isolate the scanner collision; actual emitted C below
+    # remains the native/freestanding ABI oracle for every exported function.
+    check not hasCIdentifier("ct_reader_open_bytes", "ct_reader_open")
+    check not hasCIdentifier("ct_reader_refresh_bytes", "ct_reader_refresh")
+    check hasCIdentifier("ct_reader_open(path)", "ct_reader_open")
     let names = exportcNames()
     check names.len > 100          # the source really was parsed
     for m in ExpectedMissing:
@@ -106,18 +125,9 @@ suite "freestanding writer surface":
 
       # A whole identifier, not a substring: `ct_reader_open` is a prefix of
       # `ct_reader_open_bytes`, which a freestanding build keeps.
-      proc emits(name: string): bool =
-        var at = emitted.find(name)
-        while at >= 0:
-          let after = at + name.len
-          if after >= emitted.len or emitted[after] notin IdentChars:
-            if at == 0 or emitted[at - 1] notin IdentChars:
-              return true
-          at = emitted.find(name, after)
-        false
-      let missing = names.filterIt(not emits(it)).sorted()
+      let missing = names.filterIt(not hasCIdentifier(emitted, it)).sorted()
       # What a freestanding host opens a reader with instead.
-      check emits("ct_reader_open_bytes")
+      check hasCIdentifier(emitted, "ct_reader_open_bytes")
       echo "freestanding C ABI: ", names.len - missing.len, " of ", names.len,
         " exportc functions present; ", missing.len, " missing"
       if missing != @ExpectedMissing.sorted():

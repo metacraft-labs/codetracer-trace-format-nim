@@ -19,6 +19,7 @@
  * No mocks: the real archive, the real header, real threads.
  */
 #include <pthread.h>
+#include "ffi_start_barrier.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,74 +36,24 @@ typedef struct {
   char err_seen[256];
 } job_t;
 
-/* A reusable barrier on a mutex and a condition variable.
- *
- * `pthread_barrier_t` is an optional POSIX feature (the Barriers option,
- * _POSIX_BARRIERS) that Apple's libc does not provide, so this host would not
- * compile on macOS. The same small barrier is used on every platform, so the
- * code the test runs is the code it runs everywhere.
- *
- * Semantics match `pthread_barrier_wait` for what this test needs: no thread
- * returns from `barrier_wait` until all `count` threads have called it, and
- * the barrier can be waited on again straight away (it is used twice). The
- * generation counter is what makes reuse safe: a woken thread leaves when the
- * generation it arrived in has ended, which also absorbs spurious wake-ups,
- * and a fast thread that re-enters for the next round cannot be counted
- * into the round the slow ones are still leaving.
- * https://pubs.opengroup.org/onlinepubs/9799919799/functions/pthread_barrier_wait.html
- */
-typedef struct {
-  pthread_mutex_t mutex;
-  pthread_cond_t all_arrived;
-  unsigned count;
-  unsigned waiting;
-  unsigned long generation;
-} barrier_t;
+static ffi_start_barrier start_line;
 
-static int barrier_init(barrier_t *b, unsigned count) {
-  if (count == 0) return -1;
-  if (pthread_mutex_init(&b->mutex, NULL) != 0) return -1;
-  if (pthread_cond_init(&b->all_arrived, NULL) != 0) {
-    pthread_mutex_destroy(&b->mutex);
-    return -1;
+static void check_thread_status(int status, const char *operation) {
+  if (status != 0) {
+    fprintf(stderr, "FAIL: %s: %s\n", operation, strerror(status));
+    abort();
   }
-  b->count = count;
-  b->waiting = 0;
-  b->generation = 0;
-  return 0;
 }
-
-static void barrier_wait(barrier_t *b) {
-  pthread_mutex_lock(&b->mutex);
-  unsigned long arrived_in = b->generation;
-  if (++b->waiting == b->count) {
-    /* Last one in: open the barrier and start the next round. */
-    b->waiting = 0;
-    b->generation++;
-    pthread_cond_broadcast(&b->all_arrived);
-  } else {
-    while (b->generation == arrived_in) {
-      pthread_cond_wait(&b->all_arrived, &b->mutex);
-    }
-  }
-  pthread_mutex_unlock(&b->mutex);
-}
-
-static void barrier_destroy(barrier_t *b) {
-  pthread_cond_destroy(&b->all_arrived);
-  pthread_mutex_destroy(&b->mutex);
-}
-
-static barrier_t start_line;
 
 static void *record(void *arg) {
   job_t *job = (job_t *)arg;
   trace_writer_t w = trace_writer_new("concurrent", FFI_TRACE_FORMAT_BINARY);
-  if (w == NULL) { job->failed = 1; return NULL; }
+  if (w == NULL) job->failed = 1;
   /* Same recording id everywhere, so the containers can be compared. */
-  if (trace_writer_set_recording_id(w, "0190f0a0-0000-7000-8000-000000000001") != 0 ||
-      trace_writer_begin_in_memory(w) != 0) { job->failed = 1; return NULL; }
-  barrier_wait(&start_line);
+  if (!job->failed && (trace_writer_set_recording_id(w, "0190f0a0-0000-7000-8000-000000000001") != 0 ||
+      trace_writer_begin_in_memory(w) != 0)) job->failed = 1;
+  check_thread_status(ffi_start_barrier_wait(&start_line), "start barrier wait");
+  if (!job->failed) {
   trace_writer_start(w, "/src/main.c", 1);
   char path[32], name[32];
   for (int i = 0; i < STEPS; i++) {
@@ -114,9 +65,14 @@ static void *record(void *arg) {
   if (job->idx == 0) {
     /* Thread 0 alone makes a call fail; the others must not see it. */
     trace_writer_clear_last_error();
-    if (trace_writer_close(NULL) == 0) { job->failed = 1; return NULL; }
+    if (trace_writer_close(NULL) == 0) job->failed = 1;
   }
-  barrier_wait(&start_line);
+  }
+  check_thread_status(ffi_start_barrier_wait(&start_line), "start barrier wait");
+  if (job->failed) {
+    if (w != NULL) trace_writer_free(w);
+    return NULL;
+  }
   snprintf(job->err_seen, sizeof job->err_seen, "%s", trace_writer_last_error());
   if (trace_writer_close(w) != 0) { job->failed = 1; return NULL; }
   job->len = trace_writer_container_len(w);
@@ -128,19 +84,17 @@ static void *record(void *arg) {
 
 int main(void) {
   codetracer_trace_writer_init();
-  if (barrier_init(&start_line, THREADS) != 0) {
-    fprintf(stderr, "FAIL: could not initialise the start barrier\n");
-    return 1;
-  }
+  check_thread_status(ffi_start_barrier_init(&start_line, THREADS), "start barrier init");
   pthread_t t[THREADS];
   job_t jobs[THREADS];
   memset(jobs, 0, sizeof jobs);
   for (int i = 0; i < THREADS; i++) {
     jobs[i].idx = i;
-    pthread_create(&t[i], NULL, record, &jobs[i]);
+    check_thread_status(pthread_create(&t[i], NULL, record, &jobs[i]), "pthread_create");
   }
-  for (int i = 0; i < THREADS; i++) pthread_join(t[i], NULL);
-  barrier_destroy(&start_line);
+  for (int i = 0; i < THREADS; i++)
+    check_thread_status(pthread_join(t[i], NULL), "pthread_join");
+  check_thread_status(ffi_start_barrier_destroy(&start_line), "start barrier destroy");
   for (int i = 0; i < THREADS; i++) {
     if (jobs[i].failed || jobs[i].len == 0) {
       fprintf(stderr, "FAIL: thread %d did not produce a container\n", i);
@@ -163,7 +117,7 @@ int main(void) {
     }
   }
   printf("PASS: %d concurrent writers produced identical %zu-byte containers; errors stayed per thread\n",
-         THREADS, jobs[0].len);
+          THREADS, jobs[0].len);
   for (int i = 0; i < THREADS; i++) free(jobs[i].bytes);
   return 0;
 }

@@ -3,24 +3,29 @@
 ## Minimal bindings for libzstd frame-level compression/decompression.
 ## Links against the system libzstd library.
 
-when defined(windows) and defined(vcc):
-  {.passC: "/IC:\\zstd\\include".}
-  {.passL: "C:\\zstd\\lib\\zstd.lib".}
-elif defined(windows):
+when defined(windows):
+  import std/os
   const
+    ctZstdIncludeDir {.strdefine.} = getEnv("CT_ZSTD_INCLUDE_DIR")
+    ctZstdLibraryFile {.strdefine.} = getEnv("CT_ZSTD_LIBRARY_FILE")
+    # Preserve explicit legacy caller parameters without a host-path default.
     msys2MingwInc {.strdefine.} = ""
     msys2MingwLib {.strdefine.} = ""
-  when msys2MingwInc.len > 0:
-    {.passC: "-I" & msys2MingwInc.}
-  else:
-    {.passC: "-ID:/metacraft-dev-deps/msys2/msys64/mingw64/include".}
-  # Use the exact archive instead of adding the MSYS2 library directory to
-  # the global search path. The latter can replace a standalone GCC install's
-  # implicit pthread/CRT archives with ABI-incompatible MSYS2 copies.
-  when msys2MingwLib.len > 0:
-    {.passL: msys2MingwLib & "/libzstd.a".}
-  else:
-    {.passL: "D:/metacraft-dev-deps/msys2/msys64/mingw64/lib/libzstd.a".}
+  when ctZstdIncludeDir.len > 0:
+    when defined(vcc):
+      {.passC: "/I" & quoteShell(ctZstdIncludeDir).}
+    else:
+      {.passC: "-I" & quoteShell(ctZstdIncludeDir).}
+  elif not defined(vcc) and msys2MingwInc.len > 0:
+    {.passC: "-I" & quoteShell(msys2MingwInc).}
+  when ctZstdLibraryFile.len > 0:
+    # The declared artifact may have a producer-specific name. Never rename
+    # it or add its entire directory to the compiler's CRT/library search path.
+    {.passL: quoteShell(ctZstdLibraryFile).}
+  elif not defined(vcc) and msys2MingwLib.len > 0:
+    {.passL: quoteShell(msys2MingwLib / "libzstd.a").}
+  # A consumer SDK may instead supply the complete native flags itself.
+  # In that case no undeclared C:\zstd/MSYS2 host path is injected here.
 else:
   {.passL: "-lzstd".}
 

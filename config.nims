@@ -70,3 +70,22 @@ block worktreeLocalNimcache:
   if rel.len > 0:
     cacheDir.add("/" & rel)
   switch("nimcache", cacheDir & "/" & project & suffix)
+
+# Native Windows commands share the exact complete source roots declared by CI.
+# No implicit package download or fallback: partial binding is an error.
+when defined(windows):
+  import std/os
+  block declaredWindowsNimSources:
+    let keys = ["CT_NIM_STEW_SRC", "CT_NIM_RESULTS_SRC", "CT_NIM_UNITTEST2_SRC"]
+    var selected: seq[string] = @[]
+    var anySelected = false
+    for key in keys:
+      let value = getEnv(key)
+      selected.add(value)
+      if value.len > 0:
+        anySelected = true
+    if anySelected:
+      for value in selected:
+        doAssert os.isAbsolute(value) and dirExists(value),
+          "Windows Nim source dependency binding must contain three existing absolute directories"
+        switch("path", value)

@@ -167,11 +167,17 @@ testCase "the auto-filled root ends at block 0 (one slot more finds a ghost)":
     "v6 declared 0: the member in slot 168 is not found")
   check(not hasInternalFile(v6, "ghost", 0'u32),
     "v6 declared 0: a slot past the auto-filled root was scanned")
-  # The ghost word is where the probe says it is: an explicit count one past
-  # the auto-filled root finds it.
-  check(hasInternalFile(v5, "ghost", uint32(V5Auto + 1)) and
-    hasInternalFile(v6, "ghost", uint32(V6Auto + 1)),
+  # The ghost word is where the probe says it is: the name word of the slot
+  # one past the auto-filled root. (A lookup never scans past the root the
+  # header declares, whatever count its caller passes, so the control reads
+  # the word itself rather than asking for one slot more.)
+  let ghost = base40Encode("ghost")
+  check(readU64LE(v5, 16 + V5Auto * 24 + 16) == ghost and
+    readU64LE(v6, 24 + V6Auto * 24 + 16) == ghost,
     "the ghost word is not at the slot past the auto-filled root")
+  check(not hasInternalFile(v5, "ghost", uint32(V5Auto + 1)) and
+    not hasInternalFile(v6, "ghost", uint32(V6Auto + 1)),
+    "a caller's count one past the auto-filled root scanned a data block")
 
 testCase "rootMembers enumerates the auto-filled root":
   for requested in [0'u32, DefaultMaxRootEntries]:

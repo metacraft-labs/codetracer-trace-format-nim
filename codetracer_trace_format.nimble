@@ -1,3 +1,5 @@
+import std/strutils
+
 # Package
 version       = "0.1.0"
 author        = "Metacraft Labs"
@@ -11,6 +13,9 @@ requires "stew >= 0.1.0"
 requires "results"
 
 task test, "Run all tests":
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_recorded_entry_identity.nim"
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_recorded_entry_hierarchy.nim"
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_recorded_entry_sealed.nim"
   exec "nim c -r tests/test_nimcache_is_worktree_local.nim"
   exec "nim c -r tests/test_base40.nim"
   exec "nim c -r tests/test_container.nim"
@@ -108,6 +113,7 @@ task test, "Run all tests":
   # A header declaring `MaxRootEntries = 0` is the auto-filled root
   # (`ctfs-container.md` §1): every reader scans the slots that fill block 0.
   exec "nim c -r -p:src tests/test_root_auto_fill.nim"
+  exec "nim c -r tests/test_sharded_root_layout.nim"
   exec "nim c -r tests/test_chunk_index.nim"
   exec "nim c -r tests/test_fixed_record_table.nim"
   exec "nim c -r tests/test_variable_record_table.nim"
@@ -565,8 +571,32 @@ task testFfiThreads, "C hosts: close after the recording thread exited; concurre
     for t in ["worker_thread_exit", "concurrent_writers"]:
       for v in ["ship", "tls", "nolock"]:
         exec "gcc -O1 -o " & dir & "/" & t & "-" & v & " tests/test_ffi_" & t & ".c " & dir & "/lib-" & v & ".a -lzstd -lm -lpthread -I include" & extra
-    exec dir & "/worker_thread_exit-ship"
-    exec dir & "/concurrent_writers-ship"
+    exec "gcc -O1 -o " & dir & "/host_guard tests/ffi_host_guard.c"
+    # `runner` prefixes the guardian's command line (an `env` assignment); the
+    # guardian hands its environment on to the host it runs.
+    proc guardedHost(name: string; runner = ""): int =
+      let (reserved, reserveCode) = gorgeEx(dir & "/host_guard --reserve " & dir)
+      let receipt = reserved.strip()
+      let prefix = dir & "/guardian-result-"
+      if reserveCode != 0 or not receipt.startsWith(prefix) or
+          receipt.len != prefix.len + 6:
+        raise newException(AssertionDefect, "FFI guardian receipt acquisition failed")
+      for ch in receipt[prefix.len ..< receipt.len]:
+        if ch notin {'a'..'z', 'A'..'Z', '0'..'9'}:
+          raise newException(AssertionDefect, "FFI guardian receipt name refused")
+      let (output, code) = gorgeEx(runner & dir & "/host_guard " & dir & "/" & name & " " & receipt)
+      echo output
+      let terminalProof = "FFI-GUARD-RESULT-v1\nnatural\n" & $code & "\n"
+      if code == 125 or code == 126 or not fileExists(receipt) or
+          readFile(receipt) != terminalProof:
+        raise newException(AssertionDefect,
+          "FFI host guardian refused or timed out: " & name & " (exit " & $code & ")")
+      code
+    for name in ["worker_thread_exit-ship", "concurrent_writers-ship"]:
+      let code = guardedHost(name)
+      if code != 0:
+        raise newException(AssertionDefect,
+          "shipped FFI host failed: " & name & " (exit " & $code & ")")
     # The host unmaps the dead worker's stack so the dead heap's descriptor,
     # which Nim keeps in thread-local storage, is gone when the main thread
     # frees into it. That holds on glibc, which places TLS inside the thread's
@@ -590,42 +620,27 @@ task testFfiThreads, "C hosts: close after the recording thread exited; concurre
       # must still pass under Guard Malloc. Without it, a Guard Malloc that
       # crashed every program would make the --threads:on control below pass
       # without having reached the cross-thread free at all.
-      let (shipOutput, shipCode) = gorgeEx(tlsRunner & dir & "/worker_thread_exit-ship")
+      let shipCode = guardedHost("worker_thread_exit-ship", tlsRunner)
       if shipCode != 0:
         raise newException(AssertionDefect, "the worker-thread host FAILED " &
           "against the shipped archive under Guard Malloc (exit " & $shipCode &
-          "), so a crash of the --threads:on control would prove nothing: " &
-          shipOutput)
-    let (tlsOutput, tlsCode) = gorgeEx(tlsRunner & dir & "/worker_thread_exit-tls")
-    # 126/127 are `env`/the shell failing to start the host: a nonzero exit
-    # from a host that never ran would pass this control vacuously.
-    if tlsCode in 126 .. 127:
-      raise newException(AssertionDefect, "the --threads:on worker-thread " &
-        "host did not run (exit " & $tlsCode & "): " & tlsOutput)
+          "), so a crash of the --threads:on control would prove nothing")
+    # The guardian refuses a host that never ran or did not terminate
+    # naturally (no receipt, or exit 125/126), so a nonzero exit here is the
+    # host's own: it cannot pass this control vacuously.
+    let tlsCode = guardedHost("worker_thread_exit-tls", tlsRunner)
     if tlsCode == 0:
       raise newException(AssertionDefect, "the worker-thread host PASSED against a --threads:on " &
         "archive: the test no longer reaches the cross-thread free it guards")
     # Unlocked concurrent entry into one heap is a data race, and it does not
     # always crash: on 2026-10-18 this host deadlocked on futexes with no CPU
-    # time for 35 minutes. A hang is the same failure as a crash, so
-    # `timeout` turns it into a nonzero exit (124) instead of a stalled suite;
-    # `-k 10` follows the TERM with a KILL. The shipped-flags run above
-    # finishes in well under a second and is not bounded.
-    #
-    # `timeout` must exist, and its own failures (125: timeout failed, 126:
-    # not executable, 127: not found) must not count: each is a nonzero exit
-    # from a host that never ran, which would pass the control vacuously.
-    let timeoutExe = findExe("timeout")
-    if timeoutExe.len == 0:
-      raise newException(AssertionDefect, "testFfiThreads needs coreutils " &
-        "`timeout` on PATH to bound the no-lock control (the dev shell has it)")
+    # time for 35 minutes. A hang is the same failure as a crash, but the
+    # guardian reports its own timeout (125) as a harness failure rather than
+    # as a caught race, so a hang fails the suite instead of stalling it or
+    # passing the control vacuously.
     var lockCaught = false
     for attempt in 0 ..< 5:
-      let (output, code) = gorgeEx(timeoutExe & " -k 10 120 " &
-        dir & "/concurrent_writers-nolock")
-      if code in 125 .. 127:
-        raise newException(AssertionDefect, "the no-lock concurrent-writers " &
-          "host did not run (exit " & $code & "): " & output)
+      let code = guardedHost("concurrent_writers-nolock")
       if code != 0:
         lockCaught = true
         break

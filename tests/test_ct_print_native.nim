@@ -61,11 +61,15 @@ let
              encodeEventHeader(1'u16, 26'u32, Tid0, 2'u64, 110'u64)
 
 proc buildSyntheticBundle(osKind = 0'u8, withDat = true,
-                          withIdx = true): seq[byte] =
+                          withIdx = true, recordingMode = "mcr",
+                          poisonLegacyJson = false): seq[byte] =
   ## A small native MCR bundle:
-  ##   meta.dat     — program/args/workdir + MCR fields (platform=linux,
-  ##                  tick source "none", granularity "edge",
-  ##                  hookProfile=test, hookStrategies=[ldpreload])
+  ##   meta.dat     — program/args/workdir, recorderId `recordingMode`, and
+  ##                  MCR fields (platform=linux, tick source "none",
+  ##                  granularity "edge", hookProfile=test,
+  ##                  hookStrategies=[ldpreload])
+  ##   meta.json    — only with `poisonLegacyJson`: a retired sidecar naming
+  ##                  another recording mode, which must not be read
   ##   paths.dat    — one registered source path
   ##   t00000000000 — 2 thread events (lock acquire begin/success)
   ##   t00000000001 — 1 thread event (write syscall, payload "hi\n")
@@ -79,6 +83,7 @@ proc buildSyntheticBundle(osKind = 0'u8, withDat = true,
       workdir: "/synthetic",
       program: "/synthetic/program",
       args: @["--demo", "fixture"]),
+    recorderId = recordingMode,
     mcrFields = some(McrMetaFields(
       tickSource: tsMonotonic,
       totalThreads: 2,
@@ -92,6 +97,11 @@ proc buildSyntheticBundle(osKind = 0'u8, withDat = true,
       hookStrategies: @["ldpreload"])))
   var metaFile = ctfs.addFile("meta.dat").get()
   doAssert ctfs.writeToFile(metaFile, meta).isOk
+  if poisonLegacyJson:
+    # Only the binary recorderId is authoritative.
+    var legacyFile = ctfs.addFile("meta.json").get()
+    doAssert ctfs.writeToFile(legacyFile,
+      cast[seq[byte]]("{\"recordingMode\":\"poisoned-legacy-mode\"}")).isOk
 
   var tables = initTraceInterningTables(ctfs).get()
   doAssert ctfs.ensurePathId(tables, SourcePath).get() == 0
@@ -345,6 +355,19 @@ proc test_event_log_unassigned_kind_is_refused_by_value() =
     doAssert ("unassigned event log kind " & $kind) in r.error, r.error
   echo "[ok] test_event_log_unassigned_kind_is_refused_by_value"
 
+proc test_recording_mode_is_the_recorder_id() =
+  ## `metadata.recording_mode` is `meta.dat`'s recorderId, verbatim, for
+  ## every mode the native recorder writes, and a retired `meta.json`
+  ## naming another mode is not read.
+  for mode in ["hook", "instrumented", "mcr", "mcr-interpose",
+               "mcr-interpose-debug"]:
+    let decoded = buildNativeFullDocument(
+      buildSyntheticBundle(recordingMode = mode, poisonLegacyJson = true),
+      NativeOpts()).get()
+    doAssert decoded["metadata"]["recording_mode"].getStr == mode,
+      "binary recorderId must survive verbatim despite poisoned legacy JSON"
+  echo "[ok] test_recording_mode_is_the_recorder_id"
+
 proc test_golden_snapshot() =
   ## Snapshot comparison against tests/goldens/native_replay_hello.full.json.
   ## The *parsed* JSON is compared, so a JSON formatter re-laying the file
@@ -428,6 +451,7 @@ test_event_log_one_member_without_the_other_is_refused()
 test_event_log_without_both_members_has_no_os_events()
 test_event_log_every_assigned_kind_is_named()
 test_event_log_unassigned_kind_is_refused_by_value()
+test_recording_mode_is_the_recorder_id()
 test_golden_snapshot()
 test_real_fixture()
 

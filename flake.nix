@@ -2,6 +2,10 @@
   description = "CTFS (CodeTracer File System) container format — Nim implementation";
 
   inputs = {
+    standard-hooks-src = {
+      url = "github:metacraft-labs/devops-modules/c8ef41d446e211892fe9775182b43d5d517554ac";
+      flake = false;
+    };
     # Same toolchain source as the sibling Rust `codetracer-trace-format`
     # repo, so the Nim/Rust pair that make up the trace-format layer are
     # built with one pinned compiler set rather than two.
@@ -55,7 +59,46 @@
           toolchainsPkgs = inputs.codetracer-toolchains.packages.${system};
 
           nim = toolchainsPkgs.nim-2_2;
-          nimble = toolchainsPkgs.nimble;
+          nimbleSource = pkgs.applyPatches {
+            name = "trace-nim-nimble-supported-github-auth-source";
+            src = toolchainsPkgs.nimble.src;
+            patches = [ ./nix/nimble-github-api-auth.patch ];
+          };
+          nimble = toolchainsPkgs.nimble.overrideAttrs (_: {
+            src = nimbleSource;
+          });
+
+          nimbleRuntimeMetadata = nimble.overrideAttrs (
+            old:
+            let
+              compilerWrappers = builtins.filter (p: p ? nim) old.nativeBuildInputs;
+              metadataCompiler =
+                assert builtins.length compilerWrappers == 1;
+                (builtins.head compilerWrappers).nim;
+            in
+            {
+              pname = "trace-nim-runtime-metadata";
+              buildPhase = ''
+                runHook preBuild
+                cp ${./nix/construct-runtime-metadata.nim} construct_runtime_metadata.nim
+                nim c -d:ssl -d:zippyNoSimd -d:nimcore \
+                  --define:git_revision_override=v0.20.1 \
+                  --path:${metadataCompiler}/nim \
+                  --path:src --path:vendor/zippy/src --path:vendor/sat/src \
+                  --path:vendor/checksums/src --out:construct-runtime-metadata \
+                  construct_runtime_metadata.nim
+                runHook postBuild
+              '';
+              installPhase = ''
+                runHook preInstall
+                install -Dm755 construct-runtime-metadata $out/bin/construct-runtime-metadata
+                runHook postInstall
+              '';
+              postInstall = ''
+                wrapProgram $out/bin/construct-runtime-metadata --suffix PATH : ${nim}/bin
+              '';
+            }
+          );
 
           # `--path:` arguments that make the .nimble's `requires` importable
           # from a bare `nim c` (the package build below, and the FFI static
@@ -92,18 +135,30 @@
             cp ${inputs.nim-packages-index}/packages.json $out/packages_official.json
           '';
 
+          standardHooks = import (inputs.standard-hooks-src + "/git-hooks/standard-hooks.nix") {
+            inherit pkgs;
+            lib = pkgs.lib;
+            src = inputs.standard-hooks-src;
+          };
           preCommit = inputs.pre-commit-hooks.lib.${system}.run {
             src = ./.;
-            hooks = {
+            package = pkgs.prek;
+            default_stages = [
+              "pre-commit"
+              "pre-push"
+            ];
+            hooks = standardHooks // {
               lint = {
                 enable = true;
                 name = "Lint";
                 entry = "just lint";
                 language = "system";
                 pass_filenames = false;
+                stages = [ "pre-commit" ];
               };
             };
           };
+
         in
         {
           checks.pre-commit-check = preCommit;
@@ -116,6 +171,7 @@
 
               # The C back-end `nim c` shells out to.
               pkgs.gcc
+              pkgs.bash # Declared non-SIP monitored launch shell.
 
               # `codetracer_ctfs` links libzstd; several tests resolve its
               # include/lib dirs through pkg-config.
@@ -149,11 +205,18 @@
               pkgs.just
               pkgs.nixfmt-rfc-style
               pkgs.prek
+              pkgs.pre-commit
+              pkgs.python3
               pkgs.git
             ]
             ++ preCommit.enabledPackages;
 
             PKG_CONFIG_PATH = "${pkgs.zstd.dev}/lib/pkgconfig";
+            CT_NIM_STEW_SRC = "${inputs.nim-stew}";
+            CT_NIM_RESULTS_SRC = "${inputs.nim-results}";
+            CT_NIM_UNITTEST2_SRC = "${inputs.nim-unittest2}";
+            CT_ZSTD_INCLUDE_DIR = "${pkgs.zstd.dev}/include";
+            CT_ZSTD_LIB_DIR = "${pkgs.zstd.out}/lib";
 
             # Consumed by `repro.nim`'s `test_path_filter` edge, which links
             # pcre directly instead of relying on a run-time library search.
@@ -173,12 +236,13 @@
               ct_tfn_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
               if [ -n "$ct_tfn_root" ] \
                 && [ -f "$ct_tfn_root/codetracer_trace_format.nimble" ] \
-                && [ -f "$ct_tfn_root/src/codetracer_trace_writer_ffi.nim" ]; then
+                && [ -f "$ct_tfn_root/src/codetracer_trace_writer_ffi.nim" ] \
+                && [ "$(${pkgs.coreutils}/bin/sha256sum "$ct_tfn_root/flake.nix" | ${pkgs.coreutils}/bin/cut -d' ' -f1)" = "${builtins.hashFile "sha256" ./flake.nix}" ]; then
                 # The committed `.pre-commit-config.yaml` is the hook, run by the
                 # flake's pre-commit: the flake provides the tools, the committed
                 # config provides the rules. git-hooks.nix's own installer refuses
                 # to replace a committed config and then installs nothing.
-                ( cd "$ct_tfn_root" && bash ${./scripts/install-git-hooks.sh} ${pkgs.lib.getExe preCommit.config.package} ) || exit $?
+                ( cd "$ct_tfn_root" && bash ${./scripts/install-git-hooks.sh} ${pkgs.lib.getExe pkgs.pre-commit} ) || exit $?
                 # A clone where git-hooks.nix's own installer once ran keeps its RELATIVE
                 # core.hooksPath `.git/hooks`, in the config every worktree shares. A linked
                 # worktree cannot resolve it (there `.git` is a file), so git silently runs
@@ -246,6 +310,13 @@
           # writer, for one) links to emit `.ct` containers.  `lib/` and
           # `include/` mirror the source-tree locations the sibling-checkout
           # builds read.  Consumers also link libzstd.
+          # Same selected constructors used by the guarded owning shell.
+          packages.ci-nimble = nimble;
+          packages.ci-nimble-source = nimbleSource;
+          packages.ci-nimble-runtime-metadata = nimbleRuntimeMetadata;
+          packages.ci-checkout-git = pkgs.git;
+          packages.ci-checkout-python = pkgs.python3;
+
           packages.trace-writer-ffi = pkgs.stdenv.mkDerivation {
             pname = "codetracer-trace-writer-ffi";
             version = "0.1.0";

@@ -90,7 +90,7 @@ PINNED_ID="$(grep -E '^- +recording_id: +' "$EXPECTED" | head -1 | \
   sed -E 's/^- +recording_id: +//' | tr -d ' ')"
 
 for v in BASE_REV BASE_SHA_EXPECT BASE_SIZE_EXPECT META_SHA_EXPECT \
-         STEPS_SHA_EXPECT PINNED_ID; do
+          STEPS_SHA_EXPECT PINNED_ID; do
   [[ -n "${!v}" ]] || fail_script "$EXPECTED does not record $v. A baseline
 field the driver cannot read is a comparison the driver will not make, and an
 unmade comparison is green"
@@ -170,7 +170,7 @@ for spec in "${ARMS[@]}"; do
   fi
   if ! grep -q "GDH2-FAIL\[$wantgate\]" "$bin.out"; then
     echo "ARM-FAIL: $armdef exited $rc but not with GDH2-FAIL[$wantgate];" \
-         "it went red for some other reason:" >&2
+          "it went red for some other reason:" >&2
     tail -20 "$bin.out" >&2
     failures=$((failures + 1))
     continue
@@ -188,7 +188,7 @@ echo "== ct-print instrument =="
 CTP="$WORK/ct-print"
 instrument_ok=1
 if ! nim c "${NIMFLAGS[@]}" --mm:arc --nimcache:"$WORK/nc-ctprint" \
-     -o:"$CTP" src/codetracer_ct_print.nim >"$WORK/ctprint.build.log" 2>&1; then
+      -o:"$CTP" src/codetracer_ct_print.nim >"$WORK/ctprint.build.log" 2>&1; then
   tail -30 "$WORK/ctprint.build.log" >&2
   echo "INSTRUMENT-FAIL: ct-print did not build" >&2
   failures=$((failures + 1))
@@ -271,8 +271,8 @@ else
       instrument_ok=0
     elif [[ "$n_steps_line" -ne "$c_steps" || "$n_reload_line" -ne "$c_reloads" ]]; then
       echo "INSTRUMENT-FAIL: the --events dump is INCOMPLETE:" \
-           "$n_steps_line step entries vs counts.steps=$c_steps," \
-           "$n_reload_line marker entries vs counts.source_reloads=$c_reloads" >&2
+            "$n_steps_line step entries vs counts.steps=$c_steps," \
+            "$n_reload_line marker entries vs counts.source_reloads=$c_reloads" >&2
       instrument_ok=0
     elif [[ "$n_reload_line" -eq 0 ]]; then
       echo "INSTRUMENT-FAIL: zero marker entries; every assertion above is vacuous" >&2
@@ -322,23 +322,23 @@ if [[ "$WT_REV" != "$PIN_REV" ]]; then
   identity_ok=0
 fi
 for sym in TagSourceReload registerSourceReload FlagExtHasSourceReload \
-           registerPathVersion; do
+            registerPathVersion; do
   if grep -rq "$sym" "$WT/src"; then
     echo "IDENTITY-FAIL: the baseline tree at $BASE_REV already contains" \
-         "\`$sym\`, so it is NOT a pre-campaign build and comparing against" \
-         "it would be comparing this campaign with itself" >&2
+          "\`$sym\`, so it is NOT a pre-campaign build and comparing against" \
+          "it would be comparing this campaign with itself" >&2
     identity_ok=0
   fi
 done
 
 cp "$PROBE" "$WT/tests/"
 if ! ( cd "$WT" && nim c "${NIMFLAGS[@]}" --nimcache:"$WORK/nc-base" \
-       -o:"$WORK/probe-base" tests/gdh2_identity_probe.nim ) \
-     >"$WORK/probe-base.build.log" 2>&1; then
+        -o:"$WORK/probe-base" tests/gdh2_identity_probe.nim ) \
+      >"$WORK/probe-base.build.log" 2>&1; then
   tail -30 "$WORK/probe-base.build.log" >&2
   echo "IDENTITY-FAIL: the probe does not compile against the baseline tree." \
-       "That means it uses API this campaign added, and the comparison" \
-       "cannot be made at all" >&2
+        "That means it uses API this campaign added, and the comparison" \
+        "cannot be made at all" >&2
   identity_ok=0
 fi
 if ! build "$WORK/probe-head" "$WORK/nc-head" "$PROBE"; then
@@ -367,7 +367,7 @@ if [[ $identity_ok -eq 1 ]]; then
   hsz=$(stat -c%s "$WORK/head.ct" 2>/dev/null || echo 0)
   if [[ "$bsz" -eq 0 || "$hsz" -eq 0 ]]; then
     echo "IDENTITY-FAIL: a container is empty or missing (base $bsz, head $hsz);" \
-         "a comparison of two files that both failed to open is equal for free" >&2
+          "a comparison of two files that both failed to open is equal for free" >&2
     identity_ok=0
   elif [[ "$bsz" -ne "$hsz" ]]; then
     echo "IDENTITY-FAIL: sizes differ (base $bsz, head $hsz)" >&2
@@ -379,7 +379,7 @@ if [[ $identity_ok -eq 1 ]]; then
       v=$(grep -oE "^$k=[0-9]+" "$WORK/$f.out" | head -1 | cut -d= -f2)
       if [[ -z "$v" || "$v" -le 0 ]]; then
         echo "IDENTITY-FAIL: $f.ct reports $k=$v; byte-identity over an" \
-             "empty container is free" >&2
+              "empty container is free" >&2
         identity_ok=0
       fi
     done
@@ -388,14 +388,14 @@ if [[ $identity_ok -eq 1 ]]; then
     rid=$(grep -oE '^recording_id=.*' "$WORK/$f.out" | head -1 | cut -d= -f2-)
     if [[ "$rid" != "$PINNED_ID" ]]; then
       echo "IDENTITY-FAIL: $f.ct carries recording id '$rid', not the pinned" \
-           "'$PINNED_ID'. The containers cannot be byte-identical, so a green" \
-           "result would mean the comparison did not run" >&2
+            "'$PINNED_ID'. The containers cannot be byte-identical, so a green" \
+            "result would mean the comparison did not run" >&2
       identity_ok=0
     fi
     mv=$(grep -oE '^meta_version=[0-9]+' "$WORK/$f.out" | head -1 | cut -d= -f2)
     if [[ "$mv" != "4" ]]; then
       echo "IDENTITY-FAIL: $f.ct is at meta.dat schema version $mv; a recording" \
-           "with no reload must stay at 4" >&2
+            "with no reload must stay at 4" >&2
       identity_ok=0
     fi
   done
@@ -412,7 +412,7 @@ if [[ $identity_ok -eq 1 ]]; then
   echo "  head   $hsha  ($hsz bytes)  meta $hmeta  steps $hsteps"
   if ! cmp -s "$WORK/base.ct" "$WORK/head.ct"; then
     echo "IDENTITY-FAIL: the two containers DIFFER. A recording with no reload" \
-         "must be byte-identical to one produced before this campaign" >&2
+          "must be byte-identical to one produced before this campaign" >&2
     cmp "$WORK/base.ct" "$WORK/head.ct" | head -3 >&2
     identity_ok=0
   fi
@@ -420,7 +420,7 @@ if [[ $identity_ok -eq 1 ]]; then
   # golden" from deleting the property without touching an assertion.
   if [[ "$bsha" != "$BASE_SHA_EXPECT" || "$hsha" != "$BASE_SHA_EXPECT" ]]; then
     echo "IDENTITY-FAIL: the container digest is not the one recorded in" \
-         "$EXPECTED ($BASE_SHA_EXPECT). base=$bsha head=$hsha" >&2
+          "$EXPECTED ($BASE_SHA_EXPECT). base=$bsha head=$hsha" >&2
     identity_ok=0
   fi
   if [[ "$bsz" != "$BASE_SIZE_EXPECT" ]]; then
@@ -429,12 +429,12 @@ if [[ $identity_ok -eq 1 ]]; then
   fi
   if [[ "$bmeta" != "$META_SHA_EXPECT" || "$hmeta" != "$META_SHA_EXPECT" ]]; then
     echo "IDENTITY-FAIL: the meta.dat member digest is not the recorded one" \
-         "($META_SHA_EXPECT). base=$bmeta head=$hmeta" >&2
+          "($META_SHA_EXPECT). base=$bmeta head=$hmeta" >&2
     identity_ok=0
   fi
   if [[ "$bsteps" != "$STEPS_SHA_EXPECT" || "$hsteps" != "$STEPS_SHA_EXPECT" ]]; then
     echo "IDENTITY-FAIL: the steps.dat member digest is not the recorded one" \
-         "($STEPS_SHA_EXPECT). base=$bsteps head=$hsteps" >&2
+          "($STEPS_SHA_EXPECT). base=$bsteps head=$hsteps" >&2
     identity_ok=0
   fi
 fi
@@ -446,7 +446,7 @@ fi
 if [[ -s "$WORK/two_markers.ct" && -s "$WORK/no_marker.ct" ]]; then
   if cmp -s "$WORK/two_markers.ct" "$WORK/no_marker.ct"; then
     echo "IDENTITY-FAIL: CONTROL ARM — a container with a marker compares" \
-         "EQUAL to one without. The comparison is not reading the files" >&2
+          "EQUAL to one without. The comparison is not reading the files" >&2
     identity_ok=0
   else
     echo "  control arm: a container WITH a marker differs, as it must"
@@ -460,7 +460,7 @@ fi
 # then moves to schema version 5 and its bytes must differ.
 echo "-- identity falsifier arm 1: gdh2FalsifyAlwaysSetBit"
 if ! build "$WORK/probe-armed" "$WORK/nc-armed" "$PROBE" \
-     -d:gdh2FalsifierArms -d:gdh2FalsifyAlwaysSetBit; then
+      -d:gdh2FalsifierArms -d:gdh2FalsifyAlwaysSetBit; then
   tail -20 "$WORK/probe-armed.build.log" >&2
   echo "ARM-FAIL: gdh2FalsifyAlwaysSetBit did not COMPILE" >&2
   failures=$((failures + 1))
@@ -473,11 +473,11 @@ else
   elif [[ $rca -ne 0 ]]; then
     cat "$WORK/armed.out" >&2
     echo "ARM-FAIL: gdh2FalsifyAlwaysSetBit's probe exited $rca before producing" \
-         "a container; a crash is not a byte difference" >&2
+          "a container; a crash is not a byte difference" >&2
     failures=$((failures + 1))
   elif cmp -s "$WORK/base.ct" "$WORK/armed.ct"; then
     echo "ARM-FAIL: gdh2FalsifyAlwaysSetBit produced a container BYTE-IDENTICAL" \
-         "to the baseline; the gate did not go red" >&2
+          "to the baseline; the gate did not go red" >&2
     failures=$((failures + 1))
   else
     amv=$(grep -oE '^meta_version=[0-9]+' "$WORK/armed.out" | head -1 | cut -d= -f2)
@@ -494,7 +494,7 @@ HEAD_REV="$(git rev-parse HEAD)"
 arm2_red=0
 if [[ "$HEAD_REV" == "$PIN_REV" ]]; then
   echo "ARM-FAIL: HEAD is the pinned baseline revision, so this arm cannot" \
-       "distinguish anything" >&2
+        "distinguish anything" >&2
   failures=$((failures + 1))
 else
   # (a) the revision check must reject it, and
@@ -507,13 +507,13 @@ else
   if [[ $found_sym -eq 1 ]]; then arm2_red=$((arm2_red + 1)); fi
   if [[ $arm2_red -eq 2 ]]; then
     echo "RED: a baseline taken from HEAD is rejected on BOTH grounds —" \
-         "revision $HEAD_REV != pinned $PIN_REV, and the tree carries this" \
-         "campaign's symbols"
+          "revision $HEAD_REV != pinned $PIN_REV, and the tree carries this" \
+          "campaign's symbols"
     redarms=$((redarms + 1))
   else
     echo "ARM-FAIL: a baseline taken from HEAD was not rejected on both" \
-         "grounds (score $arm2_red of 2); the driver would compare a binary" \
-         "with itself" >&2
+          "grounds (score $arm2_red of 2); the driver would compare a binary" \
+          "with itself" >&2
     failures=$((failures + 1))
   fi
 fi
