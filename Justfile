@@ -48,7 +48,8 @@ test-nim:
 # The codetracer-ci sender writes each object by the route its upload session
 # names, into a real MinIO with a stand-in of codetracer-ci's upload routes
 # (`tests/test_managed_sender_ci_routes.nim`; the dev shell provides `minio`
-# and `python3`). Not in the nimble task, like `tests/test_managed_sender.nim`.
+# and `python3`). The nimble `test` task (so `just test`) runs it on every host
+# but Windows; this recipe runs it alone.
 test-managed-sender-ci-routes:
     nim c -r -d:release -p:src -o:build/test-bin/test_managed_sender_ci_routes tests/test_managed_sender_ci_routes.nim
 

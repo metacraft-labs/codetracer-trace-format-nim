@@ -222,6 +222,12 @@
             # pcre directly instead of relying on a run-time library search.
             CT_PCRE_LIB_DIR = "${pkgs.pcre.out}/lib";
 
+            # Consumed by `repro.nim`'s `test_managed_sender_ci_routes` edge, which
+            # hands them to the test as `MINIO_BIN` / `PYTHON3_BIN`: a test action's
+            # PATH holds only the provisioned tools, not this shell's packages.
+            CT_MINIO_BIN = "${pkgs.minio}/bin/minio";
+            CT_PYTHON3_BIN = "${pkgs.python3}/bin/python3";
+
             # EVERYTHING THIS HOOK WRITES IS ANCHORED TO THIS REPOSITORY, never
             # to the directory the shell happens to be entered from.
             # A git-hooks installer writes its pre-commit hook into whatever

@@ -150,6 +150,12 @@ task test, "Run all tests":
   # that fails.
   when defined(linux):
     exec "nim c -r -p:src tests/test_close_reports_final_flush_failure.nim"
+  # The codetracer-ci sender writes each object by the route its upload
+  # session names, into a real MinIO with a Python stand-in of codetracer-ci's
+  # upload routes (the dev shell provides `minio` and `python3`). POSIX only:
+  # the test interposes `connect` through dlfcn and signals itself.
+  when not defined(windows):
+    exec "nim c -r -d:release -p:src tests/test_managed_sender_ci_routes.nim"
   exec "nim c -r tests/test_meta_dat.nim"
   # The writer writes the MCR, replay-launch and layout blocks it is given.
   exec "nim c -r tests/test_writer_meta_blocks.nim"

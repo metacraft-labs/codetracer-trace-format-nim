@@ -56,7 +56,8 @@
 ##   the dev shell provides it), on a private bucket: an unsigned PUT to it is
 ##   refused (checked), so an accepted upload came through a valid signature.
 ## - codetracer-ci's three upload routes are a stand-in
-##   (tests/support/ci_upload_standin.py, run with `python3`). Justification:
+##   (tests/support/ci_upload_standin.py, run with `PYTHON3_BIN`, else
+##   `python3` on PATH; the dev shell provides it). Justification:
 ##   codetracer-ci is a .NET service this repository cannot build or run, and
 ##   what is under test here is the sender's side of the routes as
 ##   http-api.md defines them. The stand-in presigns with AWS Signature
@@ -81,6 +82,10 @@
 ##   own `ManagedUploadCiTokenTests` check the method each store names.
 ##
 ## A missing MinIO or python3 fails the test; it never passes without them.
+## Under `repro test` the two variables are set from the dev shell's
+## `CT_MINIO_BIN` and `CT_PYTHON3_BIN` (`repro.nim`), because a test action's
+## PATH holds only the provisioned tools; a variable that names no file is
+## an error, never a fallback to PATH.
 
 import std/[json, net, os, osproc, httpclient, options, random, streams, strtabs, strutils, times, unittest]
 from std/posix import nil
@@ -322,6 +327,19 @@ var handledSignals: int
 proc countSignal(sig: cint) {.noconv.} =
   inc handledSignals
 
+type SignalHandler = proc (sig: cint) {.noconv.}
+  ## C's `sighandler_t`.
+
+proc installSignalHandler(sig: cint, handler: SignalHandler): SignalHandler
+    {.importc: "signal", header: "<signal.h>".}
+  ## C's `signal()` itself (https://man7.org/linux/man-pages/man2/signal.2.html),
+  ## the call std/posix's `signal` makes. It is bound here rather than called
+  ## through std/posix because that binding's return type differs between the
+  ## Nim releases this repository builds with: Nim 2.2.4 (the compiler
+  ## `repro test --tool-provisioning=nix` provisions) declares it with no
+  ## result, so `discard posix.signal(...)` does not compile there, while 2.2.8
+  ## (the dev shell's) returns the previous handler.
+
 proc signalThisProcessAfter(ms: int): Process =
   ## A separate process sends this one SIGUSR1 `ms` milliseconds from now: a
   ## process-directed signal, as `kill` from a stop script is, delivered
@@ -548,7 +566,8 @@ try:
       check once.err.retryable
       check "HTTP 503" in once.err.message
   suite "codetracer-ci sender under a handled signal":
-    discard posix.signal(posix.SIGUSR1, countSignal)
+    let previous = installSignalHandler(posix.SIGUSR1, countSignal)
+    doAssert previous != posix.SIG_ERR, "SIGUSR1 handler not installed"
 
     test "a slice write whose wait a signal interrupts is repeated, and the object is stored":
       # The stand-in answers the first write 2 s after it arrives; SIGUSR1

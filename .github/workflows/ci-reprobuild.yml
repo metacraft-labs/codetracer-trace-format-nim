@@ -215,6 +215,11 @@ jobs:
             test -d "$CT_ZSTD_LIB_DIR"
             [[ "${CT_PCRE_LIB_DIR:?missing owning PCRE library}" =~ ^/nix/store/[a-z0-9]{32}-[^[:space:]]+/lib$ ]]
             test -f "$CT_PCRE_LIB_DIR/libpcre.so" || test -f "$CT_PCRE_LIB_DIR/libpcre.dylib"
+            # test_managed_sender_ci_routes runs these two from the owning shell.
+            [[ "${CT_MINIO_BIN:?missing owning MinIO binary}" =~ ^/nix/store/[a-z0-9]{32}-[^[:space:]]+/bin/minio$ ]]
+            test -x "$CT_MINIO_BIN"
+            [[ "${CT_PYTHON3_BIN:?missing owning python3 binary}" =~ ^/nix/store/[a-z0-9]{32}-[^[:space:]]+/bin/python3$ ]]
+            test -x "$CT_PYTHON3_BIN"
             pkg_config_dir="${CT_ZSTD_INCLUDE_DIR%/include}/lib/pkgconfig"
             test -f "$pkg_config_dir/libzstd.pc"
             for key in CT_NIM_STEW_SRC CT_NIM_RESULTS_SRC CT_NIM_UNITTEST2_SRC; do
@@ -225,6 +230,7 @@ jobs:
             done
             printf "CT_ZSTD_INCLUDE_DIR=%s\nCT_ZSTD_LIB_DIR=%s\nCT_PCRE_LIB_DIR=%s\nPKG_CONFIG_PATH=%s\n" \
               "$CT_ZSTD_INCLUDE_DIR" "$CT_ZSTD_LIB_DIR" "$CT_PCRE_LIB_DIR" "$pkg_config_dir" >> "$GITHUB_ENV"
+            printf "CT_MINIO_BIN=%s\nCT_PYTHON3_BIN=%s\n" "$CT_MINIO_BIN" "$CT_PYTHON3_BIN" >> "$GITHUB_ENV"
           '
 
       - name: Acquire complete locked Nim source dependencies (Windows)
