@@ -16,12 +16,16 @@
 ## does not begin with the CTFS magic — one too short to hold it, empty
 ## included, or a longer one whose first bytes are something else — is refused
 ## with an error naming it, never a defect.
+##
+## Its root directory, and `rootMembers`, end where the header says: a
+## caller's larger entry count does not read a data block as entries.
 
 import std/[os, strutils]
 import results
 import codetracer_ctfs/types
 import codetracer_ctfs/container
 import codetracer_ctfs/compact
+import codetracer_ctfs/base40
 import codetracer_ctfs/member_view
 
 proc patterned(n: int, seed: int): seq[byte] =
@@ -178,3 +182,51 @@ block a_file_without_the_ctfs_magic_is_refused:
     doAssert "not a CTFS container: " in r.error and path in r.error,
       what & ": " & r.error
   echo "PASS a_file_without_the_ctfs_magic_is_refused"
+
+block the_root_directory_ends_where_the_header_says:
+  # `rootMembers` and the root read of an image read from its file stop at
+  # the root directory the header declares, whatever count the caller passes
+  # -- as `findFileEntryKey` does (`ctfs-container.md` §1: `MaxRootEntries`
+  # sizes the root). At a 1024-byte block and a declared root of one entry,
+  # slot 42 of a 170-entry scan (16 + 42 * 24 = 1024) lies over block 1, the
+  # data block of "real", whose bytes 16..23 carry the name word "fake" and
+  # whose bytes 0..7 a `Size` of 0x0807060504030201. A scan past the root
+  # would list "fake" as a member, and a follower's refresh would compare
+  # that "member"'s size across reads.
+  const smallBlock = 1024'u32
+  const callerCount = 170'u32
+  var fake = newSeq[byte](24)
+  for i in 0 ..< 8: fake[i] = byte(i + 1)
+  writeU64LE(fake, 16, base40Encode("fake"))
+  var c = createCtfs(blockSize = smallBlock, maxRootEntries = 1)
+  var real = c.addFile("real").get()
+  doAssert c.writeToFile(real, fake).isOk
+  let whole = c.toBytes()
+  doAssert headerRootEntryCount(whole) == 1
+  # Control: the name word really lies where a 170-entry scan reaches.
+  doAssert readU64LE(whole, 16 + 42 * FileEntrySize + 16) ==
+    base40Encode("fake"), "the planted name word is not at slot 42"
+  proc names(members: seq[tuple[name, size: uint64]]): seq[string] =
+    for m in members: result.add base40Decode(m.name)
+  doAssert names(rootMembers(whole, callerCount)) == @["real"],
+    "rootMembers read past the declared root: " &
+    $names(rootMembers(whole, callerCount))
+  doAssert names(rootMembers(whole, 0'u32)) == @["real"]
+  # An image read from its file reads the declared root, block 0, and not
+  # the data block a 170-entry scan would reach -- at the open and at a
+  # refresh.
+  let path = tempPath("small-root.ct")
+  writeFile(path, cast[string](whole))
+  defer: removeFile(path)
+  let image = openFileImage(path, smallBlock, callerCount).get()
+  doAssert image.readsFromFile
+  doAssert image.blocksRead == 1,
+    "the open read " & $image.blocksRead & " blocks for a one-block root"
+  doAssert image.refresh(callerCount).isOk
+  doAssert image.blocksRead == 1,
+    "the refresh read " & $image.blocksRead & " blocks for a one-block root"
+  doAssert names(rootMembers(image.bytes, callerCount)) == @["real"]
+  doAssert viewMember(image, "real", smallBlock, callerCount).get().contents().get() ==
+    fake
+  doAssert viewMember(image, "fake", smallBlock, callerCount).isErr
+  echo "PASS the_root_directory_ends_where_the_header_says"

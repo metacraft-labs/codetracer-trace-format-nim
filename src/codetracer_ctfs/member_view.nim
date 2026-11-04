@@ -179,22 +179,29 @@ proc blocksRead*(image: ContainerImage): int =
 proc isLoaded(image: ContainerImage, at: int): bool {.inline.} =
   not image.readsFromFile or image.loaded[at div image.blockSize]
 
-proc rootEnd(d: openArray[byte], maxEntries: uint32): int =
+proc rootEnd(d: openArray[byte]): int =
   ## Where the root directory of the container image `d` ends: the entry
-  ## array after the header, as many entries as the header or the reader
-  ## allows, whichever is more, and no further than the image. A declared `0`
-  ## is the auto-filled root (`ctfs-container.md` §1, "Auto-fill").
+  ## array after the header, as many entries as the header declares, and no
+  ## further than the image. A declared `0` is the auto-filled root
+  ## (`ctfs-container.md` §1, "Auto-fill").
+  ##
+  ## The header's count bounds it whatever count a caller passes, as it
+  ## bounds `findFileEntryKey`: the root directory is fixed at creation
+  ## (§1), and a slot past it lies in a data block once a caller's count
+  ## reaches past block 0. A member's bytes there would otherwise read as
+  ## entries: a phantom member in `rootMembers`, and a data block read, twice,
+  ## as part of the root by `loadRoot`.
   let base = containerHeaderSize(d)
   let declared = headerRootEntryCount(d)
-  int(min(uint64(base) + uint64(max(declared, maxEntries)) *
-    uint64(FileEntrySize), uint64(d.len)))
+  int(min(uint64(base) + uint64(declared) * uint64(FileEntrySize),
+    uint64(d.len)))
 
-proc loadRoot(image: ContainerImage, maxEntries: uint32): Result[void, string] =
+proc loadRoot(image: ContainerImage): Result[void, string] =
   ## Read the root directory of an image read from its file, under §6's
   ## reader protocol: from the live coordination page's root mirror when the
   ## image is attached; otherwise from the file twice, until both reads agree
   ## (the torn-read rule of a reader that cannot attach).
-  let n = rootEnd(image.bytes, maxEntries)
+  let n = rootEnd(image.bytes)
   when fileImages:
     if image.readsFromFile:
       var accepted = false
@@ -232,10 +239,12 @@ proc loadRoot(image: ContainerImage, maxEntries: uint32): Result[void, string] =
 proc rootMembers*(d: openArray[byte], maxEntries: uint32):
     seq[tuple[name, size: uint64]] =
   ## The root directory of the container image `d`: each populated entry's
-  ## base40 name and `Size`, in slot order.
+  ## base40 name and `Size`, in slot order. The directory is the one the
+  ## header declares (`rootEnd`); `maxEntries` does not extend it.
   let base = containerHeaderSize(d)
+  let rootStop = rootEnd(d)
   var at = base
-  while at + FileEntrySize <= rootEnd(d, maxEntries):
+  while at + FileEntrySize <= rootStop:
     var size, name = 0'u64
     for i in 0 ..< 8:
       size = size or (uint64(d[at + i]) shl (8 * i))
@@ -256,6 +265,8 @@ when fileImages:
     ## A file that does not begin with the CTFS magic is refused, with an
     ## error naming it: one shorter than the magic (an empty one included)
     ## before a byte of it is read, any other once its first block is.
+    ## The root directory read is the one the header declares, whatever
+    ## `maxEntries` says (`rootEnd`).
     var f: File
     if not open(f, path, fmRead):
       return err("failed to read file: " & path)
@@ -300,7 +311,7 @@ when fileImages:
     if page.isOk:
       image.page = page.get()
       image.attached = true
-    ? image.loadRoot(maxEntries)
+    ? image.loadRoot()
     ok(image)
 
 when fileImages:
@@ -313,6 +324,7 @@ when fileImages:
     ## appended to it -- a member's last block, a mapping block -- so every
     ## block is read again when it is next asked for; nothing is read now but
     ## the root directory. A file that shrank is refused.
+    ## As at the open, the root read is the header's (`rootEnd`).
     if not image.readsFromFile:
       return err("this container image is held whole, not read from its file")
     var size: int64
@@ -326,7 +338,7 @@ when fileImages:
     image.bytes.setLen(int(size))
     image.loaded = newSeq[bool](image.bytes.len div image.blockSize +
       ord(image.bytes.len mod image.blockSize != 0))
-    image.loadRoot(maxEntries)
+    image.loadRoot()
 
 proc init(image: ContainerImage, runs: sink seq[MemberRun]): MemberView =
   result = MemberView(image: image, runs: runs)
