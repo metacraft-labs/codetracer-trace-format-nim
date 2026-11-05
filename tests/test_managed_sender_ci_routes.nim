@@ -548,7 +548,9 @@ try:
       check once.err.retryable
       check "HTTP 503" in once.err.message
   suite "codetracer-ci sender under a handled signal":
-    discard posix.signal(posix.SIGUSR1, countSignal)
+    # Nim 2.2.4 declares signal without a return value; newer versions
+    # return the previous handler as discardable. A statement supports both.
+    posix.signal(posix.SIGUSR1, countSignal)
 
     test "a slice write whose wait a signal interrupts is repeated, and the object is stored":
       # The stand-in answers the first write 2 s after it arrives; SIGUSR1
