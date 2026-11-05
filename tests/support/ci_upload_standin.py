@@ -45,6 +45,13 @@ answers nothing it would act on); `busy:<seconds>` answers
 503 upload_session_busy with `Retry-After: <seconds>`; `finalizing` answers
 409 upload_finalizing; `mismatch` answers 409 slice_content_mismatch without
 checking (http-api.md, "POST /api/v1/traces/{sessionId}/finalize").
+`accept` records the actual session and manifest and answers 204 without
+reading storage. Only the timeout-retry semantic case uses it: the separate
+GET /_test/verify-accepted-finalize then performs the same manifest check
+against real storage outside the short finalize timeout. This separates a
+scripted successful retry from object-store latency without dropping the
+uploaded-byte proof. --slow-object-reads SECONDS delays every object read
+to exercise that separation even on an otherwise idle host.
 
 --redirect ROUTE=STATUS answers every call of one route with that 3xx status
 and `Location: <--redirect-to><request path>` instead of serving it, for the
@@ -130,6 +137,7 @@ class Store:
         self.requests: list[dict] = []
         self.sessions: dict[str, dict] = {}
         self.read_back: dict[str, dict] = {}
+        self.accepted_finalize: tuple[dict, dict] | None = None
         self.finalize_script: list[str] = [
             step for step in (args.finalize_script or "").split(",") if step]
         self.redirects: dict[str, int] = {}
@@ -142,6 +150,7 @@ class Store:
         return presign(method, a.minio_url, f"/{a.bucket}/{key}", a.access_key, a.secret_key)
 
     def read_object(self, key: str) -> bytes | None:
+        time.sleep(self.args.slow_object_reads)
         if self.args.method == "presigned-url":
             try:
                 with urlopen(self.s3_url("GET", key), timeout=30) as response:
@@ -150,6 +159,22 @@ class Store:
                 return None
         path = Path(self.args.local_root) / key
         return path.read_bytes() if path.is_file() else None
+
+    def check_manifest(self, session: dict, manifest: dict) -> bool:
+        """Check the sender's manifest against the actual stored bytes."""
+        ok = bool(manifest.get("mcrSlices"))
+        for entry in manifest.get("mcrSlices", []):
+            key = entry["sliceKey"]
+            stored = self.read_object(key)
+            seen = None if stored is None else {
+                "length": len(stored), "sha256": hashlib.sha256(stored).hexdigest()}
+            with self.lock:
+                self.read_back[key] = seen
+            if (not key.startswith(session["prefix"]) or seen is None
+                    or seen["length"] != entry.get("contentLength")
+                    or f"sha256:{seen['sha256']}" != entry.get("contentHash")):
+                ok = False
+        return ok
 
 
 def make_handler(store: Store):
@@ -213,6 +238,14 @@ def make_handler(store: Store):
             elif path == "/_test/objects":
                 with store.lock:
                     self.answer(200, store.read_back)
+            elif path == "/_test/verify-accepted-finalize":
+                with store.lock:
+                    accepted = store.accepted_finalize
+                # No accepted request must fail, rather than vacuously
+                # claiming that an empty collection of manifests is valid.
+                ok = accepted is not None and store.check_manifest(*accepted)
+                with store.lock:
+                    self.answer(200, {"ok": ok, "objects": store.read_back})
             else:
                 self.problem(404, "not_found")
 
@@ -297,18 +330,12 @@ def make_handler(store: Store):
                 if kind == "slow":
                     time.sleep(float(arg))
                 manifest = json.loads(data)["recordingManifest"]
-                ok = bool(manifest.get("mcrSlices"))
-                for entry in manifest.get("mcrSlices", []):
-                    key = entry["sliceKey"]
-                    stored = store.read_object(key)
-                    seen = None if stored is None else {
-                        "length": len(stored), "sha256": hashlib.sha256(stored).hexdigest()}
+                if kind == "accept":
                     with store.lock:
-                        store.read_back[key] = seen
-                    if (not key.startswith(session["prefix"]) or seen is None
-                            or seen["length"] != entry.get("contentLength")
-                            or f"sha256:{seen['sha256']}" != entry.get("contentHash")):
-                        ok = False
+                        store.accepted_finalize = (session, manifest)
+                    self.answer(204)
+                    return
+                ok = store.check_manifest(session, manifest)
                 try:
                     if ok:
                         self.answer(204)
@@ -409,6 +436,7 @@ def main() -> int:
     parser.add_argument("--fail-upload-urls", type=int, default=0)
     parser.add_argument("--fail-sessions", type=int, default=0)
     parser.add_argument("--slow-local-writes", type=float, default=0.0)
+    parser.add_argument("--slow-object-reads", type=float, default=0.0)
     parser.add_argument("--redirect", action="append", default=[])
     parser.add_argument("--redirect-to", default="")
     parser.add_argument("--sink", action="store_true")

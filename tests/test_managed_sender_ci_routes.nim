@@ -65,7 +65,13 @@
 ##   reads back from the store has the length and SHA-256 the manifest
 ##   declares. For the retry tests it can also answer the first finalize
 ##   calls slowly or with the refusals http-api.md defines for them
-##   (`--finalize-script`), and refuse the first slice-upload-url calls
+##   (`--finalize-script`). The timeout-retry case scripts the retry's 204
+##   without reading storage: a real MinIO read is not the retry semantics
+##   under test and must not consume its 1 s request timeout. It then checks
+##   the actual accepted manifest against the real stored bytes separately,
+##   with deliberately slow object reads and no request timeout on that check.
+##   The ordinary route cases still validate storage before finalizing.
+##   It can also refuse the first slice-upload-url calls
 ##   (`--fail-upload-urls`): the real Monolith produces those answers only
 ##   under load or contention a test cannot schedule. For the redirect tests
 ##   it answers one route with a 3xx (`--redirect`), and stands in for the
@@ -171,7 +177,8 @@ var standins: seq[Process]
 
 proc startStandin(name, methodName: string, wrongKey = false, badSignature = false,
     finalizeScript = "", failUploadUrls = 0, slowLocalWrites = 0.0,
-    failSessions = 0, redirects: openArray[string] = [], redirectTo = ""): Running =
+    failSessions = 0, redirects: openArray[string] = [], redirectTo = "",
+    slowObjectReads = 0.0): Running =
   let portFile = work / (name & ".port")
   var args = @[standinScript, "--port-file", portFile,
     "--token", Token, "--method", methodName, "--minio-url", minioUrl,
@@ -187,6 +194,8 @@ proc startStandin(name, methodName: string, wrongKey = false, badSignature = fal
     args.add ["--fail-upload-urls", $failUploadUrls]
   if slowLocalWrites > 0:
     args.add ["--slow-local-writes", $slowLocalWrites]
+  if slowObjectReads > 0:
+    args.add ["--slow-object-reads", $slowObjectReads]
   if failSessions > 0:
     args.add ["--fail-sessions", $failSessions]
   for r in redirects:
@@ -238,8 +247,8 @@ proc backendFor(standin: Running, finalizeTimeoutMs = 0): CodetracerCiSenderBack
     bearerToken: Token, platform: "native", serviceName: "inventory", instanceId: "ct-mcr",
     finalizeTimeoutMs: finalizeTimeoutMs))
 
-proc getJson(standin: Running, path: string): JsonNode =
-  let client = newHttpClient(timeout = 10_000)
+proc getJson(standin: Running, path: string, timeoutMs = 10_000): JsonNode =
+  let client = newHttpClient(timeout = timeoutMs)
   try:
     parseJson(client.getContent("http://127.0.0.1:" & $standin.port & path))
   finally:
@@ -462,7 +471,11 @@ try:
       check standin.finalizeTimes().len == 1
 
     test "a finalize slower than its timeout is retried, and the retry finalizes":
-      let standin = startStandin("slow-retry", SliceUploadPresignedUrl, finalizeScript = "slow:3")
+      # Storage is intentionally slower than the 1 s finalize timeout.
+      # The successful retry is scripted; real byte verification follows
+      # outside that timeout, over the manifest the sender actually sent.
+      let standin = startStandin("slow-retry", SliceUploadPresignedUrl,
+        finalizeScript = "slow:3,accept", slowObjectReads = 1.5)
       let up = uploadTwoSlices(standin, "slow-retry", finalizeTimeoutMs = 1000)
       var state = up.state
       let finalized = state.tryFinalizeManagedUpload(up.backend, finalizeRequest(receiptsOf(up)), quickRetries())
@@ -470,9 +483,12 @@ try:
       check finalized.err.message == ""
       check standin.finalizeTimes().len == 2
       check state.finalized
-      # The retry's check read every slice back with the uploaded bytes.
-      let objects = standin.getJson("/_test/objects")
+      let verified = standin.getJson("/_test/verify-accepted-finalize", timeoutMs = -1)
+      check verified["ok"].getBool()
+      let objects = verified["objects"]
+      check objects.len == up.items.len
       for i, r in up.results:
+        check objects[r.receipt.objectKey]["length"].getInt() == int(up.items[i].contentLength)
         check objects[r.receipt.objectKey]["sha256"].getStr() == up.items[i].sha256
 
     test "503 upload_session_busy and 409 upload_finalizing are retried, Retry-After honored":
