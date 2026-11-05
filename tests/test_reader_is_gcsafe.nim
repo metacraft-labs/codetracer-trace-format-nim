@@ -15,15 +15,19 @@
 ## as well as the default memory manager, since consumers build with both; it
 ## then runs the procs over a container written by this repository's writer,
 ## so the calls are exercised and not only type-checked.
+##
+## Two real copies of this binary also run with the same temporary root. Each
+## announces readiness only after opening its writer and waits on stdin, so
+## the second writer must open while the first remains live. This recreates
+## concurrent test runs without sleeps, mocks or touching another run's files.
+## Both copies must finish the original reader checks and remove their own
+## fixture directories.
 
-import std/[os, assertions]
+import std/[os, assertions, osproc, streams, strtabs, strutils, tempfiles]
 import results
 import codetracer_trace_writer/multi_stream_writer
 import codetracer_trace_writer/new_trace_reader
 import codetracer_ctfs/live_page
-
-let dir = getTempDir() / "ctfnim-reader-is-gcsafe"
-createDir(dir)
 
 proc openTrace(path: string): Result[NewTraceReader, string] {.gcsafe.} =
   openNewTrace(path)
@@ -51,8 +55,15 @@ proc firstCall(r: var NewTraceReader):
   let file = ? r.path(pos.file)
   ok((name, file, pos.line))
 
-proc writeTrace(name: string): string =
+proc writeTrace(dir, name: string, holdWriter: bool): string =
   var w = initMultiStreamWriter(dir / name & ".build", name).get()
+  defer:
+    let closed = w.closeCtfs()
+    doAssert closed.isOk, "closeCtfs: " & closed.error
+  if holdWriter:
+    echo "READY:" & dir
+    stdout.flushFile()
+    doAssert stdin.readLine() == "continue"
   doAssert w.enableColumnAwareSteps().isOk
   let p = w.registerPath("/src/app.py", [10'u32, 10, 10])
   doAssert p.isOk, p.error
@@ -66,10 +77,8 @@ proc writeTrace(name: string): string =
   doAssert closed.isOk, "close: " & closed.error
   result = dir / name & ".ct"
   writeFile(result, cast[string](w.toBytes()))
-  discard w.closeCtfs()
 
-proc test_the_reader_entry_points_run_from_gcsafe_procs() =
-  let file = writeTrace("gcsafe")
+proc checkReader(file: string) {.noinline.} =
   let handle = open(file, fmRead)
   let page = attachPage(handle)
   close(handle)
@@ -83,6 +92,67 @@ proc test_the_reader_entry_points_run_from_gcsafe_procs() =
   var fromBytes = openBytes(cast[seq[byte]](readFile(file)))
   doAssert fromBytes.isOk, "openNewTraceFromBytes: " & fromBytes.error
   doAssert firstCall(fromBytes.get()) == got
+
+proc test_the_reader_entry_points_run_from_gcsafe_procs(holdWriter = false) =
+  # Both memory-manager builds and other checkouts can run at the same time.
+  # Atomic creation gives this invocation sole ownership of its whole fixture.
+  let dir = createTempDir("ctfnim-reader-is-gcsafe-", "")
+  defer: removeDir(dir)
+  let file = writeTrace(dir, "gcsafe", holdWriter)
+  checkReader(file)
+  when defined(gcRefc):
+    # The reader's file belongs to its shared ContainerImage. Release every
+    # reader reference by returning from checkReader before collecting refc's
+    # deferred finalizers; Windows cannot remove a still-open fixture file.
+    GC_fullCollect()
   echo "PASS: test_the_reader_entry_points_run_from_gcsafe_procs"
 
-test_the_reader_entry_points_run_from_gcsafe_procs()
+proc test_concurrent_reader_fixtures_are_isolated() =
+  let sharedTemp = createTempDir("ctfnim-reader-concurrent-", "")
+  defer: removeDir(sharedTemp)
+  var env = newStringTable(
+    when defined(windows): modeCaseInsensitive else: modeCaseSensitive)
+  for key, value in envPairs():
+    env[key] = value
+  # Windows consults TMP/TEMP; POSIX consults TMPDIR first.
+  for key in ["TMPDIR", "TMP", "TEMP"]:
+    env[key] = sharedTemp
+  var children: seq[Process]
+  var dirs: seq[string]
+  var outputs: seq[string]
+  var codes: seq[int]
+  try:
+    for i in 0 ..< 2:
+      let child = startProcess(getAppFilename(), args = ["--worker"], env = env)
+      children.add(child)
+      let ready = child.outputStream.readLine()
+      doAssert ready.startsWith("READY:"),
+        "worker failed before opening its writer:\n" & ready & "\n" &
+        child.outputStream.readAll()
+      dirs.add(ready["READY:".len .. ^1])
+      doAssert dirExists(dirs[^1]), "worker announced a missing fixture"
+    doAssert dirs[0] != dirs[1], "concurrent workers share a fixture directory"
+  finally:
+    # Release even the first worker when the second fails. Let it close its
+    # real coordination page normally rather than leaving an abandoned writer.
+    for child in children:
+      if child.running():
+        child.inputStream.writeLine("continue")
+        child.inputStream.flush()
+    for child in children:
+      outputs.add(child.outputStream.readAll())
+      codes.add(child.waitForExit())
+      child.close()
+  for i in 0 ..< children.len:
+    doAssert codes[i] == 0, "worker exited " & $codes[i] & ":\n" & outputs[i]
+    doAssert "PASS: test_the_reader_entry_points_run_from_gcsafe_procs" in outputs[i],
+      "worker did not finish the reader checks:\n" & outputs[i]
+  for dir in dirs:
+    doAssert not dirExists(dir), "worker left its fixture behind: " & dir
+  echo "PASS: test_concurrent_reader_fixtures_are_isolated"
+
+if commandLineParams() == @["--worker"]:
+  test_the_reader_entry_points_run_from_gcsafe_procs(holdWriter = true)
+else:
+  test_the_reader_entry_points_run_from_gcsafe_procs()
+  test_concurrent_reader_fixtures_are_isolated()
