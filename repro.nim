@@ -112,7 +112,8 @@ type
     ## thing.
     ##   * ``source`` — repo-relative ``.nim`` path.
     ##   * ``binary`` — ``build/test-bin/<stem>`` output. A file the nimble
-    ##     task compiles twice (``test_reader_is_gcsafe``, once per memory
+    ##     task compiles twice (``test_reader_is_gcsafe`` and
+    ##     ``test_container_writer_is_gcsafe``, once per memory
     ##     manager) has one entry per build, with distinct binaries.
     ##   * ``pool`` — run the EXECUTE edge in this capacity-1 pool: the
     ##     cross-read tests share the sibling Rust target dir
@@ -277,6 +278,8 @@ const testSpecs: seq[TestSpec] = @[
   # nimble `test` task compiles it.
   TestSpec(source: "tests/test_reader_is_gcsafe.nim", binary: "build/test-bin/test_reader_is_gcsafe"),
   TestSpec(source: "tests/test_reader_is_gcsafe.nim", binary: "build/test-bin/test_reader_is_gcsafe_refc", mm: "refc"),
+  TestSpec(source: "tests/test_container_writer_is_gcsafe.nim", binary: "build/test-bin/test_container_writer_is_gcsafe"),
+  TestSpec(source: "tests/test_container_writer_is_gcsafe.nim", binary: "build/test-bin/test_container_writer_is_gcsafe_refc", mm: "refc"),
   TestSpec(source: "tests/test_golden_fixtures.nim", binary: "build/test-bin/test_golden_fixtures"),
   TestSpec(source: "tests/test_cross_compat.nim", binary: "build/test-bin/test_cross_compat"),
   TestSpec(source: "tests/test_xxh64.nim", binary: "build/test-bin/test_xxh64"),

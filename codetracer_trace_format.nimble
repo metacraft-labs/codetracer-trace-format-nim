@@ -133,6 +133,10 @@ task test, "Run all tests":
   # inferred GC-safety. refc too, because consumers build with it.
   exec "nim c -r -p:src tests/test_reader_is_gcsafe.nim"
   exec "nim c -r -p:src --mm:refc tests/test_reader_is_gcsafe.nim"
+  # The same for the container writer's entry points (`publish`, every seal,
+  # `createCtfsStreaming`, `closeCtfs`).
+  exec "nim c -r -p:src tests/test_container_writer_is_gcsafe.nim"
+  exec "nim c -r -p:src --mm:refc tests/test_container_writer_is_gcsafe.nim"
   # The same §5d bound in the *other* Nim transcription of the §4 walk:
   # `codetracer_trace_reader.nim`'s own `readInternalFile`. It bounded byte
   # offsets only, and read a null mapping root as a walk through block 0 —

@@ -1121,7 +1121,10 @@ proc claimWriterSlot(p: LivePage): Result[int, string] =
     " writer slots are taken (a page has 16, so at most 15 producer " &
     "processes beside the coordinator)")
 
-proc closeLivePage*(p: LivePage)
+proc closeLivePage*(p: LivePage) {.gcsafe.}
+  ## `createLivePage` calls this before its body below. State the effect here
+  ## so that the writer's inferred GC-safety does not depend on declaration
+  ## order; Nim still checks the implementation against it.
 
 proc slotLiveness(mode: LivePageMode): uint64 =
   ## The arm `inguest-heartbeat-liveness` marks an in-guest slot with the

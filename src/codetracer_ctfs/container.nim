@@ -505,7 +505,11 @@ proc interningSetRefusal*(c: Ctfs): string =
 
 proc readMemberBytes*(data: openArray[byte], name: string,
     fileSize: uint64, mapBlock: uint64,
-    blockSize: uint32): Result[seq[byte], string]
+    blockSize: uint32): Result[seq[byte], string] {.gcsafe.}
+  ## `entryItem`, and through it `publish`, calls this before its body
+  ## below. State the effect here so that the writer's inferred GC-safety
+  ## does not depend on declaration order; Nim still checks the
+  ## implementation against it.
 
 proc flushDirtyData*(c: var Ctfs) =
   ## Hand every block written since the last publication, outside the root
