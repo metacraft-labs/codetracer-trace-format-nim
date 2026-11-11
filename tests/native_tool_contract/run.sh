@@ -29,8 +29,11 @@
 # Run from the owning dev shell (`just test-native-tool-contract`): it needs
 # `repro` and `nix` on PATH, and forwards CT_NIM_STEW_SRC / CT_NIM_RESULTS_SRC
 # so the compile finds the pinned Nim sources a recorder gets from its cargo
-# build's `nimble install` instead. POSIX only: the Windows constructors take
-# zstd through explicit paths and are not covered by this contract.
+# build's `nimble install` instead. POSIX only, because it provisions through
+# Nix. `buildCtPrint`'s Windows contract is the same (`gcc` and `zstd-dev`,
+# realized there as a MinGW static `libzstd.a`), and the recorders' Windows CI
+# legs are what exercise it; `buildSharedLib` still takes zstd through
+# explicit paths on Windows.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

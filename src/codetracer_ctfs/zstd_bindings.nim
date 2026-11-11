@@ -24,7 +24,17 @@ when defined(windows):
     {.passL: quoteShell(ctZstdLibraryFile).}
   elif not defined(vcc) and msys2MingwLib.len > 0:
     {.passL: quoteShell(msys2MingwLib / "libzstd.a").}
-  # A consumer SDK may instead supply the complete native flags itself.
+  elif not defined(vcc):
+    # No explicit archive: link zstd the way POSIX does, by name. The
+    # declared development package supplies it, as on POSIX: reprobuild's
+    # ``zstd-dev`` puts its ``include/`` on ``CPATH`` and its ``lib/`` on
+    # ``LIBRARY_PATH``, and on Windows that ``lib/`` holds ``libzstd.a``
+    # alone (no import library, no CRT or pthread archives), so ``-lzstd``
+    # can only bind the static archive. A consumer SDK wrapper must make
+    # ``-lzstd`` resolvable the same way. Without any of these the link fails
+    # by name at ``-lzstd`` rather than on unresolved ``ZSTD_*`` symbols.
+    {.passL: "-lzstd".}
+  # Under MSVC a consumer SDK supplies the complete native flags itself.
   # In that case no undeclared C:\zstd/MSYS2 host path is injected here.
 else:
   {.passL: "-lzstd".}

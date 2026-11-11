@@ -26,15 +26,19 @@
 ##   nim.c adapter and pinned nim.cfg: macOS defaults to clang, other ctPrint
 ##   hosts to gcc. Canonical shared MSVC flags select vccexe.exe, whose
 ##   compiler/linker subprocesses are cl.exe/link.exe.
-## * on POSIX, ``zstd-dev`` (the reprobuild stdlib's Zstandard development
-##   package: ``zstd.h`` and ``libzstd``), because
-##   ``src/codetracer_ctfs/zstd_bindings.nim`` includes ``zstd.h`` and links
-##   ``-lzstd``. It is registered only when the caller does not supply zstd
-##   itself: explicit ``nativeIncludeDir`` / ``nativeLibDir`` /
-##   ``nativeLibraryFile`` (the owning recipe passes its dev shell's
-##   ``CT_ZSTD_*``; on Windows zstd always arrives this way), or
-##   ``compilerSdkRefs``, whose measured compiler wrapper already carries
-##   zstd's headers and link inputs.
+## * ``zstd-dev`` (the reprobuild stdlib's Zstandard development package:
+##   ``zstd.h`` on ``CPATH`` and ``libzstd`` on ``LIBRARY_PATH``), because
+##   ``src/codetracer_ctfs/zstd_bindings.nim`` includes ``zstd.h`` and, given
+##   no explicit archive, links ``-lzstd``. ``buildCtPrint`` names it on every
+##   host: on Windows the package realizes a MinGW static ``libzstd.a``,
+##   which the gcc backend links. ``buildSharedLib`` names it on POSIX only:
+##   its Windows backend is MSVC, which reads neither channel and cannot link
+##   a MinGW archive, so a Windows shared library still takes zstd through
+##   explicit paths. Either constructor registers it only when the caller does
+##   not supply zstd itself: explicit ``nativeIncludeDir`` / ``nativeLibDir``
+##   / ``nativeLibraryFile`` (the owning recipe passes its dev shell's
+##   ``CT_ZSTD_*``), or ``compilerSdkRefs``, whose measured compiler wrapper
+##   already carries zstd's headers and link inputs.
 ##
 ## ``CtPrintToolSelectors`` and ``SharedLibToolSelectors`` export the
 ## selectors for this host. **A consumer must write each of them in its own
@@ -46,9 +50,10 @@
 ## its packaging producers, and exports their selectors as constants for the
 ## same reason). An edge ref the package never declared used to be dropped
 ## without a diagnostic, and the compile then failed far away, at
-## ``zstd.h: No such file or directory``. On POSIX the constructors now
-## refuse such a consumer by name, listing the selectors to add. Windows is
-## not checked: its refs, and what its consumers declare, are unchanged.
+## ``zstd.h: No such file or directory``. The constructors now refuse such a
+## consumer by name, listing the selectors to add: ``buildCtPrint`` on every
+## host, ``buildSharedLib`` on POSIX. ``buildSharedLib``'s Windows refs, and
+## what its Windows consumers declare, are unchanged.
 ##
 ## Optional consumer-declared compiler SDK refs precede the canonical backend
 ## refs, so its measured compiler wrapper supplies native headers/link inputs.
@@ -67,13 +72,21 @@ const
   SharedLibBackendSelectors = (when defined(windows): @["vccexe", "cl", "link"]
                                elif defined(macosx): @["clang"]
                                else: @["gcc"])
-  NativeZstdSelectors =
+  CtPrintZstdSelectors = @[ZstdDevelopmentSelector]
+    ## On Windows too: ``zstd_bindings`` links ``-lzstd`` there when no
+    ## archive is named, and ``zstd-dev``'s Windows realization supplies the
+    ## header and a gcc-linkable ``libzstd.a`` through ``CPATH`` /
+    ## ``LIBRARY_PATH``, as on POSIX.
+  SharedLibZstdSelectors =
     (when defined(windows): newSeq[string]() else: @[ZstdDevelopmentSelector])
-  CtPrintToolSelectors* = CtPrintBackendSelectors & NativeZstdSelectors
+    ## Empty on Windows: the shared library is built by MSVC (``vccexe``),
+    ## which neither reads ``CPATH`` / ``LIBRARY_PATH`` nor links the
+    ## MinGW-built archive ``zstd-dev`` realizes there.
+  CtPrintToolSelectors* = CtPrintBackendSelectors & CtPrintZstdSelectors
     ## Every selector ``buildCtPrint`` names on its edge on this host when the
     ## caller supplies no zstd of its own. A consumer declares each one in
     ## ``uses:`` (module doc, "Native tool contract").
-  SharedLibToolSelectors* = SharedLibBackendSelectors & NativeZstdSelectors
+  SharedLibToolSelectors* = SharedLibBackendSelectors & SharedLibZstdSelectors
     ## The same for ``buildSharedLib``.
 
 proc requireDeclaredInUses(constructor, exportedName: string;
@@ -109,17 +122,18 @@ proc requireDeclaredInUses(constructor, exportedName: string;
     return
 
 proc registerNativeTools(constructor, exportedName, actionId: string;
-                         backendSelectors, compilerSdkRefs: openArray[string];
-                         callerSuppliesZstd: bool) =
+                         backendSelectors, zstdSelectors,
+                         compilerSdkRefs: openArray[string];
+                         callerSuppliesZstd, checkUses: bool) =
   ## Name the native tools the constructor's compile needs on ``actionId``:
-  ## the consumer's SDK refs first, then the C backend, then (POSIX, unless
-  ## the caller supplies zstd through explicit paths or an SDK wrapper)
-  ## ``zstd-dev``. On POSIX the consuming package must have declared the
-  ## constructor's own selectors in ``uses:``.
+  ## the consumer's SDK refs first, then the C backend, then (unless the
+  ## caller supplies zstd through explicit paths or an SDK wrapper)
+  ## ``zstdSelectors``. When ``checkUses`` holds, the consuming package must
+  ## have declared the constructor's own selectors in ``uses:``.
   var selectors = @backendSelectors
-  when not defined(windows):
-    if not callerSuppliesZstd and compilerSdkRefs.len == 0:
-      selectors.add(NativeZstdSelectors)
+  if not callerSuppliesZstd and compilerSdkRefs.len == 0:
+    selectors.add(zstdSelectors)
+  if checkUses:
     requireDeclaredInUses(constructor, exportedName, selectors)
   appendRegisteredActionToolIdentityRefs(actionId, compilerSdkRefs)
   appendRegisteredActionToolIdentityRefs(actionId, selectors)
@@ -189,8 +203,11 @@ proc buildSharedLib*(projectRoot: string;
       projectRoot / "config.nims", projectRoot / "codetracer_trace_format.nimble"] & nativeInputs & nimDependencyDirs,
     extraOutputs = @[output], dependencyPolicy = automaticMonitorPolicy())
   registerNativeTools("buildSharedLib", "SharedLibToolSelectors", result.id,
-    SharedLibBackendSelectors, compilerSdkRefs,
-    callerSuppliesZstd = nativeFlags.len > 0)
+    SharedLibBackendSelectors, SharedLibZstdSelectors, compilerSdkRefs,
+    callerSuppliesZstd = nativeFlags.len > 0,
+    # Its Windows contract names no zstd (``SharedLibZstdSelectors``), so its
+    # Windows consumers are not checked, as before.
+    checkUses = not defined(windows))
 
 proc buildCtPrint*(projectRoot: string;
                    compilerSdkRefs: seq[string] = @[];
@@ -213,7 +230,7 @@ proc buildCtPrint*(projectRoot: string;
   ## edge here.
   ##
   ## The consuming package must declare ``CtPrintToolSelectors`` in its
-  ## ``uses:`` block (on POSIX: the C compiler and ``zstd-dev``), and the
+  ## ``uses:`` block (the C compiler and ``zstd-dev``, on every host), and the
   ## call refuses a package that does not; the module doc's "Native tool
   ## contract" says why the constructor cannot provision them itself.
   doAssert projectRoot.len > 0 and not projectRoot.isAbsolute,
@@ -263,5 +280,6 @@ proc buildCtPrint*(projectRoot: string;
       projectRoot / "build_writer_artifacts.nim"] & nativeInputs & nimDependencyDirs,
     extraOutputs = @[output], dependencyPolicy = automaticMonitorPolicy())
   registerNativeTools("buildCtPrint", "CtPrintToolSelectors", result.id,
-    CtPrintBackendSelectors, compilerSdkRefs,
-    callerSuppliesZstd = nativeFlags.len > 0)
+    CtPrintBackendSelectors, CtPrintZstdSelectors, compilerSdkRefs,
+    callerSuppliesZstd = nativeFlags.len > 0,
+    checkUses = true)
