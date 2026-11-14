@@ -305,26 +305,10 @@ task test, "Run all tests":
   exec "nim c -r -d:release -p:src tests/test_mixed_column_aware_position_space.nim"
   exec "nim c -r -d:release -p:src tests/test_reader_calls_events.nim"
   exec "nim c -r -d:release -p:src tests/test_reader_integration.nim"
-  # The four cross-reads below are declared by this task, so a missing Rust
-  # repo or toolchain FAILS them instead of skipping
-  # (`tests/crossread_prerequisite.nim`). The dev shell supplies both.
-  putEnv("CT_CROSSREAD_REQUIRED", "1")
-  # M24a-1: cross-read proof — a Nim-written production steps.dat is read by
-  # the canonical Rust StepStreamReader (the Rust repo and its toolchain are
-  # required here).
-  exec "nim c -r -d:release -p:src tests/test_nim_step_stream_crossread.nim"
-  # M24a-2: cross-read proof — a Nim-written production values.dat is read by
-  # the canonical Rust ValueStreamReader (the Rust repo and its toolchain are
-  # required here).
-  exec "nim c -r -d:release -p:src tests/test_nim_value_stream_crossread.nim"
-  # M24a-3: cross-read proof — a Nim-written production events.dat is read by
-  # the canonical Rust IoEventStreamReader (the Rust repo and its toolchain
-  # are required here).
-  exec "nim c -r -d:release -p:src tests/test_nim_io_event_stream_crossread.nim"
-  # The Nim and Rust step-map readers answer every lookup alike, a lookup of
-  # line 0 (answered as line 1) included.
-  exec "nim c -r -d:release -p:src tests/test_nim_step_map_crossread.nim"
-  delEnv("CT_CROSSREAD_REQUIRED")
+  # The Nim reader answers a step-map lookup of line 0 as line 1. Holding
+  # this library's bundles against the Rust readers is the job of
+  # codetracer-trace-format-conformance, which depends on both.
+  exec "nim c -r -d:release -p:src tests/test_step_map_line_zero_lookups.nim"
   exec "nim c -r -p:src tests/test_streaming_value_encoder.nim"
   exec "nim c -r -p:src tests/test_value_ref.nim"
   exec "nim c -r -d:release -p:src tests/test_multi_stream_writer.nim"

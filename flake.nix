@@ -6,9 +6,9 @@
       url = "github:metacraft-labs/devops-modules/c8ef41d446e211892fe9775182b43d5d517554ac";
       flake = false;
     };
-    # Same toolchain source as the sibling Rust `codetracer-trace-format`
-    # repo, so the Nim/Rust pair that make up the trace-format layer are
-    # built with one pinned compiler set rather than two.
+    # The toolchain source shared by the CodeTracer trace-format repositories,
+    # so the Nim and Rust implementations of the format are built with one
+    # pinned compiler set rather than two.
     codetracer-toolchains.url = "github:metacraft-labs/nix-codetracer-toolchains";
     nixpkgs.follows = "codetracer-toolchains/nixpkgs";
 
@@ -221,16 +221,6 @@
               # `tests/test_path_filter.nim` uses `std/re`, which dlopens
               # libpcre at run time.
               pkgs.pcre
-
-              # The three `test_nim_*_crossread` tests shell out to
-              # `cargo test` in the sibling `codetracer-trace-format`
-              # checkout to prove a Nim-written bundle is readable by the
-              # canonical Rust reader.  Without a Rust toolchain here they
-              # would take their SKIP arm and the cross-read proof would
-              # silently stop running.  capnproto is needed by that
-              # sibling's `codetracer_trace_format_capnp` crate.
-              toolchainsPkgs.rust-stable
-              pkgs.capnproto
 
               # `tests/test_managed_sender_ci_routes.nim` uploads through the
               # codetracer-ci sender into a real MinIO, with codetracer-ci's

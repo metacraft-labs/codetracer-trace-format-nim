@@ -46,7 +46,7 @@ const
 let dir = getTempDir() / "ctfnim-ct-print-unresolvable-position"
 
 proc packGlobalLineIndexRust(pathId: uint64, line: uint64): uint64 =
-  ## `codetracer-trace-format/codetracer_trace_writer/src/step_stream.rs`
+  ## The Rust `codetracer_trace_writer/src/step_stream.rs`
   ## `pack_global_line_index`: `(path_id << 32) | (line & 0xFFFF_FFFF)`.
   ## Reproduced rather than linked because the point is that the two
   ## packings are independent.

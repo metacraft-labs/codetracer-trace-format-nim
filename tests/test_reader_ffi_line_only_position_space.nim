@@ -45,7 +45,7 @@ const
   PathB = "/src/helper.py"
 
 proc packGlobalLineIndexRust(pathId: uint64, line: uint64): uint64 =
-  ## `codetracer-trace-format/codetracer_trace_writer/src/step_stream.rs`
+  ## The Rust `codetracer_trace_writer/src/step_stream.rs`
   ## `pack_global_line_index`. Reproduced rather than linked: the point is
   ## that the two packings are independent.
   (pathId shl 32) or (line and ((1'u64 shl 32) - 1))

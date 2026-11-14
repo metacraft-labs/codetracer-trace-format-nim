@@ -13,8 +13,8 @@ when defined(nimPreviewSlimSystem):
 ## the others refuse. So the writer refuses to finish such a container and
 ## every reader refuses to open one, all with the message built here. The
 ## Rust implementation (`codetracer_ctfs::interning_set`) states it in the
-## same words; the cross-reader test in `codetracer-trace-format` compares
-## them byte for byte.
+## same words; codetracer-trace-format-conformance's cross-reader test
+## compares them byte for byte.
 ##
 ## A table that is empty is still present: its `.off` member holds the single
 ## offset 0, and the member counts as carried.

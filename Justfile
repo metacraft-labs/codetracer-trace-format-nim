@@ -7,8 +7,8 @@ alias fmt := format
 # --- Build ------------------------------------------------------------
 
 # Build every shipping artifact: the `ct-print` / `ct-space` inspectors and
-# the C-FFI static library the sibling Rust crate
-# (`codetracer-trace-format/codetracer_trace_writer_nim`) links against.
+# the C-FFI static library the Rust adapter crate
+# (`codetracer_trace_writer_nim`) links against.
 build: build-ct-print build-ct-space build-ctfs-salvage build-static-lib
 
 # `ct-print` lands at the repo root on purpose — downstream recorder tests
@@ -40,8 +40,8 @@ test: test-nim test-ffi
 
 # The repo's canonical corpus — the `test` task in
 # `codetracer_trace_format.nimble` (every `tests/test_*.nim` the package
-# declares, including the three `test_nim_*_crossread` proofs that drive the
-# sibling Rust reader through `cargo test`).
+# declares). The checks against the Rust implementation of the format live in
+# codetracer-trace-format-conformance.
 test-nim:
     nimble test
 

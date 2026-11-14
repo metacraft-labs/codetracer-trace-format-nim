@@ -10,11 +10,20 @@ linchpin of the CodeTracer subtree:
   the repo root and not under `build/bin/`);
 - it ships **`ct-space`**, the container space inspector;
 - it ships **`libcodetracer_trace_writer.a`**, the C-FFI static library that
-  the sibling Rust crate `codetracer-trace-format/codetracer_trace_writer_nim`
-  compiles (via its `build.rs`) and links into every Rust-side recorder.
+  the Rust adapter crate `codetracer_trace_writer_nim` compiles (via its
+  `build.rs`) and links into every Rust-side recorder.
 
-The container format itself is specified in `codetracer-trace-format-spec`;
-the canonical Rust implementation is the sibling `codetracer-trace-format`.
+The container format itself is specified in `codetracer-trace-format-spec`.
+
+**This repository depends on no other implementation of the format.** The
+Rust implementation and its Nim adapter crate depend on this one, never the
+other way. Tests that hold the two implementations against each other (a
+Nim-written bundle read by the Rust readers, the shared trace-storage fixtures
+read by both parsers) live in
+[`codetracer-trace-format-conformance`](https://github.com/metacraft-labs/codetracer-trace-format-conformance),
+which depends on both. This repository's CI runs that suite against every
+change here (`.github/workflows/conformance.yml`). Do not add a test here that
+needs a checkout of the other implementation: put it in the conformance repo.
 
 ## Dev environment
 
@@ -29,9 +38,8 @@ nix develop             # or just `cd` in with direnv active
 
 `flake.nix` provides:
 
-- `devShells.default` — Nim 2.2 + nimble (from `nix-codetracer-toolchains`,
-  the same pin the sibling Rust repo uses), `gcc`, `pkg-config`, `zstd`,
-  `pcre`, a Rust toolchain + `capnproto`, and `just` / `nixfmt` / `prek`.
+- `devShells.default` — Nim 2.2 + nimble (from `nix-codetracer-toolchains`),
+  `gcc`, `pkg-config`, `zstd`, `pcre`, and `just` / `nixfmt` / `prek`.
 - `packages.default` — `ct-print`, built with a bare `nim c` against the
   pinned dependency sources (no network inside the sandbox).
 - `checks.pre-commit-check` — the `git-hooks.nix` hook set (`just lint`).
@@ -50,25 +58,6 @@ into a project-local writable `NIMBLE_DIR` at `./.nimble` (gitignored). A
 first `nimble test` on a clean machine therefore resolves its dependencies
 without hitting the network. Set `NIMBLE_DIR` yourself before entering the
 shell if you want a shared cache instead.
-
-### Why Rust is in a Nim repo's shell
-
-`tests/test_nim_{step,value,io_event}_stream_crossread.nim` write a real
-production `.ct` bundle and then drive the sibling Rust reader's integration
-test (`cargo test -p codetracer_trace_reader …` in
-`../codetracer-trace-format`) to prove the bundle is byte-compatible with the
-canonical reader. Those tests contain a source-level SKIP arm for
-environments that have neither `cargo` nor `direnv`. Shipping the Rust
-toolchain in this shell is what keeps the cross-read proof actually running
-instead of silently skipping. The two runners that declare these tests, the
-`repro.nim` execute edges and the nimble `test` task, set
-`CT_CROSSREAD_REQUIRED=1`, and there a missing Rust repo or toolchain fails
-the test rather than skipping it (`tests/crossread_prerequisite.nim`); the
-`repro.nim` edges get `cargo`, `rustc` and `capnp` through `uses:`. Only an
-ad-hoc run outside both still skips. **Never** "fix" a cross-read failure by
-removing the toolchain or the variable so the SKIP arm engages. To
-cross-check against a Rust checkout that is not the sibling (a worktree on the
-branch being ported), point `CODETRACER_TRACE_FORMAT_DIR` at it.
 
 ## Commands
 

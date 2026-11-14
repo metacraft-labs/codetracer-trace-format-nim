@@ -240,9 +240,9 @@ jobs:
         run: ./ci/ensure-declared-gcc.ps1 -Destination "$env:RUNNER_TEMP/trace-nim-gcc"
 
       - name: Setup dev env (reprobuild flavor)
-        # setup-dev-env clones the siblings listed in .github/sibling-repos
-        # (codetracer-trace-format, codetracer-trace-format-nim) at the
-        # workspace-lock-pinned revisions before materialising the env.
+        # This repository declares no cross-repo siblings (no
+        # .github/sibling-repos). The cross-implementation checks run in
+        # conformance.yml.
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: reprobuild
