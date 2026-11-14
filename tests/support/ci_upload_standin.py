@@ -41,7 +41,11 @@ per call, consumed in order; once it is used up, every finalize checks the
 store as above.  Steps: `slow:<seconds>` checks the store and answers after
 that long (a finalize slower than the sender's timeout: the sender has
 disconnected by then, and codetracer-ci then cancels the check, so this one
-answers nothing it would act on); `busy:<seconds>` answers
+answers nothing it would act on); `stall` answers nothing until the sender
+closes the connection (a finalize slower than any timeout the sender sets,
+with no duration of its own to race against that timeout; it gives up after
+`STALL_LIMIT_SECONDS`, so a sender that never disconnects still ends the
+test); `busy:<seconds>` answers
 503 upload_session_busy with `Retry-After: <seconds>`; `finalizing` answers
 409 upload_finalizing; `mismatch` answers 409 slice_content_mismatch without
 checking (http-api.md, "POST /api/v1/traces/{sessionId}/finalize").
@@ -91,6 +95,8 @@ from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
 REGION = "us-east-1"
+# How long a `stall` finalize waits for the client to disconnect at most.
+STALL_LIMIT_SECONDS = 120
 
 
 def _sign(key: bytes, message: str) -> bytes:
@@ -199,6 +205,20 @@ def make_handler(store: Store):
             self.end_headers()
             return True
 
+        def stall_until_disconnected(self) -> None:
+            """Waits, answering nothing, until the client closes the
+            connection: `recv` returns no bytes at end of stream (recv(2)).
+            The request has been read whole, so nothing else arrives on a
+            connection the client keeps open (the sender sends one request
+            per connection)."""
+            self.connection.settimeout(STALL_LIMIT_SECONDS)
+            try:
+                while self.connection.recv(4096):
+                    pass
+            except OSError:
+                pass  # a reset, or the limit: either way the wait is over
+            self.close_connection = True
+
         def authorized(self) -> bool:
             if self.headers.get("authorization") == f"Bearer {store.args.token}":
                 return True
@@ -293,6 +313,9 @@ def make_handler(store: Store):
                     return
                 if kind == "mismatch":
                     self.problem(409, "slice_content_mismatch")
+                    return
+                if kind == "stall":
+                    self.stall_until_disconnected()
                     return
                 if kind == "slow":
                     time.sleep(float(arg))

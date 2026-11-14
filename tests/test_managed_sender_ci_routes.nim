@@ -480,8 +480,14 @@ try:
       check standin.finalizeTimes().len == 1
 
     test "a finalize slower than its timeout is retried, and the retry finalizes":
-      let standin = startStandin("slow-retry", SliceUploadPresignedUrl, finalizeScript = "slow:3")
-      let up = uploadTwoSlices(standin, "slow-retry", finalizeTimeoutMs = 1000)
+      # The first finalize is answered only after the sender gives up on it
+      # (`stall`), so it outlasts the timeout whatever that is. The timeout
+      # is the one every other request of the sender has, not the negative
+      # control's 1 s: the retry must answer within it, and it reads both
+      # slices back from MinIO first, which a loaded host made take over 1 s
+      # (a third attempt, then a retry of the retry).
+      let standin = startStandin("slow-retry", SliceUploadPresignedUrl, finalizeScript = "stall")
+      let up = uploadTwoSlices(standin, "slow-retry", finalizeTimeoutMs = RequestTimeoutMs)
       var state = up.state
       let finalized = state.tryFinalizeManagedUpload(up.backend, finalizeRequest(receiptsOf(up)), quickRetries())
       check finalized.ok
