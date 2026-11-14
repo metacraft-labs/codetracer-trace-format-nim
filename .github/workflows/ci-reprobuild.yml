@@ -252,7 +252,22 @@ jobs:
         with:
           env-flavor: reprobuild
           repro-from-source: ${{ runner.os != 'Windows' && 'true' || 'false' }}
-          repro-build-pin: "064daf5b154ea6a0758ddb2dcbcbc07685216e44"
+          # The pin is reprobuild v0.2.23. Keep it equal to the revision
+          # .github/scripts/bind-unix-constructor.sh binds.
+          repro-build-pin: "9dbf4e710d7cc0b9a79a4bcd54c931afb6849dd0"
+          # Windows legs install this release instead of building the pin
+          # (both arm64 and x64 install its windows-x86_64 archive). Keep it
+          # the tag of repro-build-pin so every leg runs the same revision;
+          # the default `latest` moves with each release.
+          repro-version: "v0.2.23"
+          # The source build overrides reprobuild's `runquota-src` with a clone
+          # of this ref (default `dev`). Keep it equal to the runquota-src rev
+          # in the pinned reprobuild's flake.lock, so the build uses the
+          # RunQuota that reprobuild was locked against rather than whatever
+          # `dev` holds (v0.2.19+ needs runquota's `directoryResolvesWithin`).
+          # io-mon-src stays on that flake lock while `repro-posix-io-mon-pin`
+          # is empty.
+          repro-runquota-pin: "9818dc0c90be8ba7993424a7bbfbb6e009ffa965"
           gh-token: ${{ steps.ci_token.outputs.token }}
 
       - name: Provision the declared Windows lease authority and Nim compiler payload
@@ -280,7 +295,7 @@ jobs:
           git rev-parse HEAD
           engine_source="$(git -C .reprobuild-src rev-parse HEAD)"
           echo "Repro source: $engine_source"
-          test "$engine_source" = 064daf5b154ea6a0758ddb2dcbcbc07685216e44
+          test "$engine_source" = 9dbf4e710d7cc0b9a79a4bcd54c931afb6849dd0
           test -z "$(git -C .reprobuild-src status --porcelain)"
           test "$(command -v repro)" = "$GITHUB_WORKSPACE/.reprobuild-src/build/bin/repro"
           test "${REPROBUILD_NIX_DAEMON_BIN:?missing source daemon helper}" = "$GITHUB_WORKSPACE/.reprobuild-src/build/bin/reprobuild-nix-daemon"
