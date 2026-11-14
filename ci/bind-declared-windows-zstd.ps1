@@ -23,7 +23,7 @@ public static class TraceZstdPhysicalPath {
 }
 '@
 $manifest = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'windows-zstd-artifact-manifest.json') -Raw | ConvertFrom-Json
-if ($manifest.sdkRevision -ne '064daf5b154ea6a0758ddb2dcbcbc07685216e44' -or
+if ($manifest.sdkRevision -ne '9dbf4e710d7cc0b9a79a4bcd54c931afb6849dd0' -or
     $manifest.archiveSha256 -ne '7b4eff6719990e38aca93a4844c2e86a1935090625c4611f7e89675e999c56cc' -or
     $manifest.files.Count -ne 3) { throw 'unexpected declared Zstd manifest' }
 # Exact authenticated member set: count plus membership alone permits duplicates.

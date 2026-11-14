@@ -1,20 +1,20 @@
 # Archive-member authority is independent of the selected prefix's own bytes.
 # Holds are retained by the caller through selected-compiler probes/publication.
 function Read-AuthenticatedNimArchive([string]$Archive, $Hold) {
-    $sha = 'fe0686a9b298e5b13d0a983df37e002a8c6320f8b16cc45a51d15cf4046a109f'
+    $sha = 'e6eaf87df71f83629a8877ac496bcd8cdb7755f9e860b982bb0b886e38eac1c3'
     if (-not [IO.Path]::IsPathFullyQualified($Archive)) { throw 'nim-archive/absolute-path' }
     $Hold.HoldFile((Split-Path -Parent $Archive), (Split-Path -Leaf $Archive), $sha)
-    # The upstream nim-2.2.10 Windows archive carries one legacy (non-UTF8-flagged)
+    # The declared nim-2.2.10 Windows archive carries one legacy (non-UTF8-flagged)
     # member -- tests/misc/åäö.nim -- whose name is DOS/OEM-encoded bytes with no
-    # declared code page. .NET's ZipFile.OpenRead() falls back to CP437 for such
-    # entries; the declared Windows Nim producer's own tool-store extraction (7-Zip)
-    # decodes the same bytes with the runner's ANSI code page (1252 on the hosted
-    # Windows runners) instead. Reading with CP437 here while the prefix on disk was
-    # written with CP1252 makes the two inventories disagree on this one file's name
+    # declared code page. The SDK's tool-store extraction decodes such names as
+    # CP437, the zip specification's default (Repro 9dbf4e71,
+    # repro_core/powershell_zip.nim; since 8e88ae4e3, after v0.2.10, whose
+    # extractor used the runner's ANSI code page 1252). Reading with any other
+    # code page here makes the two inventories disagree on this one file's name
     # (åäö.nim vs. †„".nim) and fails the whole prefix as having an "undeclared
-    # member", even though both sides agree on every byte of content. Decode with the
-    # same ANSI code page the extractor uses so the two inventories compare equal.
-    $legacyEncoding = [Text.Encoding]::GetEncoding(1252)
+    # member", even though both sides agree on every byte of content. Decode with
+    # the code page the extractor uses so the two inventories compare equal.
+    $legacyEncoding = [Text.Encoding]::GetEncoding(437)
     $zip = [IO.Compression.ZipFile]::Open($Archive, [IO.Compression.ZipArchiveMode]::Read, $legacyEncoding)
     $members = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -46,15 +46,15 @@ function Read-AuthenticatedNimArchive([string]$Archive, $Hold) {
             } finally { $hash.Dispose(); $stream.Dispose() }
             $members.Add($relative,[pscustomobject]@{path=$relative;size=$actual;sha256=$digest})
         }
-        if ($members.Count -ne 5249 -or $total -ne 102062602) { throw 'nim-archive/member-census' }
+        if ($members.Count -ne 4822 -or $total -ne 51692170) { throw 'nim-archive/member-census' }
         $Hold.Verify()
         return ,$members
     } finally { $zip.Dispose() }
 }
 function Assert-NimPrefixInventory([string]$Prefix, $Members, $Hold) {
-    if ($Members.Count -ne 5249) { throw 'nim-prefix/authority-count' }
+    if ($Members.Count -ne 4822) { throw 'nim-prefix/authority-count' }
     $extras = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    # Exact files added by authenticated SDK064 tarball materialization/registerInUnifiedStore.
+    # Exact files added by authenticated SDK (9dbf4e71) tarball materialization/registerInUnifiedStore.
     [void]$extras.Add('.reprobuild-tarball-receipt.json'); [void]$extras.Add('.repro-receipt')
     $found = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $directories = [Collections.Generic.Queue[string]]::new(); $directories.Enqueue($Prefix)

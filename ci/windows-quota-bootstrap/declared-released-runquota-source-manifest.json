@@ -1,6 +1,6 @@
 {
-  "archiveSha256": "151092a89f63d5a7f8d0beeac6e607fa1346302aa1c5514b88f7194e8a51d63d",
-  "sourcePrefix": "reprobuild-0.2.10-windows-x86_64/share/repro/src/runquota/",
+  "archiveSha256": "83c21f613b9a4ac90ce61c964a723019fcd0e40cf8bbed46ca019cd5be39288d",
+  "sourcePrefix": "reprobuild-0.2.23-windows-x86_64/share/repro/src/runquota/",
   "members": [
     {
       "path": "config.nims",
@@ -29,8 +29,8 @@
     },
     {
       "path": "apps/runquotad/runquotad.nim",
-      "sha256": "c3d9b07b040e4c4c177a0de655c14425b64cb4bed6ba26f1d18487d13f2a8823",
-      "size": 14409
+      "sha256": "6f2d4f1236ef94beaf5496da4550c42cc45bbce36c5694001b02ccc3f15506e6",
+      "size": 15632
     },
     {
       "path": "benchmarks/lib/runquota_m1_bench.nim",
@@ -54,8 +54,8 @@
     },
     {
       "path": "benchmarks/lib/runquota_m5_bench.nim",
-      "sha256": "8dc9af5e690d3a6bcac6b2203acaa4b0b6e69b8e02f60781bc333a07536fb360",
-      "size": 19940
+      "sha256": "95b9804879fff3cb3e8e53a2589534c315b84b9f3fe76726e1775bf28c8735ff",
+      "size": 19407
     },
     {
       "path": "docs/book-isonim/config.nims",
@@ -144,8 +144,8 @@
     },
     {
       "path": "libs/runquota_client/src/runquota_client.nim",
-      "sha256": "9a4928c5523b6e09ccae930bc034d4620e4ef3cd92ee9a189ad8043fbc158efc",
-      "size": 43951
+      "sha256": "3b80a0c30e6322164aa21b40fd252ad9dba6bec7ce4ef3577bfc33b8d3a5108e",
+      "size": 48931
     },
     {
       "path": "libs/runquota_client/src/runquota_client/standalone.nim",
@@ -164,8 +164,8 @@
     },
     {
       "path": "libs/runquota_cli_support/src/runquota_cli_support.nim",
-      "sha256": "1f2069d80042c594e6cdd47f678f8926d2e3031bf6969f1c0a7d3262abdfa1be",
-      "size": 31849
+      "sha256": "2495160eb8880ea8bdbadc27456b4fb76a5128196112ba3ef6a8b73d676a497e",
+      "size": 37703
     },
     {
       "path": "libs/runquota_cli_support/src/runquota_cli_support/config.nim",
@@ -218,6 +218,11 @@
       "size": 2222
     },
     {
+      "path": "libs/runquota_core/src/runquota_core/image_digest.nim",
+      "sha256": "2a87b341b45df7008fe5437e63c909decfe4209e3f82388036d81785e3da732c",
+      "size": 1576
+    },
+    {
       "path": "libs/runquota_core/src/runquota_core/owner_id.nim",
       "sha256": "0650993ab2bf06e1e6944965f54b71bec809b46fe0b032328c2fa98694dba1cd",
       "size": 4286
@@ -249,8 +254,8 @@
     },
     {
       "path": "libs/runquota_daemon/src/runquota_daemon.nim",
-      "sha256": "b640c9d2f414a77711a1155ffecc394b68b247b14c51bab17ed7b24476aad4f5",
-      "size": 205279
+      "sha256": "20268a924f55c831807fc3dd645411d89e4d23d1938e50213df747a174513124",
+      "size": 224742
     },
     {
       "path": "libs/runquota_daemon/src/runquota_daemon/child_identity.nim",
@@ -273,14 +278,19 @@
       "size": 5828
     },
     {
+      "path": "libs/runquota_daemon/src/runquota_daemon/parent_watch.nim",
+      "sha256": "9f62fc0c943c721d3c387269e020e7b104daabbed7905792fdbc1b7bb7f39f0b",
+      "size": 7242
+    },
+    {
       "path": "libs/runquota_daemon/src/runquota_daemon/reload_report.nim",
       "sha256": "0b5a2d9cf3b188482742627b3c2a071c0467333d591de7161306ade88c6dfc04",
       "size": 1524
     },
     {
       "path": "libs/runquota_daemon/src/runquota_daemon/types.nim",
-      "sha256": "28be9c1a7c2c47e0b103b8e604156b6b97e4f9b6b4ef1f5f4b78d17e15888617",
-      "size": 18542
+      "sha256": "657e725f56d0e47b5a6899d5c0b8652b0b625438357992671015966fc2a5952f",
+      "size": 19934
     },
     {
       "path": "libs/runquota_daemon/src/runquota_daemon/windows_service.nim",
@@ -379,8 +389,8 @@
     },
     {
       "path": "libs/runquota_ipc/src/runquota_ipc.nim",
-      "sha256": "b1664128852317914ddfc6d42c894597b41937435d1ae618c2ddb6260342bab7",
-      "size": 81645
+      "sha256": "16859702d21aa62b3063f3652945262b44000a869ad154d0c31a2e93d4a02a6b",
+      "size": 94886
     },
     {
       "path": "libs/runquota_ipc/src/runquota_ipc/owner_identity.nim",
@@ -394,8 +404,8 @@
     },
     {
       "path": "libs/runquota_ipc/src/runquota_ipc/types.nim",
-      "sha256": "f2823736b96e389e1896a6dc97b8a21f63426a3ceb3f384e8be18efe2d070ec4",
-      "size": 2765
+      "sha256": "714e08ed71fa0d827550a20580ecdd5c4ea8488b069cde4b7fe30dd8d4a783a7",
+      "size": 3115
     },
     {
       "path": "libs/runquota_observation_store/runquota_observation_store.nimble",
@@ -559,13 +569,13 @@
     },
     {
       "path": "libs/runquota_process/src/runquota_process.nim",
-      "sha256": "f5b27cd3ba719e06894e9262aea5c6220063106900aed26cb6ce1f5c4d5a91b2",
-      "size": 62359
+      "sha256": "9cd06dc3c4c4bf621f07dc800df74f83b3079f52645faf5569ef146dfd13f48f",
+      "size": 62922
     },
     {
       "path": "libs/runquota_process/src/runquota_process/types.nim",
-      "sha256": "d49e77279885a94006f8738dffc026d0bbbce33978bdaf44dc0d5360eab599f7",
-      "size": 3811
+      "sha256": "8814d575151d4c990eb4a909d6ad4d075297976d0ecf25be47c0b26a1d594bcb",
+      "size": 3973
     },
     {
       "path": "libs/runquota_protocol/runquota_protocol.nimble",
@@ -574,13 +584,13 @@
     },
     {
       "path": "libs/runquota_protocol/src/runquota_protocol.nim",
-      "sha256": "c6f21afdb281902554f19ac7c167cf02ee4b4e45c3b5fadd66af57723c39d335",
-      "size": 66307
+      "sha256": "8514bb58109059398f594212733416105190293ec7061580ed576a74e897c882",
+      "size": 68765
     },
     {
       "path": "libs/runquota_protocol/src/runquota_protocol/types.nim",
-      "sha256": "536afd4999fbd984473c69f515ffc20226bf8ef606175584f511ca05ad10f08f",
-      "size": 35526
+      "sha256": "ab4eb8dec858eba277a337a47b611a8eafcde74b97d75c9f6c2658f78a1e4ab1",
+      "size": 37588
     },
     {
       "path": "libs/runquota_stats_table/runquota_stats_table.nimble",

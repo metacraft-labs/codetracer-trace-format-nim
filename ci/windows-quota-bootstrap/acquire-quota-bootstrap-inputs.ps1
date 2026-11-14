@@ -74,25 +74,28 @@ function Expand-DirectZip([string]$Archive, [string]$Root, [long]$ExpandedLimit)
     } finally { $zip.Dispose() }
 }
 $nimArchive = Join-Path $OutputRoot 'nim.zip'
-Get-Bounded 'https://nim-lang.org/download/nim-2.2.10_x64.zip' $nimArchive 33554432
-if ((Get-FileHash -LiteralPath $nimArchive -Algorithm SHA256).Hash.ToLowerInvariant() -cne 'fe0686a9b298e5b13d0a983df37e002a8c6320f8b16cc45a51d15cf4046a109f') { throw 'quota-intake/nim-archive' }
+# The Windows Nim archive the SDK (Repro 9dbf4e71, v0.2.23) declares for
+# `nim` (repro_dsl_stdlib/packages/nim.nim). bind-declared-windows-nim.ps1
+# authenticates the SDK-realized prefix against this same archive.
+Get-Bounded 'https://github.com/metacraft-labs/nim/releases/download/nim-2.2.10-vccexe-8910b50d2d21ca1a3e982fe8b8b9bf0d8832e633/nim-2.2.10-vccexe-8910b50d2d21ca1a3e982fe8b8b9bf0d8832e633-windows-x64.zip' $nimArchive 33554432
+if ((Get-FileHash -LiteralPath $nimArchive -Algorithm SHA256).Hash.ToLowerInvariant() -cne 'e6eaf87df71f83629a8877ac496bcd8cdb7755f9e860b982bb0b886e38eac1c3') { throw 'quota-intake/nim-archive' }
 $nim = Join-Path $OutputRoot 'nim'
 if (-not ('QuotaBootstrapInputs' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'QuotaBootstrapInputs.cs') }
 $rawArchiveHold = [QuotaBootstrapInputs]::new()
 try {
-    $rawArchiveHold.HoldFile($OutputRoot, 'nim.zip', 'fe0686a9b298e5b13d0a983df37e002a8c6320f8b16cc45a51d15cf4046a109f')
+    $rawArchiveHold.HoldFile($OutputRoot, 'nim.zip', 'e6eaf87df71f83629a8877ac496bcd8cdb7755f9e860b982bb0b886e38eac1c3')
     $nimMembers = @(Expand-DirectZip $nimArchive $nim 134217728)
     $rawArchiveHold.Verify()
 } finally { $rawArchiveHold.Dispose() }
-if ($nimMembers.Count -ne 5249) { throw 'quota-intake/nim-member-count' }
+if ($nimMembers.Count -ne 4822) { throw 'quota-intake/nim-member-count' }
 $nimMembers | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $OutputRoot 'nim-members.json')
 $leaseArchive = Join-Path $OutputRoot 'lease.zip'
-Get-Bounded 'https://codeload.github.com/metacraft-labs/nim-shm-lease/zip/e3254b7ba1c501de6e64dbb41c96306be5ca6058' $leaseArchive 4194304
+Get-Bounded 'https://codeload.github.com/metacraft-labs/nim-shm-lease/zip/22e3100cdb4fbc374689ddac55b4b32c90654140' $leaseArchive 4194304
 $lease = Join-Path $OutputRoot 'lease'
 $leaseMembers = @(Expand-DirectZip $leaseArchive $lease 4194304)
 $plan = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'staged-major2-bootstrap-source-plan.json') -Raw | ConvertFrom-Json
 . (Join-Path $PSScriptRoot 'validate-source-tree.ps1')
-Assert-DeclaredSourceTree $lease $plan.leaseCandidate.fullTrackedManifest 136
+Assert-DeclaredSourceTree $lease $plan.leaseCandidate.fullTrackedManifest 139
 $result = [pscustomobject]@{nimRoot=$nim;nimMembers=$nimMembers;leaseRoot=$lease;leaseMemberCount=$leaseMembers.Count}
 $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $OutputRoot 'actual-bootstrap-inputs.json')
 Write-Output -NoEnumerate $result

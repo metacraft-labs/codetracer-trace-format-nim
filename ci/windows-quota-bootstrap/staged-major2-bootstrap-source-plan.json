@@ -1,8 +1,8 @@
 {
   "status": "proposal-only-no-native-execution",
   "traceHead": "1e58aae4412f94a1a13eaed658cbc3686c38967d",
-  "releaseArchiveSha256": "151092a89f63d5a7f8d0beeac6e607fa1346302aa1c5514b88f7194e8a51d63d",
-  "supplierAuthority": "Exact unmodified127 staged RunQuota files in authenticated released-client archive; not875 or guessed Git coordinate",
+  "releaseArchiveSha256": "83c21f613b9a4ac90ce61c964a723019fcd0e40cf8bbed46ca019cd5be39288d",
+  "supplierAuthority": "Exact unmodified129 staged RunQuota files in authenticated released-client archive v0.2.23 (runquota 9818dc0c with CRLF line ends); not the full repository tree or a guessed Git coordinate",
   "buildRecipe": {
     "sourceRevision": "cbfba94e2e10ed5a6078e2b9f90b406f5a8784b7",
     "path": "setup-reprobuild/build-runquota-bootstrap.ps1",
@@ -18,8 +18,8 @@
     ]
   },
   "leaseCandidate": {
-    "revision": "e3254b7ba1c501de6e64dbb41c96306be5ca6058",
-    "authority": "official064 flake.lock candidate, NOT established as historical release workspace dependency",
+    "revision": "22e3100cdb4fbc374689ddac55b4b32c90654140",
+    "authority": "official v0.2.23 (9dbf4e71) flake.lock nim-shm-lease input of runquota-src; equals runquota 9818dc0c flake.lock root input and repro.lock",
     "fullTrackedManifest": [
       {
         "path": ".editorconfig",
@@ -31,9 +31,16 @@
       {
         "path": ".gitignore",
         "mode": "100644",
-        "gitBlob": "e7542f0c2217343ade2275dafc9633efea8366a9",
-        "sha256": "d4ba3da647fc1580196befda4866e8005d56b6a1f409f215e05e666e699717ef",
-        "size": 942
+        "gitBlob": "092791095b7264655312565ccbf9ef9ac6bd7c6f",
+        "sha256": "a38c8aa961b416b54241770e7608a44706fcf5cb0cda1c95a413487b23e4c449",
+        "size": 1112
+      },
+      {
+        "path": ".pre-commit-config.yaml",
+        "mode": "100644",
+        "gitBlob": "14a79a37a909abc3dcdbd036143c52bc7dd280c0",
+        "sha256": "123a33f5ac1688b66b4fcbc560fca778dbd6ac1098526b28679805cb0e25f970",
+        "size": 3546
       },
       {
         "path": ".prettierignore",
@@ -45,9 +52,9 @@
       {
         "path": "Justfile",
         "mode": "100644",
-        "gitBlob": "416cfbdcd83ffa7c4156f71901183b80c9ad1f57",
-        "sha256": "375cf1d04467af2e02dc8ac1e5f4e929b0d6863511f13e57bfd968e1ed96442e",
-        "size": 43834
+        "gitBlob": "96d548d2e5ceb39325d4c6ecb2bf4062de756e07",
+        "sha256": "740f79b76791f34520afa714b5e2ead54055462ae29c6245024ee2edc89a9995",
+        "size": 47871
       },
       {
         "path": "LICENSE",
@@ -108,16 +115,23 @@
       {
         "path": "config.nims",
         "mode": "100644",
-        "gitBlob": "f68eec01203e2606ce22cfed343f23d943c6b034",
-        "sha256": "a081421155dbd5ca9090bddaaca365cf09967951fb05e9861d09c4f4f7cd4a51",
-        "size": 567
+        "gitBlob": "3183760b7cc429391244352b911232f4f920efff",
+        "sha256": "bafe6ca30c1013a7733aba83448aa7a089da0a0661bb216dfbe2c461f816dd74",
+        "size": 4507
+      },
+      {
+        "path": "repro.nim",
+        "mode": "100644",
+        "gitBlob": "6f9ef2a2bfbbd924c2e185ec6ec912b2886ecda8",
+        "sha256": "22889f4dd780d164de0215255ec0f85f558b4cfed5e7c319f6e92e25dcc2fb40",
+        "size": 389
       },
       {
         "path": "shm_lease.nimble",
         "mode": "100644",
-        "gitBlob": "25e9a9aea9ab3766b0cbf2d8b02d15eef7b20ef5",
-        "sha256": "943ae308009dc8cc974fb7515b82a58acf5882978a895e543f440405868bfbb3",
-        "size": 3244
+        "gitBlob": "822aa007f837de22a9505658cef95d35859456a6",
+        "sha256": "7d5e81a19b98966f6763c619f5120adafc7aff7b37c103eaadd96878079446c4",
+        "size": 3399
       },
       {
         "path": "src/shm_lease.nim",
@@ -195,6 +209,13 @@
         "gitBlob": "859893f695c34d6a46e65c56d395989e0cbe3551",
         "sha256": "42d46b815a287373950086ce5da2d3d72abf8e0551b129d33bde5f267788a99e",
         "size": 1628
+      },
+      {
+        "path": "tests/test_nimcache_is_worktree_local.nim",
+        "mode": "100644",
+        "gitBlob": "c92a51d955a4a78760907b00913c42c40ea6aa1f",
+        "sha256": "6f971861d4fbd28833ba65bc87d796fd749fdb90327af5fe7c66700d3dfbb223",
+        "size": 9052
       },
       {
         "path": "tests/test_shm_lease.nim",
@@ -977,7 +998,7 @@
   },
   "requiredBeforeAdoption": [
     "Review complete lease source import/API correspondence against actual staged anchor/waitword consumers, including Windows branch",
-    "Bootstrap actual fe068 Nim image/header/config, exact GCC16 identity independently before SDK develop",
+    "Bootstrap actual SDK-declared e6eaf87 Nim image/header/config, exact GCC16 identity independently before SDK develop",
     "Extract unchanged staged RunQuota source to exclusive namespace; no source modifications or SDK tree writes",
     "Bind all actual compiler/header/lease source inputs and produce daemon SHA plus --version",
     "Use normal SDK discovery/startup with RUNQUOTAD_BIN, preserve quota enforcement",
@@ -987,12 +1008,12 @@
   "nativeCredit": false,
   "installedReleaseMembers": {
     "bin/repro.exe": {
-      "size": 1040468,
-      "sha256": "9c92b68adcbdc87caf3b127ea6d2cdbaaec670e1c91c31f8e95e1c174c53c9e1"
+      "size": 1266104,
+      "sha256": "2305f464019743f7ec47e75552dc89cdd675413fcb0ccff0bd006714bbc52e7e"
     },
     "bin/reprobuild.exe": {
-      "size": 26355799,
-      "sha256": "e2f1eeb59e97220f4e7dbd15811c51bcff1e223dcb6dafdba6443b9b1b00ad6a"
+      "size": 40488490,
+      "sha256": "f811ecd05d147f7040a4135e779f236c4e527c9c23c0149fe90b83d894784f84"
     }
   },
   "nativeControls": {
