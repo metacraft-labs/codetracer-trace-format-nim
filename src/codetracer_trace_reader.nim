@@ -150,7 +150,7 @@ proc openTrace*(path: string): Result[TraceReader, string] =
   reader.metadata.workdir = contents.workdir
   reader.metadata.args = contents.args
   if findInternalFileEntry(data, "paths.dat", maxEntries).found:
-    let nrRes = openNewTraceFromBytes(data, blockSize, maxEntries)
+    let nrRes = openNewTraceFromBytes(data)
     if nrRes.isErr:
       return err("paths.dat: " & nrRes.error)
     let nr = nrRes.get()
@@ -199,8 +199,7 @@ proc readEventsV4(reader: var TraceReader): Result[void, string] =
   ##        d. If n is the exitStep of any pending call records,
   ##           emit tleReturn (innermost-first / LIFO — deeper exits first).
   ##   4. tleEvent for each IO event (in stream order).
-  let trRes = openNewTraceFromBytes(
-    reader.ctfsData, reader.blockSize, reader.maxRootEntries)
+  let trRes = openNewTraceFromBytes(reader.ctfsData)
   if trRes.isErr:
     return err("failed to open v4 trace: " & trRes.error)
   var nr = trRes.get()

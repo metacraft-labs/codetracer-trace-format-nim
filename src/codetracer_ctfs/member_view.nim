@@ -245,9 +245,7 @@ proc rootMembers*(d: openArray[byte], maxEntries: uint32):
     at += FileEntrySize
 
 when fileImages:
-  proc openFileImage*(path: string,
-      blockSize: uint32 = DefaultBlockSize,
-      maxEntries: uint32 = DefaultMaxRootEntries): Result[ContainerImage, string] =
+  proc openFileImage*(path: string): Result[ContainerImage, string] =
     ## The container at `path`, read as it is used: its first block and its
     ## root directory now, everything else on first use. A container this
     ## could not read in place — a compact one, or one stored under a
@@ -256,10 +254,18 @@ when fileImages:
     ## A file that does not begin with the CTFS magic is refused, with an
     ## error naming it: one shorter than the magic (an empty one included)
     ## before a byte of it is read, any other once its first block is.
+    ##
+    ## The block the image is read in, and the root directory read now, are
+    ## the ones the container's own header declares (`ctfs-container.md` §1:
+    ## `BlockSize` and `MaxRootEntries` are fields a reader takes from the
+    ## container, and "The Root Directory Is Fixed At Creation"), never a
+    ## caller's. A member's mapping block is loaded by its block number
+    ## (`viewMember`'s loader), so an image tracked in units of any other
+    ## block size would load other bytes than the ones the mapping names.
     var f: File
     if not open(f, path, fmRead):
       return err("failed to read file: " & path)
-    var image = ContainerImage(blockSize: int(blockSize), file: f, path: path)
+    var image = ContainerImage(file: f, path: path)
     try:
       image.bytes = newSeqUninit[byte](f.getFileSize())
     except IOError, OSError:
@@ -270,7 +276,20 @@ when fileImages:
         "-byte CTFS magic")
     let noMagic = "not a CTFS container: " & path & " (" & $image.bytes.len &
       " bytes) does not begin with the CTFS magic"
-    let whole = image.bytes.len < int(blockSize) or blockSize == 0
+    # The header's `BlockSize`, read before any block is: a header too short
+    # to carry one, or one declaring a size no full container may (a compact
+    # container declares `0`, §1d), leaves the image to be read whole, and
+    # whoever reads it refuses what it cannot read (`checkReadableContainer`).
+    var blockSize = 0'u32
+    let headerLen = HeaderSize + ExtHeaderSize
+    if image.bytes.len >= headerLen:
+      if image.readAt(0, headerLen) != headerLen:
+        return err("failed to read file: " & path)
+      let declared = readU32LE(image.bytes, 8)
+      if blockSizeRefusal(declared).len == 0:
+        blockSize = declared
+    image.blockSize = int(blockSize)
+    let whole = blockSize == 0 or image.bytes.len < int(blockSize)
     if not whole:
       image.loaded = newSeq[bool](image.bytes.len div int(blockSize) +
         ord(image.bytes.len mod int(blockSize) != 0))
@@ -300,7 +319,7 @@ when fileImages:
     if page.isOk:
       image.page = page.get()
       image.attached = true
-    ? image.loadRoot(maxEntries)
+    ? image.loadRoot(uint32(slots))
     ok(image)
 
 when fileImages:

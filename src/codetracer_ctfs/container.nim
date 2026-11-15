@@ -1609,6 +1609,34 @@ proc isCompactContainer*(data: openArray[byte]): bool =
   data.len > V6ProfileOffset and data[5] == CtfsVersionV6 and
     data[V6ProfileOffset] == uint8(ord(cpCompact))
 
+proc declaredGeometry*(bytes: openArray[byte]):
+    tuple[blockSize, maxEntries: uint32] =
+  ## The block size and the root directory size to look the members of the
+  ## container image `bytes` up with (`locateMember`, `readInternalFile`,
+  ## `hasInternalFile` and every reader over them): the ones its header
+  ## declares (`ctfs-container.md` §1, "Container Header"), a declared
+  ## `MaxRootEntries` of `0` read as the auto-filled root ("Block 0 Layout").
+  ## A reader may take them once, when it opens the container, and keep them
+  ## ("The Root Directory Is Fixed At Creation").
+  ##
+  ## Never the library's defaults (4096 bytes, 31 slots): a lookup that scans
+  ## 31 slots of a larger root misses every member past slot 30 and opens the
+  ## container as an empty one, and one that resolves members with a block
+  ## size other than the header's is refused (`memberRuns`).
+  ##
+  ## A compact container has neither: its header carries `0` for both and its
+  ## members are found through its directory (§1d), which `locateMember` and
+  ## `hasInternalFile` read without either value. The defaults are returned
+  ## for it only so that no reader is handed a zero block size. An image too
+  ## short to carry the two fields answers `(0, 0)`; `checkReadableContainer`
+  ## refuses it before anything is looked up.
+  if bytes.len < HeaderSize + ExtHeaderSize:
+    (0'u32, 0'u32)
+  elif isCompactContainer(bytes):
+    (DefaultBlockSize, DefaultMaxRootEntries)
+  else:
+    (readU32LE(bytes, 8), headerRootEntryCount(bytes))
+
 proc locateMember*(data: openArray[byte], name: string,
     blockSize: uint32 = DefaultBlockSize,
     maxEntries: uint32 = DefaultMaxRootEntries,

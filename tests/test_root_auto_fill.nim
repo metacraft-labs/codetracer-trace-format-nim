@@ -191,7 +191,8 @@ testCase "rootMembers enumerates the auto-filled root":
 proc viewAll(path: string) =
   ## Every member through an image read from its file; the image (and its
   ## file handle) is released when this returns.
-  let image = openFileImage(path, BS, 0'u32)
+  # The image takes the block size and the root from the header itself.
+  let image = openFileImage(path)
   check(image.isOk, "openFileImage: " & (if image.isErr: image.unsafeError else: ""))
   if image.isOk:
     var bad = 0

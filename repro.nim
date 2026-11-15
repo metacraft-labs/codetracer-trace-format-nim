@@ -33,13 +33,14 @@
 ## flake on Nix hosts; ``defaultToolProvisioning "path"`` consumes its tools
 ## without changing the existing native build graph.
 ##
-## **libzstd.** ``test_ct_print_agreement``, ``test_logical_step_count`` and
-## ``test_retired_streams_are_refused`` compile ct-print at runtime, through
-## ``tests/ct_print_binary.nim``. On POSIX that supplies ``pkg-config
-## --cflags/--libs libzstd``; the dev shell's ``PKG_CONFIG_PATH`` satisfies
-## both. On Windows the binding names the zstd archive directly: adding MSYS2's
-## whole library directory would let it replace the selected MinGW toolchain's
-## implicit CRT and pthread archives. Each test process compiles its own
+## **libzstd.** ``test_ct_print_agreement``, ``test_logical_step_count``,
+## ``test_retired_streams_are_refused`` and
+## ``test_open_new_trace_reads_the_declared_root`` compile ct-print at
+## runtime, through ``tests/ct_print_binary.nim``. On POSIX that supplies
+## ``pkg-config --cflags/--libs libzstd``; the dev shell's
+## ``PKG_CONFIG_PATH`` satisfies both. On Windows the binding names the zstd
+## archive directly: adding MSYS2's whole library directory would let it
+## replace the selected MinGW toolchain's implicit CRT and pthread archives. Each test process compiles its own
 ## ct-print into a temporary directory it alone owns, with the compiler, Nim
 ## library and search paths it was itself compiled with, so no warm binary or
 ## shared nimcache can stand in for the tree under test. Their EXECUTE edges
@@ -417,6 +418,7 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_ffi_call_entry_is_the_next_step.nim", binary: "build/test-bin/test_ffi_call_entry_is_the_next_step", mm: "arc"),
   TestSpec(source: "tests/test_ffi_refused_column_stays_with_its_step.nim", binary: "build/test-bin/test_ffi_refused_column_stays_with_its_step", mm: "arc"),
   TestSpec(source: "tests/test_block_size_is_one_of_three.nim", binary: "build/test-bin/test_block_size_is_one_of_three", mm: "arc"),
+  TestSpec(source: "tests/test_open_new_trace_reads_the_declared_root.nim", binary: "build/test-bin/test_open_new_trace_reads_the_declared_root", pool: CtPrintPool, mm: "arc", extraPaths: @["tests"]),
   TestSpec(source: "tests/test_meta_text_is_utf8.nim", binary: "build/test-bin/test_meta_text_is_utf8", mm: "arc"),
   TestSpec(source: "tests/test_ffi_assignment_refuses_unknown_kinds.nim", binary: "build/test-bin/test_ffi_assignment_refuses_unknown_kinds", mm: "arc"),
   # The fault-injection seam is compiled in for this test only. Its two

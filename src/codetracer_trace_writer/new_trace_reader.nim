@@ -642,18 +642,18 @@ proc recordedEntryIdentity*(r: NewTraceReader): Option[RecordedEntryIdentity] =
   ## Only the checked identity from the reader's own image is exposed.
   r.entryIdentity
 
-proc openNewTraceFromImage(image: ContainerImage, blockSize: uint32,
-    maxEntries: uint32, assumeColumnAwarePaths: bool):
-    Result[NewTraceReader, string] =
+proc openNewTraceFromImage(image: ContainerImage,
+    assumeColumnAwarePaths: bool): Result[NewTraceReader, string] =
   ## The reader over a container image whose header has been checked
   ## (`checkReadableContainer`): held whole, or read from its file as it is
-  ## used (`openFileImage`).
+  ## used (`openFileImage`). Every member is looked up with the geometry the
+  ## header declares (`declaredGeometry`).
+  let (blockSize, maxEntries) = declaredGeometry(image.bytes)
   # `entry.dat` is optional finalized metadata. Its structural presence is
   # counted over exactly the root directory the header declares,
-  # independently of table decoding and of the caller's `maxEntries`: a
-  # smaller caller count would hide a member, and a larger one would read
-  # data blocks as entries, so a member's bytes could count as a second
-  # `entry.dat`. A duplicate is refused rather than resolved to either copy.
+  # independently of table decoding: a smaller count would hide a member,
+  # and a larger one would read data blocks as entries, so a member's bytes
+  # could count as a second `entry.dat`. A duplicate is refused rather than resolved to either copy.
   # Compact directory parsing already refuses duplicate names.
   let entrySlots = headerRootEntryCount(image.bytes)
   var entryMembers = 0
@@ -812,11 +812,13 @@ proc openNewTraceFromImage(image: ContainerImage, blockSize: uint32,
   ok(reader)
 
 proc openNewTraceFromBytes*(data: sink seq[byte],
-    blockSize: uint32 = DefaultBlockSize,
-    maxEntries: uint32 = DefaultMaxRootEntries,
     assumeColumnAwarePaths: bool = false): Result[NewTraceReader, string] =
   ## Open a trace from in-memory bytes. The reader keeps ``data``: pass the
   ## buffer by its last use (or ``move`` it) and it is taken without a copy.
+  ##
+  ## The block size and the root directory are the container's own, read
+  ## from its header (`ctfs-container.md` §1); a caller does not supply
+  ## them, so none can open a container with a geometry it does not have.
   ##
   ## ``assumeColumnAwarePaths`` overrides the ``meta.dat`` bit 4
   ## declaration for the ``paths.dat`` record layout only.  Pass it when
@@ -840,8 +842,7 @@ proc openNewTraceFromBytes*(data: sink seq[byte],
     image[V6CompressionOffset] = uint8(ord(wfcNone))
     bytes = move image
   ? checkReadableContainer(bytes)
-  openNewTraceFromImage(newContainerImage(move bytes), blockSize, maxEntries,
-    assumeColumnAwarePaths)
+  openNewTraceFromImage(newContainerImage(move bytes), assumeColumnAwarePaths)
 
 when ctHasFilesystem:
   # The only two entry points in this module that name a file. Everything
@@ -865,8 +866,7 @@ when ctHasFilesystem:
       return openNewTraceFromBytes(move image.bytes,
         assumeColumnAwarePaths = assumeColumnAwarePaths)
     ? checkReadableContainer(image.bytes)
-    openNewTraceFromImage(image, DefaultBlockSize, DefaultMaxRootEntries,
-      assumeColumnAwarePaths)
+    openNewTraceFromImage(image, assumeColumnAwarePaths)
 
   proc refresh*(r: var NewTraceReader, path: string): Result[void, string] =
     ## Follow a container that is being written (`ctfs-container.md` §6,
@@ -905,8 +905,7 @@ when ctHasFilesystem:
       ? r.callReader.refresh(r.image, r.blockSize, r.maxEntries)
     if r.ioEventLoaded:
       ? r.ioEventReader.refresh(r.image, r.blockSize, r.maxEntries)
-    var fresh = ? openNewTraceFromImage(r.image, r.blockSize, r.maxEntries,
-      r.assumedColumnAwarePaths)
+    var fresh = ? openNewTraceFromImage(r.image, r.assumedColumnAwarePaths)
     if r.execLoaded:
       fresh.execReader = move r.execReader
       fresh.execLoaded = true

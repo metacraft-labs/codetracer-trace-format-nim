@@ -462,6 +462,10 @@ task test, "Run all tests":
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_call_entry_is_the_next_step.nim"
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_refused_column_stays_with_its_step.nim"
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_block_size_is_one_of_three.nim"
+  # Every open entry point -- by path, from bytes, `refresh`, the C ABI and
+  # ct-print -- takes the block size and the root directory from the
+  # container's header, not from the 4096-byte, 31-slot defaults.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_open_new_trace_reads_the_declared_root.nim"
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_meta_text_is_utf8.nim"
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_assignment_refuses_unknown_kinds.nim"
   # Every class of C ABI entry point reports its failure to the caller, and
