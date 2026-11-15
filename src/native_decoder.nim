@@ -191,7 +191,8 @@ proc probeContainerLayout*(data: openArray[byte]): Result[NativeBundleInfo, stri
   # A declared `0` is the auto-filled root (`ctfs-container.md` §1,
   # "Auto-fill"), not a nonsensical header.
   let maxRoot = if compact: 0'u32 else: headerRootEntryCount(data)
-  if not compact and (blockSize == 0 or maxRoot == 0 or int(maxRoot) > 4096):
+  if not compact and (blockSize == 0 or maxRoot == 0 or
+      not rootDirectoryFits(data)):
     return err(
       "nonsensical CTFS root header (blockSize=" & $blockSize &
       " maxRoot=" & $maxRoot & ")")

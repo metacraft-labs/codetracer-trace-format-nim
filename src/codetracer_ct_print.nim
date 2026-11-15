@@ -814,7 +814,7 @@ proc printSpans(filePath: string, jsonOut: bool) =
   # A declared `0` is the auto-filled root (`ctfs-container.md` §1,
   # "Auto-fill"), not a nonsensical header.
   let maxRoot = headerRootEntryCount(bytes)
-  if blockSize == 0'u32 or maxRoot == 0'u32 or int(maxRoot) > 4096:
+  if blockSize == 0'u32 or maxRoot == 0'u32 or not rootDirectoryFits(bytes):
     quit("ct-print: nonsensical CTFS root header (blockSize=" & $blockSize &
       " maxRootEntries=" & $maxRoot & ") in " & filePath)
 

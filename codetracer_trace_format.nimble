@@ -116,6 +116,9 @@ task test, "Run all tests":
   # A header declaring `MaxRootEntries = 0` is the auto-filled root
   # (`ctfs-container.md` §1): every reader scans the slots that fill block 0.
   exec "nim c -r -p:src tests/test_root_auto_fill.nim"
+  # A root larger than 4096 entries (a checkpointed MCR recording declares
+  # 10,922) is read; one larger than the image is still refused.
+  exec "nim c -r -p:src tests/test_native_decoder_large_root.nim"
   exec "nim c -r tests/test_sharded_root_layout.nim"
   exec "nim c -r tests/test_chunk_index.nim"
   exec "nim c -r tests/test_fixed_record_table.nim"

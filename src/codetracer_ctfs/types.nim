@@ -440,3 +440,22 @@ proc rootDirectoryLayout*(data: openArray[byte]): tuple[entryStart: int, entryCo
   if uint64(headerSize) + uint64(count) * uint64(FileEntrySize) > uint64(data.len):
     return (0, 0'u32, "truncated CTFS root directory")
   (headerSize, count, "")
+
+proc rootDirectoryFits*(data: openArray[byte]): bool =
+  ## Whether the root directory the header of the container image `data`
+  ## declares lies inside the image: `rootBlockCount` blocks of its
+  ## `BlockSize`. `ctfs-container.md` §1 bounds the entry count by nothing
+  ## else -- a root larger than block 0 continues into the blocks after it,
+  ## and a writer may declare one up front (a checkpointed MCR recording
+  ## declares 10,922 entries: 64 blocks of 4096 bytes) or grow it
+  ## (`growRootDirectory`). A count no image of this size can hold is the
+  ## nonsensical header; a fixed ceiling such as 4096 refused real recordings.
+  if data.len < HeaderSize + ExtHeaderSize:
+    return false
+  let blockSize = readU32LE(data, 8)
+  if blockSize == 0'u32:
+    return false
+  let blocks = rootBlockCount(blockSize, headerRootEntryCount(data), 0'u8,
+                              containerHeaderSize(data))
+  blocks * uint64(blockSize) <= uint64(data.len)
+
