@@ -7,7 +7,7 @@ function Read-AuthenticatedNimArchive([string]$Archive, $Hold) {
     # The declared nim-2.2.10 Windows archive carries one legacy (non-UTF8-flagged)
     # member -- tests/misc/åäö.nim -- whose name is DOS/OEM-encoded bytes with no
     # declared code page. The SDK's tool-store extraction decodes such names as
-    # CP437, the zip specification's default (Repro 9dbf4e71,
+    # CP437, the zip specification's default (Repro 7c670d24,
     # repro_core/powershell_zip.nim; since 8e88ae4e3, after v0.2.10, whose
     # extractor used the runner's ANSI code page 1252). Reading with any other
     # code page here makes the two inventories disagree on this one file's name
@@ -54,7 +54,7 @@ function Read-AuthenticatedNimArchive([string]$Archive, $Hold) {
 function Assert-NimPrefixInventory([string]$Prefix, $Members, $Hold) {
     if ($Members.Count -ne 4822) { throw 'nim-prefix/authority-count' }
     $extras = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    # Exact files added by authenticated SDK (9dbf4e71) tarball materialization/registerInUnifiedStore.
+    # Exact files added by authenticated SDK (7c670d24) tarball materialization/registerInUnifiedStore.
     [void]$extras.Add('.reprobuild-tarball-receipt.json'); [void]$extras.Add('.repro-receipt')
     $found = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $directories = [Collections.Generic.Queue[string]]::new(); $directories.Enqueue($Prefix)

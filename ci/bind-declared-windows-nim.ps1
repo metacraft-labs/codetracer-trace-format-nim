@@ -42,7 +42,7 @@ function Assert-DeclaredNimProducer($Profile, $Receipt, [string]$ExportedPrefix)
   }
   if (-not [IO.Path]::IsPathFullyQualified($ExportedPrefix)) { throw 'nim-producer/exported-prefix' }
   $prefix = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($Profile.selectedStorePath))
-  # The SDK (064daf5b through 9dbf4e71) writes receipt.realizationBoundary in the extraction directory
+  # The SDK (064daf5b through 7c670d24) writes receipt.realizationBoundary in the extraction directory
   # before moving/publishing it. That typed historical path is not final
   # physical authority; the public profile/exported prefix is, together with
   # complete independent archive-member correspondence below.
@@ -252,7 +252,7 @@ try {
           }
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "REPRO_PREFIX_NIM=$prefix"
           Add-Content -LiteralPath $env:GITHUB_PATH -Value (Join-Path $prefix 'bin')
-          [ordered]@{declaredSdkContractRevision='9dbf4e710d7cc0b9a79a4bcd54c931afb6849dd0'; archiveSha256=$archiveSha;
+          [ordered]@{declaredSdkContractRevision='7c670d248b936188f8aad689f32bb7e64522c5ac'; archiveSha256=$archiveSha;
             physicalPrefix=$prefix; image=$binding.ImagePath; imageSha256=$binding.ImageSha256;
             headerSha256=$binding.HeaderSha256; profileInspection=$env:REPRO_TOOL_PROFILE_INSPECTION} | ConvertTo-Json -Depth 5
         } finally { $binding.Dispose() }

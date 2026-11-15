@@ -1,8 +1,8 @@
 {
   "status": "proposal-only-no-native-execution",
   "traceHead": "1e58aae4412f94a1a13eaed658cbc3686c38967d",
-  "releaseArchiveSha256": "83c21f613b9a4ac90ce61c964a723019fcd0e40cf8bbed46ca019cd5be39288d",
-  "supplierAuthority": "Exact unmodified129 staged RunQuota files in authenticated released-client archive v0.2.23 (runquota 9818dc0c with CRLF line ends); not the full repository tree or a guessed Git coordinate",
+  "releaseArchiveSha256": "557bc937b0a3d3ff4dbdbe24f160a6199e5737893229049bb53163d21e9f3ab1",
+  "supplierAuthority": "Exact unmodified131 staged RunQuota files in authenticated released-client archive v0.2.24 (runquota 37192074 with CRLF line ends); not the full repository tree or a guessed Git coordinate",
   "buildRecipe": {
     "sourceRevision": "cbfba94e2e10ed5a6078e2b9f90b406f5a8784b7",
     "path": "setup-reprobuild/build-runquota-bootstrap.ps1",
@@ -19,7 +19,7 @@
   },
   "leaseCandidate": {
     "revision": "22e3100cdb4fbc374689ddac55b4b32c90654140",
-    "authority": "official v0.2.23 (9dbf4e71) flake.lock nim-shm-lease input of runquota-src; equals runquota 9818dc0c flake.lock root input and repro.lock",
+    "authority": "official v0.2.24 (7c670d24, the release-asset build) flake.lock nim-shm-lease input of runquota-src; equals runquota 37192074 flake.lock root input and repro.lock",
     "fullTrackedManifest": [
       {
         "path": ".editorconfig",
@@ -1008,12 +1008,12 @@
   "nativeCredit": false,
   "installedReleaseMembers": {
     "bin/repro.exe": {
-      "size": 1266104,
-      "sha256": "2305f464019743f7ec47e75552dc89cdd675413fcb0ccff0bd006714bbc52e7e"
+      "size": 1266137,
+      "sha256": "06a16845e86e90d3862cbd2a03a3ba3faca9a179bcd54471c07312e2a5460a38"
     },
     "bin/reprobuild.exe": {
-      "size": 40488490,
-      "sha256": "f811ecd05d147f7040a4135e779f236c4e527c9c23c0149fe90b83d894784f84"
+      "size": 40554730,
+      "sha256": "e2e336fbb4dee51b9496bf7a8d5349957f6a028159f52920ef050d2713387b64"
     }
   },
   "nativeControls": {

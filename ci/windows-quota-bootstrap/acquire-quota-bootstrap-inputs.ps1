@@ -74,7 +74,7 @@ function Expand-DirectZip([string]$Archive, [string]$Root, [long]$ExpandedLimit)
     } finally { $zip.Dispose() }
 }
 $nimArchive = Join-Path $OutputRoot 'nim.zip'
-# The Windows Nim archive the SDK (Repro 9dbf4e71, v0.2.23) declares for
+# The Windows Nim archive the SDK (Repro 7c670d24, v0.2.24) declares for
 # `nim` (repro_dsl_stdlib/packages/nim.nim). bind-declared-windows-nim.ps1
 # authenticates the SDK-realized prefix against this same archive.
 Get-Bounded 'https://github.com/metacraft-labs/nim/releases/download/nim-2.2.10-vccexe-8910b50d2d21ca1a3e982fe8b8b9bf0d8832e633/nim-2.2.10-vccexe-8910b50d2d21ca1a3e982fe8b8b9bf0d8832e633-windows-x64.zip' $nimArchive 33554432
