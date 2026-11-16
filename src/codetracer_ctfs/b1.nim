@@ -420,7 +420,7 @@ proc readNode*(b: var B1Reader, r: var LiveReader, n: uint64): Result[B1Node3, s
       let hi = r.page.view.loadRelaxed(so + 16)
       let rt = r.page.view.loadRelaxed(so + 24)
       let blk = ? r.readMember(b.nodSlot, off, NodeSize)
-      atomicThreadFence(ATOMIC_ACQUIRE)
+      fenceAcquire()  # live_page: MemoryBarrier under MSVC, a C11 fence elsewhere
       if r.page.view.loadRelaxed(so) != s1: continue
       res = B1Node3(kind: uint8(w0 and 0xff), count: int((w0 shr 16) and 0xFFFF'u64),
         high: hi, right: rt, first: readU64LE(blk, 24), blk: blk)

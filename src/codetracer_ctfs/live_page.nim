@@ -279,8 +279,8 @@ when defined(vcc) or defined(clang_cl):
     cast[uint64](compareExchange64(cast[ptr int64](wordPtr(v, off)),
       cast[int64](desired), cast[int64](expected))) == expected
 
-  proc fenceRelease() {.inline.} = memoryBarrier()
-  proc fenceAcquire() {.inline.} = memoryBarrier()
+  proc fenceRelease*() {.inline.} = memoryBarrier()
+  proc fenceAcquire*() {.inline.} = memoryBarrier()
 else:
   proc load*(v: PageView, off: int): uint64 {.inline.} =
     atomicLoadN(wordPtr(v, off), ATOMIC_ACQUIRE)
@@ -302,8 +302,8 @@ else:
     atomicCompareExchangeN(wordPtr(v, off), addr e, desired, false,
       ATOMIC_ACQ_REL, ATOMIC_RELAXED)
 
-  proc fenceRelease() {.inline.} = atomicThreadFence(ATOMIC_RELEASE)
-  proc fenceAcquire() {.inline.} = atomicThreadFence(ATOMIC_ACQUIRE)
+  proc fenceRelease*() {.inline.} = atomicThreadFence(ATOMIC_RELEASE)
+  proc fenceAcquire*() {.inline.} = atomicThreadFence(ATOMIC_ACQUIRE)
 
 # ---------------------------------------------------------------------------
 # The machine's monotonic clock, process start times
