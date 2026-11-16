@@ -556,10 +556,8 @@ proc entryChanged*(c: Ctfs, i: int): bool =
   let off = c.fileEntryOffset(i)
   if off + FileEntrySize > c.fileRoot.len:
     return true
-  for k in 0 ..< FileEntrySize:
-    if c.data[off + k] != c.fileRoot[off + k]:
-      return true
-  false
+  not equalMem(unsafeAddr c.data[off], unsafeAddr c.fileRoot[off],
+               FileEntrySize)
 
 proc rootLayoutChanged(c: Ctfs): bool =
   ## The root region is not the one the file holds: its size, or its header,
@@ -574,11 +572,40 @@ proc rootLayoutChanged(c: Ctfs): bool =
   false
 
 proc changedEntries*(c: Ctfs): seq[int] =
-  ## The root slots whose entry differs from what the file last received.
-  for i in 0 ..< int(c.maxRootEntries):
-    if c.fileEntryOffset(i) + FileEntrySize > c.data.len: break
-    if c.entryChanged(i):
-      result.add i
+  ## The root slots whose entry differs from what the file last received:
+  ## `entryChanged` of every slot the image holds whole, in slot order.
+  ##
+  ## Every `publish` asks this, and a streaming writer publishes at every
+  ## `syncEntry`, so the scan runs once per sealed chunk over the WHOLE root
+  ## directory -- about 10,900 slots for a recorder container that takes
+  ## periodic checkpoints (64 root blocks).  Compared slot by slot, a byte at
+  ## a time, it was 30-50% of such a recording's CPU (ct-mcr, ck10 with
+  ## 50 ms checkpoints, 2026-11-16).  The slots the file
+  ## already holds are compared in runs of `Run` slots with one `equalMem`
+  ## each, and only a run that differs is looked at slot by slot; the slots
+  ## the file does not hold yet are changed by definition.
+  const Run = 64
+  let base = containerHeaderSize(c.data)
+  if c.data.len < base: return
+  let inImage = min(int(c.maxRootEntries),
+                    (c.data.len - base) div FileEntrySize)
+  let inFile =
+    if c.fileRoot.len < base: 0
+    else: min(inImage, (c.fileRoot.len - base) div FileEntrySize)
+  var i = 0
+  while i < inFile:
+    let n = min(Run, inFile - i)
+    let off = base + i * FileEntrySize
+    if not equalMem(unsafeAddr c.data[off], unsafeAddr c.fileRoot[off],
+                    n * FileEntrySize):
+      for k in i ..< i + n:
+        let o = base + k * FileEntrySize
+        if not equalMem(unsafeAddr c.data[o], unsafeAddr c.fileRoot[o],
+                        FileEntrySize):
+          result.add k
+    i += n
+  for k in inFile ..< inImage:
+    result.add k
 
 proc setRootPublicationOrder*(c: var Ctfs, names: openArray[string]):
     Result[void, string] =

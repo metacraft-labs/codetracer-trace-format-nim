@@ -194,6 +194,7 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_recorded_entry_hierarchy.nim", binary: "build/test-bin/test_recorded_entry_hierarchy", mm: "arc"),
   TestSpec(source: "tests/test_base40.nim", binary: "build/test-bin/test_base40"),
   TestSpec(source: "tests/test_container.nim", binary: "build/test-bin/test_container"),
+  TestSpec(source: "tests/test_changed_entries_scan.nim", binary: "build/test-bin/test_changed_entries_scan"),
   TestSpec(source: "tests/test_ctfs_v5_member_forms.nim", binary: "build/test-bin/test_ctfs_v5_member_forms"),
   # `ctfs-container.md` §1: `root_blocks`, the overflow of the entry array past
   # block 0 and its growth, with no free list root area at any `max_shards`

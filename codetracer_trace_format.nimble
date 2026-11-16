@@ -19,6 +19,7 @@ task test, "Run all tests":
   exec "nim c -r tests/test_nimcache_is_worktree_local.nim"
   exec "nim c -r tests/test_base40.nim"
   exec "nim c -r tests/test_container.nim"
+  exec "nim c -r -d:release tests/test_changed_entries_scan.nim"
   # Container version 5: a member's MapBlock is 0 (empty), its only data
   # block tagged with bit 63, or a mapping block; readers refuse every
   # other container version, naming it.
