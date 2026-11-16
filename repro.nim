@@ -334,6 +334,7 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_name_only_funcs_refusal.nim", binary: "build/test-bin/test_name_only_funcs_refusal"),
   TestSpec(source: "tests/test_ct_print_full.nim", binary: "build/test-bin/test_ct_print_full"),
   TestSpec(source: "tests/test_ct_print_native.nim", binary: "build/test-bin/test_ct_print_native"),
+  TestSpec(source: "tests/test_ct_print_event_log_preview.nim", binary: "build/test-bin/test_ct_print_event_log_preview"),
   TestSpec(source: "tests/test_managed_sender.nim", binary: "build/test-bin/test_managed_sender"),
   # Starts a MinIO and a Python stand-in of codetracer-ci's upload routes,
   # both from the dev shell (``flake.nix``).
