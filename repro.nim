@@ -364,6 +364,7 @@ const testSpecs: seq[TestSpec] = @[
   # `-d:release` on the nimble line):
   TestSpec(source: "tests/test_nimcache_is_worktree_local.nim", binary: "build/test-bin/test_nimcache_is_worktree_local", debugOnly: true),
   TestSpec(source: "tests/test_root_auto_fill.nim", binary: "build/test-bin/test_root_auto_fill", debugOnly: true),
+  TestSpec(source: "tests/test_native_decoder_large_root.nim", binary: "build/test-bin/test_native_decoder_large_root", debugOnly: true),
   TestSpec(source: "tests/test_namespace_images_refuse_malformed_input.nim", binary: "build/test-bin/test_namespace_images_refuse_malformed_input", debugOnly: true),
   TestSpec(source: "tests/test_cbor_top_level_type_id.nim", binary: "build/test-bin/test_cbor_top_level_type_id", debugOnly: true),
   TestSpec(source: "tests/test_follow_is_incremental.nim", binary: "build/test-bin/test_follow_is_incremental", debugOnly: true),
