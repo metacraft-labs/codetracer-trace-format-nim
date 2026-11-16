@@ -36,6 +36,13 @@ when defined(windows):
     {.passL: "-lzstd".}
   # Under MSVC a consumer SDK supplies the complete native flags itself.
   # In that case no undeclared C:\zstd/MSYS2 host path is injected here.
+elif (defined(android) or defined(ios)) and
+    (defined(CtAndroidVendorZstd) or defined(CtVendorZstd)):
+  # The consumer compiles a vendored zstd into the same library
+  # (codetracer-native-recorder's ct_cooperative builds for Android and iOS,
+  # whose SDKs ship no libzstd). A `-lzstd` here failed the Android shared
+  # library's link with "unable to find library -lzstd".
+  discard
 else:
   {.passL: "-lzstd".}
 

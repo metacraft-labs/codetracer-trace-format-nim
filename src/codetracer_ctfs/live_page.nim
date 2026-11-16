@@ -674,6 +674,24 @@ when defined(windows):
     InvalidHandleValue = -1
 
   proc sectionName(name: string): string = "Local\\" & name
+elif defined(android):
+  # Android's bionic has no POSIX shared memory: shm_open and shm_unlink are
+  # not declared, and the cooperative recorder's Android build failed to
+  # compile here. A named region is a file in a directory both sides reach
+  # (CT_SHM_DIR, else TMPDIR, else /data/local/tmp), mapped as shm_open's would
+  # be; shmPath gives its full path, so open/unlink stand in for
+  # shm_open/shm_unlink.
+  proc c_getenv(name: cstring): cstring {.importc: "getenv", header: "<stdlib.h>".}
+  proc shmDir(): string =
+    for v in ["CT_SHM_DIR", "TMPDIR"]:
+      let d = c_getenv(cstring(v))
+      if d != nil and d[0] != '\0':
+        return $d
+    "/data/local/tmp"
+  proc shmPath(name: string): string = shmDir() & "/ctfs-shm-" & name
+  proc shm_open(name: cstring, oflag: cint, mode: Mode): cint =
+    posix.open(name, oflag, mode)
+  proc shm_unlink(name: cstring): cint = posix.unlink(name)
 else:
   proc shm_open(name: cstring, oflag: cint, mode: Mode): cint {.importc,
     header: "<sys/mman.h>".}
