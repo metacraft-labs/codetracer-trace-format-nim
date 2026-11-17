@@ -147,6 +147,33 @@ proc ctPrintPath*(projectRoot: string): string =
   ## repository-root ``ct-print`` (``ct-print.exe`` on Windows).
   projectRoot / (when defined(windows): "ct-print.exe" else: "ct-print")
 
+proc nimSourceDependencyFlags*(nimDependencyDirs: openArray[string]): seq[string] =
+  ## The ``nim c`` flags that make ``nimDependencyDirs`` the compile's only
+  ## source of Nim packages: ``--noNimblePath``, then one ``--path:`` per
+  ## directory, in order. Empty when no directory is given, so the compile
+  ## keeps Nim's default nimble path.
+  ##
+  ## ``--noNimblePath`` is what makes the directories the whole set. Without
+  ## it Nim also lists the ``nimblepath`` entries of its own ``config/nim.cfg``
+  ## (``$HOME/.nimble/pkgs2``, ``$HOME/.nimble/pkgs`` and, off Windows,
+  ## ``/opt/nimble/pkgs2`` and ``/opt/nimble/pkgs``) at startup, and resolves
+  ## any import the given directories do not provide from whatever packages
+  ## the host has installed there. The listings are read by the edge, so they
+  ## would make its recorded dependencies, and its cache key, depend on the
+  ## host, and a dependency the caller forgot would build anyway.
+  ## https://nim-lang.org/docs/nimc.html#compiler-usage-commandminusline-switches
+  ## documents the switch; it clears the nimble paths and stops later
+  ## ``nimblepath`` entries in the configuration files from adding any.
+  ##
+  ## Each directory must be an existing absolute path.
+  if nimDependencyDirs.len == 0:
+    return @[]
+  result = @["--noNimblePath"]
+  for dependencyDir in nimDependencyDirs:
+    doAssert dependencyDir.isAbsolute and dirExists(dependencyDir),
+      "declared Nim source dependency must be an existing absolute directory"
+    result.add("--path:" & dependencyDir)
+
 proc buildSharedLib*(projectRoot: string;
                      compilerSdkRefs: seq[string] = @[];
                      nativeIncludeDir = ""; nativeLibDir = "";
@@ -154,17 +181,15 @@ proc buildSharedLib*(projectRoot: string;
                      nativeLibraryFile = ""): BuildActionDef =
   ## Construct the typed ``nim c`` edge that compiles the C ABI writer shared
   ## library from the checkout at ``projectRoot`` (relative, as for
-  ## ``buildCtPrint``). The consuming package must declare
+  ## ``buildCtPrint``). ``nimDependencyDirs`` has the meaning
+  ## ``buildCtPrint`` documents: when it is given, the compile resolves Nim
+  ## packages from those directories only. The consuming package must declare
   ## ``SharedLibToolSelectors`` in its ``uses:`` block; see the module doc's
   ## "Native tool contract".
   doAssert projectRoot.len > 0 and not projectRoot.isAbsolute
   const target = (when defined(windows): "msvc" else: "posix")
   let output = sharedLibraryPath(projectRoot)
-  var dependencyFlags: seq[string] = @[]
-  for dependencyDir in nimDependencyDirs:
-    doAssert dependencyDir.isAbsolute and dirExists(dependencyDir),
-      "declared Nim source dependency must be an existing absolute directory"
-    dependencyFlags.add("--path:" & dependencyDir)
+  let dependencyFlags = nimSourceDependencyFlags(nimDependencyDirs)
   var nativeFlags: seq[string] = @[]
   var nativeInputs: seq[string] = @[]
   when defined(windows):
@@ -221,13 +246,24 @@ proc buildCtPrint*(projectRoot: string;
   ## from a sibling). An absolute path would bake one host's layout into the
   ## graph, so it is refused.
   ##
-  ## ``after`` orders the compile behind edges it does not read the outputs
-  ## of. Without ``nimDependencyDirs`` the compile resolves this package's
-  ## nimble ``requires`` (``results``, ``stew``) from Nim's default nimble
-  ## path; in a recorder's graph the edge that installs them there is the
-  ## cargo build whose ``codetracer_trace_writer_nim`` ``build.rs`` runs
-  ## ``nimble install --depsOnly`` in this checkout, so a recorder passes that
-  ## edge here.
+  ## ``nimDependencyDirs`` names the directories this package's nimble
+  ## ``requires`` (``results``, ``stew``) are compiled from, each an existing
+  ## absolute path. When it is non-empty those directories are the ONLY place
+  ## the compile looks for Nim packages: it passes ``--noNimblePath``, so it
+  ## neither lists nor reads anything under Nim's default nimble path
+  ## (``~/.nimble/pkgs2``, ``~/.nimble/pkgs``, ``/opt/nimble/...``), and an
+  ## import none of the directories provides fails to compile instead of
+  ## being resolved from the host (``nimSourceDependencyFlags``). Every
+  ## directory is also an input of the edge, so the caller should name pinned
+  ## checkouts.
+  ##
+  ## When it is empty the compile resolves the ``requires`` from Nim's
+  ## default nimble path, as before. ``after`` orders the compile behind edges
+  ## it does not read the outputs of; in a recorder's graph the edge that
+  ## installs the ``requires`` on the nimble path is the cargo build whose
+  ## ``codetracer_trace_writer_nim`` ``build.rs`` runs
+  ## ``nimble install --depsOnly`` in this checkout, so a recorder that passes
+  ## no ``nimDependencyDirs`` passes that edge here.
   ##
   ## The consuming package must declare ``CtPrintToolSelectors`` in its
   ## ``uses:`` block (the C compiler and ``zstd-dev``, on every host), and the
@@ -237,11 +273,7 @@ proc buildCtPrint*(projectRoot: string;
     "buildCtPrint: projectRoot must be a non-empty relative path, got '" &
     projectRoot & "'"
   let output = ctPrintPath(projectRoot)
-  var dependencyFlags: seq[string] = @[]
-  for dependencyDir in nimDependencyDirs:
-    doAssert dependencyDir.isAbsolute and dirExists(dependencyDir),
-      "declared Nim source dependency must be an existing absolute directory"
-    dependencyFlags.add("--path:" & dependencyDir)
+  let dependencyFlags = nimSourceDependencyFlags(nimDependencyDirs)
   var nativeFlags: seq[string] = @[]
   var nativeInputs: seq[string] = @[]
   when defined(windows):
