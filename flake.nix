@@ -341,6 +341,11 @@
           # `include/` mirror the source-tree locations the sibling-checkout
           # builds read.  Consumers also link libzstd.
           # Same selected constructors used by the guarded owning shell.
+          # The schema-1 tool-path manifest this repo's own shell selects
+          # through the `toolPathsFile` variant. A consumer whose repro build
+          # evaluates this recipe (codetracer's `build-once`) selects the same
+          # file, so the paths are stated once, here, by the recipe's owner.
+          packages.repro-tool-paths = reproToolPaths;
           packages.ci-nimble = nimble;
           packages.ci-nimble-source = nimbleSource;
           packages.ci-nimble-runtime-metadata = nimbleRuntimeMetadata;
