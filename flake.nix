@@ -9,7 +9,16 @@
     # The toolchain source shared by the CodeTracer trace-format repositories,
     # so the Nim and Rust implementations of the format are built with one
     # pinned compiler set rather than two.
-    codetracer-toolchains.url = "github:metacraft-labs/nix-codetracer-toolchains";
+    codetracer-toolchains = {
+      url = "github:metacraft-labs/nix-codetracer-toolchains";
+      # microvm.nix (reached through devops-modules) takes its `spectrum`
+      # input from spectrum-os.org, a single host with no mirror of record.
+      # Only microvm's cloud-hypervisor-graphics overlay reads it, and nothing
+      # here uses that, but `nix flake archive` fetches every locked input:
+      # when that host is unreachable, the conformance suite's source
+      # constructor fails. Point it at this flake's own source instead.
+      inputs.nixos-modules.inputs.microvm.inputs.spectrum.follows = "";
+    };
     nixpkgs.follows = "codetracer-toolchains/nixpkgs";
 
     flake-parts = {
