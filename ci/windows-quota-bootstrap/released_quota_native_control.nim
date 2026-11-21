@@ -17,6 +17,48 @@ proc processImage(process: Handle; flags: DWORD; buffer: WideCString;
   size: ptr DWORD): WINBOOL {.stdcall, dynlib: "kernel32.dll",
   importc: "QueryFullProcessImageNameW".}
 
+# Expected refusal texts. The daemon this control talks to is built from the
+# released reprobuild 0.2.26 bundle's `share/repro/src/runquota`, which
+# `declared-released-runquota-source-manifest.json` pins file by file; its
+# `libs/runquota_daemon/src/runquota_daemon.nim` is runquota 98ea3e58 with CRLF
+# line endings. There `possible` (runquota_daemon.nim:1133) names the amount
+# asked for and the budget in force in every budget refusal; runquota's
+# `libs/runquota_daemon/tests/t_denial_names_the_amounts.nim` pins those texts
+# with `==`, and so does this control, because a prefix match would keep
+# passing if the amounts were dropped again.
+
+proc budgetBytesText(value: uint64): string =
+  ## The daemon's byte spelling (`humanBytes`, runquota
+  ## `libs/runquota_daemon/src/runquota_daemon/host_config.nim:329` at
+  ## 98ea3e58): `N GiB` or `N MiB` only for exact multiples, otherwise the
+  ## byte count, so neither figure is rounded. Restated here rather than
+  ## imported so the control checks the daemon's output against the
+  ## documented format instead of against the daemon's own formatter.
+  const
+    MiB = 1024'u64 * 1024'u64
+    GiB = MiB * 1024'u64
+  if value >= GiB and value mod GiB == 0: $(value div GiB) & " GiB"
+  elif value >= MiB and value mod MiB == 0: $(value div MiB) & " MiB"
+  else: $value & " bytes"
+
+const InvalidRequestRefusal =
+  # runquota_daemon.nim:1158 at 98ea3e58 for `milliCpu(0)`, `bytes(4096)`:
+  # both halves are named, CPU in milli-CPU with an `m` suffix. The request
+  # carries no client estimate and no command-stats id, so
+  # `effectiveResources` leaves it unchanged and these are the figures the
+  # daemon reports.
+  "lease request must reserve CPU and memory (requested 0m CPU and 4096 bytes)"
+
+proc overMemoryBudgetRefusal(budget: uint64): string =
+  ## runquota_daemon.nim:1180 at 98ea3e58 for a request of `budget + 1` bytes
+  ## on the default machine. `resourceRequest` names no machine, so the
+  ## request resolves to `local` (`DefaultMachineId`); `normalizeTopology`
+  ## makes `local`'s memory the daemon's `config.memoryBytes`, which is the
+  ## `memoryBytes` capability the daemon advertised in HelloOk. The budget is
+  ## host-dependent, so the text is computed from that capability.
+  "lease request exceeds machine memory budget: local (requested " &
+    budgetBytesText(budget + 1'u64) & ", budget " & budgetBytesText(budget) & ")"
+
 proc main() =
   doAssert paramCount() == 3
   let endpoint = if paramStr(1) == "default": defaultEndpoint() else: endpointForPath(paramStr(1))
@@ -51,7 +93,8 @@ proc main() =
     if invalid.active: invalid.release()
   except RunQuotaClientError:
     doAssert client.lastDiagnostic.code == diagDenied
-    doAssert client.lastDiagnostic.message == "lease request must reserve CPU and memory"
+    doAssert client.lastDiagnostic.message == InvalidRequestRefusal,
+      client.lastDiagnostic.message
     denied = true
   doAssert denied
   doAssert client.capabilities.memoryBytes.value < high(uint64)
@@ -62,7 +105,9 @@ proc main() =
     if impossible.active: impossible.release()
   except RunQuotaClientError:
     doAssert client.lastDiagnostic.code == diagDenied
-    doAssert client.lastDiagnostic.message.startsWith("lease request exceeds machine memory budget: ")
+    let expected = overMemoryBudgetRefusal(client.capabilities.memoryBytes.value)
+    doAssert client.lastDiagnostic.message == expected,
+      client.lastDiagnostic.message & " != " & expected
     overBudgetDenied = true
   doAssert overBudgetDenied
 
