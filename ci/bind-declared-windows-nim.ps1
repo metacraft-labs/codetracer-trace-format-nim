@@ -2,6 +2,19 @@
 param([Parameter(Mandatory)][string]$AuthenticatedArchive)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+# Diagnostics only: an unhandled error reaches the log as one line, and a .NET
+# failure arrives wrapped (MethodInvocationException), so print every exception
+# in the chain with its type, HResult and Win32 code before rethrowing it.
+trap {
+  $chainError = $_.Exception
+  for ($depth = 0; $null -ne $chainError; $depth++) {
+    $line = '  [{0}] {1}: {2} (HResult 0x{3:x8})' -f $depth, $chainError.GetType().FullName, $chainError.Message, $chainError.HResult
+    if ($chainError -is [ComponentModel.Win32Exception]) { $line += ' win32 ' + $chainError.NativeErrorCode }
+    [Console]::Error.WriteLine($line)
+    $chainError = $chainError.InnerException
+  }
+  break
+}
 if (!$IsWindows) { throw 'declared Nim producer requires native Windows' }
 $archiveSha = 'e6eaf87df71f83629a8877ac496bcd8cdb7755f9e860b982bb0b886e38eac1c3'
 $archiveUrl = 'https://github.com/metacraft-labs/nim/releases/download/nim-2.2.10-vccexe-8910b50d2d21ca1a3e982fe8b8b9bf0d8832e633/nim-2.2.10-vccexe-8910b50d2d21ca1a3e982fe8b8b9bf0d8832e633-windows-x64.zip'
@@ -151,7 +164,8 @@ try {
                 $refused = $false
                 try { $copyHold.HoldFile($archiveControlRoot,'copied-member',$member.sha256) } catch {
                   $reason=$_.Exception; while ($null -ne $reason.InnerException) { $reason=$reason.InnerException }
-                  if ($mutation -ne 'changed' -or $reason.Message -cne 'quota-hold/member-bytes') { throw }
+                  # The message carries path and digests after the tag; Data['tag'] is the exact tag.
+                  if ($mutation -ne 'changed' -or $reason.Data['tag'] -cne 'quota-hold/member-bytes') { throw }
                   $refused=$true
                 }
                 if (($mutation -eq 'changed') -ne $refused) { throw 'nim-archive/control-result' }
