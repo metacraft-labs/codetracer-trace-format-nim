@@ -47,7 +47,10 @@ jobs:
             runner: [self-hosted, linux, arm64]
           - os: macos
             arch: arm64
-            runner: [self-hosted, macos, arm64]
+            # `nix-darwin` pins this leg to the persistent macOS workers. The
+            # ephemeral macOS VMs run out of disk while Nix unpacks the Rust
+            # toolchain, and the benchmark runner must not take generic jobs.
+            runner: [self-hosted, macos, arm64, nix-darwin]
           - os: windows
             arch: x64
             runner: [self-hosted, windows, x64]
