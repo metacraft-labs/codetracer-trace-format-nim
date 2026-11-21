@@ -277,6 +277,16 @@ jobs:
           # at v0.2.26) while `repro-posix-io-mon-pin` is empty.
           repro-runquota-pin: "98ea3e58df67f736a8527788d1563e31291a4881"
           gh-token: ${{ steps.ci_token.outputs.token }}
+          # The ci_token installation token expires an hour after it is
+          # minted. On a loaded host this step alone has outlasted it: run
+          # 44882837197 (PR #22, linux-x64) minted it at 08:12, spent 104 min
+          # here, and its `repro exec` nixpkgs fetch then failed with
+          # `HTTP error 401`, 107 min after the mint. With the App credentials setup-dev-env starts
+          # its job credential broker, which re-mints the token and rewrites
+          # the Nix credential files setup-nix installed, before expiry.
+          # Non-Windows only; the broker does not run on Windows.
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          app-private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
 
       - name: Provision the declared Windows lease authority and Nim compiler payload
         if: runner.os == 'Windows'
