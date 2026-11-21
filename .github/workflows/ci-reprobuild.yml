@@ -237,6 +237,14 @@ jobs:
             printf "CT_MINIO_BIN=%s\nCT_PYTHON3_BIN=%s\n" "$CT_MINIO_BIN" "$CT_PYTHON3_BIN" >> "$GITHUB_ENV"
           '
 
+      # Pure string checks of the extended-length (\\?\) form the held-input
+      # classes give every raw CreateFileW. Seconds, no filesystem access, so
+      # it runs before any download and fails fast if the conversion regresses.
+      - name: Check extended-length Win32 path forms
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./ci/test-win32-path-forms.ps1
+
       - name: Acquire complete locked Nim source dependencies (Windows)
         if: runner.os == 'Windows'
         shell: pwsh

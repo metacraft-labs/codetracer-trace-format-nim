@@ -75,6 +75,38 @@ public sealed class NimPayloadBinding : IDisposable {
             path.StartsWith(@"\??\", StringComparison.OrdinalIgnoreCase)) return path.Substring(4);
         return path;
     }
+    // Extended-length form of a fully qualified, already normalised path, for
+    // the raw Win32 calls below. Without the \\?\ prefix CreateFileW refuses a
+    // path longer than MAX_PATH (260) with ERROR_PATH_NOT_FOUND unless the host
+    // sets LongPathsEnabled AND the process manifest is longPathAware; .NET's
+    // own file APIs add the prefix internally, raw P/Invoke does not. Windows
+    // does not normalise a \\?\ path, so this accepts only a path that is
+    // already normal (callers pass Normal(path)) and refuses '/', '.', '..',
+    // empty segments and trailing dots or spaces rather than open a literal
+    // name the normal form does not denote. Comparisons and diagnostics stay
+    // on the normal form. Pure string logic: no Path API, so it behaves the
+    // same off-Windows (ci/test-win32-path-forms.ps1).
+    // https://learn.microsoft.com/windows/win32/fileio/maximum-file-path-limitation
+    // https://learn.microsoft.com/windows/win32/fileio/naming-a-file#win32-file-namespaces
+    public static string Win32Path(string normal) {
+        if (normal == null) throw new ArgumentNullException("normal");
+        if (normal.StartsWith(@"\\?\", StringComparison.Ordinal)) return normal;
+        string prefix, rest;
+        if (normal.Length >= 3 && normal[1] == ':' && normal[2] == '\\' &&
+            ((normal[0] >= 'A' && normal[0] <= 'Z') || (normal[0] >= 'a' && normal[0] <= 'z'))) {
+            prefix = @"\\?\" + normal.Substring(0, 3); rest = normal.Substring(3);
+        } else if (normal.StartsWith(@"\\", StringComparison.Ordinal) && normal.Length > 2 &&
+            normal[2] != '?' && normal[2] != '.' && normal[2] != '\\') {
+            // \\server\share\x -> \\?\UNC\server\share\x; server and share are required.
+            prefix = @"\\?\UNC\"; rest = normal.Substring(2);
+            if (rest.Split('\\').Length < 2) throw new ArgumentException("UNC path lacks a share: " + normal, "normal");
+        } else throw new ArgumentException("not a fully qualified drive or UNC path: " + normal, "normal");
+        if (rest.IndexOf('/') >= 0) throw new ArgumentException("forward slash in path: " + normal, "normal");
+        if (rest.Length > 0) foreach (string part in rest.Split('\\'))
+            if (part.Length == 0 || part == "." || part == ".." || part.EndsWith(".") || part.EndsWith(" "))
+                throw new ArgumentException("path is not normalised: " + normal, "normal");
+        return prefix + rest;
+    }
     // `held` names the path the handle was opened for; it is used only in diagnostics.
     static string FinalPath(SafeFileHandle handle, string held) {
         var buffer = new StringBuilder(32768);
@@ -91,7 +123,7 @@ public sealed class NimPayloadBinding : IDisposable {
         // GENERIC_READ includes FILE_LIST_DIRECTORY/FILE_READ_DATA, so the
         // held directories actually deny later write/delete opens as well.
         // https://learn.microsoft.com/openspecs/windows_protocols/ms-fsa/8c0e3f4f-0729-49f4-a14d-7f7add593819
-        var handle = CreateFileW(path, 0x80000000u, 1,
+        var handle = CreateFileW(Win32Path(Normal(path)), 0x80000000u, 1,
             IntPtr.Zero, 3, 0x00200000u | (directory ? 0x02000000u : 0), IntPtr.Zero);
         if (handle.IsInvalid) {
             int error = Marshal.GetLastWin32Error(); handle.Dispose();
