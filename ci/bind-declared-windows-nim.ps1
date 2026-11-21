@@ -266,7 +266,7 @@ try {
           }
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "REPRO_PREFIX_NIM=$prefix"
           Add-Content -LiteralPath $env:GITHUB_PATH -Value (Join-Path $prefix 'bin')
-          [ordered]@{declaredSdkContractRevision='b9cf09b07e2c780f314c4244e4c8df7988fc2e78'; archiveSha256=$archiveSha;
+          [ordered]@{declaredSdkContractRevision='9979846112d606818f13f5952d808cb4da5bba0b'; archiveSha256=$archiveSha;
             physicalPrefix=$prefix; image=$binding.ImagePath; imageSha256=$binding.ImageSha256;
             headerSha256=$binding.HeaderSha256; profileInspection=$env:REPRO_TOOL_PROFILE_INSPECTION} | ConvertTo-Json -Depth 5
         } finally { $binding.Dispose() }

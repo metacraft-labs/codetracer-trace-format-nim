@@ -1,8 +1,8 @@
 {
   "status": "proposal-only-no-native-execution",
   "traceHead": "1e58aae4412f94a1a13eaed658cbc3686c38967d",
-  "releaseArchiveSha256": "7f10657d2666b04714fdfe90260b631afdfd65a3f85b4bca67ec0a66958e7160",
-  "supplierAuthority": "Exact unmodified145 staged RunQuota files in authenticated released-client archive v0.2.26 (runquota 98ea3e58 with CRLF line ends); not the full repository tree or a guessed Git coordinate",
+  "releaseArchiveSha256": "8138b98b6be7ba6cd6d176ff092c091f30488a467855de7fe4f6ec8d505c2345",
+  "supplierAuthority": "Exact unmodified155 staged RunQuota files in authenticated released-client archive v0.2.29 (runquota 6ff97313 with CRLF line ends); not the full repository tree or a guessed Git coordinate",
   "buildRecipe": {
     "sourceRevision": "cbfba94e2e10ed5a6078e2b9f90b406f5a8784b7",
     "path": "setup-reprobuild/build-runquota-bootstrap.ps1",
@@ -18,8 +18,8 @@
     ]
   },
   "leaseCandidate": {
-    "revision": "22e3100cdb4fbc374689ddac55b4b32c90654140",
-    "authority": "official v0.2.26 (b9cf09b0, the release-asset build) flake.lock nim-shm-lease input of runquota-src; equals runquota 98ea3e58 flake.lock root input and repro.lock",
+    "revision": "08a3f50a391b32b053598f64c670d5232e1eb051",
+    "authority": "official v0.2.29 (99798461, the release-asset build) flake.lock nim-shm-lease input of runquota-src; equals runquota 6ff97313 flake.lock root input and repro.lock",
     "fullTrackedManifest": [
       {
         "path": ".editorconfig",
@@ -31,9 +31,9 @@
       {
         "path": ".gitignore",
         "mode": "100644",
-        "gitBlob": "092791095b7264655312565ccbf9ef9ac6bd7c6f",
-        "sha256": "a38c8aa961b416b54241770e7608a44706fcf5cb0cda1c95a413487b23e4c449",
-        "size": 1112
+        "gitBlob": "10f98d4add7216b9990ce2992fe10aabcbff2fb6",
+        "sha256": "cd5894989fb5c9f900c1936a6baf48d1571754c1f937f356ebcaced95c363766",
+        "size": 1147
       },
       {
         "path": ".pre-commit-config.yaml",
@@ -52,9 +52,9 @@
       {
         "path": "Justfile",
         "mode": "100644",
-        "gitBlob": "96d548d2e5ceb39325d4c6ecb2bf4062de756e07",
-        "sha256": "740f79b76791f34520afa714b5e2ead54055462ae29c6245024ee2edc89a9995",
-        "size": 47871
+        "gitBlob": "7ac6392d6aad6f4bba7f27754608d473c33daad8",
+        "sha256": "93cd2f1ec268195378fbd04353f8df95bce5881ad96a2d2f37c922691997089a",
+        "size": 49076
       },
       {
         "path": "LICENSE",
@@ -66,9 +66,9 @@
       {
         "path": "README.md",
         "mode": "100644",
-        "gitBlob": "d0de239a27faa64194eb597cd2102510cbacbec9",
-        "sha256": "bee5de3ed8165a6184f1dd74199eb460eecd58152c72d6eb0061ddf544a89617",
-        "size": 69319
+        "gitBlob": "9027b8549c9e5bf512e553aeea9f796f58ffa0b2",
+        "sha256": "90dd9c5c6c3886edceaf5b9914321d875d3b2a6ff7cca80d24bf435a1368b676",
+        "size": 70533
       },
       {
         "path": "benchmarks/bench_claim.nim",
@@ -136,9 +136,9 @@
       {
         "path": "src/shm_lease.nim",
         "mode": "100644",
-        "gitBlob": "98bcc0cb76199c46d70818fdc2fa1160f5db5251",
-        "sha256": "62a70ef980aa393953e83214c1e57346fddf7da24b4f80a89ff4f44d107edbae",
-        "size": 49215
+        "gitBlob": "286acbc4a092de615b8f4e6dcf9bf0e18a774933",
+        "sha256": "39eaaf85708349c1a02a22ec46d6a4562ad4a85c2e2b6fa4e5efda290d219fcf",
+        "size": 49696
       },
       {
         "path": "src/shm_lease/anchor.nim",
@@ -150,9 +150,9 @@
       {
         "path": "src/shm_lease/arbiter.nim",
         "mode": "100644",
-        "gitBlob": "1b9bac75fae6383f15fbe6c88c8bea6ed63ad351",
-        "sha256": "1ff6aaeb777fff50a923a0847fd04e2ead6ba77e17d290e7630fd2e5feaca4a9",
-        "size": 104833
+        "gitBlob": "ffd7e9f9b24548f479baf74782707e270d1dfbca",
+        "sha256": "46643194355c6f395c016cdbd0d0503ac482027cfaa940fc17c6279266b997aa",
+        "size": 108944
       },
       {
         "path": "src/shm_lease/hooks.nim",
@@ -234,22 +234,29 @@
       {
         "path": "tests/test_shm_lease_arbiter.nim",
         "mode": "100644",
-        "gitBlob": "a7058af5ff6c8fa02396877ab558c97e9d72da72",
-        "sha256": "72adba134af804cf80655865ff731568996abfe2da6de01f17a1ea99404e4015",
-        "size": 53754
+        "gitBlob": "0a2ec633f09cae29e576ec2c52d7b1deb48836c2",
+        "sha256": "56903388964fd21073868933d03fb88b3e1f0ef639b6ea057c4c0608f1b3d328",
+        "size": 54588
       },
       {
         "path": "tests/test_shm_lease_arbiter_multiprocess.nim",
         "mode": "100644",
-        "gitBlob": "fcef95df9dcaee9d97836a0c9eab8171fa207531",
-        "sha256": "5621f03e493fd5248b50d02d553356e72e11f34eb7b56e925daf2864f33d321d",
+        "gitBlob": "61ddcdeaf9e1a69aed87e983c98f3989bae10f0c",
+        "sha256": "9eb648b503a98deba2b8dc01aff791b8e28ac466543e96084062637d947951c4",
         "size": 64475
+      },
+      {
+        "path": "tests/test_shm_lease_epoch_horizon.nim",
+        "mode": "100644",
+        "gitBlob": "b034cf644ab939c09db3a71c9bbe28fa93b8bb79",
+        "sha256": "310937d15f3245ca781068eea451703a2818d845bc3daf16b850ff5a53e8598a",
+        "size": 11414
       },
       {
         "path": "tests/test_shm_lease_hooks.nim",
         "mode": "100644",
-        "gitBlob": "a5436145c30129f17dc13efa0a0a5b6acb152566",
-        "sha256": "39706ba7a71bc6a4336d218dfd7c9bbaa2b0287a3942e4dbf432f6971b715257",
+        "gitBlob": "94628634179f1f2cc41213debe3219ad2ded50c3",
+        "sha256": "0b8308631bf3482e90d79cbafa3569a7a2c545e66c8d7d8e5aeb4a552f20980e",
         "size": 36631
       },
       {
@@ -1008,12 +1015,12 @@
   "nativeCredit": false,
   "installedReleaseMembers": {
     "bin/repro.exe": {
-      "size": 1298922,
-      "sha256": "539a310651c6a0e45a16bbe7a59b505e6f38c95c940fee98986d6463b960ac34"
+      "size": 1303158,
+      "sha256": "333c3c72eac55030886b9dc84fe0c42abf6f09c305a3cdd0672dcfa38b84e17b"
     },
     "bin/reprobuild.exe": {
-      "size": 43391156,
-      "sha256": "3a55fa9d3065c4870683049a9063045daf87306670c39fbcb94702e2e1ccb3ad"
+      "size": 51134694,
+      "sha256": "8364bcb22bd324558087feb9d597c4ad20b393e8da51c2ad45ced6ea479c322c"
     }
   },
   "nativeControls": {
