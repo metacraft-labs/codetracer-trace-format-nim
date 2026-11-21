@@ -1,6 +1,21 @@
 ## Owning typed compiler producers shared by this recipe and pinned consumers.
-## Call each once per graph and consume both its returned action and path helper.
-## Paths are anchored to the declared project root; no cwd/environment discovery.
+##
+## The CodeTracer recorders decode the ``.ct`` containers their tests record
+## with ``ct-print``, at the fixed sibling path
+## ``../codetracer-trace-format-nim/ct-print``, and link the C ABI writer
+## library. A recorder's typed test graph must CONSTRUCT those prerequisites
+## rather than assume they were built beforehand, so that ``repro test`` runs
+## the same tests ``just test`` does from the same clean checkout. It does so
+## by importing this module and calling ``buildCtPrint`` / ``buildSharedLib``
+## with the relative path of this checkout, so the compiler flags live in one
+## place: here.
+##
+## Call each once per graph and consume both its returned action and path
+## helper: the action ID keeps this repository's identity, so a graph must
+## construct it at most once and share the returned handle between the edges
+## that consume it. Paths are anchored to the declared project root; no
+## cwd/environment discovery.
+##
 ## Backend refs mirror the standard nim.c adapter and pinned nim.cfg: macOS
 ## defaults to clang, other ctPrint hosts to gcc. Canonical shared MSVC flags
 ## select vccexe.exe, whose compiler/linker subprocesses are cl.exe/link.exe.
@@ -19,6 +34,8 @@ proc sharedLibraryPath*(projectRoot: string): string =
                  else: "libcodetracer_trace_writer.so")
 
 proc ctPrintPath*(projectRoot: string): string =
+  ## The ``ct-print`` binary ``buildCtPrint(projectRoot)`` produces: the
+  ## repository-root ``ct-print`` (``ct-print.exe`` on Windows).
   projectRoot / (when defined(windows): "ct-print.exe" else: "ct-print")
 
 proc buildSharedLib*(projectRoot: string;
@@ -81,10 +98,26 @@ proc buildSharedLib*(projectRoot: string;
 
 proc buildCtPrint*(projectRoot: string;
                    compilerSdkRefs: seq[string] = @[];
-                     nativeIncludeDir = ""; nativeLibDir = "";
-                     nimDependencyDirs: seq[string] = @[];
-                     nativeLibraryFile = ""): BuildActionDef =
-  doAssert projectRoot.len > 0 and not projectRoot.isAbsolute
+                   nativeIncludeDir = ""; nativeLibDir = "";
+                   nimDependencyDirs: seq[string] = @[];
+                   nativeLibraryFile = "";
+                   after: openArray[BuildActionDef] = []): BuildActionDef =
+  ## Construct the typed ``nim c`` edge that compiles ``ct-print`` from the
+  ## checkout at ``projectRoot``, a path relative to the calling recipe's
+  ## root (``"."`` from this repository, ``"../codetracer-trace-format-nim"``
+  ## from a sibling). An absolute path would bake one host's layout into the
+  ## graph, so it is refused.
+  ##
+  ## ``after`` orders the compile behind edges it does not read the outputs
+  ## of. Without ``nimDependencyDirs`` the compile resolves this package's
+  ## nimble ``requires`` (``results``, ``stew``) from Nim's default nimble
+  ## path; in a recorder's graph the edge that installs them there is the
+  ## cargo build whose ``codetracer_trace_writer_nim`` ``build.rs`` runs
+  ## ``nimble install --depsOnly`` in this checkout, so a recorder passes that
+  ## edge here.
+  doAssert projectRoot.len > 0 and not projectRoot.isAbsolute,
+    "buildCtPrint: projectRoot must be a non-empty relative path, got '" &
+    projectRoot & "'"
   let output = ctPrintPath(projectRoot)
   var dependencyFlags: seq[string] = @[]
   for dependencyDir in nimDependencyDirs:
@@ -123,6 +156,7 @@ proc buildCtPrint*(projectRoot: string;
              cpkPositional, 0)
   ])
   result = recordToolInvocation("codetracer-trace-format-nim.ct-print.nim-c", call,
+    deps = combineActionDeps([], after),
     extraInputs = @[projectRoot / "src", projectRoot / "codetracer_trace_format.nimble",
       projectRoot / "nim.cfg", projectRoot / "config.nims",
       projectRoot / "build_writer_artifacts.nim"] & nativeInputs & nimDependencyDirs,

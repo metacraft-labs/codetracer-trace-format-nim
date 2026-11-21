@@ -11,7 +11,7 @@ include codetracer_trace_writer_ffi
 # Pop the raises restriction so test code can use strutils.contains etc.
 {.pop.}
 
-import std/strutils
+import std/[os, strutils]
 
 # We also need these imports that may not be pulled in by the FFI include
 import codetracer_ctfs/container
@@ -105,11 +105,7 @@ proc writeTestTrace(path: string) =
   doAssert metaFileRes.isOk
   var metaFile = metaFileRes.get()
   let meta = TraceMetadata(recordingId: "01949fcc-7d92-7e9c-aaaa-bbbbbbbbbbbb", program: "test_ffi_prog", args: @["--test"], workdir: "/tmp/ffi")
-  # ``hasValueStream`` is what routes the reader to the SPEC ``values.dat`` /
-  # ``values.idx`` layout this fixture writes; a clear flag selects the legacy
-  # ``values.off`` VariableRecordTable, which nothing here produces. The
-  # fixture declared a container it had not written, and every value lookup
-  # was refused for a file that was never going to exist.
+  # The stream-presence bits state the streams this fixture writes.
   let metaWr = ctfs.writeMetaDat(metaFile, meta,
     recorderId = "ffi-test", hasStepStream = true, hasValueStream = true,
     hasCallStream = true, hasIoEventStream = true, hasInterningTables = true)
@@ -150,16 +146,16 @@ proc writeTestTrace(path: string) =
   # §"Encoding Rules").
   doAssert ctfs.writeEvent(execW, StepEvent(kind: sekAbsoluteStep, globalLineIndex: 1000)).isOk
   doAssert ctfs.writeStepValues(valW, @[
-    VariableValue(varnameId: 0, typeId: 0,
+    VariableValue(varnameId: 0,
       data: cborOf(ValueRecord(kind: vrkInt, intVal: 42, intTypeId: IntTypeId))),
-    VariableValue(varnameId: 1, typeId: 1,
+    VariableValue(varnameId: 1,
       data: cborOf(ValueRecord(kind: vrkString, text: "hello",
         strTypeId: StrTypeId)))]).isOk
 
   # Step 1: delta step +1
   doAssert ctfs.writeEvent(execW, StepEvent(kind: sekDeltaStep, lineDelta: 1)).isOk
   doAssert ctfs.writeStepValues(valW, @[
-    VariableValue(varnameId: 0, typeId: 0,
+    VariableValue(varnameId: 0,
       data: cborOf(ValueRecord(kind: vrkInt, intVal: 43,
         intTypeId: IntTypeId)))]).isOk
 
@@ -204,12 +200,18 @@ proc writeTestTrace(path: string) =
     discard f.writeBuffer(unsafeAddr ctfsBytes[0], ctfsBytes.len)
   f.close()
 
+proc scratchPath(name: string): string =
+  ## A per-user, per-process path for one test's container. A fixed `/tmp`
+  ## path is shared by every account on the host, so a file another user left
+  ## there makes this run fail with `Permission denied`.
+  getTempDir() / (name & "-" & $getCurrentProcessId() & ".ct")
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
 proc test_reader_ffi_lifecycle() =
-  let tmpPath = "/tmp/test_reader_ffi.ct"
+  let tmpPath = scratchPath("test_reader_ffi")
   writeTestTrace(tmpPath)
 
   # NimMain already called by Nim's own startup for this executable
@@ -304,7 +306,7 @@ proc test_reader_ffi_lifecycle() =
 
 proc test_reader_ffi_structured_accessors() =
   ## Test the new structured FFI functions (no JSON parsing).
-  let tmpPath = "/tmp/test_reader_ffi_structured.ct"
+  let tmpPath = scratchPath("test_reader_ffi_structured")
   writeTestTrace(tmpPath)
 
   let h = ct_reader_open(cstring(tmpPath))
@@ -456,11 +458,45 @@ proc test_reader_ffi_structured_accessors() =
   removeFile(tmpPath)
   echo "PASS: test_reader_ffi_structured_accessors (complete)"
 
+proc test_reader_ffi_open_bytes() =
+  ## `ct_reader_open_bytes` reads what `ct_reader_open` reads, from bytes the
+  ## caller may free as soon as the call returns.
+  let tmpPath = scratchPath("test_reader_ffi_bytes")
+  writeTestTrace(tmpPath)
+  let fromPath = ct_reader_open(cstring(tmpPath))
+  doAssert fromPath != nil, "ct_reader_open failed: " & $trace_writer_last_error()
+
+  var bytes = toBytes(readFile(tmpPath))
+  let h = ct_reader_open_bytes(addr bytes[0], csize_t(bytes.len))
+  doAssert h != nil, "ct_reader_open_bytes failed: " & $trace_writer_last_error()
+  # The handle owns a copy: overwrite and release the caller's buffer.
+  for b in bytes.mitems: b = 0xFF
+  bytes = @[]
+
+  doAssert ffiGetMeta(h, ct_reader_program) == "test_ffi_prog"
+  doAssert ct_reader_step_count(h) == ct_reader_step_count(fromPath)
+  doAssert ct_reader_call_count(h) == ct_reader_call_count(fromPath)
+  doAssert ct_reader_event_count(h) == ct_reader_event_count(fromPath)
+  doAssert ffiGetStr(h, 1, ct_reader_path) == "/src/util.py"
+  for n in 0'u64 ..< ct_reader_step_count(h):
+    doAssert ffiGetJson(h, n, ct_reader_step) == ffiGetJson(fromPath, n, ct_reader_step)
+    doAssert ffiGetJson(h, n, ct_reader_values) ==
+      ffiGetJson(fromPath, n, ct_reader_values)
+  ct_reader_close(h)
+  ct_reader_close(fromPath)
+
+  # A NULL buffer that claims bytes is refused, with a reason.
+  trace_writer_clear_last_error()
+  doAssert ct_reader_open_bytes(nil, 4) == nil
+  doAssert ($trace_writer_last_error()).len > 0
+  removeFile(tmpPath)
+  echo "PASS: test_reader_ffi_open_bytes"
+
 proc test_reader_ffi_null_safety() =
   # NimMain already called by Nim's own startup for this executable
 
   doAssert ct_reader_open(nil) == nil
-  doAssert ct_reader_open(cstring("/tmp/nonexistent.ct")) == nil
+  doAssert ct_reader_open(cstring(scratchPath("nonexistent"))) == nil
   doAssert ct_reader_step_count(nil) == 0
   doAssert ct_reader_call_count(nil) == 0
   doAssert ct_reader_event_count(nil) == 0
@@ -504,5 +540,6 @@ proc test_reader_ffi_null_safety() =
 
 test_reader_ffi_lifecycle()
 test_reader_ffi_structured_accessors()
+test_reader_ffi_open_bytes()
 test_reader_ffi_null_safety()
 echo "ALL PASS: test_reader_ffi"

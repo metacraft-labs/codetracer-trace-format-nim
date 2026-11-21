@@ -63,12 +63,8 @@ proc ctSelftest(): int32 {.exportc: "ct_selftest", cdecl.} =
   ## adjudicate it: `wasmtime run --invoke ct_selftest` prints the result.
   ## 0 means both containers were built and every field decoded as expected;
   ## anything else is the failing check from `verifyCorpus` /
-  ## `verifyLegacyCorpus`, or 1 if a write failed.
-  ##
-  ## The legacy container is built here rather than only host-side because the
-  ## legacy DECODERS are the ones with no other coverage on this target: they
-  ## are selected by three meta.dat bits that this repo's writer never clears,
-  ## so nothing else in the build path executes them.
+  ## `verifyLegacyCorpus` (which checks that a container in the retired
+  ## record-table layout is refused), or 1 if a write failed.
   nimMain()
   if ctBuild() != 0: return 1
   let mainRc = verifyCorpus(built)

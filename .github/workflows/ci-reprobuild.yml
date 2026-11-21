@@ -15,10 +15,11 @@ name: CI (reprobuild)
 # host without any other repo-side change.
 
 on:
+  workflow_dispatch:
   push:
-    branches: [main, dev, stable]
+    branches: [dev, stable]
   pull_request:
-    branches: [main, dev, stable]
+    branches: [dev, stable]
 
 # Cancel superseded PR runs only: a new push to a PR makes its previous run
 # moot, and stale runs otherwise hold scarce self-hosted runners. Every other
@@ -30,6 +31,9 @@ concurrency:
 
 jobs:
   reprobuild:
+    # Manual full-suite qualification uses feature refs. Agent landing and
+    # promotion branches stay without direct CI; promotion PRs still run.
+    if: github.event_name != 'workflow_dispatch' || (github.ref != 'refs/heads/agents' && !startsWith(github.ref, 'refs/heads/agents-to-dev-'))
     name: ${{ matrix.os }}-${{ matrix.arch }} — repro build/test
     strategy:
       fail-fast: false
@@ -177,6 +181,10 @@ jobs:
           sha256sum --check "$RUNNER_TEMP/trace-checkout-git-templates/git-image.sha256"
           selected_git_package="$(nix build --no-link --no-write-lock-file --print-out-paths .#ci-checkout-git)"
           selected_python_package="$(nix build --no-link --no-write-lock-file --print-out-paths .#ci-checkout-python)"
+          # Prove the copy-mode prediction against both real constructors under
+          # several umasks before trusting it for the runner's captured umask.
+          "$selected_python_package/bin/python3" ci/reconcile-checkout-templates.py \
+            --self-test "$initialized_git" "$selected_git_package/bin/git"
           "$selected_python_package/bin/python3" ci/reconcile-checkout-templates.py \
             --root "$GITHUB_WORKSPACE" --initialized-git "$initialized_git" \
             --initialized-umask "$(cat "$RUNNER_TEMP/trace-checkout-git-templates/initialized-umask.txt")" \
@@ -211,6 +219,11 @@ jobs:
             test -d "$CT_ZSTD_LIB_DIR"
             [[ "${CT_PCRE_LIB_DIR:?missing owning PCRE library}" =~ ^/nix/store/[a-z0-9]{32}-[^[:space:]]+/lib$ ]]
             test -f "$CT_PCRE_LIB_DIR/libpcre.so" || test -f "$CT_PCRE_LIB_DIR/libpcre.dylib"
+            # test_managed_sender_ci_routes runs these two from the owning shell.
+            [[ "${CT_MINIO_BIN:?missing owning MinIO binary}" =~ ^/nix/store/[a-z0-9]{32}-[^[:space:]]+/bin/minio$ ]]
+            test -x "$CT_MINIO_BIN"
+            [[ "${CT_PYTHON3_BIN:?missing owning python3 binary}" =~ ^/nix/store/[a-z0-9]{32}-[^[:space:]]+/bin/python3$ ]]
+            test -x "$CT_PYTHON3_BIN"
             pkg_config_dir="${CT_ZSTD_INCLUDE_DIR%/include}/lib/pkgconfig"
             test -f "$pkg_config_dir/libzstd.pc"
             for key in CT_NIM_STEW_SRC CT_NIM_RESULTS_SRC CT_NIM_UNITTEST2_SRC; do
@@ -221,7 +234,16 @@ jobs:
             done
             printf "CT_ZSTD_INCLUDE_DIR=%s\nCT_ZSTD_LIB_DIR=%s\nCT_PCRE_LIB_DIR=%s\nPKG_CONFIG_PATH=%s\n" \
               "$CT_ZSTD_INCLUDE_DIR" "$CT_ZSTD_LIB_DIR" "$CT_PCRE_LIB_DIR" "$pkg_config_dir" >> "$GITHUB_ENV"
+            printf "CT_MINIO_BIN=%s\nCT_PYTHON3_BIN=%s\n" "$CT_MINIO_BIN" "$CT_PYTHON3_BIN" >> "$GITHUB_ENV"
           '
+
+      # Pure string checks of the extended-length (\\?\) form the held-input
+      # classes give every raw CreateFileW. Seconds, no filesystem access, so
+      # it runs before any download and fails fast if the conversion regresses.
+      - name: Check extended-length Win32 path forms
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./ci/test-win32-path-forms.ps1
 
       - name: Acquire complete locked Nim source dependencies (Windows)
         if: runner.os == 'Windows'
@@ -242,8 +264,37 @@ jobs:
         with:
           env-flavor: reprobuild
           repro-from-source: ${{ runner.os != 'Windows' && 'true' || 'false' }}
-          repro-build-pin: "064daf5b154ea6a0758ddb2dcbcbc07685216e44"
+          # The pin is reprobuild v0.2.26 as released: b9cf09b07 is the commit
+          # the v0.2.26 release assets were built from (release run
+          # 43892878762), so the source-built legs run the same revision as
+          # the binary the Windows legs install. Keep it equal to the revision
+          # .github/scripts/bind-unix-constructor.sh binds.
+          repro-build-pin: "b9cf09b07e2c780f314c4244e4c8df7988fc2e78"
+          # Windows legs install this release instead of building the pin
+          # (both arm64 and x64 install its windows-x86_64 archive). Keep it
+          # the tag of repro-build-pin so every leg runs the same revision;
+          # the default `latest` moves with each release.
+          repro-version: "v0.2.26"
+          # The source build overrides reprobuild's `runquota-src` with a clone
+          # of this ref (default `dev`). Keep it equal to the runquota-src rev
+          # in the pinned reprobuild's flake.lock, so the build uses the
+          # RunQuota that reprobuild was locked against rather than whatever
+          # `dev` holds (v0.2.19+ needs runquota's `directoryResolvesWithin`).
+          # v0.2.26's flake.lock pins runquota-src at 98ea3e58; move this value
+          # with repro-build-pin. io-mon-src stays on that flake lock (30d85793
+          # at v0.2.26) while `repro-posix-io-mon-pin` is empty.
+          repro-runquota-pin: "98ea3e58df67f736a8527788d1563e31291a4881"
           gh-token: ${{ steps.ci_token.outputs.token }}
+          # The ci_token installation token expires an hour after it is
+          # minted. On a loaded host this step alone has outlasted it: run
+          # 44882837197 (PR #22, linux-x64) minted it at 08:12, spent 104 min
+          # here, and its `repro exec` nixpkgs fetch then failed with
+          # `HTTP error 401`, 107 min after the mint. With the App credentials setup-dev-env starts
+          # its job credential broker, which re-mints the token and rewrites
+          # the Nix credential files setup-nix installed, before expiry.
+          # Non-Windows only; the broker does not run on Windows.
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          app-private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
 
       - name: Provision the declared Windows lease authority and Nim compiler payload
         if: runner.os == 'Windows'
@@ -270,7 +321,7 @@ jobs:
           git rev-parse HEAD
           engine_source="$(git -C .reprobuild-src rev-parse HEAD)"
           echo "Repro source: $engine_source"
-          test "$engine_source" = 064daf5b154ea6a0758ddb2dcbcbc07685216e44
+          test "$engine_source" = b9cf09b07e2c780f314c4244e4c8df7988fc2e78
           test -z "$(git -C .reprobuild-src status --porcelain)"
           test "$(command -v repro)" = "$GITHUB_WORKSPACE/.reprobuild-src/build/bin/repro"
           test "${REPROBUILD_NIX_DAEMON_BIN:?missing source daemon helper}" = "$GITHUB_WORKSPACE/.reprobuild-src/build/bin/reprobuild-nix-daemon"
@@ -295,6 +346,14 @@ jobs:
           '
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           dev-exec pwsh -NoProfile -File ./ci/inspect-gcc-header-boundary.ps1 -ProjectInclude (Join-Path $env:GITHUB_WORKSPACE "include") -ProjectHeader codetracer_crossing_state.h
+
+      # The shipping Windows FFI uses MSVC with threads off. The regular
+      # corpus also runs unchanged; this selects that compiler explicitly so
+      # its mapped-page backend and read-only protection control cannot hide
+      # behind a default MinGW compiler.
+      - name: MSVC live-page read-only mapping and word ABI
+        if: matrix.os == 'windows'
+        run: dev-exec nim c -r '--cc:vcc' '--threads:off' '--mm:arc' '-d:release' '-p:src' '-o:build/test-bin/test_live_page_lifetime_msvc.exe' tests/test_live_page_lifetime.nim
 
       - name: repro build
         # Builds the conventional `build` collection declared in
@@ -362,7 +421,7 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
-      - name: Retain constructor and narrow guard refusal evidence
+      - name: Retain constructor binding evidence
         if: always() && runner.os != 'Windows'
         uses: actions/upload-artifact@v4
         with:

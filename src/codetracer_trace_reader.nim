@@ -1,20 +1,18 @@
 when defined(nimPreviewSlimSystem):
-  import std/[syncio, assertions]
+  import std/[syncio, assertions, formatfloat]
 
 {.push raises: [].}
 
 ## High-level trace reader API for .ct files produced by TraceWriter.
 ##
-## Opens a .ct file, parses the CTFS container, decompresses seekable Zstd
-## chunks from events.log, decodes split-binary events, and provides
-## JSON and text output.
+## Opens a .ct file, parses the CTFS container, assembles the recording's
+## events from its split streams, and provides JSON and text output.
 
 import std/[json, strutils]
 import results
 import codetracer_ctfs/types
 import codetracer_ctfs/base40
 import codetracer_ctfs/container
-import codetracer_ctfs/chunk_index
 import codetracer_ctfs/zstd_bindings
 import codetracer_trace_types
 import codetracer_trace_writer/split_binary
@@ -27,21 +25,9 @@ import codetracer_trace_writer/call_stream as v4_call_stream
 import codetracer_trace_writer/io_event_stream as v4_io_event_stream
 import codetracer_trace_writer/cbor as v4_cbor
 import codetracer_trace_writer/global_line_index as v4_gli
+import codetracer_trace_writer/unsigned_json
 
 export results, codetracer_trace_types
-
-const
-  EventsLogHeaderV1* = [
-    # "CodeTracer" in hex leetspeak, then file-format version 1, then two
-    # reserved bytes that are zero in this version.
-    byte 0xC0, 0xDE, 0x72, 0xAC, 0xE2,
-    0x01,
-    0x00, 0x00
-  ]
-    ## The 8-byte CodeTracer file header the Rust `CtfsTraceWriter` writes at
-    ## the start of `events.log`, ahead of the first inline chunk header.  The
-    ## Nim `TraceWriter` does not write it, so `readEvents` treats it as
-    ## optional and skips it when present.
 
 # ---------------------------------------------------------------------------
 # Types
@@ -114,37 +100,19 @@ proc openTrace*(path: string): Result[TraceReader, string] =
   bs4[0] = data[8]; bs4[1] = data[9]; bs4[2] = data[10]; bs4[3] = data[11]
   let blockSize = fromBytesLE(uint32, bs4)
 
-  var mr4: array[4, byte]
-  mr4[0] = data[12]; mr4[1] = data[13]; mr4[2] = data[14]; mr4[3] = data[15]
-  let maxEntries = fromBytesLE(uint32, mr4)
+  # The header's `MaxRootEntries`, a declared `0` read as the auto-filled
+  # root (`ctfs-container.md` §1, "Auto-fill") rather than as no entries.
+  let maxEntries = headerRootEntryCount(data)
 
-  # DETECT v4 POSITIVELY, BY `steps.dat`. This used to infer it from the ABSENCE
-  # of `events.log`, which worked only while some writer still emitted that
-  # stream to be absent from. No writer does now, and an inference from absence
-  # over a file that contains NOTHING answers "v4" — so a truncated stub, a
-  # zero-filled file or any other garbage classified as a v4 recording with no
-  # events, and `ct-print` reported an empty program and zero counts with exit
-  # 0. Measured on a 512-byte head of a real container, which this reader used
-  # to refuse.
-  #
-  # A positive test cannot do that: `steps.dat` is the stream the v4 path
-  # actually reads, and a file that does not carry it is not a v4 recording
-  # whatever else is true of it.
-  #
-  # The old comment's point still stands and is kept: the question is whether
-  # the ENTRY is there, not whether it resolves. A v3 trace whose `events.log`
-  # mapping root was lost to a torn write still has the entry, and classifying
-  # that as v4 would answer "no events" instead of reporting the damage — so a
-  # container carrying BOTH entries is read as v3, as before.
-  # A container with NEITHER stream is not refused here, and that is deliberate:
-  # a metadata-only container — `meta.dat` and paths, no events — is a legitimate
-  # thing to open for its metadata, and `test_meta_dat` writes one. Refusing it
-  # here broke that. The refusal belongs where a caller asks to DECODE a
-  # recording, which is `ct-print`'s archetype detector, and it keys on
-  # `meta.dat` rather than on the streams for the reason recorded there.
-  let hasEvents = findInternalFileEntry(data, "events.log", maxEntries).found
-  let hasSteps = findInternalFileEntry(data, "steps.dat", maxEntries).found
-  let isV4 = hasSteps and not hasEvents
+  # A container carrying a member that is not part of the trace format is
+  # refused before anything in it is read.
+  ? refuseRetiredMembers(data, maxEntries)
+
+  # A container with no `steps.dat` is not refused here: a metadata-only
+  # container — `meta.dat` and paths, no events — is a legitimate thing to open
+  # for its metadata. `readEvents` refuses it, because that is where a caller
+  # asks to decode a recording.
+  let isV4 = findInternalFileEntry(data, "steps.dat", maxEntries).found
 
   var reader = TraceReader(
     ctfsData: data,
@@ -543,167 +511,11 @@ proc readEventsV4(reader: var TraceReader): Result[void, string] =
   reader.eventCount = reader.events.len
   ok()
 
-const
-  # A frame that does not pledge its content size has to be inflated into a
-  # buffer this reader guesses.  The first guess is 16x the compressed bytes
-  # (the same heuristic `native_decoder.decompressZstdFrame` uses), then
-  # doubling up to `UnknownSizeMaxFactor`.  The cap is what stops a damaged
-  # frame -- one whose header merely CLAIMS to be unpledged -- from driving an
-  # unbounded allocation: the walk is bounded to six doublings and to a fixed
-  # ceiling, so a hostile chunk costs a bounded amount of memory and then a
-  # named error rather than an OOM.
-  UnknownSizeInitialFactor = 16
-  UnknownSizeMaxFactor = 1024
-  UnknownSizeMinBytes = 4096
-  UnknownSizeCeilingBytes = 512 * 1024 * 1024
-
-proc inflateEventsLogChunk*(compressed: openArray[byte]):
-    Result[seq[byte], string] =
-  ## Inflate one `events.log` chunk, whether or not its Zstd frame header
-  ## pledges the decompressed size.
-  ##
-  ## `ZSTD_getFrameContentSize` answers one of three things, and the two
-  ## sentinels are ORDINARY RETURN VALUES, not errors -- they are compared
-  ## against the `ZSTD_CONTENTSIZE_*` constants in
-  ## `codetracer_ctfs/zstd_bindings.nim`, never against an error STRING.  This
-  ## matters: `ZSTD_getErrorName`'s text is not a stable API and a zstd bump
-  ## can reword it, whereas the two sentinel values are fixed by the format.
-  ## Every other stream module in this repo tests the same two constants
-  ## (`exec_stream`, `value_stream`, `call_stream`, `io_event_stream`,
-  ## `span_stream`, `chunked_compressed_table`, `native_decoder`); this reader
-  ## was the sole exception, testing only `_ERROR`, so `_UNKNOWN`
-  ## (0xFFFFFFFFFFFFFFFF) flowed into `int(...)` and killed the process with a
-  ## RangeDefect instead of being handled or refused.
-  ##
-  ## An unpledged frame is what a streaming encoder produces.  The Rust
-  ## `CtfsTraceWriter` compresses `events.log` chunks that way when it cannot
-  ## reach libzstd -- notably every container written from
-  ## `wasm32-unknown-unknown`, where the pure-Rust encoder emits
-  ## `frame_content_size: None` unconditionally.
-  if compressed.len == 0:
-    var empty: seq[byte] = @[]
-    return ok(empty)
-
-  let contentSize = ZSTD_getFrameContentSize(
-    unsafeAddr compressed[0], csize_t(compressed.len))
-
-  if contentSize == ZSTD_CONTENTSIZE_ERROR:
-    return err("failed to get decompressed size for chunk")
-
-  if contentSize != ZSTD_CONTENTSIZE_UNKNOWN:
-    # The ordinary path: the frame pledges its size, so one exactly-sized
-    # allocation and one call.  Byte-for-byte the behaviour this reader has
-    # always had for pledged frames.
-    let pledged = int(contentSize)
-    var decompressed = newSeq[byte](pledged)
-    if pledged > 0:
-      let actualSize = ZSTD_decompress(
-        addr decompressed[0], csize_t(decompressed.len),
-        unsafeAddr compressed[0], csize_t(compressed.len))
-      if ZSTD_isError(actualSize) != 0:
-        return err("zstd decompression failed")
-      decompressed.setLen(int(actualSize))
-    return ok(decompressed)
-
-  # Unpledged: grow and retry, bounded.
-  #
-  # A failed `ZSTD_decompress` is not distinguished here between "destination
-  # too small" and "corrupt frame", because the binding surface exposes only
-  # `ZSTD_getErrorName` for that and its text is not a contract.  Retrying a
-  # genuinely corrupt frame is harmless -- it costs at most six doublings and
-  # then reports the error -- whereas keying the decision off a string would
-  # silently change behaviour the next time zstd rewords a message.
-  var capacity = compressed.len * UnknownSizeInitialFactor
-  if capacity < UnknownSizeMinBytes:
-    capacity = UnknownSizeMinBytes
-  var limit = compressed.len * UnknownSizeMaxFactor
-  if limit < UnknownSizeMinBytes:
-    limit = UnknownSizeMinBytes
-  if limit > UnknownSizeCeilingBytes:
-    limit = UnknownSizeCeilingBytes
-  if capacity > limit:
-    capacity = limit
-
-  while true:
-    var decompressed = newSeq[byte](capacity)
-    let actualSize = ZSTD_decompress(
-      addr decompressed[0], csize_t(decompressed.len),
-      unsafeAddr compressed[0], csize_t(compressed.len))
-    if ZSTD_isError(actualSize) == 0:
-      decompressed.setLen(int(actualSize))
-      return ok(decompressed)
-    if capacity >= limit:
-      return err(
-        "zstd decompression failed: chunk declares no content size and did " &
-        "not fit in " & $limit & " bytes")
-    capacity = capacity * 2
-    if capacity > limit:
-      capacity = limit
-
 proc readEvents*(reader: var TraceReader): Result[void, string] =
-  ## Decompress and decode all events. Dispatches to v3 (events.log) or
-  ## v4 (multi-stream) based on the file layout detected at openTrace time.
-  if reader.isV4:
-    return readEventsV4(reader)
-
-  let eventsRes = readInternalFile(reader.ctfsData, "events.log",
-                                    reader.blockSize, reader.maxRootEntries)
-  if eventsRes.isErr:
-    return err("failed to read events.log: " & eventsRes.error)
-
-  let eventsData = eventsRes.get()
-  if eventsData.len == 0:
-    reader.events = @[]
-    reader.eventCount = 0
-    return ok()
-
-  # The SECONDARY (Rust) CTFS writer prefixes `events.log` with the 8-byte
-  # CodeTracer stream header (`HEADERV1` in
-  # `codetracer-trace-format/codetracer_trace_format_cbor_zstd`): the 5-byte
-  # magic `C0 DE 72 AC E2`, a format-version byte, and two reserved bytes.
-  # Both Rust readers (`ctfs_reader.rs`, `seekable_reader.rs`) require it and
-  # skip it before walking chunks.  This reader did not, so it read the magic
-  # as a chunk header: the first four bytes little-endian give a
-  # `compressedSize` of 0xAC72DEC0 (~2.9 GB) and the walk aborted with
-  # "chunk compressed data extends beyond events.log" — a Rust-written
-  # container was unreadable here even though it is valid.
-  #
-  # The Nim writer does NOT emit this prefix (see `codetracer_trace_writer.nim`,
-  # which adds `events.log` and writes chunks straight into it), so the skip
-  # is conditional and Nim-written containers are unaffected.
-  var pos = 0
-  if eventsData.len >= HeaderSize and hasCtfsMagic(eventsData):
-    pos = HeaderSize
-
-  # Decode all chunks: [16-byte header][compressed data]...
-  while pos + ChunkIndexEntrySize <= eventsData.len:
-    let chunk = decodeChunkHeader(eventsData, pos)
-    if chunk.compressedSize == 0:
-      break
-    pos += ChunkIndexEntrySize
-
-    if pos + int(chunk.compressedSize) > eventsData.len:
-      return err("chunk compressed data extends beyond events.log")
-
-    # Decompress the chunk.  Handles both a frame that pledges its content
-    # size and one that does not; see `inflateEventsLogChunk`.
-    let compressedSlice = eventsData[pos ..< pos + int(chunk.compressedSize)]
-    let inflated = inflateEventsLogChunk(compressedSlice)
-    if inflated.isErr:
-      return err(inflated.unsafeError)
-    let decompressed = inflated.get()
-
-    # Decode split-binary events
-    let decoded = decodeAllEvents(decompressed)
-    if decoded.isErr:
-      return err("failed to decode events: " & decoded.unsafeError)
-    for event in decoded.get():
-      reader.events.add(event)
-
-    pos += int(chunk.compressedSize)
-
-  reader.eventCount = reader.events.len
-  ok()
+  ## Decode every event of the recording from its split streams.
+  if not reader.isV4:
+    return err("steps.dat missing: this container records no events")
+  readEventsV4(reader)
 
 # ---------------------------------------------------------------------------
 # JSON output
@@ -717,22 +529,22 @@ proc valueRecordToJson(v: ValueRecord): JsonNode =
   of vrkInt:
     result["kind"] = newJString("Int")
     result["i"] = newJInt(v.intVal)
-    result["type_id"] = newJInt(int64(uint64(v.intTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.intTypeId))
   of vrkFloat:
     result["kind"] = newJString("Float")
     result["f"] = newJFloat(v.floatVal)
-    result["type_id"] = newJInt(int64(uint64(v.floatTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.floatTypeId))
   of vrkBool:
     result["kind"] = newJString("Bool")
     result["b"] = newJBool(v.boolVal)
     # `text` carries the printed boolean ("true"|"false"), matching the
     # 4-key CBOR map produced by writeBool / encodeCborValueRecord.
     result["text"] = newJString(if v.boolVal: "true" else: "false")
-    result["type_id"] = newJInt(int64(uint64(v.boolTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.boolTypeId))
   of vrkString:
     result["kind"] = newJString("String")
     result["text"] = newJString(v.text)
-    result["type_id"] = newJInt(int64(uint64(v.strTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.strTypeId))
   of vrkSequence:
     result["kind"] = newJString("Sequence")
     var elems = newJArray()
@@ -740,14 +552,14 @@ proc valueRecordToJson(v: ValueRecord): JsonNode =
       elems.add(valueRecordToJson(e))
     result["elements"] = elems
     result["is_slice"] = newJBool(v.isSlice)
-    result["type_id"] = newJInt(int64(uint64(v.seqTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.seqTypeId))
   of vrkTuple:
     result["kind"] = newJString("Tuple")
     var elems = newJArray()
     for e in v.tupleElements:
       elems.add(valueRecordToJson(e))
     result["elements"] = elems
-    result["type_id"] = newJInt(int64(uint64(v.tupleTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.tupleTypeId))
   of vrkStruct:
     result["kind"] = newJString("Struct")
     var fields = newJArray()
@@ -762,7 +574,7 @@ proc valueRecordToJson(v: ValueRecord): JsonNode =
         pair.add(valueRecordToJson(v.fieldValues[i]))
         pairs.add(pair)
       result["fields"] = pairs
-    result["type_id"] = newJInt(int64(uint64(v.structTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.structTypeId))
   of vrkVariant:
     result["kind"] = newJString("Variant")
     result["discriminator"] = newJString(v.discriminator)
@@ -770,38 +582,38 @@ proc valueRecordToJson(v: ValueRecord): JsonNode =
       result["contents"] = valueRecordToJson(v.contents[0])
     else:
       result["contents"] = newJNull()
-    result["type_id"] = newJInt(int64(uint64(v.variantTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.variantTypeId))
   of vrkReference:
     result["kind"] = newJString("Reference")
     if v.dereferenced.len > 0:
       result["dereferenced"] = valueRecordToJson(v.dereferenced[0])
     else:
       result["dereferenced"] = newJNull()
-    result["address"] = newJInt(int64(v.address))
+    result["address"] = unsignedJson(v.address)
     result["mutable"] = newJBool(v.mutable)
-    result["type_id"] = newJInt(int64(uint64(v.refTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.refTypeId))
   of vrkRaw:
     result["kind"] = newJString("Raw")
     result["r"] = newJString(v.rawStr)
-    result["type_id"] = newJInt(int64(uint64(v.rawTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.rawTypeId))
   of vrkError:
     result["kind"] = newJString("Error")
     result["msg"] = newJString(v.errorMsg)
-    result["type_id"] = newJInt(int64(uint64(v.errorTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.errorTypeId))
   of vrkNone:
     result["kind"] = newJString("None")
-    result["type_id"] = newJInt(int64(uint64(v.noneTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.noneTypeId))
   of vrkCell:
     result["kind"] = newJString("Cell")
     result["place"] = newJInt(int64(v.cellPlace))
   of vrkBigInt:
     result["kind"] = newJString("BigInt")
     result["negative"] = newJBool(v.negative)
-    result["type_id"] = newJInt(int64(uint64(v.bigIntTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.bigIntTypeId))
   of vrkChar:
     result["kind"] = newJString("Char")
     result["c"] = newJString($v.charVal)
-    result["type_id"] = newJInt(int64(uint64(v.charTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.charTypeId))
   of vrkValueRef:
     result["kind"] = newJString("ValueRef")
     result["ref_id"] = newJInt(int64(v.refId))
@@ -811,19 +623,19 @@ proc valueRecordToJson(v: ValueRecord): JsonNode =
     for e in v.setMembers:
       members.add(valueRecordToJson(e))
     result["members"] = members
-    result["type_id"] = newJInt(int64(uint64(v.setTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.setTypeId))
   of vrkEnum:
     result["kind"] = newJString("Enum")
     result["name"] = newJString(v.enumName)
     result["ordinal"] = newJInt(v.enumOrdinal)
-    result["type_id"] = newJInt(int64(uint64(v.enumTypeId)))
+    result["type_id"] = unsignedJson(uint64(v.enumTypeId))
 
 proc eventToJson(event: TraceLowLevelEvent): JsonNode =
   result = newJObject()
   case event.kind
   of tleStep:
     result["type"] = newJString("Step")
-    result["path_id"] = newJInt(int64(uint64(event.step.pathId)))
+    result["path_id"] = unsignedJson(uint64(event.step.pathId))
     result["line"] = newJInt(int64(event.step.line))
     # P1.4: surface the column on column-aware traces so JSON-events
     # consumers can observe the per-step column without re-decoding the
@@ -848,20 +660,20 @@ proc eventToJson(event: TraceLowLevelEvent): JsonNode =
     result["lang_type"] = newJString(event.typeRecord.langType)
   of tleValue:
     result["type"] = newJString("Value")
-    result["variable_id"] = newJInt(int64(uint64(event.fullValue.variableId)))
+    result["variable_id"] = unsignedJson(uint64(event.fullValue.variableId))
     result["value"] = valueRecordToJson(event.fullValue.value)
   of tleFunction:
     result["type"] = newJString("Function")
-    result["path_id"] = newJInt(int64(uint64(event.functionRecord.pathId)))
+    result["path_id"] = unsignedJson(uint64(event.functionRecord.pathId))
     result["line"] = newJInt(int64(event.functionRecord.line))
     result["name"] = newJString(event.functionRecord.name)
   of tleCall:
     result["type"] = newJString("Call")
-    result["function_id"] = newJInt(int64(uint64(event.callRecord.functionId)))
+    result["function_id"] = unsignedJson(uint64(event.callRecord.functionId))
     var args = newJArray()
     for arg in event.callRecord.args:
       var argNode = newJObject()
-      argNode["variable_id"] = newJInt(int64(uint64(arg.variableId)))
+      argNode["variable_id"] = unsignedJson(uint64(arg.variableId))
       argNode["value"] = valueRecordToJson(arg.value)
       args.add(argNode)
     result["args"] = args
@@ -881,17 +693,17 @@ proc eventToJson(event: TraceLowLevelEvent): JsonNode =
     result["lines"] = lines
   of tleBindVariable:
     result["type"] = newJString("BindVariable")
-    result["variable_id"] = newJInt(int64(uint64(event.bindVar.variableId)))
+    result["variable_id"] = unsignedJson(uint64(event.bindVar.variableId))
     result["place"] = newJInt(int64(event.bindVar.place))
   of tleAssignment:
     result["type"] = newJString("Assignment")
-    result["to"] = newJInt(int64(uint64(event.assignment.to)))
+    result["to"] = unsignedJson(uint64(event.assignment.to))
     result["pass_by"] = newJString($event.assignment.passBy)
   of tleDropVariables:
     result["type"] = newJString("DropVariables")
     var ids = newJArray()
     for id in event.dropVarIds:
-      ids.add(newJInt(int64(uint64(id))))
+      ids.add(unsignedJson(uint64(id)))
     result["ids"] = ids
   of tleCompoundValue:
     result["type"] = newJString("CompoundValue")
@@ -904,7 +716,7 @@ proc eventToJson(event: TraceLowLevelEvent): JsonNode =
   of tleAssignCompoundItem:
     result["type"] = newJString("AssignCompoundItem")
     result["place"] = newJInt(int64(event.assignCompoundItem.place))
-    result["index"] = newJInt(int64(event.assignCompoundItem.index))
+    result["index"] = unsignedJson(event.assignCompoundItem.index)
     result["item_place"] = newJInt(int64(event.assignCompoundItem.itemPlace))
   of tleAssignCell:
     result["type"] = newJString("AssignCell")
@@ -912,20 +724,20 @@ proc eventToJson(event: TraceLowLevelEvent): JsonNode =
     result["value"] = valueRecordToJson(event.assignCell.newValue)
   of tleVariableCell:
     result["type"] = newJString("VariableCell")
-    result["variable_id"] = newJInt(int64(uint64(event.variableCell.variableId)))
+    result["variable_id"] = unsignedJson(uint64(event.variableCell.variableId))
     result["place"] = newJInt(int64(event.variableCell.place))
   of tleDropVariable:
     result["type"] = newJString("DropVariable")
-    result["variable_id"] = newJInt(int64(uint64(event.dropVarId)))
+    result["variable_id"] = unsignedJson(uint64(event.dropVarId))
   of tleThreadStart:
     result["type"] = newJString("ThreadStart")
-    result["thread_id"] = newJInt(int64(uint64(event.threadStartId)))
+    result["thread_id"] = unsignedJson(uint64(event.threadStartId))
   of tleThreadExit:
     result["type"] = newJString("ThreadExit")
-    result["thread_id"] = newJInt(int64(uint64(event.threadExitId)))
+    result["thread_id"] = unsignedJson(uint64(event.threadExitId))
   of tleThreadSwitch:
     result["type"] = newJString("ThreadSwitch")
-    result["thread_id"] = newJInt(int64(uint64(event.threadSwitchId)))
+    result["thread_id"] = unsignedJson(uint64(event.threadSwitchId))
   of tleDropLastStep:
     result["type"] = newJString("DropLastStep")
 

@@ -2,11 +2,11 @@
 
 ## Tests for binary meta.dat writer and reader.
 
-import std/[hashes, options, os, strutils]
+import std/[options, os, strutils]
 import results
 import codetracer_ctfs
 import codetracer_trace_types
-import codetracer_trace_writer
+import codetracer_trace_writer/multi_stream_writer
 import codetracer_trace_writer/meta_dat
 import codetracer_trace_writer/interning_table
 import codetracer_trace_writer/varint
@@ -101,7 +101,7 @@ proc test_meta_dat_write_layout() {.raises: [].} =
   # Flags
   doAssert readU16LEAt(raw, pos) == 0, "flags should be 0 (no MCR)"
   pos += 2
-  # flags_ext: always present at version 6
+  # flags_ext: always present from version 6 on
   doAssert readU16LEAt(raw, pos) == 0 and readU16LEAt(raw, pos + 2) == 0
   pos += 4
 
@@ -183,7 +183,7 @@ proc test_meta_dat_with_mcr_fields() {.raises: [].} =
   doAssert (flags and 1) == 1, "flags bit 0 should be set for MCR fields"
   pos += 6
 
-  # recording_id, program, args, workdir, recorder_id (version 6: no paths)
+  # recording_id, program, args, workdir, recorder_id (no paths from version 6 on)
   let recId = decodeString(raw, pos)
   doAssert recId.isOk and recId.get() == TestRecordingId,
     "recording_id mismatch"
@@ -310,7 +310,7 @@ proc test_meta_dat_empty_fields() {.raises: [].} =
   doAssert rid.isOk and rid.get() == ""
 
   # 12 fixed bytes + 1 varint (=36) + 36 recording_id bytes + 4 varint
-  # zeros (each 1 byte) = 53 bytes total; no path list at version 6.
+  # zeros (each 1 byte) = 53 bytes total; no path list from version 6 on.
   doAssert pos == raw.len, "trailing bytes: consumed " & $pos & " of " & $raw.len
   doAssert raw.len == 53,
     "expected 53 bytes for a minimal meta.dat, got " & $raw.len
@@ -584,9 +584,9 @@ proc test_meta_dat_openTrace_binary() {.raises: [].} =
   let wRes = c.writeMetaDat(metaDatFile, meta, recorderId = "test-rec")
   doAssert wRes.isOk, "writeMetaDat failed: " & wRes.unsafeError
   # Source paths are `paths.dat`'s records; meta.dat carries none (v6).
-  var pathsTable = initInterningTableWriter(c, "paths").get()
+  var tables = initTraceInterningTables(c).get()
   for p in paths:
-    doAssert c.ensureId(pathsTable, p).isOk
+    doAssert c.ensurePathId(tables, p).isOk
 
   let tmpPath = getTempDir() / "test_meta_dat_binary.ct"
   let saveRes = c.writeCtfsToFile(tmpPath)
@@ -704,8 +704,8 @@ proc test_meta_dat_recording_id_malformed_rejected() {.raises: [].} =
     "01949fcc-7d92-7e9c-caaa-bbbbbbbbbbbb",        # variant 'c' (= 11b, wrong)
     "01949fcc7d927e9caaaabbbbbbbbbbbbbbbb",        # missing hyphens
   ]
-  for bad in badCases:
-    let fileRes = c.addFile("bad_" & $hash(bad))
+  for i, bad in badCases:
+    let fileRes = c.addFile("bad" & $i)
     doAssert fileRes.isOk
     var f = fileRes.get()
     let meta = TraceMetadata(
@@ -751,7 +751,7 @@ proc test_meta_dat_reader_rejects_missing_recording_id() {.raises: [].} =
 
 
 proc test_meta_dat_writer_mints_when_blank() {.raises: [].} =
-  ## newTraceWriter with empty recordingId mints a fresh UUIDv7.
+  ## A writer given no recordingId mints a fresh UUIDv7.
   ## Two writers in a row produce different ids.
   let tmpDir = getTempDir() / "test_meta_dat_writer_mints"
   try:
@@ -762,14 +762,14 @@ proc test_meta_dat_writer_mints_when_blank() {.raises: [].} =
   let path1 = tmpDir / "a.ct"
   let path2 = tmpDir / "b.ct"
 
-  let w1Res = newTraceWriter(path1, "p", @["arg"])
-  doAssert w1Res.isOk, "newTraceWriter failed: " & w1Res.error
+  let w1Res = initMultiStreamWriter(path1, "p")
+  doAssert w1Res.isOk, "initMultiStreamWriter failed: " & w1Res.error
   var w1 = w1Res.get()
   let id1 = w1.metadata.recordingId
   doAssert validateRecordingIdStr(id1).isOk,
     "minted id1 is not a canonical UUIDv7: '" & id1 & "'"
 
-  let w2Res = newTraceWriter(path2, "p", @["arg"])
+  let w2Res = initMultiStreamWriter(path2, "p")
   doAssert w2Res.isOk
   var w2 = w2Res.get()
   let id2 = w2.metadata.recordingId
@@ -778,7 +778,9 @@ proc test_meta_dat_writer_mints_when_blank() {.raises: [].} =
     "two freshly-minted ids should differ; both were '" & id1 & "'"
 
   doAssert w1.close().isOk
+  doAssert w1.closeCtfs().isOk
   doAssert w2.close().isOk
+  doAssert w2.closeCtfs().isOk
 
   try:
     removeFile(path1)
@@ -829,7 +831,7 @@ proc test_meta_dat_strict_unknown_flag_rejection() {.raises: [].} =
     buf.add(byte((MetaDatVersion shr 8) and 0xFF))
     buf.add(byte(flags and 0xFF))
     buf.add(byte((flags shr 8) and 0xFF))
-    # flags_ext — always present at version 6
+    # flags_ext — always present from version 6 on
     buf.add(0'u8); buf.add(0'u8); buf.add(0'u8); buf.add(0'u8)
     # recording_id (canonical UUIDv7)
     encodeVarint(uint64(TestRecordingId.len), buf)
@@ -1041,14 +1043,48 @@ proc test_meta_dat_strict_unknown_flag_rejection() {.raises: [].} =
     # the other half of the same contract.
     let res = readMetaDat(craftVersion(99'u16))
     doAssert res.isErr, "an unknown meta.dat version must be refused"
-    # Version 6 is the only one read; every other is refused by name
-    # (`internal-files.md` §"Version History", v6).
-    for v in [3'u16, 4, 5, 7]:
+    # Version 7 is the only one read; every other is refused by name
+    # (`internal-files.md` §"Version History", v7). Version 6 included: it
+    # was written against the fourteen-kind `EventLogKind` table.
+    doAssert MetaDatVersion == 7'u16
+    for v in [3'u16, 4, 5, 6, 8]:
       let old = readMetaDat(craftVersion(v))
       doAssert old.isErr and ("version " & $v) in old.error and
-        "version 6" in old.error, "version " & $v & ": " & $old
+        "version 7" in old.error, "version " & $v & ": " & $old
 
   echo "PASS: test_meta_dat_strict_unknown_flag_rejection"
+
+
+proc test_meta_dat_counts_past_32_bits_are_refused() {.raises: [].} =
+  ## `total_threads` and `total_checkpoints` are varints in the spec and
+  ## 32-bit fields here: a count past 32 bits is refused by name, not read as
+  ## its low half. Controls: 2^32 - 1 reads back as itself.
+  let meta = TraceMetadata(recordingId: TestRecordingId, program: "p")
+  let mcr = McrMetaFields(tickSource: tsMonotonic, totalThreads: 1,
+    atomicMode: amSeqCst, totalEvents: 1, totalCheckpoints: 1)
+  let plain = encodeMetaDat(meta, MetaDatFlagsInput()).get()
+  let base = encodeMetaDat(meta, MetaDatFlagsInput(mcrFields: some(mcr))).get()
+  # The MCR block follows `recorder_id`, where the plain encoding ends:
+  # tick_source, total_threads, atomic_mode, total_events, total_checkpoints,
+  # each one byte here.
+  let mcrStart = plain.len
+  proc withCount(at: int, v: uint64): seq[byte] =
+    result = base[0 ..< at]
+    encodeVarint(v, result)
+    result.add(base[at + 1 .. ^1])
+  for (field, at) in [("total_threads", mcrStart + 1),
+      ("total_checkpoints", mcrStart + 4)]:
+    doAssert base[at] == 1, field & " is the one-byte count it was written as"
+    let top = readMetaDat(withCount(at, uint64(high(uint32))))
+    doAssert top.isOk, field & ": " & $top
+    let m = top.get().mcrFields.get()
+    doAssert (if field == "total_threads": m.totalThreads
+              else: m.totalCheckpoints) == high(uint32), field
+    for v in [1'u64 shl 32, (1'u64 shl 32) + 5, high(uint64)]:
+      let r = readMetaDat(withCount(at, v))
+      doAssert r.isErr and r.error == "meta.dat: " & field & " value " & $v &
+        " does not fit 32 bits", field & " " & $v & ": " & $r
+  echo "PASS: test_meta_dat_counts_past_32_bits_are_refused"
 
 
 # Run all tests
@@ -1063,6 +1099,7 @@ test_meta_dat_with_mcr_fields()
 test_meta_dat_empty_fields()
 test_meta_dat_roundtrip()
 test_meta_dat_roundtrip_with_mcr()
+test_meta_dat_counts_past_32_bits_are_refused()
 test_meta_dat_roundtrip_with_filter_provenance()
 test_meta_dat_roundtrip_empty_filter_provenance()
 test_meta_dat_no_filter_provenance_omits_flag()

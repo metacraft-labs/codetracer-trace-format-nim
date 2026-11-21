@@ -65,7 +65,7 @@ proc test_v4_basic_round_trip() =
   # Step 0 (main.nim line 10) — one int value x=42
   let intVal = ValueRecord(kind: vrkInt, intVal: 42, intTypeId: TypeId(t0.get()))
   doAssert w.registerStep(0, 10, @[
-    VariableValue(varnameId: vn0.get(), typeId: t0.get(), data: encodeValue(intVal))
+    VariableValue(varnameId: vn0.get(), data: encodeValue(intVal))
   ]).isOk
 
   # Call foo()
@@ -74,7 +74,7 @@ proc test_v4_basic_round_trip() =
   # Step 1 (main.nim line 11) — one int value y=99
   let intVal2 = ValueRecord(kind: vrkInt, intVal: 99, intTypeId: TypeId(t0.get()))
   doAssert w.registerStep(0, 11, @[
-    VariableValue(varnameId: vn1.get(), typeId: t0.get(), data: encodeValue(intVal2))
+    VariableValue(varnameId: vn1.get(), data: encodeValue(intVal2))
   ]).isOk
 
   # Return from foo()

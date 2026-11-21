@@ -78,7 +78,7 @@ proc populate(w: var MultiStreamTraceWriter) {.raises: [].} =
   for i in 0 ..< 12:
     let pathId = if i < 6: 0'u64 else: 1'u64
     let line = uint64((i mod 6) + 1)
-    let vals = @[VariableValue(varnameId: 0, typeId: 0, data: ($i).toBytes)]
+    let vals = @[VariableValue(varnameId: 0, data: ($i).toBytes)]
     let res = w.registerStep(pathId, line, vals)
     doAssert res.isOk, "registerStep " & $i & ": " & res.error
 

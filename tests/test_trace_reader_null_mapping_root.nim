@@ -42,7 +42,8 @@
 import std/[os, strutils]
 import results
 import codetracer_trace_reader
-import codetracer_trace_writer
+import codetracer_trace_writer/multi_stream_writer
+import codetracer_ctfs/base40
 
 const
   EntryArrayOffset = 16
@@ -87,13 +88,17 @@ proc u64le(d: openArray[byte], off: int): uint64 {.raises: [].} =
 ## A real trace, large enough that its streams span several blocks and the
 ## container needs more than a root block plus one mapping block.
 proc writeRealTrace(path: string) {.raises: [].} =
-  let wr = newTraceWriter(path, "prog", @["a"], workdir = "/tmp/w")
-  doAssert wr.isOk, "newTraceWriter failed"
+  let wr = initMultiStreamWriter(path, "prog")
+  doAssert wr.isOk, "initMultiStreamWriter failed"
   var w = wr.get()
-  doAssert w.writePath("/src/main.nim").isOk, "writePath"
+  w.metadata.args = @["a"]
+  w.metadata.workdir = "/tmp/w"
+  let p = w.registerPath("/src/main.nim")
+  doAssert p.isOk, "registerPath"
   for i in 0 ..< 400:
-    doAssert w.writeStep(0, i).isOk, "writeStep " & $i
+    doAssert w.registerStep(p.get(), uint64(i + 1), []).isOk, "registerStep " & $i
   doAssert w.close().isOk, "close"
+  doAssert w.closeCtfs().isOk, "closeCtfs"
 
 ## Every populated root-directory slot, as (index, size, mapBlock).
 iterator populatedEntries(raw: seq[byte]): (int, uint64, uint64) {.raises: [].} =
@@ -132,7 +137,7 @@ proc test_a_null_mapping_root_is_reported_and_never_silently_degrades() {.raises
   ## regress silently.
   ##
   ## The assertion is deliberately **not** "every nulled entry must produce an
-  ## error". Some streams (`events.fmt`) this reader never reads, so nulling
+  ## error". Some streams (`step-map.ns`) this reader never reads, so nulling
   ## them is legitimately unobservable, and demanding an error would either be
   ## false or need an allowlist that rots. What is asserted instead is that
   ## each damaged container is either *refused, naming the damage*, or answers
@@ -286,9 +291,19 @@ proc test_a_data_block_past_the_container_is_refused_not_served() {.raises: [].}
   let control = observe(path)
   doAssert control.opened, "the undamaged control does not read: " & control.err
 
-  # Keep the final block's first 100 bytes: present on disk, but in the
-  # partial region, so `floor(len / blockSize)` no longer covers its block.
-  let cut = (clean.len - 4096) + 100
+  # Cut inside the block of the read stream that lies furthest into the file,
+  # keeping its first 100 bytes: present on disk, but in the partial region,
+  # so `floor(len / blockSize)` no longer covers its block. `steps.dat` is
+  # one block here, stored direct (`ctfs-container.md` §2).
+  var stepsBlock = 0
+  for (i, size, mapBlock) in populatedEntries(clean):
+    if u64le(clean, EntryArrayOffset + i * FileEntrySize + 16) ==
+        base40Encode("steps.dat"):
+      doAssert (mapBlock and (1'u64 shl 63)) != 0,
+        "steps.dat is not a direct one-block member"
+      stepsBlock = int(mapBlock and not (1'u64 shl 63))
+  doAssert stepsBlock > 0, "steps.dat has no data block"
+  let cut = stepsBlock * 4096 + 100
   let victim = dir / "cut.ct"
   writeBytes(victim, clean[0 ..< cut])
 
@@ -296,8 +311,8 @@ proc test_a_data_block_past_the_container_is_refused_not_served() {.raises: [].}
   doAssert got.len mod 4096 != 0,
     "the truncated fixture is still block-aligned, so it does not exercise " &
     "the partial region"
-  doAssert (got.len div 4096) == (clean.len div 4096) - 1,
-    "the cut did not move the last block outside the whole blocks"
+  doAssert (got.len div 4096) == stepsBlock,
+    "the cut did not move steps.dat's block outside the whole blocks"
 
   let after = observe(victim)
   doAssert not after.opened,

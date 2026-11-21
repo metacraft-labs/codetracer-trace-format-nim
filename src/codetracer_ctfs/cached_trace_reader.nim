@@ -17,6 +17,7 @@ type
     diskCache: PartialTraceCache        ## .ctp disk layer
     ramCache: LruCache[uint64, seq[byte]]  ## RAM LRU layer
     blockSize: int
+    rootBlocks: uint64
 
 proc initCachedBlockReader*(fetcher: BlockFetcher,
     ramMaxBytes: uint64 = 256 * 1024 * 1024,
@@ -31,9 +32,23 @@ proc initCachedBlockReader*(fetcher: BlockFetcher,
     blockSize: 4096
   )
 
+proc setRootBlocks*(reader: var CachedBlockReader, rootBlocks: uint64) =
+  ## The container's root region: re-read at every read, never kept.
+  reader.rootBlocks = rootBlocks
+  reader.diskCache.rootBlocks = rootBlocks
+
+proc invalidate*(reader: var CachedBlockReader, blockIds: openArray[uint64]) =
+  ## Drop, from both layers, the blocks a revalidation found changed
+  ## (`live_reader.blocksToDrop`).
+  for b in blockIds: reader.ramCache.remove(b)
+  reader.diskCache.invalidate(blockIds)
+
 proc readBlock*(reader: var CachedBlockReader, blockId: uint64): Result[seq[byte], string] =
   ## Read a block through the two-layer cache.
-  ## Check RAM cache first, then disk cache, then fetch remotely.
+  ## Check RAM cache first, then disk cache, then fetch remotely. A
+  ## root-region block is never kept (`ctfs-container.md` §6).
+  if blockId < reader.rootBlocks:
+    return reader.diskCache.fetchBlock(blockId)
 
   # 1. RAM hit?
   #

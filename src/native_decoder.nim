@@ -21,7 +21,9 @@
 ##                               frames (seekable-zstd; companion index
 ##                               `iNNNNNNNNNNN`).  Uncompressed streams are
 ##                               accepted too (auto-detected).
-##   - `event_log.dat` + `.idx`— chunk-indexed OS-event log with structured
+##   - `eventlog.dat` + `.idx` (a bundle carrying the retired `event_log.*`
+##     words is refused by name) —
+##     chunk-indexed OS-event log with structured
 ##                               (geid, tick, tid, kind, fd, returnValue,
 ##                               metadata, content) entries.
 ##   - `cpidx.idx` + `cpdata.bin` (optional) — checkpoint records
@@ -51,8 +53,14 @@
 ##   header — type / size / geid / tick / thread_id / payload_bytes / payload
 ##   length — without trying to fully decode every event-type subform (that
 ##   would duplicate the native replayer's domain knowledge).
-## * `event_log.dat` is decoded into structured OS-event records (one entry
+## * `eventlog.dat` is decoded into structured OS-event records (one entry
 ##   per write/read/open/close/...) using the writer's serializer format.
+## * The document is produced as a header plus a stream of events
+##   (`decodeNativeDocument`, `forEachNativeEvent`), so ct-print writes it
+##   through `streamed_json` without holding the tree or its rendering; the
+##   decoded records are held (bounded by the container), the per-event
+##   `JsonNode`s are not. `buildNativeFullDocument` is the whole tree, for
+##   in-process callers, built from the same two.
 ## * The output document is byte-deterministic given the same input bytes:
 ##   thread streams are emitted in ascending CtTid order, OS events in their
 ##   stored order, and counts are computed up front.
@@ -67,14 +75,41 @@ import results
 import stew/endians2
 import codetracer_ctfs/base40
 import codetracer_ctfs/container
+import codetracer_ctfs/compact
 import codetracer_ctfs/types
 import codetracer_ctfs/zstd_bindings
 import codetracer_trace_writer/meta_dat
 import codetracer_trace_writer/interning_table
+import codetracer_trace_writer/streamed_json
+
+proc readContainerImage*(filePath: string): Result[seq[byte], string] =
+  ## Probes and direct-member views inspect the same reconstructed image as
+  ## NewTraceReader. Offsets in a stored whole-file compressed body do not
+  ## address its members, and the reconstructed copy declares that fact.
+  var data = ? readCtfsFromFile(filePath)
+  if data.len > 5 and data[5] == CtfsVersionV6:
+    let scheme = ? readWholeFileCompression(data)
+    if scheme != wfcNone:
+      data = ? reconstructImage(data)
+      data[V6CompressionOffset] = uint8(ord(wfcNone))
+  ok(move data)
 
 # ---------------------------------------------------------------------------
 # Wire-format constants (must match the native recorder)
 # ---------------------------------------------------------------------------
+
+const
+  EventLogDat* = "eventlog.dat"
+  EventLogIdx* = "eventlog.idx"
+    ## The OS event log's members, as the native recorder names them.
+  RetiredEventLogNames* = ["event_log.dat", "event_log.idx"]
+    ## The names the recorder used before its rename, which base40 cannot
+    ## pack (13 characters, and an underscore).  A recording made then
+    ## carries the lossy words a writer stored for them; such a bundle is
+    ## refused by name, never read.
+  EventLogMaxKind* = 14'u8
+    ## The last kind of the event log's own table
+    ## (`MCR-Event-Log-Stream.md` §2.3: 0 `elkWrite` .. 14 `elkGetrandom`).
 
 const
   HeaderSize = 8
@@ -141,22 +176,22 @@ proc parseTidFromName(name: string): uint32 =
     v = v * 10 + uint32(ord(name[i]) - ord('0'))
   v
 
-proc detectNativeBundle*(data: openArray[byte]): Result[NativeBundleInfo, string] =
-  ## Inspect a CTFS container's root block and decide whether it looks like a
-  ## native MCR shard (per-thread `tNNN` streams + binary `meta.dat`).
-  ## Returns the discovered structure on success, or an error message on
-  ## inputs that aren't a valid CTFS file.
+proc probeContainerLayout*(data: openArray[byte]): Result[NativeBundleInfo, string] =
+  ## Inspect a readable CTFS directory to choose a decoder. Finding native
+  ## stream names does not claim that the native decoder reads this version;
+  ## detectNativeBundle keeps that decoder's independent version guard.
   if data.len < HeaderSize + ExtHeaderSize:
     return err("file too small to be a CTFS container")
   if not hasCtfsMagic(data):
     return err("invalid CTFS magic")
-  let versionErr = ctfsVersionError(data)
-  if versionErr.len > 0:
-    return err(versionErr)
+  ? checkReadableContainer(data)
 
-  let blockSize = readU32LE(data, 8)
-  let maxRoot = readU32LE(data, 12)
-  if blockSize == 0 or maxRoot == 0 or int(maxRoot) > 4096:
+  let compact = isCompactContainer(data)
+  let blockSize = if compact: 0'u32 else: readU32LE(data, 8)
+  # A declared `0` is the auto-filled root (`ctfs-container.md` §1,
+  # "Auto-fill"), not a nonsensical header.
+  let maxRoot = if compact: 0'u32 else: headerRootEntryCount(data)
+  if not compact and (blockSize == 0 or maxRoot == 0 or int(maxRoot) > 4096):
     return err(
       "nonsensical CTFS root header (blockSize=" & $blockSize &
       " maxRoot=" & $maxRoot & ")")
@@ -172,30 +207,61 @@ proc detectNativeBundle*(data: openArray[byte]): Result[NativeBundleInfo, string
     return err("meta.dat missing: " & metaDatR.error)
   info.metaDat = metaDatR.get()
 
-  # Enumerate root-block entries to find tNNNN streams and event_log files.
-  for i in 0 ..< int(maxRoot):
-    let off = HeaderSize + ExtHeaderSize + i * FileEntrySize
-    if off + FileEntrySize > data.len:
-      break
-    let nameVal = readU64LE(data, off + 16)
+  # The native stream names discriminate the layouts, independently of the
+  # container profile. Compact containers have a directory instead of a root
+  # block; full containers start their entries after their version's header.
+  var names: seq[uint64]
+  if compact:
+    let directory = ? readCompactDirectory(data)
+    for entry in directory.entries:
+      names.add(entry.encodedName)
+  else:
+    for i in 0 ..< int(maxRoot):
+      let off = containerHeaderSize(data) + i * FileEntrySize
+      if off + FileEntrySize > data.len:
+        break
+      names.add(readU64LE(data, off + 16))
+  for nameVal in names:
     if nameVal == 0:
       continue
     let name = base40Decode(nameVal)
     if isThreadStreamName(name):
       info.threadStreams.add((parseTidFromName(name), name))
-    elif (nameVal == base40Encode("event_log.dat")) or
-        (nameVal == base40Encode("event_log.idx")):
-      # base40 truncates names >12 chars and maps `_` to `\0`, so the
-      # decoded string contains a NUL — match by encoded value instead.
+    elif nameVal == base40Encode(EventLogDat) or
+        nameVal == base40Encode(EventLogIdx):
       info.hasEventLog = true
+    elif nameVal == base40Encode(RetiredEventLogNames[0]) or
+        nameVal == base40Encode(RetiredEventLogNames[1]):
+      let retired =
+        if nameVal == base40Encode(RetiredEventLogNames[0]): RetiredEventLogNames[0]
+        else: RetiredEventLogNames[1]
+      return err("this recording stores its event log as `" & retired &
+        "`, a name CTFS cannot address (more than 12 characters, and `_`); " &
+        "the event log is read as `" & EventLogDat & "` / `" & EventLogIdx &
+        "` only: re-record the trace")
     elif nameVal == base40Encode("cpidx.idx"):
       info.hasCheckpointIndex = true
+
+  # The interning tables are carried all four or none (`internal-files.md`
+  # "Interning Tables"); `paths.dat` is read below only when the set is whole.
+  let partialSet = interningSetRefusal(data, maxRoot)
+  if partialSet.len > 0:
+    return err(partialSet)
 
   # Sort thread streams by ctTid for deterministic output.
   info.threadStreams.sort(proc(a, b: (uint32, string)): int =
     cmp(a[0], b[0]))
 
   ok(info)
+
+proc detectNativeBundle*(data: openArray[byte]): Result[NativeBundleInfo, string] =
+  ## The native event decoder implements version 5 only. The CLI's generic
+  ## directory probe must not impose this limit on split-stream recordings.
+  if data.len >= HeaderSize + ExtHeaderSize and hasCtfsMagic(data):
+    let versionErr = ctfsVersionError(data)
+    if versionErr.len > 0:
+      return err(versionErr)
+  probeContainerLayout(data)
 
 proc isNativeBundle*(data: openArray[byte]): bool =
   ## True when the container carries per-thread `tNNN` streams, which is
@@ -298,7 +364,18 @@ proc decodeThreadEvents(threadId: uint32, stream: seq[byte]):
   ## Walk a per-thread stream, slicing on the size field of each event header.
   ## Any header whose `size` would overrun the buffer is treated as a hard
   ## decode error — we never silently skip past corrupt regions.
-  var events: seq[NativeEvent] = @[]
+  # Count first, so the records are allocated once at their final size: a
+  # seq grown by doubling holds up to three times its contents while it
+  # reallocates, which on a large bundle is most of the decoder's peak.
+  var total = 0
+  var probe = 0
+  while probe + EventHeaderSize <= stream.len:
+    let size = int(readU32LE(stream, probe + 2))
+    if size < EventHeaderSize:
+      break
+    inc total
+    probe += size
+  var events = newSeqOfCap[NativeEvent](total)
   var pos = 0
   while pos < stream.len:
     if pos + EventHeaderSize > stream.len:
@@ -421,7 +498,7 @@ proc nativeEventTypeName*(et: uint16): string =
   else: "ev_unknown_" & $et
 
 # ---------------------------------------------------------------------------
-# event_log.dat / .idx decoding
+# eventlog.dat / .idx decoding
 # ---------------------------------------------------------------------------
 
 type
@@ -456,57 +533,70 @@ proc osEventKindName*(k: uint8): string =
 
 proc decodeOsEventLog(data: openArray[byte], blockSize, maxRoot: uint32):
     Result[seq[OsEventLogEntry], string] =
-  ## Decode `event_log.dat` (chunk-prefixed records) using `event_log.idx`
+  ## Decode `eventlog.dat` (chunk-prefixed records) using `eventlog.idx`
   ## for the chunk count and offsets. Returns entries in stored order.
-  let datR = readInternalFile(data, "event_log.dat", blockSize, maxRoot)
-  if datR.isErr:
+  let hasDat = hasInternalFile(data, EventLogDat, maxRoot)
+  let hasIdx = hasInternalFile(data, EventLogIdx, maxRoot)
+  if not hasDat and not hasIdx:
     var empty: seq[OsEventLogEntry] = @[]
-    return ok(empty)  # event log file is optional (older bundles)
-  let idxR = readInternalFile(data, "event_log.idx", blockSize, maxRoot)
+    return ok(empty)  # a bundle without an event log
+  if not hasIdx:
+    return err(EventLogDat & " present but " & EventLogIdx & " missing")
+  if not hasDat:
+    return err(EventLogIdx & " present but " & EventLogDat & " missing")
+  let datR = readInternalFile(data, EventLogDat, blockSize, maxRoot)
+  if datR.isErr:
+    return err(EventLogDat & ": " & datR.error)
+  let idxR = readInternalFile(data, EventLogIdx, blockSize, maxRoot)
   if idxR.isErr:
-    return err("event_log.dat present but event_log.idx missing: " & idxR.error)
+    return err(EventLogIdx & ": " & idxR.error)
   let dat = datR.get()
   let idx = idxR.get()
   if idx.len < 4 + 2 + 4 + 4 + 4:
-    return err("event_log.idx truncated (len=" & $idx.len & ")")
+    return err("eventlog.idx truncated (len=" & $idx.len & ")")
   for i in 0 ..< 4:
     if idx[i] != EventLogMagic[i]:
-      return err("event_log.idx: bad magic at byte " & $i)
+      return err("eventlog.idx: bad magic at byte " & $i)
   let entryCount = readU32LE(idx, 4 + 2)
   let chunkCount = readU32LE(idx, 4 + 2 + 4 + 4)
   let chunkOffsetsStart = 4 + 2 + 4 + 4 + 4
   if idx.len < chunkOffsetsStart + int(chunkCount) * 8:
-    return err("event_log.idx: truncated chunk-offsets table")
+    return err("eventlog.idx: truncated chunk-offsets table")
 
   var entries: seq[OsEventLogEntry] = @[]
   for c in 0 ..< int(chunkCount):
     let chunkOff = readU64LE(idx, chunkOffsetsStart + c * 8)
     if int(chunkOff) + 4 > dat.len:
-      return err("event_log.dat: chunk " & $c & " offset out of bounds")
+      return err("eventlog.dat: chunk " & $c & " offset out of bounds")
     let chunkRawSize = readU32LE(dat, int(chunkOff))
     let bodyStart = int(chunkOff) + 4
     if bodyStart + int(chunkRawSize) > dat.len:
-      return err("event_log.dat: chunk " & $c & " size overruns end")
+      return err("eventlog.dat: chunk " & $c & " size overruns end")
     if chunkRawSize < 4:
-      return err("event_log.dat: chunk " & $c & " too small for entry count")
+      return err("eventlog.dat: chunk " & $c & " too small for entry count")
     let nEntries = readU32LE(dat, bodyStart)
     var pos = bodyStart + 4
     let bodyEnd = bodyStart + int(chunkRawSize)
     for e in 0 ..< int(nEntries):
       if pos + 8 + 8 + 4 + 1 + 4 + 8 + 2 > bodyEnd:
         return err(
-          "event_log.dat: chunk " & $c & " entry " & $e &
+          "eventlog.dat: chunk " & $c & " entry " & $e &
           " truncated header")
       let geid = readU64LE(dat, pos); pos += 8
       let tick = readU64LE(dat, pos); pos += 8
       let tid = readU32LE(dat, pos); pos += 4
       let kind = dat[pos]; pos += 1
+      if kind > EventLogMaxKind:
+        return err(
+          "eventlog.dat: chunk " & $c & " entry " & $e &
+          " carries unassigned event log kind " & $kind &
+          " (assigned: 0-" & $EventLogMaxKind & ")")
       let fdRaw = readU32LE(dat, pos); pos += 4
       let rvRaw = readU64LE(dat, pos); pos += 8
       let mdLen = int(readU16LE(dat, pos)); pos += 2
       if pos + mdLen + 4 > bodyEnd:
         return err(
-          "event_log.dat: chunk " & $c & " entry " & $e &
+          "eventlog.dat: chunk " & $c & " entry " & $e &
           " truncated metadata")
       var md = newString(mdLen)
       for i in 0 ..< mdLen:
@@ -515,7 +605,7 @@ proc decodeOsEventLog(data: openArray[byte], blockSize, maxRoot: uint32):
       let ctLen = int(readU32LE(dat, pos)); pos += 4
       if pos + ctLen > bodyEnd:
         return err(
-          "event_log.dat: chunk " & $c & " entry " & $e &
+          "eventlog.dat: chunk " & $c & " entry " & $e &
           " truncated content (len=" & $ctLen & ")")
       var content = newSeq[byte](ctLen)
       for i in 0 ..< ctLen:
@@ -530,7 +620,7 @@ proc decodeOsEventLog(data: openArray[byte], blockSize, maxRoot: uint32):
       ))
   if uint32(entries.len) != entryCount:
     return err(
-      "event_log: index says " & $entryCount &
+      "eventlog: index says " & $entryCount &
       " entries, decoded " & $entries.len)
   ok(entries)
 
@@ -568,10 +658,23 @@ proc payloadJson(payload: seq[byte]): JsonNode =
     node["text"] = newJString(bytesToUtf8(payload))
   return node
 
-proc buildNativeFullDocument*(data: openArray[byte], opts: NativeOpts):
-    Result[JsonNode, string] =
-  ## Decode a native MCR bundle and produce the same shape document the v4
-  ## `--full` mode emits, with per-thread events interleaved by (geid, tid).
+type NativeDocument* = object
+  ## A decoded native bundle, ready to be printed without being held whole:
+  ## ``header`` is every key of the ``--full`` document except ``events``,
+  ## in order, and the decoded records are kept to produce the events one at
+  ## a time (``forEachNativeEvent``). The records are bounded by the
+  ## container's decompressed contents; the ``JsonNode`` per event, at
+  ## several times that, is not held. See ``streamed_json``.
+  header*: JsonNode
+  threadEvents: seq[seq[NativeEvent]]  ## per thread stream, in stream order
+  order: seq[(int, int)]               ## (thread, position), geid-ordered
+  osEvents: seq[OsEventLogEntry]   ## stored order
+
+proc decodeNativeDocument*(data: openArray[byte], opts: NativeOpts):
+    Result[NativeDocument, string] =
+  ## Decode a native MCR bundle into the header of the same shape document
+  ## the v4 `--full` mode emits, and the records its events are made from,
+  ## with per-thread events interleaved by (geid, tid).
   let infoR = detectNativeBundle(data)
   if infoR.isErr:
     return err(infoR.error)
@@ -664,20 +767,33 @@ proc buildNativeFullDocument*(data: openArray[byte], opts: NativeOpts):
   root["types"] = newJArray()
 
   # ----- decode each thread stream into events -----
-  var allEvents: seq[NativeEvent] = @[]
+  var perThread: seq[seq[NativeEvent]]
+  var eventTotal = 0
   for (tid, name) in info.threadStreams:
-    let streamR = readThreadStream(data, info.blockSize, info.maxRoot, name)
-    if streamR.isErr:
-      return err(streamR.error)
-    let evR = decodeThreadEvents(tid, streamR.get())
+    var evR: Result[seq[NativeEvent], string]
+    block:
+      # The stream bytes are dropped as soon as they are decoded.
+      let streamR = readThreadStream(data, info.blockSize, info.maxRoot, name)
+      if streamR.isErr:
+        return err(streamR.error)
+      evR = decodeThreadEvents(tid, streamR.get())
     if evR.isErr:
       return err(evR.error)
-    for ev in evR.get():
-      allEvents.add(ev)
-
+    perThread.add(move evR.get())
+    eventTotal += perThread[^1].len
   # Stable interleave: by (geid, threadId, streamOffset). geid is the
   # global event ID assigned at recording time, so this matches replay order.
-  allEvents.sort(proc(a, b: NativeEvent): int =
+  # The records stay where each thread's decode put them, and an order over
+  # (thread, position) pairs is sorted: merging them into one sequence, or
+  # sorting the records themselves, held or copied every record twice.
+  var order = newSeqOfCap[(int, int)](eventTotal)
+  for t in 0 ..< perThread.len:
+    for i in 0 ..< perThread[t].len:
+      order.add((t, i))
+  let evp = addr perThread
+  order.sort(proc(x, y: (int, int)): int =
+    let a = addr evp[][x[0]][x[1]]
+    let b = addr evp[][y[0]][y[1]]
     if a.geid != b.geid:
       cmp(a.geid, b.geid)
     elif a.threadId != b.threadId:
@@ -701,7 +817,7 @@ proc buildNativeFullDocument*(data: openArray[byte], opts: NativeOpts):
   counts["calls"] = newJInt(0)
   counts["values"] = newJInt(0)
   counts["io_events"] = newJInt(int64(osEvents.len))
-  counts["thread_events"] = newJInt(int64(allEvents.len))
+  counts["thread_events"] = newJInt(int64(eventTotal))
   counts["thread_streams"] = newJInt(int64(info.threadStreams.len))
   root["counts"] = counts
 
@@ -714,9 +830,15 @@ proc buildNativeFullDocument*(data: openArray[byte], opts: NativeOpts):
     threadsArr.add(tObj)
   root["threads"] = threadsArr
 
-  # ----- events: thread_event records first (geid-ordered), then os events -----
-  var eventsArr = newJArray()
-  for ev in allEvents:
+  ok(NativeDocument(header: root, threadEvents: move perThread,
+    order: move order, osEvents: osEvents))
+
+proc forEachNativeEvent*(doc: NativeDocument, emit: EventSink) =
+  ## The ``events`` of the native ``--full`` document, in order, handed to
+  ## ``emit`` one at a time: thread_event records first (geid-ordered), then
+  ## the OS events in their stored order.
+  for (t, i) in doc.order:
+    template ev: untyped = doc.threadEvents[t][i]
     var obj = newJObject()
     obj["kind"] = newJString("thread_event")
     obj["thread_id"] = newJInt(int64(ev.threadId))
@@ -727,9 +849,9 @@ proc buildNativeFullDocument*(data: openArray[byte], opts: NativeOpts):
     obj["ct_tid"] = newJInt(int64(ev.ctTid))
     obj["size"] = newJInt(int64(ev.size))
     obj["payload"] = payloadJson(ev.payload)
-    eventsArr.add(obj)
+    emit(obj)
 
-  for e in osEvents:
+  for e in doc.osEvents:
     var obj = newJObject()
     obj["kind"] = newJString("os_event")
     obj["os_kind"] = newJString(osEventKindName(e.kind))
@@ -744,15 +866,34 @@ proc buildNativeFullDocument*(data: openArray[byte], opts: NativeOpts):
     obj["content_b64"] = newJString(base64.encode(e.content))
     if e.content.len > 0 and isPrintable(e.content):
       obj["content_text"] = newJString(bytesToUtf8(e.content))
-    eventsArr.add(obj)
+    emit(obj)
 
+proc buildNativeFullDocument*(data: openArray[byte], opts: NativeOpts):
+    Result[JsonNode, string] =
+  ## The whole native ``--full`` document as one tree: the header plus the
+  ## collected events. For in-process callers on bundles small enough to
+  ## afford it; ``ct-print`` streams ``decodeNativeDocument`` instead.
+  let doc = ?decodeNativeDocument(data, opts)
+  var eventsArr = newJArray()
+  doc.forEachNativeEvent(proc(event: JsonNode) {.raises: [].} =
+    eventsArr.add(event))
+  let root = doc.header
   root["events"] = eventsArr
   ok(root)
 
 proc decodeNativeFromFile*(path: string, opts: NativeOpts):
     Result[JsonNode, string] =
-  ## Convenience wrapper used by the CLI: read the file, then decode.
-  let dataR = readCtfsFromFile(path)
+  ## Read the file, then build the whole document (``buildNativeFullDocument``).
+  let dataR = readContainerImage(path)
   if dataR.isErr:
     return err(dataR.error)
   buildNativeFullDocument(dataR.get(), opts)
+
+proc decodeNativeDocumentFromFile*(path: string, opts: NativeOpts):
+    Result[NativeDocument, string] =
+  ## Read the file, then decode it for streaming (``decodeNativeDocument``);
+  ## what the CLI uses.
+  let dataR = readContainerImage(path)
+  if dataR.isErr:
+    return err(dataR.error)
+  decodeNativeDocument(dataR.get(), opts)

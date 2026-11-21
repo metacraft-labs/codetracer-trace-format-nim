@@ -5,6 +5,8 @@
 ## Encodes filenames up to 12 characters into a single uint64 using a
 ## 40-character alphabet: \0, 0-9, a-z, ., /, -
 
+import std/strutils
+
 # Base40 alphabet: \0, 0-9, a-z, ., /, -
 const Base40Chars* = "\x000123456789abcdefghijklmnopqrstuvwxyz./-"
 
@@ -63,3 +65,25 @@ proc base40Decode*(val: uint64): string =
   result = ""
   for i in 0 .. lastNonZero:
     result.add(chars[i])
+
+proc base40Refusal*(name: string): string =
+  ## Why `name` cannot be a member name, or "" when it can: the refusal a
+  ## writer and a reader give, naming the name and the rule it breaks
+  ## (`ctfs-container.md` §3).
+  if base40Encodable(name):
+    return ""
+  let shown = name.escape
+  let why =
+    if name.len == 0: "it is empty"
+    elif name.len > 12: "it is " & $name.len & " characters long"
+    else:
+      var bad = ""
+      for c in name:
+        if not ((c >= '0' and c <= '9') or (c >= 'a' and c <= 'z') or
+                c == '.' or c == '/' or c == '-'):
+          bad = ($c).escape
+          break
+      "it contains " & bad
+  "CTFS member name " & shown & " cannot be stored: " & why & ", and a " &
+    "name is 1 to 12 characters from 0-9 a-z . / - (ctfs-container.md §3); " &
+    "base40 would pack it as a different name"

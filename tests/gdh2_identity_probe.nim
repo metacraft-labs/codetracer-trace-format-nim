@@ -86,7 +86,7 @@ proc main() =
     let line = uint64(3 + (i mod 11))
     var vals: seq[VariableValue] = @[]
     if i mod 3 != 0:
-      vals.add(VariableValue(varnameId: vnAcc.get(), typeId: tyInt.get(),
+      vals.add(VariableValue(varnameId: vnAcc.get(),
         data: @[byte(i and 0x7F)]))
     let s = w.registerStep(pid, line, vals)
     if s.isErr: die("registerStep " & $i & ": " & s.error)

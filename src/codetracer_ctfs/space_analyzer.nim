@@ -45,7 +45,6 @@ type
     totalBlocks*: int
     totalBytes*: uint64
     headerBytes*: int
-    freeListRootBytes*: int
     fileEntryBytes*: int
     files*: seq[FileStats]
     namespaces*: seq[NamespaceStats]
@@ -138,8 +137,10 @@ proc analyzeCtfs*(data: openArray[byte],
   if versionErr.len > 0:
     return err(versionErr)
 
-  # Root traversal follows the header; the public blockSize parameter still
-  # controls the analyzer's block accounting exactly as before.
+  # Root traversal follows the header (`rootDirectoryLayout`: the entries
+  # start right after it, and a declared `0` is the auto-filled root,
+  # `ctfs-container.md` §1); the public blockSize parameter still controls the
+  # analyzer's block accounting exactly as before.
   let layout = rootDirectoryLayout(data)
   if layout.error.len > 0: return err(layout.error)
   let maxEntries = int(layout.entryCount)
@@ -149,7 +150,6 @@ proc analyzeCtfs*(data: openArray[byte],
   report.totalBytes = uint64(data.len)
   report.totalBlocks = data.len div blockSize
   report.headerBytes = HeaderSize + ExtHeaderSize
-  report.freeListRootBytes = entryStart - report.headerBytes
   report.fileEntryBytes = maxEntries * FileEntrySize
 
   for i in 0 ..< maxEntries:
@@ -300,7 +300,6 @@ proc toJson*(report: SpaceReport): string {.raises: [].} =
   j["totalBlocks"] = newJInt(report.totalBlocks)
   j["totalBytes"] = newJInt(int(report.totalBytes))
   j["headerBytes"] = newJInt(report.headerBytes)
-  j["freeListRootBytes"] = newJInt(report.freeListRootBytes)
   j["fileEntryBytes"] = newJInt(report.fileEntryBytes)
 
   var filesArr = newJArray()
@@ -375,7 +374,6 @@ proc toText*(report: SpaceReport): string {.raises: [].} =
   lines.add("Total blocks: " & $report.totalBlocks)
   lines.add("Total bytes:  " & $report.totalBytes)
   lines.add("Header bytes: " & $report.headerBytes)
-  lines.add("Free-list root bytes: " & $report.freeListRootBytes)
   lines.add("File entry bytes: " & $report.fileEntryBytes)
   lines.add("")
 

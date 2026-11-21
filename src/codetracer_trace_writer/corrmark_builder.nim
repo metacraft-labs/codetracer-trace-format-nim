@@ -53,6 +53,11 @@ type
     threadId*: uint64
     kind*: uint16
     flags*: uint16
+    indexKey*: uint64
+      ## The B-tree key of a kind-1 entry, computed from `(marker_id,
+      ## key_value)` when the entry is built. Not part of the entry's bytes:
+      ## `key_value` is not retained, so the key cannot be recomputed from the
+      ## entry, and the writer needs it only to place the entry.
 
 proc putU16LE(dst: var seq[byte], v: uint16) =
   for i in 0 ..< 2:
@@ -131,16 +136,15 @@ proc initBoundaryMarker*(markerId: uint64, keyValue: string, isRecv: bool,
   ## Build a kind-1 entry.  The 24-byte identity block holds
   ## `marker_id` (exact) then `key_fingerprint`, both big-endian; the
   ## remaining 8 bytes are reserved and zero.
-  let idx = boundaryIndexKey(markerId, keyValue)
   let fp = keyFingerprint(keyValue)
   result.kind = MarkerKindBoundary
   result.flags = (if isRecv: MarkerFlagExit else: 0'u16)
   result.geid = geid
   result.threadId = threadId
+  result.indexKey = boundaryIndexKey(markerId, keyValue)
   for i in 0 ..< 8:
     result.traceId[i] = byte((markerId shr ((7 - i) * 8)) and 0xFF)
     result.traceId[8 + i] = byte((fp shr ((7 - i) * 8)) and 0xFF)
-    result.spanId[i] = byte((idx shr ((7 - i) * 8)) and 0xFF)
 
 proc initSpanMarker*(traceIdBe: openArray[byte], spanIdBe: openArray[byte],
                      wallTimeUnixNs: uint64, monotonicTimeNs: uint64,
@@ -218,14 +222,11 @@ proc keyFingerprintOf*(m: CorrelationMarker): uint64 =
 proc markerKey*(m: CorrelationMarker): uint64 =
   ## The `corrmark.ns` B-tree key for `m`, derived PER KIND.
   ##
-  ## kind 0 hashes the wire-order `(trace_id, span_id)`; kind 1 has already
-  ## had its index key computed from `(boundary_id, key_value)` and carries it
-  ## in `spanId`, because those strings are not retained in the entry.
+  ## kind 0 hashes the wire-order `(trace_id, span_id)`; kind 1 carries the
+  ## key computed from `(marker_id, key_value)` when it was built, because
+  ## `key_value` is not retained in the entry.
   if m.kind == MarkerKindBoundary:
-    var k: uint64 = 0
-    for i in 0 ..< 8:
-      k = (k shl 8) or uint64(m.spanId[i])
-    k
+    m.indexKey
   else:
     correlationKey(m.traceId, m.spanId)
 
@@ -332,6 +333,27 @@ type
     tree: CowBTree
     image: seq[byte]
 
+proc bucketAt(idx: CorrmarkIndex, desc: openArray[byte]):
+    Result[(int, int), string] =
+  ## The byte offset and entry count of the bucket `desc` addresses. The
+  ## descriptor must lie inside the image and span exactly the bucket: its
+  ## `u32` count and that many 60-byte entries.
+  if desc.len != 16:
+    return err("corrmark.ns: descriptor is " & $desc.len & " bytes, not 16")
+  let off = readU64LE(desc, 0)
+  let size = readU64LE(desc, 8)
+  let imageLen = uint64(idx.image.len)
+  if off > imageLen or size > imageLen - off:
+    return err("corrmark.ns: descriptor out of range")
+  if size < 4:
+    return err("corrmark.ns: bucket of " & $size &
+      " bytes is shorter than its count")
+  let count = uint64(readU32LE(idx.image, int(off)))
+  if 4'u64 + count * uint64(CorrmarkEntrySize) != size:
+    return err("corrmark.ns: bucket of " & $count & " entries does not " &
+      "span its " & $size & "-byte descriptor")
+  ok((int(off), int(count)))
+
 proc openCorrmarkIndex*(image: openArray[byte]): Result[CorrmarkIndex, string] =
   ## Parse a `corrmark.ns` image once, ready for repeated lookups.
   var idx = CorrmarkIndex(image: @image)
@@ -353,13 +375,7 @@ proc lookup*(idx: var CorrmarkIndex,
   let descRes = idx.tree.lookup(key)
   if descRes.isErr:
     return ok(newSeq[CorrelationMarker]())  # no such key — a legitimate miss
-  let desc = descRes.get()
-  if desc.len < 16:
-    return err("corrmark.ns: short descriptor")
-  let off = int(readU64LE(desc, 0))
-  let size = int(readU64LE(desc, 8))
-  if size < 4 or off + size > idx.image.len:
-    return err("corrmark.ns: descriptor out of range")
+  let (off, count) = ?idx.bucketAt(descRes.get())
 
   var probe: CorrelationMarker
   let tn = min(traceIdBe.len, 16)
@@ -367,13 +383,10 @@ proc lookup*(idx: var CorrmarkIndex,
   let sn = min(spanIdBe.len, 8)
   for i in 0 ..< sn: probe.spanId[i] = spanIdBe[i]
 
-  let count = int(readU32LE(idx.image, off))
-  if 4 + count * CorrmarkEntrySize > size:
-    return err("corrmark.ns: bucket overruns its descriptor")
   var hits: seq[CorrelationMarker] = @[]
   for i in 0 ..< count:
     let m = decodeEntry(idx.image, off + 4 + i * CorrmarkEntrySize)
-    if sameKey(m, probe):
+    if m.kind == MarkerKindSpan and sameKey(m, probe):
       hits.add(m)
   ok(hits)
 
@@ -390,16 +403,7 @@ proc lookupBoundary*(idx: var CorrmarkIndex, markerId: uint64, keyValue: string)
   let descRes = idx.tree.lookup(key)
   if descRes.isErr:
     return ok(newSeq[CorrelationMarker]())
-  let desc = descRes.get()
-  if desc.len < 16:
-    return err("corrmark.ns: short descriptor")
-  let off = int(readU64LE(desc, 0))
-  let size = int(readU64LE(desc, 8))
-  if size < 4 or off + size > idx.image.len:
-    return err("corrmark.ns: descriptor out of range")
-  let count = int(readU32LE(idx.image, off))
-  if 4 + count * CorrmarkEntrySize > size:
-    return err("corrmark.ns: bucket overruns its descriptor")
+  let (off, count) = ?idx.bucketAt(descRes.get())
   var hits: seq[CorrelationMarker] = @[]
   for i in 0 ..< count:
     let m = decodeEntry(idx.image, off + 4 + i * CorrmarkEntrySize)
@@ -408,6 +412,23 @@ proc lookupBoundary*(idx: var CorrmarkIndex, markerId: uint64, keyValue: string)
     if m.markerIdOf() == markerId and m.keyFingerprintOf() == wantFp:
       hits.add(m)
   ok(hits)
+
+proc allEntriesWithKeys*(idx: var CorrmarkIndex):
+    Result[seq[(uint64, CorrelationMarker)], string] =
+  ## Every entry with the B-tree key of its bucket, in ascending key order and
+  ## bucket order. For inspection, like `allEntries`.
+  let keysRes = idx.tree.keys()
+  if keysRes.isErr:
+    return err("corrmark.ns: " & keysRes.error)
+  var entries: seq[(uint64, CorrelationMarker)] = @[]
+  for key in keysRes.get():
+    let descRes = idx.tree.lookup(key)
+    if descRes.isErr:
+      return err("corrmark.ns: " & descRes.error)
+    let (off, count) = ?idx.bucketAt(descRes.get())
+    for i in 0 ..< count:
+      entries.add((key, decodeEntry(idx.image, off + 4 + i * CorrmarkEntrySize)))
+  ok(entries)
 
 proc allEntries*(idx: var CorrmarkIndex): Result[seq[CorrelationMarker], string] =
   ## Every entry in the index, in ascending key order.
@@ -424,26 +445,10 @@ proc allEntries*(idx: var CorrmarkIndex): Result[seq[CorrelationMarker], string]
   ## `ct print` mode could show it. Without a view like this, a recorder that
   ## declared coverage and a recorder that silently dropped the call produce
   ## output that is identical.
-  let keysRes = idx.tree.keys()
-  if keysRes.isErr:
-    return err("corrmark.ns: " & keysRes.error)
+  let withKeys = ?idx.allEntriesWithKeys()
   var entries: seq[CorrelationMarker] = @[]
-  for key in keysRes.get():
-    let descRes = idx.tree.lookup(key)
-    if descRes.isErr:
-      continue
-    let desc = descRes.get()
-    if desc.len < 16:
-      return err("corrmark.ns: short descriptor")
-    let off = int(readU64LE(desc, 0))
-    let size = int(readU64LE(desc, 8))
-    if size < 4 or off + size > idx.image.len:
-      return err("corrmark.ns: descriptor out of range")
-    let count = int(readU32LE(idx.image, off))
-    if 4 + count * CorrmarkEntrySize > size:
-      return err("corrmark.ns: bucket overruns its descriptor")
-    for i in 0 ..< count:
-      entries.add(decodeEntry(idx.image, off + 4 + i * CorrmarkEntrySize))
+  for (_, m) in withKeys:
+    entries.add(m)
   ok(entries)
 
 proc traceIdHexOf*(m: CorrelationMarker): string =

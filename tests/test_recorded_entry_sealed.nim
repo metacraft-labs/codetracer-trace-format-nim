@@ -1,8 +1,8 @@
 ## Genuine finalized CTFS images and targeted structural corruption; no mocks.
-import std/[strutils, json]
+import std/[strutils, json, os, options]
 import results
-import codetracer_ctfs/[types, container, base40]
-import codetracer_trace_writer/[multi_stream_writer, new_trace_reader]
+import codetracer_ctfs/[types, container, base40, compact]
+import codetracer_trace_writer/[multi_stream_writer, new_trace_reader, compact_profile]
 
 proc copyImage(data: seq[byte]): seq[byte] =
   result = newSeq[byte](data.len)
@@ -69,3 +69,41 @@ block:
   writeU64LE(altered, slot+16, base40Encode("entry.dat"))
   refuse(altered, "duplicate-member")
 echo "PASS finalized marked and unmarked images written"
+
+block:
+  # Keep the current reader's file-backed, compact and reconstructed-image
+  # paths honest: every representation originates in the real writer above.
+  let expected = openNewTraceFromBytes(image).get().recordedEntryIdentity()
+  doAssert expected.isSome
+  let validMembers = compactMembersOf(image).get()
+  let compactImage = encodeCompactContainer(validMembers).get()
+  let compressedImage = compressImage(compactImage).get()
+  let scratch = getTempDir() / ("recorded-entry-images-" & $getCurrentProcessId())
+  createDir(scratch)
+  defer: removeDir(scratch)
+  for index, representation in [image, compactImage, compressedImage]:
+    let held = openNewTraceFromBytes(representation)
+    doAssert held.isOk, held.error
+    doAssert held.get().recordedEntryIdentity() == expected
+    let path = scratch / ($index & ".ct")
+    saveImage(path, representation)
+    let fromFile = openNewTrace(path)
+    doAssert fromFile.isOk, fromFile.error
+    doAssert fromFile.get().recordedEntryIdentity() == expected
+  var damagedMembers = compactMembersOf(image).get()
+  var damagedEntry = false
+  for member in damagedMembers.mitems:
+    if member.name == "entry.dat":
+      doAssert member.payload.len > 0
+      member.payload[0] = 0
+      damagedEntry = true
+  doAssert damagedEntry
+  let damagedCompact = encodeCompactContainer(damagedMembers).get()
+  let damagedCompressed = compressImage(damagedCompact).get()
+  for index, representation in [damagedCompact, damagedCompressed]:
+    refuse(representation, "compact-or-zstd-invalid-entry-" & $index)
+    let path = scratch / ("damaged-" & $index & ".ct")
+    saveImage(path, representation)
+    let fromFile = openNewTrace(path)
+    doAssert fromFile.isErr and "entry.dat" in fromFile.error
+  echo "PASS full, compact and zstd held/file-backed entry identity and named refusal"

@@ -25,7 +25,11 @@ when defined(nimPreviewSlimSystem):
 ## | `spans.idx`   | Companion index    | header + `[offset u64][cumulative u64]`...  |
 ## | `spantype.ns` | Namespace          | interned `span_type` id -> span ids         |
 ##
-## All three are gated by `meta.dat` bit 13 `FlagHasSpanStream`.
+## A container carries a span stream when it carries `spans.dat`. The writer
+## creates the members at the first span; `meta.dat`, written before that,
+## never has bit 13 `FlagHasSpanStream` set by it, and a reader answers
+## presence from the root directory, never from the bit
+## (`internal-files.md` §"Stream-presence flags are a hint, not a gate").
 ##
 ## # Data layout (`spans.dat`) — CTFS §9c chunked compressed table
 ##
@@ -92,10 +96,8 @@ when defined(nimPreviewSlimSystem):
 ##
 ## `index_version` is new: the original RS-M1 layout
 ## (`[chunk_size u32][offset u64]...`, no counts, 4-byte header) carried no
-## version field at all.  It is nevertheless not a compatibility problem — the
-## whole span stream is gated on `meta.dat` bit 13 `FlagHasSpanStream`, bit 13
-## is REJECTING for readers that do not know it, and no container in existence
-## carries it — so there is no migration path to write and none is offered.
+## version field at all.  No container carrying that layout was ever
+## published, so there is no migration path to write and none is offered.
 ## Version 1 names that never-shipped layout; version 2 is what this module
 ## reads and writes, and anything else is rejected.  A stale v1 index also
 ## fails structurally: its 4-byte header would put `offset_0`'s low half where
@@ -154,7 +156,8 @@ when defined(nimPreviewSlimSystem):
 ##
 ## `decodeSpanRecord` NEVER silently drops or repairs a span.  It rejects:
 ## truncated fields, trailing bytes inside a record, unknown `flags` bits,
-## unknown `structural` bits, a `status` outside 0..2, and an open record whose
+## unknown `structural` bits, a `status` outside 0..2, a string that is not
+## UTF-8 (the encoder refuses one too), and an open record whose
 ## `end_wall_ns` / `end_step` are non-zero (the spec requires them to be 0 when
 ## `flags.open` is set).  Any of these fail the whole read with an error rather
 ## than yielding a partial span list.
@@ -179,22 +182,18 @@ when defined(nimPreviewSlimSystem):
 ##
 ## Two details make that safe against a writer that is mid-chunk:
 ##
-## 1. **The writer appends chunk data BEFORE the index entry** and syncs the
-##    data file entry before the index file entry.  An index entry therefore
-##    always means "this chunk is complete and starts here".  The spec's §7
-##    "Writer Protocol" lists the index append (step c) before the data write
-##    (step d); taken literally that publishes an offset for bytes that are not
-##    on disk yet, which contradicts the same section's own guarantee that
-##    "concurrent readers see new chunks as soon as the index entry is synced".
-##    The on-disk *layout* is identical either way — ordering is purely a
-##    runtime concern — so we use the safe order.
+## 1. **The writer publishes chunk data BEFORE the index entry**: the chunk is
+##    written and `spans.dat`'s entry synced, and only then is the offset
+##    appended to `spans.idx` and its entry synced (data before the entry that
+##    publishes it, `ctfs-container.md` §6).  An index entry therefore always
+##    means "this chunk is complete and starts here".
 ## 2. **The last indexed chunk's end offset is found from the zstd frame**, via
 ##    `ZSTD_findFrameCompressedSize`, not from the `spans.dat` file size.
 ##    While writing, `spans.dat` may already carry the leading bytes of the
 ##    next, not-yet-sealed chunk, and feeding those trailing bytes to
 ##    `ZSTD_decompress` is an error.
 
-import std/[algorithm, sets, tables]
+import std/[algorithm, sets, tables, unicode]
 import results
 import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
@@ -318,6 +317,9 @@ type
 
   SpanStreamReader* = object
     data: seq[byte]          ## raw (still COMPRESSED) spans.dat content
+    stored: bool
+      ## Chunks are stored as their content, not compressed: the container is
+      ## compact (`ctfs-container.md` §1f).
     chunkSize: uint32        ## the header's upper-bound hint, not an invariant
     offsets: seq[uint64]     ## chunk byte offsets, column 1 of spans.idx
     cumulative: seq[uint64]
@@ -349,6 +351,12 @@ proc hexByte(b: uint8): string =
   result[0] = digits[int(b shr 4)]
   result[1] = digits[int(b and 0x0F)]
 
+proc requireUtf8(s: string, what: string): Result[void, string] =
+  ## Every string a span record or `spantype.ns` carries is UTF-8 text.
+  if validateUtf8(s) >= 0:
+    return err("span record: " & what & " is not UTF-8")
+  ok()
+
 proc appendVarintStr(buf: var seq[byte], s: string) =
   encodeVarint(uint64(s.len), buf)
   for i in 0 ..< s.len:
@@ -364,6 +372,7 @@ proc readVarintStr(data: openArray[byte], pos: var int,
   for i in 0 ..< sLen:
     s[i] = char(data[pos + i])
   pos += sLen
+  ?requireUtf8(s, what)
   ok(s)
 
 proc spanFlagsByte*(s: SpanRecord): uint8 =
@@ -395,6 +404,15 @@ proc encodeSpanRecord*(s: SpanRecord): Result[seq[byte], string] =
       (s.externalRecording.len > 0 or s.externalPath.len > 0):
     return err("span record: span " & $s.spanId & " carries external " &
       "binding fields but flags.external is not set")
+
+  if s.isExternal:
+    ?requireUtf8(s.externalRecording, "external_recording")
+    ?requireUtf8(s.externalPath, "external_path")
+  ?requireUtf8(s.spanType, "span_type")
+  ?requireUtf8(s.label, "label")
+  for (k, v) in s.metadata:
+    ?requireUtf8(k, "metadata key")
+    ?requireUtf8(v, "metadata value")
 
   var buf: seq[byte] = @[]
   encodeVarint(s.spanId, buf)
@@ -555,8 +573,7 @@ proc flushChunk(ctfs: var Ctfs, w: var SpanStreamWriter): Result[void, string] =
   ## `spans.dat` and that file entry synced FIRST, and only then is the
   ## chunk's byte offset appended to `spans.idx` and synced.  A reader that
   ## observes N index entries can therefore always assume chunks 0..N-1 are
-  ## complete on disk.  See the module header for why this deviates from the
-  ## literal step ordering in CTFS §7's "Writer Protocol".
+  ## complete on disk.
   if w.recordCount == 0:
     return ok()
 
@@ -572,11 +589,13 @@ proc flushChunk(ctfs: var Ctfs, w: var SpanStreamWriter): Result[void, string] =
 
   let chunkStart = w.dataOffset
 
-  # 1. Chunk body; it is published with the index entry below.
+  # 1. Chunk body, published on its own: `spans.dat`'s entry grows before
+  #    `spans.idx` names the chunk.
   let datRes = ctfs.writeToFile(w.dataFile,
       compressed.toOpenArray(0, int(compressedSize) - 1))
   if datRes.isErr:
     return err("failed to write span chunk: " & datRes.error)
+  ctfs.syncEntry(w.dataFile)
 
   # 2. Only now does the index entry appear — it means "chunk complete".
   #    The entry publishes WHERE the chunk starts and HOW MANY records the
@@ -816,6 +835,8 @@ proc parseSpanTypeNamespace*(data: openArray[byte]):
     var name = newString(nameLen)
     for j in 0 ..< nameLen:
       name[j] = char(data[nameOff + j])
+    if validateUtf8(name) >= 0:
+      return err("spantype.ns: name of type " & $typeId & " is not UTF-8")
     var ids = newSeq[uint64](spanCount)
     for j in 0 ..< spanCount:
       ids[j] = getU64LE(data, spansOff + j * 8)
@@ -873,6 +894,8 @@ proc resetSpanChunkDecodeCount*() =
   ## Zero the chunk-decompression counter.  Tests only.
   spanChunkDecodes = 0
 
+proc splitChunkRecords(raw: openArray[byte]): Result[seq[seq[byte]], string]
+
 proc decompressChunkRecords(compressed: openArray[byte]):
     Result[seq[seq[byte]], string] =
   ## Decompress one chunk and split it into its length-prefixed records.
@@ -892,7 +915,10 @@ proc decompressChunkRecords(compressed: openArray[byte]):
       return err("zstd decompress failed for span chunk: " &
         $ZSTD_getErrorName(decompSize))
     raw.setLen(int(decompSize))
+  splitChunkRecords(raw)
 
+proc splitChunkRecords(raw: openArray[byte]): Result[seq[seq[byte]], string] =
+  ## One chunk's content split into its length-prefixed records.
   var records: seq[seq[byte]] = @[]
   var pos = 0
   while pos < raw.len:
@@ -927,8 +953,10 @@ proc chunkByteRange(r: SpanStreamReader,
     if endOff < startOff or endOff > r.data.len:
       return err("span chunk offsets out of range")
     return ok((startOff, endOff))
-  if startOff == r.data.len:
-    return ok((startOff, startOff))
+  if startOff == r.data.len or r.stored:
+    # A compact container's last chunk is its content to the end of the
+    # member (`ctfs-container.md` §1f): it is written whole, never tailed.
+    return ok((startOff, r.data.len))
   let frameLen = ZSTD_findFrameCompressedSize(
     unsafeAddr r.data[startOff], csize_t(r.data.len - startOff))
   if ZSTD_isError(frameLen) != 0:
@@ -944,6 +972,9 @@ proc decodeChunk(r: SpanStreamReader,
   let (startOff, endOff) = ?r.chunkByteRange(chunkNumber)
   if startOff == endOff:
     return ok(newSeq[seq[byte]]())
+  if r.stored:
+    spanChunkDecodes += 1
+    return splitChunkRecords(r.data.toOpenArray(startOff, endOff - 1))
   decompressChunkRecords(r.data.toOpenArray(startOff, endOff - 1))
 
 proc initSpanStreamReader*(ctfsBytes: openArray[byte],
@@ -1022,6 +1053,7 @@ proc initSpanStreamReader*(ctfsBytes: openArray[byte],
           "monotonic at entry " & $i)
 
   ok(SpanStreamReader(
+    stored: isCompactContainer(ctfsBytes),
     data: move(datData),
     chunkSize: chunkSize,
     offsets: move(offsets),
@@ -1177,7 +1209,6 @@ proc pageSpans*(r: SpanStreamReader, fromSpanId: uint64,
 
 proc hasSpanStreamFiles*(ctfsBytes: openArray[byte],
     maxEntries: uint32 = DefaultMaxRootEntries): bool =
-  ## Whether the container carries `spans.dat`.  Callers should gate on the
-  ## `meta.dat` bit 13 `FlagHasSpanStream` instead; this is for diagnostics
-  ## and for tests that assert a span-free container gained no new files.
+  ## Whether the container carries `spans.dat`: the structural answer to
+  ## whether it has a span stream, which `meta.dat` bit 13 is only a hint of.
   hasInternalFile(ctfsBytes, SpansDataFileName, maxEntries)

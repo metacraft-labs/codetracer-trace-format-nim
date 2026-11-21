@@ -6,7 +6,67 @@ samples preserve their original inode, mode, and body. Configuration is held
 only in this process and never hashed or written to the public receipt.
 """
 from pathlib import Path
-import argparse, hashlib, json, os, stat, subprocess, tempfile
+import argparse, hashlib, json, os, stat, subprocess, sys, tempfile
+
+def git_template_copy_mode(source_mode, process_umask):
+    """Return the mode `git init` gives a regular file copied from a template.
+
+    Git's copy_templates_1() passes the template's st_mode to copy_file(),
+    which keeps only "is any execute bit set" and opens the destination with
+    0777 or 0666; the kernel then applies the process umask:
+
+        mode = (mode & 0111) ? 0777 : 0666;
+        fdo = open(dst, O_WRONLY | O_CREAT | O_EXCL, mode);
+
+    https://github.com/git/git/blob/v2.54.0/copy.c#L38-L48 (unchanged in
+    v2.43.0 and v2.51.0; the caller is setup.c copy_templates_1()). The source
+    mode's other bits never reach the copy, so a 0755 supplier initializes
+    0775 under umask 0002 and 0755 under 0022. copy_file() then calls
+    adjust_shared_perm(), a no-op unless core.sharedRepository is set; such a
+    configuration makes the prediction (and so reconciliation) refuse rather
+    than pass.
+    """
+    return (0o777 if source_mode & 0o111 else 0o666) & ~process_umask & 0o777
+
+def self_test(executables):
+    """Check git_template_copy_mode() against real `git init` copies.
+
+    No mocks: each named Git initializes from a synthetic template directory
+    under several umasks, and every observed sample mode must equal the
+    prediction. Global/system configuration is excluded so an operator's
+    core.sharedRepository cannot change what is measured.
+    """
+    env = {**os.environ, 'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1'}
+    for variable in ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_TEMPLATE_DIR',
+                     'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT']:
+        env.pop(variable, None)
+    source_modes = [0o755, 0o644, 0o555, 0o444, 0o700, 0o600, 0o711]
+    checked = 0
+    with tempfile.TemporaryDirectory(prefix='trace-git-template-self-test-') as directory:
+        templates = Path(directory) / 'templates'
+        (templates / 'hooks').mkdir(parents=True)
+        for source_mode in source_modes:
+            sample = templates / 'hooks' / f'{source_mode:04o}.sample'
+            sample.write_text(f'{source_mode:04o}\n')
+            sample.chmod(source_mode)
+        for executable in executables:
+            for process_umask in [0o002, 0o022, 0o027, 0o077]:
+                probe = Path(directory) / f'probe-{checked}'
+                subprocess.run([executable, 'init', '--quiet', f'--template={templates}', str(probe)],
+                               check=True, env=env, umask=process_umask)
+                for source_mode in source_modes:
+                    name = f'{source_mode:04o}.sample'
+                    observed = stat.S_IMODE((probe / '.git/hooks' / name).lstat().st_mode)
+                    expected = git_template_copy_mode(source_mode, process_umask)
+                    if observed != expected:
+                        raise RuntimeError(f'{executable}: umask {process_umask:04o} copied {name} '
+                                           f'as {observed:04o}, predicted {expected:04o}')
+                checked += 1
+    print(f'git template copy-mode self-test passed for {checked} init probes')
+
+if sys.argv[1:2] == ['--self-test']:
+    self_test(sys.argv[2:] or ['git'])
+    sys.exit(0)
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--root', required=True, type=Path)
@@ -197,9 +257,9 @@ try:
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, umask=constructor_umask)
             probe_payload = payload(samples(probe / '.git/hooks'))
             template_payload = payload(samples(Path(constructors[str(executable)]['templates']) / 'hooks'))
-            # Genuine Git init copies immutable templates to owner-writable samples.
-            # Keep exact source modes in constructors; compare the observed copy mode.
-            template_payload = {name: [(mode | stat.S_IWUSR) & ~constructor_umask, sha] for name, (mode, sha) in template_payload.items()}
+            # Keep exact source modes in constructors; predict the copy mode with
+            # Git's own rule under the umask this probe ran with.
+            template_payload = {name: [git_template_copy_mode(mode, constructor_umask), sha] for name, (mode, sha) in template_payload.items()}
             if probe_payload != template_payload:
                 raise RuntimeError('Actual init differs from selected template supplier: ' + json.dumps({'git': str(executable), 'probeUmask': format(constructor_umask, '04o'), 'observed': probe_payload, 'expected': template_payload}, sort_keys=True))
             initialized.append(probe_payload)

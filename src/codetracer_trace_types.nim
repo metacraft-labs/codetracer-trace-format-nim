@@ -101,7 +101,8 @@ type
     tkSlice = 33
 
 # ---------------------------------------------------------------------------
-# EventLogKind enum  (matches Rust repr(u8) ordering)
+# EventLogKind enum  (matches Rust repr(u8) ordering; trace-events.md
+# §"EventLogKind (u8 enum)": the exact kind, `*Other` only when none fits)
 # ---------------------------------------------------------------------------
 
 type
@@ -120,6 +121,44 @@ type
     elkError = 11
     elkTraceLogEvent = 12
     elkEvmEvent = 13
+    elkWriteStderr = 14
+    elkExec = 15
+    elkReadEnv = 16
+    elkWriteEnv = 17
+    elkStat = 18
+    elkCreateDir = 19
+    elkRemoveDir = 20
+    elkRemoveFile = 21
+    elkRename = 22
+    elkChangeDir = 23
+
+proc eventLogKindName*(k: EventLogKind): string =
+  ## The kind's name as `trace-events.md` §"EventLogKind (u8 enum)" spells it.
+  case k
+  of elkWrite: "Write"
+  of elkWriteFile: "WriteFile"
+  of elkWriteOther: "WriteOther"
+  of elkRead: "Read"
+  of elkReadFile: "ReadFile"
+  of elkReadOther: "ReadOther"
+  of elkReadDir: "ReadDir"
+  of elkOpenDir: "OpenDir"
+  of elkCloseDir: "CloseDir"
+  of elkSocket: "Socket"
+  of elkOpen: "Open"
+  of elkError: "Error"
+  of elkTraceLogEvent: "TraceLogEvent"
+  of elkEvmEvent: "EvmEvent"
+  of elkWriteStderr: "WriteStderr"
+  of elkExec: "Exec"
+  of elkReadEnv: "ReadEnv"
+  of elkWriteEnv: "WriteEnv"
+  of elkStat: "Stat"
+  of elkCreateDir: "CreateDir"
+  of elkRemoveDir: "RemoveDir"
+  of elkRemoveFile: "RemoveFile"
+  of elkRename: "Rename"
+  of elkChangeDir: "ChangeDir"
 
 # ---------------------------------------------------------------------------
 # ValueRecord (tagged union matching Rust enum)

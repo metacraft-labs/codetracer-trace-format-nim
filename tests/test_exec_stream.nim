@@ -373,137 +373,76 @@ proc test_exec_stream_delta_column_chunk_boundary() {.raises: [].} =
 
   echo "PASS: test_exec_stream_delta_column_chunk_boundary"
 
-proc buildLegacyExecStream(ctfs: var Ctfs, events: seq[StepEvent],
-    chunkSize: int): Result[uint64, string] {.raises: [].} =
-  ## Hand-build a LEGACY-framed steps.dat/steps.idx (the pre-M24a-1 Nim-v4
-  ## layout) so the backward-compat reader path can be exercised even though
-  ## the current writer only emits the SPEC layout.  Legacy framing:
-  ##   * steps.idx: [chunk_size: u32][total_events placeholder: u64]
-  ##                [offset_0: u64]...[total_events trailer: u64]
-  ##   * each chunk's uncompressed payload: [event_count: u32][events...]
-  let datRes = ctfs.addFile("steps.dat")
-  if datRes.isErr: return err(datRes.error)
-  var datFile = datRes.get()
-  let idxRes = ctfs.addFile("steps.idx")
-  if idxRes.isErr: return err(idxRes.error)
-  var idxFile = idxRes.get()
-
-  # Index header: chunk_size + placeholder total_events (zeroed).
-  var hdr: array[12, byte]
-  let csLE = toBytesLE(uint32(chunkSize))
-  for i in 0 ..< 4: hdr[i] = csLE[i]
-  let hdrW = ctfs.writeToFile(idxFile, hdr)
-  if hdrW.isErr: return err(hdrW.error)
-
-  var dataOffset: uint64 = 0
-  var total: uint64 = 0
-  var lastGli: uint64 = 0  ## running absolute position, like the legacy writer
-  var i = 0
-  while i < events.len:
-    let endIdx = min(i + chunkSize, events.len)
-    let count = endIdx - i
-    # uncompressed payload: u32 count header + encoded events
-    var payload = newSeq[byte](4)
-    let ecLE = toBytesLE(uint32(count))
-    for k in 0 ..< 4: payload[k] = ecLE[k]
-    for j in i ..< endIdx:
-      var ev = events[j]
-      # Promote a leading DeltaStep to AbsoluteStep like the writer did,
-      # carrying the running absolute position so chunks stay independently
-      # decodable AND positionally correct.
-      if j == i and ev.kind == sekDeltaStep:
-        ev = StepEvent(kind: sekAbsoluteStep,
-          globalLineIndex: uint64(int64(lastGli) + events[j].lineDelta))
-      # Track lastGli against the (possibly promoted) event.
-      case ev.kind
-      of sekAbsoluteStep: lastGli = ev.globalLineIndex
-      of sekDeltaStep: lastGli = uint64(int64(lastGli) + ev.lineDelta)
-      else: discard
-      encodeStepEvent(ev, payload)
-    let bound = ZSTD_compressBound(csize_t(payload.len))
-    var compressed = newSeq[byte](int(bound))
-    let cs = ZSTD_compress(addr compressed[0], csize_t(bound),
-      addr payload[0], csize_t(payload.len), cint(3))
-    if ZSTD_isError(cs) != 0:
-      return err("legacy zstd compress failed")
-    # offset entry
-    var off: array[8, byte]
-    let offLE = toBytesLE(dataOffset)
-    for k in 0 ..< 8: off[k] = offLE[k]
-    let offW = ctfs.writeToFile(idxFile, off)
-    if offW.isErr: return err(offW.error)
-    let datW = ctfs.writeToFile(datFile, compressed.toOpenArray(0, int(cs) - 1))
-    if datW.isErr: return err(datW.error)
-    dataOffset += uint64(cs)
-    total += uint64(count)
-    i = endIdx
-
-  # total_events trailer
-  var teBytes: array[8, byte]
-  let teLE = toBytesLE(total)
-  for k in 0 ..< 8: teBytes[k] = teLE[k]
-  let teW = ctfs.writeToFile(idxFile, teBytes)
-  if teW.isErr: return err(teW.error)
-  ok(total)
-
-proc test_exec_stream_legacy_back_compat() {.raises: [].} =
-  ## M24a-1 backward-compat: a LEGACY-framed Nim-v4 exec stream (per-chunk
-  ## u32 count header + total_events trailer in steps.idx) must still read
-  ## correctly via ``initExecStreamReader(legacy = true)``.  This protects the
-  ## already-recorded Nim-v4 bundles whose meta.dat never set has_step_stream.
-  let chunkSize = 4
-  var events: seq[StepEvent]
-  events.add(StepEvent(kind: sekAbsoluteStep, globalLineIndex: 1000))
-  for i in 1 ..< 30:
-    if i mod 7 == 0:
-      events.add(StepEvent(kind: sekAbsoluteStep, globalLineIndex: uint64(2000 + i)))
-    else:
-      events.add(StepEvent(kind: sekDeltaStep, lineDelta: 1))
-
+proc test_exec_stream_reads_in_any_order() {.raises: [].} =
+  ## A chunk is decoded only as far as reads reach, so a read can find its
+  ## chunk partly decoded. Reads in order, backwards, in a pseudo-random walk
+  ## that crosses chunks, and position reads interleaved with event reads,
+  ## must agree with the whole-chunk decoders (`readChunkEvents`,
+  ## `resolveChunkPositions`) on every record, from fresh readers each time,
+  ## and with a cache that holds one chunk as with one that holds them all.
+  proc enc(ev: StepEvent): seq[byte] =
+    encodeStepEvent(ev, result)
   var ctfs = createCtfs()
-  let totRes = buildLegacyExecStream(ctfs, events, chunkSize)
-  doAssert totRes.isOk, "legacy build failed: " & totRes.error
-  let ctfsBytes = ctfs.toBytes()
-  ctfs.closeCtfs()
+  var writer = initExecStreamWriter(ctfs, chunkSize = 97).get()
+  for i in 0 ..< 1000:
+    let ev =
+      if i mod 37 == 5: StepEvent(kind: sekThreadSwitch, threadId: uint64(i))
+      elif i mod 11 == 0: StepEvent(kind: sekAbsoluteStep,
+        globalLineIndex: uint64(10_000 + i * 7))
+      else: StepEvent(kind: sekDeltaStep, lineDelta: int64(i mod 5) - 2)
+    doAssert ctfs.writeEvent(writer, ev).isOk
+  doAssert ctfs.flush(writer).isOk
+  let bytes = ctfs.toBytes()
 
-  # Reading WITHOUT the legacy flag (SPEC mode) must NOT misinterpret the
-  # bytes as a valid SPEC stream — the legacy trailer/count-headers make the
-  # SPEC reader's record count diverge, so the legacy flag is load-bearing.
-  var legacyRes = initExecStreamReader(ctfsBytes, legacy = true)
-  doAssert legacyRes.isOk, "legacy reader init failed: " & legacyRes.error
-  var reader = legacyRes.get()
-  doAssert reader.totalEvents == uint64(events.len),
-    "legacy totalEvents mismatch: got " & $reader.totalEvents &
-    " expected " & $events.len
+  var whole = initExecStreamReader(bytes).get()
+  var events: seq[StepEvent]
+  var positions: seq[uint64]
+  var allEvents: seq[StepEvent]
+  var allPositions: seq[uint64]
+  for c in 0 ..< whole.chunkCount:
+    discard whole.readChunkEvents(c, events).get()
+    doAssert resolveChunkPositions(events, c, positions).isOk
+    allEvents.add(events)
+    allPositions.add(positions)
+  doAssert allEvents.len == 1000
 
-  # Walk every event, tracking the absolute position the writer would track.
-  var pos: uint64 = 0
-  for i in 0 ..< events.len:
-    let got = reader.readEvent(uint64(i))
-    doAssert got.isOk, "legacy readEvent failed at " & $i & ": " & got.error
-    let ev = got.get()
-    let orig = events[i]
-    # Expected absolute position from the ORIGINAL stream (boundary promotion
-    # converts a leading DeltaStep to AbsoluteStep but the position is the same).
-    case orig.kind
-    of sekAbsoluteStep: pos = orig.globalLineIndex
-    of sekDeltaStep: pos = uint64(int64(pos) + orig.lineDelta)
-    else: discard
-    case ev.kind
-    of sekAbsoluteStep:
-      doAssert ev.globalLineIndex == pos,
-        "legacy absolute mismatch at " & $i & ": got " & $ev.globalLineIndex &
-        " expected " & $pos
-    of sekDeltaStep:
-      doAssert ev.lineDelta == orig.lineDelta, "legacy delta mismatch at " & $i
-    else: discard
-
-  echo "PASS: test_exec_stream_legacy_back_compat"
+  var orders: seq[seq[int]]
+  orders.add(@[])
+  for i in 0 ..< 1000: orders[^1].add(i)
+  orders.add(@[])
+  for i in countdown(999, 0): orders[^1].add(i)
+  orders.add(@[])
+  var x = 7
+  for _ in 0 ..< 3000:
+    x = (x * 1103 + 12345) mod 1000
+    orders[^1].add(x)
+  # The default budget holds every chunk; a budget of one byte holds one, so
+  # every read of another chunk evicts the chunk the reader last read. The
+  # last walk reads events alone, with no position read between them.
+  const all = 8'u64 shl 20
+  for (order, budget, withPositions) in [(orders[0], all, true),
+      (orders[1], all, true), (orders[2], all, true), (orders[1], 1'u64, true),
+      (orders[2], 1'u64, true), (orders[2], 1'u64, false)]:
+    var r = initExecStreamReader(bytes, cacheBytes = budget).get()
+    var k = 0
+    for i in order:
+      if withPositions and k mod 2 == 0:
+        doAssert r.eventPosition(uint64(i)).get() == allPositions[i],
+          "position of record " & $i
+      let ev = r.readEvent(uint64(i))
+      doAssert ev.isOk, ev.error
+      doAssert enc(ev.get()) == enc(allEvents[i]), "record " & $i
+      if withPositions:
+        doAssert r.eventPosition(uint64(i)).get() == allPositions[i],
+          "position of record " & $i
+      inc k
+    doAssert r.readEvent(1000).isErr
+  echo "PASS: test_exec_stream_reads_in_any_order"
 
 test_exec_stream_write_read()
+test_exec_stream_reads_in_any_order()
 test_exec_stream_raise_catch()
 test_exec_stream_thread_switch()
 test_exec_stream_delta_column_chunk_boundary()
-test_exec_stream_legacy_back_compat()
 bench_exec_stream_write_throughput()
 echo "ALL PASS: test_exec_stream"

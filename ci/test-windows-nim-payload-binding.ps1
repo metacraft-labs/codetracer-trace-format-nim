@@ -22,7 +22,8 @@ function Assert-BindingRefusal([string]$Name, [scriptblock]$Body, [string]$Reaso
   try { & $Body } catch {
     $errorObject = $_.Exception
     while ($null -ne $errorObject.InnerException) { $errorObject = $errorObject.InnerException }
-    if ($errorObject -isnot [IO.InvalidDataException] -or $errorObject.Message -ne $Reason) { throw }
+    # The message carries path and cause after the reason; Data['tag'] is the exact reason.
+    if ($errorObject -isnot [IO.InvalidDataException] -or $errorObject.Data['tag'] -ne $Reason) { throw }
     $refused = $true
   }
   if (!$refused) { throw 'native binding negative unexpectedly accepted' }

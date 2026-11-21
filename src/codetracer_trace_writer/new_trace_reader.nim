@@ -12,9 +12,10 @@ import std/tables
 import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
 import ../codetracer_ctfs/variable_record_table
+import ../codetracer_ctfs/member_view
+import ../codetracer_ctfs/base40
 import ./meta_dat
 import ./entry_identity
-import ../codetracer_ctfs/base40
 import ./interning_table
 import ./exec_stream
 import ./value_stream
@@ -23,6 +24,10 @@ import ./io_event_stream
 import ./step_encoding
 import ./varint
 import ./global_line_index
+import ../codetracer_ctfs/compact
+
+# What `values` returns, and its type id, read from the value's CBOR.
+export value_stream.VariableValue, value_stream.typeId
 
 const ctHasFilesystem* = defined(posix) or defined(windows)
   ## Whether the target this reader is being compiled for has an
@@ -42,6 +47,21 @@ when ctHasFilesystem:
   import std/os
 
 type
+  CallIndexState = enum
+    cisUnbuilt       ## no query yet, or the call stream changed
+    cisBuilt         ## `entrySteps` / `exitMax` describe `count` calls
+    cisUnavailable   ## a record of the `count` did not decode
+
+  CallStepIndex = object
+    ## What `enclosingCallKey` needs of every call record, held so a query
+    ## costs O(log calls) without decoding records (see
+    ## `buildCallStepIndex`).
+    state: CallIndexState
+    count: uint64
+    size: int                 ## leaves in `exitMax`, a power of two
+    entrySteps: seq[uint64]   ## by call_key
+    exitMax: seq[uint64]      ## max-segment-tree over exit steps, root at 1
+
   SourceView* = object
     ## Decoded shape of one ``source_views.dat`` record.  See
     ## ``codetracer-trace-format-spec/internal-files.md`` §
@@ -53,7 +73,9 @@ type
     sourcemapV3*: seq[byte]
 
   NewTraceReader* = object
-    data: seq[byte]            ## raw .ct file bytes (mmap later)
+    image: ContainerImage
+      ## The container's bytes, which the interning tables and stream readers
+      ## share and read their members out of in place.
     blockSize: uint32
     maxEntries: uint32
 
@@ -61,13 +83,6 @@ type
     # it is a prefix sum over every path, and `globalPositionSpace` is called
     # per step by a host that resolves steps one call at a time.
     posSpace: GlobalLineIndex
-
-    # The absolute positions of the last exec chunk `stepAbsoluteGlobalLineIndex`
-    # decoded, one per event (a non-step event carries the running position).
-    # A host resolving consecutive steps one call at a time decodes each chunk
-    # once instead of once per step.
-    gliChunk: int              ## index of the cached chunk, or -1
-    gliCache: seq[uint64]
 
     # Metadata
     meta*: MetaDatContents
@@ -102,7 +117,8 @@ type
     # GDH-M1 / design §7.0 — the VERSION ORDINAL of every path entry,
     # 0-based and in path-id order: 0 for the first entry carrying a
     # given interning payload, 1 for the second, and so on.  Parallel to
-    # the paths.dat records, one entry per id, computed once at open.
+    # the paths.dat records, one entry per id, computed on the first
+    # version query (`ensurePathVersions`); empty until then.
     #
     # `paths.dat` needs no new layout for this: a second version of a
     # file is a second record with the SAME payload and its own line
@@ -123,10 +139,9 @@ type
     # id in a trace with no versioned paths.  Parallel to
     # `pathVersionOrdinals`.
     pathVersionTotals: seq[uint64]
-    # Advisory: the trace declares line-only paths.dat records, yet every
-    # record also decodes as a complete Layout A record.  Surfaced by
-    # `columnAwarePathsSuspected`; never used to reinterpret data.
-    layoutASuspected: bool
+    pathVersionsBuilt: bool
+    pathVersionsError: string
+      ## Why the ordinals could not be computed, when they could not.
     # The `assumeColumnAwarePaths` override this handle was opened with,
     # kept so `refresh` re-opens the container under the same reading.
     assumedColumnAwarePaths: bool
@@ -150,6 +165,9 @@ type
     valueReader: ValueStreamReader
     callReader: CallStreamReader
     ioEventReader: IOEventStreamReader
+    callIndex: CallStepIndex
+      ## Built on the first `enclosingCallKey` / `callForStep`; a `refresh`
+      ## starts a fresh reader, and a grown call count rebuilds it.
 
     # Flags for lazy initialization
     execLoaded: bool
@@ -343,6 +361,81 @@ const MaxProbeLineCount = 1_000_000
   ## own line counts, and a corrupt count there surfaces as a decode
   ## error on the line-length varints that follow.
 
+template refuse(message: string) {.dirty.} =
+  ## `return err(message)`, for the record decoders below, which answer
+  ## `bool` and name their refusal in `why`.
+  why = message
+  return false
+
+template varintField(raw: openArray[byte], pos: var int,
+    what: string): uint64 =
+  ## The varint at `pos`, or a refusal naming `what` and why it does not
+  ## decode.
+  var v {.gensym.}: uint64
+  if not readVarint(raw, pos, v):
+    refuse(what & ": " & decodeVarint(raw, pos).unsafeError)
+  v
+
+proc decodeLayoutARecord(raw: openArray[byte], probe: bool,
+    lls: var seq[uint32], why: var string): bool =
+  ## One ``paths.dat`` record as Layout A, its line lengths into `lls`; see
+  ## `parseLayoutAPathRecords` for `probe`.
+  var pos = 0
+  let pathLen = varintField(raw, pos, "column-aware path_len varint")
+  if pathLen > uint64(raw.len - pos):
+    refuse("path_bytes truncated")
+  if probe:
+    if pathLen == uint64(raw.len - pos):
+      # No room left for the line_count varint after the path bytes.
+      # A legacy record ends right after the raw path string.
+      refuse("not Layout A (no line_count)")
+    for k in pos ..< pos + int(pathLen):
+      let b = raw[k]
+      # Reject control characters except tab — paths are filesystem
+      # names which the spec keeps within printable UTF-8 / ASCII.
+      if b < 0x09'u8 or (b > 0x0D'u8 and b < 0x20'u8):
+        refuse("not Layout A (control byte in path)")
+  pos += int(pathLen)
+  let lineCount = varintField(raw, pos, "column-aware line_count varint")
+  if probe and lineCount > uint64(MaxProbeLineCount):
+    refuse("not Layout A (line_count " & $lineCount & " exceeds probe bound)")
+  lls = newSeq[uint32](int(lineCount))
+  var prev: int64 = 0
+  for l in 0 ..< int(lineCount):
+    let z = varintField(raw, pos, "line_length[" & $l & "]")
+    let d = if (z and 1) == 0: int64(z shr 1) else: not int64(z shr 1)
+    let current = if l == 0: d else: prev + d
+    if current < 0:
+      refuse("line_length[" & $l & "] negative: " & $current)
+    lls[l] = uint32(current)
+    prev = current
+  if probe and pos != raw.len:
+    refuse("not Layout A (" & $(raw.len - pos) & " trailing byte(s))")
+  true
+
+proc decodeLineCountRecord(raw: openArray[byte], payload: var string,
+    count: var uint64, why: var string): bool =
+  ## One ``paths.dat`` record as the line-count-table layout; see
+  ## `parseLineCountPathRecords`.
+  var pos = 0
+  let payloadLen = varintField(raw, pos, "line-count payload_len varint")
+  if payloadLen > uint64(raw.len - pos):
+    refuse("payload truncated (payload_len " & $payloadLen & ", " &
+      $(raw.len - pos) & " byte(s) left)")
+  payload = newString(int(payloadLen))
+  if payloadLen > 0:
+    copyMem(addr payload[0], unsafeAddr raw[pos], int(payloadLen))
+  pos += int(payloadLen)
+  count = varintField(raw, pos, "line_count varint")
+  if count == 0:
+    refuse("line_count is 0 for " & payload &
+      ". A trace that sets FLAG_HAS_LINE_COUNT_TABLE states every " &
+      "file's size, and a file sized 0 shares its base with the next " &
+      "one — the two would be indistinguishable at decode")
+  if pos != raw.len:
+    refuse($(raw.len - pos) & " trailing byte(s) after line_count")
+  true
+
 proc parseLayoutAPathRecords(pathReader: InterningTableReader,
     probe: bool): Result[seq[seq[uint32]], string] =
   ## Decode every ``paths.dat`` record as Layout A —
@@ -370,58 +463,18 @@ proc parseLayoutAPathRecords(pathReader: InterningTableReader,
   ## record exactly.  Treat the result as a hint about a suspected
   ## recorder bug, never as a licence to reinterpret the record.
   let pathTotal = pathReader.count()
-  var llsAll = newSeq[seq[uint32]](int(pathTotal))
+  # Grown record by record: a probe usually stops at the first record, and
+  # then never needed a table per path.
+  var llsAll: seq[seq[uint32]]
   for i in 0'u64 ..< pathTotal:
     let rawRes = pathReader.readRawById(i)
-    if rawRes.isErr:
-      return err("paths.dat[" & $i & "]: " & rawRes.error)
-    let raw = rawRes.get()
-    var pos = 0
-    let pathLenRes = decodeVarint(raw, pos)
-    if pathLenRes.isErr:
-      return err("paths.dat[" & $i & "]: column-aware path_len varint: " &
-        pathLenRes.error)
-    let pathLen = int(pathLenRes.get())
-    if pos + pathLen > raw.len:
-      return err("paths.dat[" & $i & "]: path_bytes truncated")
-    if probe:
-      if pos + pathLen >= raw.len:
-        # No room left for the line_count varint after the path bytes.
-        # A legacy record ends right after the raw path string.
-        return err("paths.dat[" & $i & "]: not Layout A (no line_count)")
-      for k in pos ..< pos + pathLen:
-        let b = raw[k]
-        # Reject control characters except tab — paths are filesystem
-        # names which the spec keeps within printable UTF-8 / ASCII.
-        if b < 0x09'u8 or (b > 0x0D'u8 and b < 0x20'u8):
-          return err("paths.dat[" & $i & "]: not Layout A (control byte in path)")
-    pos += pathLen
-    let lineCountRes = decodeVarint(raw, pos)
-    if lineCountRes.isErr:
-      return err("paths.dat[" & $i & "]: column-aware line_count varint: " &
-        lineCountRes.error)
-    let lineCount = int(lineCountRes.get())
-    if probe and lineCount > MaxProbeLineCount:
-      return err("paths.dat[" & $i & "]: not Layout A (line_count " &
-        $lineCount & " exceeds probe bound)")
-    var lls = newSeq[uint32](lineCount)
-    var prev: int64 = 0
-    for l in 0 ..< lineCount:
-      let dRes = decodeSignedVarint(raw, pos)
-      if dRes.isErr:
-        return err("paths.dat[" & $i & "]: line_length[" & $l & "]: " &
-          dRes.error)
-      let d = dRes.get()
-      let current = if l == 0: d else: prev + d
-      if current < 0:
-        return err("paths.dat[" & $i & "]: line_length[" & $l &
-          "] negative: " & $current)
-      lls[l] = uint32(current)
-      prev = current
-    if probe and pos != raw.len:
-      return err("paths.dat[" & $i & "]: not Layout A (" &
-        $(raw.len - pos) & " trailing byte(s))")
-    llsAll[i] = lls
+    var lls: seq[uint32]
+    var why: string
+    if rawRes.isErr or not decodeLayoutARecord(rawRes.unsafeGet(), probe, lls,
+        why):
+      return err("paths.dat[" & $i & "]: " &
+        (if rawRes.isErr: rawRes.unsafeError else: why))
+    llsAll.add(move lls)
   ok(llsAll)
 
 proc parseLineCountPathRecords(pathReader: InterningTableReader):
@@ -450,36 +503,11 @@ proc parseLineCountPathRecords(pathReader: InterningTableReader):
   var counts = newSeq[uint64](int(pathTotal))
   for i in 0'u64 ..< pathTotal:
     let rawRes = pathReader.readRawById(i)
-    if rawRes.isErr:
-      return err("paths.dat[" & $i & "]: " & rawRes.error)
-    let raw = rawRes.get()
-    var pos = 0
-    let payloadLenRes = decodeVarint(raw, pos)
-    if payloadLenRes.isErr:
-      return err("paths.dat[" & $i & "]: line-count payload_len varint: " &
-        payloadLenRes.error)
-    let payloadLen = int(payloadLenRes.get())
-    if pos + payloadLen > raw.len:
-      return err("paths.dat[" & $i & "]: payload truncated (payload_len " &
-        $payloadLen & ", " & $(raw.len - pos) & " byte(s) left)")
-    var s = newString(payloadLen)
-    for k in 0 ..< payloadLen:
-      s[k] = char(raw[pos + k])
-    pos += payloadLen
-    let countRes = decodeVarint(raw, pos)
-    if countRes.isErr:
-      return err("paths.dat[" & $i & "]: line_count varint: " & countRes.error)
-    let count = countRes.get()
-    if count == 0:
-      return err("paths.dat[" & $i & "]: line_count is 0 for " & s &
-        ". A trace that sets FLAG_HAS_LINE_COUNT_TABLE states every " &
-        "file's size, and a file sized 0 shares its base with the next " &
-        "one — the two would be indistinguishable at decode")
-    if pos != raw.len:
-      return err("paths.dat[" & $i & "]: " & $(raw.len - pos) &
-        " trailing byte(s) after line_count")
-    payloads[i] = s
-    counts[i] = count
+    var why: string
+    if rawRes.isErr or not decodeLineCountRecord(rawRes.unsafeGet(),
+        payloads[i], counts[i], why):
+      return err("paths.dat[" & $i & "]: " &
+        (if rawRes.isErr: rawRes.unsafeError else: why))
   ok((payloads, counts))
 
 proc path*(r: NewTraceReader, id: uint64): Result[string, string] {.gcsafe.}
@@ -490,8 +518,8 @@ proc path*(r: NewTraceReader, id: uint64): Result[string, string] {.gcsafe.}
   ## `{.gcsafe.}` is declared here rather than inferred because Nim infers
   ## GC-safety from a proc's BODY, and a forward declaration has none at the
   ## point its callers are analysed: everything that reaches `path` through
-  ## this declaration — `computePathVersionOrdinals`, and therefore
-  ## `openNewTraceFromBytes` and `openNewTrace` — was silently inferred
+  ## this declaration — `computePathVersionOrdinals`, and therefore the
+  ## version accessors that call it — was silently inferred
   ## GC-UNSAFE, which made the whole reader unusable from a `{.gcsafe.}` proc
   ## type. `path` touches no globals (only the `NewTraceReader` it is given),
   ## so the annotation states a fact rather than waiving a check: the compiler
@@ -503,78 +531,150 @@ proc computePathVersionOrdinals(r: var NewTraceReader): Result[void, string] =
   ## ordinal, in path-id order, and count how many entries share each
   ## payload.
   ##
-  ## Linear in the number of paths and run once at open, so
-  ## ``pathVersionOrdinal`` is O(1). It is computed EAGERLY rather than
-  ## lazily because a lazy answer would have to be recomputed after a
-  ## ``refresh``, and a stale ordinal is the kind of wrong answer that
-  ## reads as a legitimate one.
-  let total = r.pathReader.count()
-  r.pathVersionOrdinals = newSeq[uint64](int(total))
-  r.pathVersionTotals = newSeq[uint64](int(total))
-  var seen = initTable[string, seq[uint64]]()
-  for id in 0'u64 ..< total:
-    let payloadRes = r.path(id)
+  ## Linear in the number of paths. It runs on the first version query
+  ## rather than at open, because it reads and hashes every path string,
+  ## which an open that only wants a step's location does not need. It
+  ## cannot go stale: ``refresh`` replaces the whole reader, and with it
+  ## the not-yet-built state.
+  let total = int(r.pathReader.count())
+  r.pathVersionOrdinals = newSeq[uint64](total)
+  r.pathVersionTotals = newSeq[uint64](total)
+  # One count per distinct payload; each id's ordinal is the count before it.
+  var payloads = newSeq[string](total)
+  var seen = initTable[string, uint64](total)
+  for id in 0 ..< total:
+    var payloadRes = r.path(uint64(id))
     if payloadRes.isErr:
-      return err("paths.dat[" & $id & "]: " & payloadRes.error)
-    let payload = payloadRes.get()
-    var ids = seen.getOrDefault(payload, @[])
-    r.pathVersionOrdinals[int(id)] = uint64(ids.len)
-    ids.add(id)
-    seen[payload] = ids
-  for _, ids in seen:
-    for id in ids:
-      r.pathVersionTotals[int(id)] = uint64(ids.len)
+      return err("paths.dat[" & $id & "]: " & payloadRes.unsafeError)
+    payloads[id] = move payloadRes.get()
+    let n = addr seen.mgetOrPut(payloads[id], 0'u64)
+    r.pathVersionOrdinals[id] = n[]
+    inc n[]
+  for id in 0 ..< total:
+    r.pathVersionTotals[id] = seen.getOrDefault(payloads[id])
   ok()
 
 # ---------------------------------------------------------------------------
 # Opening
 # ---------------------------------------------------------------------------
 
+proc decodeSourceView(raw: openArray[byte], v: var SourceView,
+    why: var string): bool =
+  ## One `source_views.dat` record (`internal-files.md` §"Alternate Source
+  ## Views"): `path_id`, `view_kind`, then the name, content and source map,
+  ## each length-prefixed. False, with `why` set, where it does not decode.
+  var pos = 0
+  template field(dest: var seq[byte] | var string, what: string) =
+    var n: uint64
+    if not readVarint(raw, pos, n):
+      why = what & "_len: " & decodeVarint(raw, pos).unsafeError
+      return false
+    if n > uint64(raw.len - pos):
+      why = what & " truncated"
+      return false
+    dest.setLen(int(n))
+    for k in 0 ..< int(n):
+      when dest is string: dest[k] = char(raw[pos + k])
+      else: dest[k] = raw[pos + k]
+    pos += int(n)
+  if not readVarint(raw, pos, v.pathId):
+    why = "path_id varint: " & decodeVarint(raw, pos).unsafeError
+    return false
+  if pos >= raw.len:
+    why = "view_kind byte missing"
+    return false
+  v.viewKind = raw[pos]
+  pos += 1
+  field(v.viewName, "view_name")
+  field(v.content, "content")
+  field(v.sourcemapV3, "map")
+  true
+
+const RetiredMembers* = ["events.log", "events.fmt"]
+  ## Members that are not part of the trace format: a single combined event
+  ## stream and its encoding marker. A container's events live in its split
+  ## streams.
+
+const LegacyLayoutMembers* = ["values.off", "events.off", "calls.off"]
+  ## Offset tables of a stream layout that is not part of the trace format:
+  ## values, I/O events and calls stored as uncompressed variable-size record
+  ## tables. Every stream is a chunked table with a companion `.idx`.
+
+proc refuseLegacyLayout*(containerBytes: openArray[byte],
+    maxEntries: uint32): Result[void, string] =
+  ## `err` naming the first member of that layout the container carries.
+  for name in LegacyLayoutMembers:
+    if hasInternalFile(containerBytes, name, maxEntries):
+      return err("this container carries `" & name & "`, a stream layout " &
+        "that is not part of the trace format; it is refused")
+  ok()
+
+proc refuseRetiredMembers*(containerBytes: openArray[byte],
+    maxEntries: uint32): Result[void, string] =
+  ## `err` naming the first retired member the container carries. A reader
+  ## refuses such a container before reading any stream, so it is never read
+  ## as if the member were not there.
+  for name in RetiredMembers:
+    if hasInternalFile(containerBytes, name, maxEntries):
+      return err("this container carries `" & name & "`, which is not part " &
+        "of the trace format; it is refused")
+  ok()
+
+proc loadTable(image: ContainerImage, name: string, blockSize: uint32,
+    maxEntries: uint32, dest: var InterningTableReader): Result[void, string] =
+  ## The interning table `name` into `dest`. A table that is absent is empty,
+  ## which the caller allows only when the container carries none of the four
+  ## (`interningSetRefusal`); a table that is present but does not read is
+  ## refused, not answered as empty (`ctfs-container.md` §4, "A null is not an
+  ## absence").
+  if hasInternalFile(image.bytes, name & ".dat", maxEntries) or
+      hasInternalFile(image.bytes, name & ".off", maxEntries):
+    var tr = initInterningTableReader(image, name, blockSize, maxEntries)
+    if tr.isErr:
+      return err(name & ".dat: " & tr.unsafeError)
+    dest = move tr.get()
+  ok()
+
 proc validateRecordedEntry*(r: var NewTraceReader,
     entry: RecordedEntryIdentity): Result[void, string] {.gcsafe.}
 
 proc recordedEntryIdentity*(r: NewTraceReader): Option[RecordedEntryIdentity] =
-  ## Only open's checked same-image identity is exposed.
+  ## Only the checked identity from the reader's own image is exposed.
   r.entryIdentity
 
-proc openNewTraceFromBytes*(data: seq[byte],
-    blockSize: uint32 = DefaultBlockSize,
-    maxEntries: uint32 = DefaultMaxRootEntries,
-    assumeColumnAwarePaths: bool = false): Result[NewTraceReader, string] =
-  ## Open a trace from in-memory bytes. Used for testing.
-  ##
-  ## ``assumeColumnAwarePaths`` overrides the ``meta.dat`` bit 4
-  ## declaration for the ``paths.dat`` record layout only.  Pass it when
-  ## you know out of band that the trace was produced by a recorder that
-  ## emitted Layout A path records without setting the flag (see the
-  ## note at the Layout A block below).  It is an assertion by the
-  ## caller, not a guess by the reader: on a trace whose records are not
-  ## Layout A the open fails with a named ``paths.dat[N]: …`` error
-  ## instead of returning misdecoded positions.
-
-  # A malformed or unsupported container is not an absent optional member.
-  # Keep the low-level safe lookup contract; admit the header before any
-  # metadata/table-presence branch can interpret not-found as optional absence.
-  let versionErr = ctfsVersionError(data)
-  if versionErr.len > 0:
-    return err(versionErr)
-  let rootLayout = rootDirectoryLayout(data)
-  if rootLayout.error.len > 0:
-    return err(rootLayout.error)
-
-  # Structural presence is independent of caller lookup caps and table decoding.
+proc openNewTraceFromImage(image: ContainerImage, blockSize: uint32,
+    maxEntries: uint32, assumeColumnAwarePaths: bool):
+    Result[NewTraceReader, string] =
+  ## The reader over a container image whose header has been checked
+  ## (`checkReadableContainer`): held whole, or read from its file as it is
+  ## used (`openFileImage`).
+  # `entry.dat` is optional finalized metadata. Its structural presence is
+  # counted over exactly the root directory the header declares,
+  # independently of table decoding and of the caller's `maxEntries`: a
+  # smaller caller count would hide a member, and a larger one would read
+  # data blocks as entries, so a member's bytes could count as a second
+  # `entry.dat`. A duplicate is refused rather than resolved to either copy.
+  # Compact directory parsing already refuses duplicate names.
+  let entrySlots = headerRootEntryCount(image.bytes)
   var entryMembers = 0
-  let entryName = base40Encode("entry.dat")
-  for i in 0 ..< int(rootLayout.entryCount):
-    let off = rootLayout.entryStart + i * FileEntrySize
-    if readU64LE(data, off + 16) == entryName: inc entryMembers
-  if entryMembers > 1: return err("entry.dat: duplicate member")
+  if isCompactContainer(image.bytes):
+    if hasInternalFile(image.bytes, "entry.dat", entrySlots): entryMembers = 1
+  else:
+    let base = containerHeaderSize(image.bytes)
+    let encoded = base40Encode("entry.dat")
+    for i in 0 ..< int(entrySlots):
+      let offset = base + i * FileEntrySize
+      if offset + FileEntrySize > image.bytes.len: break
+      if readU64LE(image.bytes, offset + 16) == encoded: inc entryMembers
+    if entryMembers > 1: return err("entry.dat: duplicate member")
 
   var reader: NewTraceReader
-  reader.data = data
+  reader.image = image
   reader.blockSize = blockSize
   reader.maxEntries = maxEntries
   reader.assumedColumnAwarePaths = assumeColumnAwarePaths
+  ? refuseRetiredMembers(reader.image.bytes, maxEntries)
+  ? refuseLegacyLayout(reader.image.bytes, maxEntries)
 
   # Read meta.dat.  A container that HAS one and cannot parse it is refused,
   # rather than opened with a zeroed `meta`.  Every flag this reader consults
@@ -590,27 +690,27 @@ proc openNewTraceFromBytes*(data: seq[byte],
   # It used to be the case that such a container was read through the
   # legacy `paths.json` sidecar; that sidecar is retired, so a container
   # without meta.dat is now read entirely from the binary tables.
-  let metaDataRes = readInternalFile(data, "meta.dat", blockSize, maxEntries)
-  if metaDataRes.isOk:
-    let metaRes = readMetaDat(metaDataRes.get())
+  let metaView = viewMember(reader.image, "meta.dat", blockSize, maxEntries)
+  if metaView.isOk:
+    let metaRes = readMetaDat(? metaView.get().contents())
     if metaRes.isErr:
-      return err("meta.dat present but not readable: " & metaRes.error)
+      return err("meta.dat present but not readable: " & metaRes.unsafeError)
     reader.meta = metaRes.get()
 
-  # Load interning tables (these are small, load at startup). A table that
-  # is absent is empty; a table that is present but does not read is refused,
-  # not answered as empty (`ctfs-container.md` §4, "A null is not an absence").
-  template loadTable(name: string, dest: untyped) =
-    if hasInternalFile(data, name & ".dat", maxEntries) or
-        hasInternalFile(data, name & ".off", maxEntries):
-      let tr = initInterningTableReader(data, name, blockSize, maxEntries)
-      if tr.isErr:
-        return err(name & ".dat: " & tr.error)
-      dest = tr.get()
-  loadTable("paths", reader.pathReader)
-  loadTable("funcs", reader.funcReader)
-  loadTable("types", reader.typeReader)
-  loadTable("varnames", reader.varnameReader)
+  # Load interning tables (these are small, load at startup). The four are
+  # carried together or not at all (`internal-files.md` "Interning Tables"),
+  # so a container with some but not all of them is refused, in the words
+  # the Rust readers use; with none, each table is empty. A table that is
+  # present but does not read is refused, not answered as empty
+  # (`ctfs-container.md` §4, "A null is not an absence").
+  let partialSet = interningSetRefusal(reader.image.bytes, maxEntries)
+  if partialSet.len > 0:
+    return err(partialSet)
+  ? loadTable(reader.image, "paths", blockSize, maxEntries, reader.pathReader)
+  ? loadTable(reader.image, "funcs", blockSize, maxEntries, reader.funcReader)
+  ? loadTable(reader.image, "types", blockSize, maxEntries, reader.typeReader)
+  ? loadTable(reader.image, "varnames", blockSize, maxEntries,
+    reader.varnameReader)
 
   # P6.5 / Layout A — the shape of a ``paths.dat`` record is decided by
   # ``meta.dat`` bit 4 (``FlagHasColumnAwareSteps``).  When it is set
@@ -644,12 +744,13 @@ proc openNewTraceFromBytes*(data: seq[byte],
   # promoted.  When its records nonetheless look like Layout A the
   # reader names the condition through ``columnAwarePathsSuspected``
   # (and ct-print's ``column_aware_paths_suspected`` flag) so an
-  # affected trace is reported rather than silently reinterpreted.
+  # affected trace is reported rather than silently reinterpreted. That
+  # probe reads ``paths.dat``, so it runs when it is asked, not here.
   if reader.pathReader.count() > 0:
     if reader.meta.hasColumnAwareSteps or assumeColumnAwarePaths:
       let parsed = parseLayoutAPathRecords(reader.pathReader, probe = false)
       if parsed.isErr:
-        return err(parsed.error)
+        return err(parsed.unsafeError)
       reader.lineLengths = parsed.get()
       # Only reachable via the caller's explicit override; a trace that
       # declared bit 4 already has the flag set.
@@ -663,12 +764,9 @@ proc openNewTraceFromBytes*(data: seq[byte],
       # and put every file back on the assumed stride.
       let parsed = parseLineCountPathRecords(reader.pathReader)
       if parsed.isErr:
-        return err(parsed.error)
+        return err(parsed.unsafeError)
       reader.lineCountPayloads = parsed.get().payloads
       reader.lineCounts = parsed.get().counts
-    else:
-      reader.layoutASuspected =
-        parseLayoutAPathRecords(reader.pathReader, probe = true).isOk
 
   # Alternate source views (spec §"Alternate Source Views
   # (Deminification Support)").  Found by the member's presence, not by
@@ -676,15 +774,15 @@ proc openNewTraceFromBytes*(data: seq[byte],
   # registered, so the bit cannot say (`internal-files.md` §"Stream-presence
   # flags are a hint, not a gate").  Every record is decoded eagerly so the
   # per-view accessors below run in O(1).
-  if hasInternalFile(data, "srcviews.dat", maxEntries):
+  if hasInternalFile(reader.image.bytes, "srcviews.dat", maxEntries):
     # See the writer's note on the abbreviated 12-char base name:
     # ``source_views.dat`` (spec name, 16 chars) collides with
     # ``source_views.off`` in the base40 filename encoding, so the
     # on-disk files are ``srcviews.dat`` / ``srcviews.off``.
     let svRes = initVariableRecordTableReader(
-      data, "srcviews", blockSize, maxEntries)
+      reader.image, "srcviews", blockSize, maxEntries)
     if svRes.isErr:
-      return err("source_views.dat: " & svRes.error)
+      return err("source_views.dat: " & svRes.unsafeError)
     let svReader = svRes.get()
     let total = svReader.count()
     reader.sourceViews = newSeq[SourceView](int(total))
@@ -692,80 +790,58 @@ proc openNewTraceFromBytes*(data: seq[byte],
     reader.sourceViewsByPath = newSeq[seq[uint64]](int(pathCount))
     for i in 0'u64 ..< total:
       let rawRes = svReader.read(i)
-      if rawRes.isErr:
-        return err("source_views.dat[" & $i & "]: " & rawRes.error)
-      let raw = rawRes.get()
-      var pos = 0
-      let pathIdRes = decodeVarint(raw, pos)
-      if pathIdRes.isErr:
-        return err("source_views.dat[" & $i & "]: path_id varint: " &
-          pathIdRes.error)
-      let pathId = pathIdRes.get()
-      if pos >= raw.len:
-        return err("source_views.dat[" & $i & "]: view_kind byte missing")
-      let viewKind = raw[pos]
-      pos += 1
-      let viewNameLenRes = decodeVarint(raw, pos)
-      if viewNameLenRes.isErr:
-        return err("source_views.dat[" & $i & "]: view_name_len: " &
-          viewNameLenRes.error)
-      let viewNameLen = int(viewNameLenRes.get())
-      if pos + viewNameLen > raw.len:
-        return err("source_views.dat[" & $i & "]: view_name truncated")
-      var viewName = newString(viewNameLen)
-      for k in 0 ..< viewNameLen:
-        viewName[k] = char(raw[pos + k])
-      pos += viewNameLen
-      let contentLenRes = decodeVarint(raw, pos)
-      if contentLenRes.isErr:
-        return err("source_views.dat[" & $i & "]: content_len: " &
-          contentLenRes.error)
-      let contentLen = int(contentLenRes.get())
-      if pos + contentLen > raw.len:
-        return err("source_views.dat[" & $i & "]: content truncated")
-      var content = newSeq[byte](contentLen)
-      for k in 0 ..< contentLen:
-        content[k] = raw[pos + k]
-      pos += contentLen
-      let mapLenRes = decodeVarint(raw, pos)
-      if mapLenRes.isErr:
-        return err("source_views.dat[" & $i & "]: map_len: " &
-          mapLenRes.error)
-      let mapLen = int(mapLenRes.get())
-      if pos + mapLen > raw.len:
-        return err("source_views.dat[" & $i & "]: map truncated")
-      var smap = newSeq[byte](mapLen)
-      for k in 0 ..< mapLen:
-        smap[k] = raw[pos + k]
-      pos += mapLen
-      reader.sourceViews[int(i)] = SourceView(
-        pathId: pathId,
-        viewKind: viewKind,
-        viewName: viewName,
-        content: content,
-        sourcemapV3: smap,
-      )
+      var why: string
+      if rawRes.isErr or not decodeSourceView(rawRes.unsafeGet(),
+          reader.sourceViews[int(i)], why):
+        return err("source_views.dat[" & $i & "]: " &
+          (if rawRes.isErr: rawRes.unsafeError else: why))
+      let pathId = reader.sourceViews[int(i)].pathId
       if pathId < pathCount:
         reader.sourceViewsByPath[int(pathId)].add(i)
 
-  # GDH-M1 — the version ordinals, computed after every layout decision
-  # above has been made, so the payload each ordinal is keyed on is the
-  # one `path()` answers with.
-  let ordRes = reader.computePathVersionOrdinals()
-  if ordRes.isErr:
-    return err(ordRes.error)
-
-  reader.gliChunk = -1
-  reader.posSpace = buildGlobalLineIndex(positionSpaceCounts(
-    reader.lineLengths, reader.lineCounts, int(reader.pathReader.count()),
-    reader.meta.hasColumnAwareSteps))
-  # Optional finalized metadata is read from these same owned bytes.
+  reader.posSpace = positionSpace(reader.lineLengths, reader.lineCounts,
+    int(reader.pathReader.count()), reader.meta.hasColumnAwareSteps)
   if entryMembers == 1:
-    let raw = ? readInternalFile(data, "entry.dat", blockSize, rootLayout.entryCount)
-    let entry = ? decodeEntryIdentity(raw)
+    let member = viewMember(reader.image, "entry.dat", blockSize, entrySlots)
+    if member.isErr: return err("entry.dat: " & member.error)
+    let raw = member.get().contents()
+    if raw.isErr: return err("entry.dat: " & raw.error)
+    let entry = ? decodeEntryIdentity(raw.get())
     ? reader.validateRecordedEntry(entry)
     reader.entryIdentity = some(entry)
   ok(reader)
+
+proc openNewTraceFromBytes*(data: sink seq[byte],
+    blockSize: uint32 = DefaultBlockSize,
+    maxEntries: uint32 = DefaultMaxRootEntries,
+    assumeColumnAwarePaths: bool = false): Result[NewTraceReader, string] =
+  ## Open a trace from in-memory bytes. The reader keeps ``data``: pass the
+  ## buffer by its last use (or ``move`` it) and it is taken without a copy.
+  ##
+  ## ``assumeColumnAwarePaths`` overrides the ``meta.dat`` bit 4
+  ## declaration for the ``paths.dat`` record layout only.  Pass it when
+  ## you know out of band that the trace was produced by a recorder that
+  ## emitted Layout A path records without setting the flag (see the
+  ## note at the Layout A block below).  It is an assertion by the
+  ## caller, not a guess by the reader: on a trace whose records are not
+  ## Layout A the open fails with a named ``paths.dat[N]: …`` error
+  ## instead of returning misdecoded positions.
+  var bytes = data
+  # Versions 5 and 6 in both profiles are read (`ctfs-container.md` §1a); a
+  # container stored under a whole-file scheme is reconstructed first, as
+  # `header || decompress(rest)`. The reconstructed image keeps its header,
+  # which still declares the scheme it was stored under; in the reader's own
+  # copy that byte is set to `none`, the true statement about the bytes it
+  # holds, so every member read below refuses a stored compressed body and
+  # needs no word that this one has been undone.
+  if bytes.len > V6CompressionOffset and bytes[5] == CtfsVersionV6 and
+      bytes[V6CompressionOffset] != uint8(ord(wfcNone)):
+    var image = ? reconstructImage(bytes)
+    image[V6CompressionOffset] = uint8(ord(wfcNone))
+    bytes = move image
+  ? checkReadableContainer(bytes)
+  openNewTraceFromImage(newContainerImage(move bytes), blockSize, maxEntries,
+    assumeColumnAwarePaths)
 
 when ctHasFilesystem:
   # The only two entry points in this module that name a file. Everything
@@ -782,29 +858,68 @@ when ctHasFilesystem:
 
     if not fileExists(path):
       return err("file not found: " & path)
-
-    var data: seq[byte]
-    try:
-      let f = open(path, fmRead)
-      let size = f.getFileSize()
-      data = newSeq[byte](size)
-      discard f.readBytes(data, 0, size)
-      f.close()
-    except:
-      return err("failed to read file: " & path)
-
-    openNewTraceFromBytes(data, assumeColumnAwarePaths = assumeColumnAwarePaths)
+    # Read as it is used: the members the first answers need are read, and
+    # the rest of the file when it is asked for.
+    var image = ? openFileImage(path)
+    if not image.readsFromFile:
+      return openNewTraceFromBytes(move image.bytes,
+        assumeColumnAwarePaths = assumeColumnAwarePaths)
+    ? checkReadableContainer(image.bytes)
+    openNewTraceFromImage(image, DefaultBlockSize, DefaultMaxRootEntries,
+      assumeColumnAwarePaths)
 
   proc refresh*(r: var NewTraceReader, path: string): Result[void, string] =
-    ## Re-read a growing CTFS container into this handle and invalidate every
-    ## lazily-opened stream reader whose chunk table may have grown.
-    ## Re-opens under the same ``assumeColumnAwarePaths`` reading this
-    ## handle was created with.
-    let reopened = openNewTrace(path,
-      assumeColumnAwarePaths = r.assumedColumnAwarePaths)
-    if reopened.isErr:
-      return err(reopened.error)
-    r = reopened.get()
+    ## Follow a container that is being written (`ctfs-container.md` §6,
+    ## "Live progress: per-stream following"): make what its writer has
+    ## published since this handle was opened or last refreshed readable.
+    ##
+    ## The root directory is read again; the metadata, the interning tables
+    ## and the source views, which are small, are read again whole; and each
+    ## stream reader already opened is extended by the chunks published since,
+    ## decoding only the new last chunk to count its records and keeping every
+    ## chunk it holds. A container that changed as no writer changes one -- a
+    ## member that shrank, a published chunk that moved -- is refused, naming
+    ## the member; the handle is then to be closed. A container this handle
+    ## holds whole rather than reading from its file is opened again.
+    if not r.image.readsFromFile:
+      var reopened = openNewTrace(path,
+        assumeColumnAwarePaths = r.assumedColumnAwarePaths)
+      if reopened.isErr:
+        return err(reopened.unsafeError)
+      r = move reopened.get()
+      return ok()
+    let before = rootMembers(r.image.bytes, r.maxEntries)
+    ? r.image.refresh(r.maxEntries)
+    let after = rootMembers(r.image.bytes, r.maxEntries)
+    for old in before:
+      for now in after:
+        if now.name == old.name and now.size < old.size:
+          return err("member " & base40Decode(old.name) & " shrank from " &
+            $old.size & " to " & $now.size &
+            " bytes while the container was followed")
+    if r.execLoaded:
+      ? r.execReader.refresh(r.image, int(r.blockSize), int(r.maxEntries))
+    if r.valueLoaded:
+      ? r.valueReader.refresh(r.image, r.blockSize, r.maxEntries)
+    if r.callLoaded:
+      ? r.callReader.refresh(r.image, r.blockSize, r.maxEntries)
+    if r.ioEventLoaded:
+      ? r.ioEventReader.refresh(r.image, r.blockSize, r.maxEntries)
+    var fresh = ? openNewTraceFromImage(r.image, r.blockSize, r.maxEntries,
+      r.assumedColumnAwarePaths)
+    if r.execLoaded:
+      fresh.execReader = move r.execReader
+      fresh.execLoaded = true
+    if r.valueLoaded:
+      fresh.valueReader = move r.valueReader
+      fresh.valueLoaded = true
+    if r.callLoaded:
+      fresh.callReader = move r.callReader
+      fresh.callLoaded = true
+    if r.ioEventLoaded:
+      fresh.ioEventReader = move r.ioEventReader
+      fresh.ioEventLoaded = true
+    r = move fresh
     ok()
 
 # ---------------------------------------------------------------------------
@@ -819,12 +934,12 @@ proc path*(r: NewTraceReader, id: uint64): Result[string, string] =
       # only the path prefix to surface the legacy string-shaped API.
       let rawRes = r.pathReader.readRawById(id)
       if rawRes.isErr:
-        return err(rawRes.error)
+        return err(rawRes.unsafeError)
       let raw = rawRes.get()
       var pos = 0
       let pathLenRes = decodeVarint(raw, pos)
       if pathLenRes.isErr:
-        return err("paths.dat[" & $id & "]: " & pathLenRes.error)
+        return err("paths.dat[" & $id & "]: " & pathLenRes.unsafeError)
       let pathLen = int(pathLenRes.get())
       if pos + pathLen > raw.len:
         return err("paths.dat[" & $id & "]: path_bytes truncated")
@@ -873,7 +988,7 @@ proc function*(r: NewTraceReader, id: uint64): Result[string, string] =
   ## a function called `\xa6\x8dtoken::transfer`.
   let rec = r.funcReader.readFuncById(id)
   if rec.isErr:
-    return err(r.bareRecordDiagnosis("funcs.dat", id, rec.error))
+    return err(r.bareRecordDiagnosis("funcs.dat", id, rec.unsafeError))
   ok(rec.get().name)
 
 proc functionRecord*(r: NewTraceReader, id: uint64):
@@ -882,7 +997,7 @@ proc functionRecord*(r: NewTraceReader, id: uint64):
   ## the name.
   let rec = r.funcReader.readFuncById(id)
   if rec.isErr:
-    return err(r.bareRecordDiagnosis("funcs.dat", id, rec.error))
+    return err(r.bareRecordDiagnosis("funcs.dat", id, rec.unsafeError))
   rec
 
 proc typeName*(r: NewTraceReader, id: uint64): Result[string, string] =
@@ -891,7 +1006,7 @@ proc typeName*(r: NewTraceReader, id: uint64): Result[string, string] =
   ## specific_info`.
   let rec = r.typeReader.readTypeById(id)
   if rec.isErr:
-    return err(r.bareRecordDiagnosis("types.dat", id, rec.error))
+    return err(r.bareRecordDiagnosis("types.dat", id, rec.unsafeError))
   ok(rec.get().langType)
 
 proc typeRecord*(r: NewTraceReader, id: uint64):
@@ -899,7 +1014,7 @@ proc typeRecord*(r: NewTraceReader, id: uint64):
   ## The kind alongside the name.
   let rec = r.typeReader.readTypeById(id)
   if rec.isErr:
-    return err(r.bareRecordDiagnosis("types.dat", id, rec.error))
+    return err(r.bareRecordDiagnosis("types.dat", id, rec.unsafeError))
   rec
 
 proc varname*(r: NewTraceReader, id: uint64): Result[string, string] =
@@ -920,9 +1035,15 @@ proc columnAwarePathsSuspected*(r: NewTraceReader): bool =
   ## grounds to believe the recorder was affected reopens the trace with
   ## ``assumeColumnAwarePaths = true``.
   ##
-  ## Always false when the trace declares column-aware steps: there is
-  ## nothing to suspect, the layout is stated.
-  r.layoutASuspected
+  ## Always false when the trace declares column-aware steps, or a
+  ## line-count table: there is nothing to suspect, the layout is stated.
+  ##
+  ## Probed on each call (it reads ``paths.dat``, which an open that only
+  ## wants a step's location does not); the probe usually stops at the
+  ## first record.
+  r.pathReader.count() > 0 and not r.meta.hasColumnAwareSteps and
+    not r.meta.hasLineCountTable and
+    parseLayoutAPathRecords(r.pathReader, probe = true).isOk
 
 proc pathCount*(r: NewTraceReader): uint64 =
   r.pathReader.count()
@@ -931,7 +1052,21 @@ proc pathCount*(r: NewTraceReader): uint64 =
 # Versioned paths (GDH-M1 — design §6.1 / §7.0)
 # ---------------------------------------------------------------------------
 
-proc pathVersionOrdinal*(r: NewTraceReader,
+proc ensurePathVersions(r: var NewTraceReader): Result[void, string] =
+  ## Compute the version ordinals once. The layout decisions they key on
+  ## (`path()`'s answer) were all made at open.
+  if not r.pathVersionsBuilt:
+    let res = r.computePathVersionOrdinals()
+    r.pathVersionsBuilt = true
+    if res.isErr:
+      r.pathVersionOrdinals.setLen(0)
+      r.pathVersionTotals.setLen(0)
+      r.pathVersionsError = res.unsafeError
+  if r.pathVersionsError.len > 0:
+    return err(r.pathVersionsError)
+  ok()
+
+proc pathVersionOrdinal*(r: var NewTraceReader,
     id: uint64): Result[uint64, string] =
   ## The 0-based VERSION ORDINAL of path ``id``: 0 for the first entry in
   ## ``paths.dat`` carrying this entry's string, 1 for the second, and so
@@ -947,15 +1082,17 @@ proc pathVersionOrdinal*(r: NewTraceReader,
   ## generation the observer sent starts at 1 rather than 0. The two are
   ## off by one by construction and the reload marker records the mapping
   ## rather than leaving it to be inferred.
+  ? r.ensurePathVersions()
   if id >= uint64(r.pathVersionOrdinals.len):
     return err("pathVersionOrdinal: path id " & $id & " is out of range (" &
       $r.pathVersionOrdinals.len & " path(s) in paths.dat)")
   ok(r.pathVersionOrdinals[int(id)])
 
-proc pathVersionCount*(r: NewTraceReader,
+proc pathVersionCount*(r: var NewTraceReader,
     id: uint64): Result[uint64, string] =
   ## How many ``paths.dat`` entries — including ``id`` itself — carry
   ## ``id``'s string. ``1`` for an unversioned path.
+  ? r.ensurePathVersions()
   if id >= uint64(r.pathVersionTotals.len):
     return err("pathVersionCount: path id " & $id & " is out of range (" &
       $r.pathVersionTotals.len & " path(s) in paths.dat)")
@@ -1266,30 +1403,28 @@ proc decodeGlobalPositionIndex*(r: var NewTraceReader,
 # Step access (lazy init exec reader)
 # ---------------------------------------------------------------------------
 
-proc ensureExecReader(r: var NewTraceReader): Result[void, string] =
+proc loadExecReader(r: var NewTraceReader): Result[void, string] =
   if not r.execLoaded:
-    # M24a-1: select the steps.dat/steps.idx framing by the meta.dat
-    # ``has_step_stream`` flag.  Bundles written by the current Nim writer
-    # (and by the Rust writer) set the flag and use the SPEC-canonical layout
-    # (header-less chunks, no total_events trailer) that the Rust
-    # ``StepStreamReader`` reads byte-for-byte.  Pre-M24a-1 Nim-v4 bundles
-    # never set the flag and use the legacy framing (per-chunk u32 count +
-    # total_events trailer); ``legacy = not hasStepStream`` keeps them readable.
-    let res = initExecStreamReader(r.data, int(r.blockSize), int(r.maxEntries),
-      legacy = not r.meta.hasStepStream,
+    var res = initExecStreamReader(r.image, int(r.blockSize), int(r.maxEntries),
       # GDH-M2: tag 0x08 is decodable only where the container declares
       # it.  A container that carries the tag with the flag clear is
       # refused BY NAME here rather than decoded — see
       # `decodeStepEvent`'s `allowSourceReload` note for why skipping is
       # strictly worse than refusing.
       allowSourceReload = r.meta.hasSourceReload)
-    if res.isErr: return err(res.error)
-    r.execReader = res.get()
+    if res.isErr: return err(res.unsafeError)
+    r.execReader = move res.get()
     r.execLoaded = true
   ok()
 
+template ensureExecReader(r: var NewTraceReader) =
+  ## `loadExecReader` on first use, its refusal returned from the enclosing
+  ## proc; a check of one flag afterwards.
+  if not r.execLoaded:
+    ? r.loadExecReader()
+
 proc step*(r: var NewTraceReader, n: uint64): Result[StepEvent, string] =
-  ?r.ensureExecReader()
+  r.ensureExecReader()
   r.execReader.readEvent(n)
 
 proc stepAbsoluteGlobalLineIndex*(r: var NewTraceReader,
@@ -1300,55 +1435,36 @@ proc stepAbsoluteGlobalLineIndex*(r: var NewTraceReader,
   ## each chunk's first position record is an AbsoluteStep and a reader
   ## decodes a chunk by itself (`resolveChunkPositions`), refusing a delta
   ## before the chunk's anchor.
-  ?r.ensureExecReader()
-
-  let chunkSize = uint64(r.execReader.chunkSize)
-  let chunkIdx = int(n div chunkSize)
-  let eventInChunk = int(n mod chunkSize)
-  if chunkIdx == r.gliChunk:
-    if eventInChunk >= r.gliCache.len:
-      return err("step " & $n & " is past the end of its exec chunk")
-    return ok(r.gliCache[eventInChunk])
-  # Decode the containing chunk once, in one pass, and keep every event's
-  # absolute position: a caller that resolves steps one call at a time
-  # (ct-print, the C ABI's `ct_reader_step_location`) asks for the next step
-  # of the same chunk next.
-  var chunkBuf: seq[StepEvent]
-  discard ?r.execReader.readChunkEvents(chunkIdx, chunkBuf)
-  if eventInChunk >= chunkBuf.len:
-    return err("step " & $n & " is past the end of its exec chunk")
-  r.gliChunk = -1
-  ? resolveChunkPositions(chunkBuf, chunkIdx, r.gliCache)
-  r.gliChunk = chunkIdx
-  ok(r.gliCache[eventInChunk])
+  r.ensureExecReader()
+  # The exec reader keeps each decoded chunk's positions, as far as reads
+  # have reached: a caller that resolves steps one call at a time
+  # (ct-print, the C ABI's `ct_reader_step_location`) decodes each record
+  # once.
+  r.execReader.eventPosition(n)
 
 proc stepCount*(r: var NewTraceReader): Result[uint64, string] =
-  ?r.ensureExecReader()
+  r.ensureExecReader()
   ok(r.execReader.totalEvents)
 
+proc isStepRecord*(ev: StepEvent): bool =
+  ## Whether an exec record is a step (``trace-events.md`` §"Which exec
+  ## records are steps"): only ``AbsoluteStep`` and ``DeltaStep`` are.
+  ev.kind in {sekAbsoluteStep, sekDeltaStep}
+
 proc logicalStepCount*(r: var NewTraceReader): Result[uint64, string] =
-  ## Return the user-facing "step count" — every exec event except
-  ## column-only nudges (``sekDeltaColumn``).  Matches the pre-P6
-  ## semantics of ``stepCount`` (totalEvents) on line-only traces
-  ## byte-for-byte, and continues to match it for column-aware
-  ## traces because DeltaColumn events are subtracted out.  Used by
-  ## ct-print for ``counts.steps`` so golden anchors stay stable
-  ## across the writer's column-aware-mode opt-in.
+  ## The trace's step count: the number of step records (``sekAbsoluteStep``,
+  ## ``sekDeltaStep``), and no other exec record (``trace-events.md``
+  ## §"Which exec records are steps").  A raise, a catch, the thread records,
+  ## a column-only nudge (``sekDeltaColumn``) and a source-reload marker each
+  ## occupy an exec record but are not steps.
   ##
-  ## Why this isn't named "stepCount": ``stepCount`` still returns
-  ## the raw exec event count because the FFI and chunked-storage
-  ## internals correlate calls / IO events back to events-stream
-  ## position via that index — including DeltaColumn nudges.
+  ## ``stepCount`` stays the exec-record count, because the value, call and
+  ## I/O event streams are indexed by exec record.
   ##
-  ## Fast path: when the trace is not column-aware, the count is
-  ## exactly ``stepCount`` and we skip the event walk entirely.
-  ## Column-aware traces walk the event stream via ``readChunkEvents``
-  ## (O(N) total decode cost — chunks are decompressed once each,
-  ## events read in bulk).  Looping ``readEvent`` is O(N²) because
-  ## each call re-scans from the chunk start.
-  ?r.ensureExecReader()
-  if not r.meta.hasColumnAwareSteps and not r.meta.hasSourceReload:
-    return ok(r.execReader.totalEvents)
+  ## The stream is walked chunk by chunk via ``readChunkEvents`` (O(N) total:
+  ## each chunk is decompressed once); looping ``readEvent`` would re-scan
+  ## from the chunk start on every call.
+  r.ensureExecReader()
   var n: uint64 = 0
   var chunkBuf: seq[StepEvent]
   let total = int(r.execReader.totalEvents)
@@ -1357,19 +1473,24 @@ proc logicalStepCount*(r: var NewTraceReader): Result[uint64, string] =
   for chunkIdx in 0 ..< chunkCount:
     discard ?r.execReader.readChunkEvents(chunkIdx, chunkBuf)
     for ev in chunkBuf:
-      case ev.kind
-      of sekDeltaColumn:
-        discard
-      of sekSourceReload:
-        # GDH-M2 / design §7.3: the reload marker is a timeline
-        # ANNOTATION, not a step.  It has no source location, so a
-        # consumer must not be able to step to it, and counting it as a
-        # step would put a position-less entry in the middle of a
-        # position-indexed sequence.
-        discard
-      else:
+      if ev.isStepRecord:
         n += 1
   ok(n)
+
+proc execRecords*(r: var NewTraceReader): Result[seq[StepEvent], string] =
+  ## Every exec record, in stream order (index = exec-record index), decoded
+  ## chunk by chunk.  A view that walks the whole stream uses this instead of
+  ## ``step(n)`` per record, which re-scans its chunk on every call.
+  r.ensureExecReader()
+  var records: seq[StepEvent]
+  var chunkBuf: seq[StepEvent]
+  let total = int(r.execReader.totalEvents)
+  let chunkSize = int(r.execReader.chunkSize)
+  let chunkCount = (total + chunkSize - 1) div chunkSize
+  for chunkIdx in 0 ..< chunkCount:
+    discard ?r.execReader.readChunkEvents(chunkIdx, chunkBuf)
+    records.add(chunkBuf)
+  ok(records)
 
 proc sourceReloadCount*(r: var NewTraceReader): Result[uint64, string] =
   ## GDH-M2 — how many ``TagSourceReload`` markers the execution stream
@@ -1388,7 +1509,7 @@ proc sourceReloadCount*(r: var NewTraceReader): Result[uint64, string] =
   ## (HLX-M1's resolver answered "not found" when it could not read the
   ## table), and it would have been reachable through ``ct-print`` on
   ## EVERY container written to date, since they are all v4.
-  ?r.ensureExecReader()
+  r.ensureExecReader()
   if not r.meta.hasSourceReload:
     return ok(0'u64)
   var n: uint64 = 0
@@ -1420,7 +1541,7 @@ proc sourceReloads*(r: var NewTraceReader): Result[seq[SourceReloadMarker], stri
   ## undeclared-container early return: an empty seq must mean "this
   ## stream carries no markers", never "this stream could not be read".
   var markers: seq[SourceReloadMarker] = @[]
-  ?r.ensureExecReader()
+  r.ensureExecReader()
   if not r.meta.hasSourceReload:
     return ok(markers)
   var chunkBuf: seq[StepEvent]
@@ -1458,7 +1579,7 @@ proc stepAbsoluteGlobalLineIndices*(r: var NewTraceReader,
   ## entirely.  Non-step events (Raise, Catch, ThreadStart/Exit/Switch)
   ## carry no GLI delta so the running GLI is left untouched, mirroring
   ## [stepAbsoluteGlobalLineIndex].
-  ?r.ensureExecReader()
+  r.ensureExecReader()
 
   if count == 0'u64 or output.len == 0:
     return ok(0'u64)
@@ -1488,7 +1609,7 @@ proc stepAbsoluteGlobalLineIndices*(r: var NewTraceReader,
     # so we can map seq positions back to absolute step indices.
     let firstIdxRes = r.execReader.readChunkEvents(chunkIdx, events)
     if firstIdxRes.isErr:
-      return err(firstIdxRes.error)
+      return err(firstIdxRes.unsafeError)
     let firstIdx = firstIdxRes.get()
 
     ? resolveChunkPositions(events, chunkIdx, positions)
@@ -1511,29 +1632,28 @@ proc stepAbsoluteGlobalLineIndices*(r: var NewTraceReader,
 # Value access (lazy init)
 # ---------------------------------------------------------------------------
 
-proc ensureValueReader(r: var NewTraceReader): Result[void, string] =
+proc loadValueReader(r: var NewTraceReader): Result[void, string] =
   if not r.valueLoaded:
-    # M24a-2: select the values.dat/values.idx framing by the meta.dat
-    # ``has_value_stream`` flag.  Bundles written by the current Nim writer
-    # (and by the Rust writer) set the flag and use the SPEC-canonical chunked
-    # layout that the Rust ``ValueStreamReader`` reads byte-for-byte.  Pre-M24a-2
-    # Nim-v4 bundles never set the flag and use the legacy ``.off`` VRT framing;
-    # ``legacy = not hasValueStream`` keeps them readable.
-    let res = initValueStreamReader(r.data, r.blockSize, r.maxEntries,
-      legacy = not r.meta.hasValueStream)
-    if res.isErr: return err(res.error)
-    r.valueReader = res.get()
+    var res = initValueStreamReader(r.image, r.blockSize, r.maxEntries)
+    if res.isErr: return err(res.unsafeError)
+    r.valueReader = move res.get()
     r.valueLoaded = true
   ok()
 
+template ensureValueReader(r: var NewTraceReader) =
+  ## `loadValueReader` on first use, its refusal returned from the enclosing
+  ## proc; a check of one flag afterwards.
+  if not r.valueLoaded:
+    ? r.loadValueReader()
+
 proc values*(r: var NewTraceReader, n: uint64): Result[seq[VariableValue], string] =
-  ?r.ensureValueReader()
+  r.ensureValueReader()
   r.valueReader.readStepValues(n)
 
 proc valueEvents*(r: var NewTraceReader,
     n: uint64): Result[seq[DecodedValueEvent], string] =
   ## Every value-stream event of exec record ``n`` — tags 0-9, in wire order.
-  ?r.ensureValueReader()
+  r.ensureValueReader()
   r.valueReader.readStepEvents(n)
 
 iterator valuesIter*(r: var NewTraceReader, n: uint64): VariableValue =
@@ -1554,7 +1674,7 @@ proc values*(r: var NewTraceReader, n: uint64, output: var openArray[VariableVal
   count
 
 proc valueCount*(r: var NewTraceReader): Result[uint64, string] =
-  ?r.ensureValueReader()
+  r.ensureValueReader()
   ok(r.valueReader.count())
 
 proc lastSkippedValueTags*(r: NewTraceReader): seq[uint8] =
@@ -1580,24 +1700,120 @@ proc skippedValueTagCounts*(r: NewTraceReader): seq[(uint8, int)] =
 # Call access (lazy init)
 # ---------------------------------------------------------------------------
 
-proc ensureCallReader(r: var NewTraceReader): Result[void, string] =
+proc loadCallReader(r: var NewTraceReader): Result[void, string] =
   if not r.callLoaded:
-    let res = initCallStreamReader(r.data, r.blockSize, r.maxEntries)
-    if res.isErr: return err(res.error)
-    r.callReader = res.get()
+    var res = initCallStreamReader(r.image, r.blockSize, r.maxEntries)
+    if res.isErr: return err(res.unsafeError)
+    r.callReader = move res.get()
     r.callLoaded = true
   ok()
 
+template ensureCallReader(r: var NewTraceReader) =
+  ## `loadCallReader` on first use, its refusal returned from the enclosing
+  ## proc; a check of one flag afterwards.
+  if not r.callLoaded:
+    ? r.loadCallReader()
+
 proc call*(r: var NewTraceReader, callKey: uint64): Result[CallRecord, string] =
-  ?r.ensureCallReader()
-  r.callReader.readCall(callKey)
+  r.ensureCallReader()
+  r.callReader.readCallInto(callKey)
 
 proc callCount*(r: var NewTraceReader): Result[uint64, string] =
-  ?r.ensureCallReader()
+  r.ensureCallReader()
   ok(r.callReader.count())
 
-proc callForStep*(r: var NewTraceReader, stepId: uint64): Result[CallRecord, string] =
-  ## Find the innermost enclosing call record for the given step.
+template lastEnteredBy(totalCalls, stepId: uint64,
+    entryStepAt: untyped): int64 =
+  ## Part 1 of ``enclosingCallKey``'s definition, shared by the indexed and
+  ## the walking form so both make the same probes: the largest index whose
+  ## entry step is ``<= stepId``, by binary search over ``entryStepAt(i)``
+  ## for ``totalCalls > 0`` records, or -1. ``entryStepAt`` may ``return``
+  ## from the caller (``?`` on a record that does not decode).
+  var lo: uint64 = 0
+  var hi: uint64 = totalCalls - 1
+  var k: int64 = -1
+  while lo <= hi:
+    let mid = lo + (hi - lo) div 2
+    if entryStepAt(mid) <= stepId:
+      k = int64(mid)
+      if mid == high(uint64):  # defensive, can't happen with reasonable trace
+        break
+      lo = mid + 1
+    else:
+      if mid == 0:
+        break
+      hi = mid - 1
+  k
+
+proc enclosingCallKeyByWalk(r: var NewTraceReader,
+    stepId: uint64): Result[uint64, string] =
+  ## ``enclosingCallKey`` read straight off the call stream, for a stream
+  ## the index could not be built over (a record that does not decode).
+  ## It probes exactly the records the definition names, in the same order,
+  ## so a damaged record produces the same refusal it always did, and only
+  ## where a query reaches it. Each query costs a walk back over every
+  ## sibling that already returned — the O(calls) per step this replaced.
+  let totalCalls = r.callReader.count()
+  template entryStepAt(i: uint64): uint64 =
+    (?r.callReader.readCall(i)).entryStep
+  let k = lastEnteredBy(totalCalls, stepId, entryStepAt)
+  if k < 0:
+    return err("step " & $stepId & " not found in any call")
+  var i = uint64(k)
+  while true:
+    let c = ?r.callReader.readCall(i)
+    if c.exitStep >= stepId:
+      return ok(i)
+    if i == 0:
+      break
+    i -= 1
+  err("step " & $stepId & " not found in any call")
+
+proc buildCallStepIndex(r: var NewTraceReader) =
+  ## Read every call record once and keep what ``enclosingCallKey`` asks of
+  ## it: each record's ``entryStep``, and a max-segment-tree over the
+  ## ``exitStep``s. 24 bytes per call, built on the first query and rebuilt
+  ## when a followed container's call stream has grown. A record that does
+  ## not decode leaves the index unavailable, and queries take the walk.
+  let n = r.callReader.count()
+  r.callIndex = CallStepIndex(state: cisUnavailable, count: n)
+  var entries = newSeq[uint64](n)
+  var size = 1
+  while uint64(size) < n:
+    size *= 2
+  var tree = newSeq[uint64](2 * size)
+  for i in 0'u64 ..< n:
+    let c = r.callReader.readCall(i)
+    if c.isErr:
+      return
+    entries[i] = c.get().entryStep
+    tree[size + int(i)] = c.get().exitStep
+  for node in countdown(size - 1, 1):
+    tree[node] = max(tree[2 * node], tree[2 * node + 1])
+  r.callIndex = CallStepIndex(state: cisBuilt, count: n, size: size,
+    entrySteps: move entries, exitMax: move tree)
+
+proc rightmostExitAtLeast(tree: seq[uint64], node, lo, hi, last: int,
+    stepId: uint64): int =
+  ## The largest leaf index ``<= last`` in ``[lo, hi)`` (the range ``node``
+  ## covers) whose exit step is ``>= stepId``, or -1. A subtree whose
+  ## maximum is below ``stepId``, or that starts past ``last``, is skipped
+  ## whole; the right child is tried first. O(log calls): along the path to
+  ## ``last`` each level enters at most one subtree that does not answer.
+  if lo > last or tree[node] < stepId:
+    return -1
+  if hi - lo == 1:
+    return lo
+  let mid = (lo + hi) div 2
+  let right = rightmostExitAtLeast(tree, 2 * node + 1, mid, hi, last, stepId)
+  if right >= 0:
+    return right
+  rightmostExitAtLeast(tree, 2 * node, lo, mid, last, stepId)
+
+proc enclosingCallKey*(r: var NewTraceReader,
+    stepId: uint64): Result[uint64, string] =
+  ## The call_key of the innermost call enclosing ``stepId`` — the record
+  ## ``callForStep`` returns — without decoding that record.
   ##
   ## Call records are sorted by `entryStep` ascending (= entry order, which
   ## also matches call_key allocation order after CTFS-M-CallKeyOrder).
@@ -1605,18 +1821,35 @@ proc callForStep*(r: var NewTraceReader, stepId: uint64): Result[CallRecord, str
   ## parent's `exitStep` is far larger than any of its children's: child
   ## ranges `[entryStep, exitStep]` are strictly contained in the parent's.
   ##
-  ## Strategy (correct for arbitrary nesting):
-  ##   1. Binary-search for the largest index `k` with
+  ## The answer is defined as:
+  ##   1. `k`, the result of a binary search for the largest index with
   ##      `calls[k].entryStep <= stepId`. All calls at index > k were
   ##      entered after `stepId` and cannot contain it.
-  ##   2. Walk back from `k` and return the FIRST call whose
-  ##      `exitStep >= stepId`. That call is, by construction, the
+  ##   2. The LARGEST index `i <= k` whose `exitStep >= stepId`: the
   ##      most-recently-entered frame still open at `stepId`, hence the
-  ##      deepest enclosing call. Earlier indices in the walk are either
-  ##      siblings that already returned (their parent eventually has
-  ##      `exitStep >= stepId`) or the matching parent itself.
+  ##      deepest enclosing call. A drained entry past the last step
+  ##      (`entryStep = step_count`, `exitStep = step_count - 1`) is
+  ##      never `<= stepId` for a step of the trace, and frames finalized
+  ##      at close share an exit step without changing which is largest.
+  ## Refusals: `no call records` on an empty stream, and `step N not found
+  ## in any call` when either part finds nothing.
   ##
-  ## CTFS-M-FunctionAttrTemplate: the previous implementation interleaved
+  ## Part 2 used to be a walk back from `k` over every call entered before
+  ## the step — every already-returned sibling — reading each from a call
+  ## stream that keeps one inflated chunk. On a module body that calls
+  ## thousands of functions (a recorded `import`) that is O(calls) per
+  ## step, and ct-print queries every step. It is now one query on a
+  ## max-segment-tree over the exit steps (`buildCallStepIndex`): the
+  ## rightmost leaf `<= k` whose exit is `>= stepId`. Part 1 runs the same
+  ## binary search over the index's entry steps, so a stream whose entry
+  ## steps are out of order answers as it always did. Both parts take
+  ## O(log calls), and the answer is the definition's for every stream —
+  ## the walk's, not an approximation that holds only where calls nest
+  ## (`tests/test_call_for_step_matches_reference.nim`). Following
+  ## `parentCallKey` up from `k` gives the same answer where ranges nest,
+  ## but trusts a field the definition does not read.
+  ##
+  ## CTFS-M-FunctionAttrTemplate: an earlier implementation interleaved
   ## an interpolation search with an early-exit on `stepId > hi.exitStep`
   ## and used the lo/hi-contains shortcut to record matches. Both pieces
   ## broke for steps that sit in a caller's body AFTER a nested call
@@ -1628,46 +1861,33 @@ proc callForStep*(r: var NewTraceReader, stepId: uint64): Result[CallRecord, str
   ## that physically sits after the inlined call returns -- was reported
   ## as "not found in any call", emitting a step with no `function`,
   ## `function_id`, or `depth` attribution.
-  ?r.ensureCallReader()
+  r.ensureCallReader()
   let totalCalls = r.callReader.count()
   if totalCalls == 0:
     return err("no call records")
+  if r.callIndex.state == cisUnbuilt or r.callIndex.count != totalCalls:
+    r.buildCallStepIndex()
+  if r.callIndex.state != cisBuilt:
+    return r.enclosingCallKeyByWalk(stepId)
 
-  # Step 1: binary search for largest index k with entryStep <= stepId.
-  # If no such index exists (stepId precedes the first call), bail out.
-  var lo: uint64 = 0
-  var hi: uint64 = totalCalls - 1
-  var k: int64 = -1
-  while lo <= hi:
-    let mid = lo + (hi - lo) div 2
-    let midCall = ?r.callReader.readCall(mid)
-    if midCall.entryStep <= stepId:
-      k = int64(mid)
-      if mid == high(uint64):  # defensive, can't happen with reasonable trace
-        break
-      lo = mid + 1
-    else:
-      if mid == 0:
-        break
-      hi = mid - 1
+  # Part 1, over the index: the same probes `enclosingCallKeyByWalk` makes.
+  template entryStepAt(i: uint64): uint64 = r.callIndex.entrySteps[i]
+  let k = lastEnteredBy(totalCalls, stepId, entryStepAt)
   if k < 0:
     return err("step " & $stepId & " not found in any call")
+  # Part 2: the rightmost index <= k whose exit step reaches the step.
+  let i = rightmostExitAtLeast(r.callIndex.exitMax, 1, 0, r.callIndex.size,
+    int(k), stepId)
+  if i < 0:
+    return err("step " & $stepId & " not found in any call")
+  ok(uint64(i))
 
-  # Step 2: walk backwards looking for the first enclosing call. The
-  # walk traverses sibling subtrees that already returned; their parent
-  # (or grandparent, etc.) is the answer. Worst case is O(N) but the
-  # expected cost on well-formed traces is O(call-depth-at-stepId)
-  # because each backward hop skips at most one returned subtree before
-  # landing on the enclosing frame.
-  var i = uint64(k)
-  while true:
-    let c = ?r.callReader.readCall(i)
-    if c.exitStep >= stepId:
-      return ok(c)
-    if i == 0:
-      break
-    i -= 1
-  err("step " & $stepId & " not found in any call")
+proc callForStep*(r: var NewTraceReader, stepId: uint64): Result[CallRecord, string] =
+  ## The innermost call record enclosing the given step: the record at
+  ## ``enclosingCallKey(stepId)`` (see there for the definition, its cost
+  ## and its refusals).
+  let key = ?r.enclosingCallKey(stepId)
+  r.callReader.readCall(key)
 
 proc validateRecordedEntry*(r: var NewTraceReader,
     entry: RecordedEntryIdentity): Result[void, string] =
@@ -1717,7 +1937,7 @@ proc validateRecordedEntry*(r: var NewTraceReader,
 
 iterator callRange*(r: var NewTraceReader, start, count: uint64): CallRecord =
   ## Yields call records in [start, start+count).
-  let _ = r.ensureCallReader()
+  discard r.loadCallReader()
   for i in start ..< start + count:
     let res = r.callReader.readCall(i)
     if res.isOk:
@@ -1727,7 +1947,7 @@ proc callRange*(r: var NewTraceReader, start, count: uint64,
                 output: var openArray[CallRecord]): int =
   ## Fill output buffer with call records starting at `start`.
   ## Returns the number of records written.
-  let _ = r.ensureCallReader()
+  discard r.loadCallReader()
   var written = 0
   for i in start ..< start + count:
     if written >= output.len: break
@@ -1741,32 +1961,31 @@ proc callRange*(r: var NewTraceReader, start, count: uint64,
 # IO event access (lazy init)
 # ---------------------------------------------------------------------------
 
-proc ensureIOEventReader(r: var NewTraceReader): Result[void, string] =
+proc loadIOEventReader(r: var NewTraceReader): Result[void, string] =
   if not r.ioEventLoaded:
-    # M24a-3: select the events.dat/events.idx framing by the meta.dat
-    # ``has_io_event_stream`` flag.  Bundles written by the current Nim writer
-    # (and by the Rust writer) set the flag and use the SPEC-canonical chunked
-    # layout that the Rust ``IoEventStreamReader`` reads byte-for-byte.
-    # Pre-M24a-3 Nim-v4 bundles never set the flag and use the legacy ``.off``
-    # VRT framing; ``legacy = not hasIoEventStream`` keeps them readable.
-    let res = initIOEventStreamReader(r.data, r.blockSize, r.maxEntries,
-      legacy = not r.meta.hasIoEventStream)
-    if res.isErr: return err(res.error)
-    r.ioEventReader = res.get()
+    var res = initIOEventStreamReader(r.image, r.blockSize, r.maxEntries)
+    if res.isErr: return err(res.unsafeError)
+    r.ioEventReader = move res.get()
     r.ioEventLoaded = true
   ok()
 
+template ensureIOEventReader(r: var NewTraceReader) =
+  ## `loadIOEventReader` on first use, its refusal returned from the enclosing
+  ## proc; a check of one flag afterwards.
+  if not r.ioEventLoaded:
+    ? r.loadIOEventReader()
+
 proc ioEvent*(r: var NewTraceReader, index: uint64): Result[IOEvent, string] =
-  ?r.ensureIOEventReader()
+  r.ensureIOEventReader()
   r.ioEventReader.readEvent(index)
 
 proc ioEventCount*(r: var NewTraceReader): Result[uint64, string] =
-  ?r.ensureIOEventReader()
+  r.ensureIOEventReader()
   ok(r.ioEventReader.count())
 
 iterator events*(r: var NewTraceReader, start, count: uint64): IOEvent =
   ## Yields IO events in [start, start+count).
-  let _ = r.ensureIOEventReader()
+  discard r.loadIOEventReader()
   for i in start ..< start + count:
     let res = r.ioEventReader.readEvent(i)
     if res.isOk:
@@ -1777,7 +1996,7 @@ proc events*(
     output: var openArray[IOEvent]): int =
   ## Fill output buffer with IO events starting at `start`.
   ## Returns the number of events written.
-  let _ = r.ensureIOEventReader()
+  discard r.loadIOEventReader()
   var written = 0
   for i in start ..< start + count:
     if written >= output.len: break

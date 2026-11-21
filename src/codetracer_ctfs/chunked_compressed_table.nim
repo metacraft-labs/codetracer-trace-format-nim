@@ -269,13 +269,17 @@ proc initChunkedCompressedTableReader*(
     let lastChunkRecords = uint64(frameSize) div uint64(recordSize)
     totalRecords += lastChunkRecords
 
+  # Sized before `offsets` is handed to the reader: a field initialiser that
+  # reads `offsets` after the one that takes it may see it moved out, and a
+  # cache sized for no chunks misses on every read.
+  var cache = initChunkCache[ChunkMeta](offsets.len, cacheBytes)
   ok(ChunkedCompressedTableReader(
     data: datData,
     chunkSize: chunkSize,
     recordSize: recordSize,
     offsets: offsets,
     totalRecords: totalRecords,
-    cache: initChunkCache[ChunkMeta](offsets.len, cacheBytes),
+    cache: move cache,
   ))
 
 proc count*(r: ChunkedCompressedTableReader): uint64 = r.totalRecords

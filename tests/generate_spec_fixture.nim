@@ -1,63 +1,64 @@
 ## Generate a .ct fixture file for the codetracer-trace-format-spec repo.
 ##
-## Produces a minimal but representative trace with known events:
-##   - 2 Path events (register source files)
-##   - 1 Function event (define "main")
-##   - 4 Step events (walk through lines)
-##   - 1 Call event (enter "main")
-##   - 2 Value events (an int and a string)
-##   - 1 Return event
+## A minimal but representative split-stream recording, written by the
+## split-stream writer:
+##   - 2 source paths
+##   - 2 types (`int`, `string`)
+##   - 1 function (`main`) and one call of it
+##   - 4 steps, two of them carrying a value (`x = 42`, `msg = "hello"`)
+##   - the call's return
 ##
-## Run:  nim c -r tests/generate_spec_fixture.nim <output-path>
+## The recording id is fixed so regenerating the fixture reproduces it byte
+## for byte.
+##
+## Run:  nim c -r -p:src tests/generate_spec_fixture.nim <output-path>
 
 import std/os
 import results
-import codetracer_trace_writer
 import codetracer_trace_types
+import codetracer_trace_writer/multi_stream_writer
+import codetracer_trace_writer/value_stream
+import codetracer_trace_writer/cbor
+
+const FixtureRecordingId = "0192f8a0-0000-7000-8000-000000000001"
+
+proc cborOf(v: ValueRecord): seq[byte] =
+  var enc = CborEncoder.init()
+  enc.encodeCborValueRecord(v)
+  enc.getBytes()
 
 proc main() =
   let outputPath =
     if paramCount() >= 1: paramStr(1)
     else: getTempDir() / "spec_fixture.ct"
+  removeFile(outputPath)
 
-  var writerRes = newTraceWriter(outputPath, "factorial", @["5"],
-                                  workdir = "/home/user/demo",
-                                  chunkThreshold = 64)
-  doAssert writerRes.isOk, "newTraceWriter failed: " & writerRes.error
-  var w = writerRes.get()
+  var w = initMultiStreamWriter(outputPath, "factorial",
+    recordingId = FixtureRecordingId).get()
+  w.metadata.args = @["5"]
+  w.metadata.workdir = "/home/user/demo"
 
-  # Register source files (Path events)
-  doAssert w.writePath("/src/main.nim").isOk       # pathId 0
-  doAssert w.writePath("/src/math_utils.nim").isOk # pathId 1
+  let mainNim = w.registerPath("/src/main.nim").get()
+  let mathUtils = w.registerPath("/src/math_utils.nim").get()
+  let intT = w.registerType("int", uint8(ord(tkInt))).get()
+  let strT = w.registerType("string", uint8(ord(tkString))).get()
+  let mainFn = w.registerFunctionAt("/src/main.nim", 1, "main").get()
+  let x = w.registerVarname("x").get()
+  let msg = w.registerVarname("msg").get()
 
-  # Define a function
-  doAssert w.writeFunction(0, 1, "main").isOk      # functionId 0
-
-  # Step into main at line 1
-  doAssert w.writeStep(0, 1).isOk
-
-  # Call main
-  doAssert w.writeCall(0).isOk
-
-  # Step through some lines
-  doAssert w.writeStep(0, 3).isOk
-  doAssert w.writeStep(0, 4).isOk
-
-  # Record an integer value: x = 42
-  doAssert w.writeValue(1, ValueRecord(
-    kind: vrkInt, intVal: 42, intTypeId: TypeId(7))).isOk
-
-  # Step to another line
-  doAssert w.writeStep(1, 10).isOk
-
-  # Record a string value: msg = "hello"
-  doAssert w.writeValue(2, ValueRecord(
-    kind: vrkString, text: "hello", strTypeId: TypeId(9))).isOk
-
-  # Return from main with int value 0
-  doAssert w.writeReturn().isOk
+  doAssert w.registerCall(mainFn, []).isOk
+  doAssert w.registerStep(mainNim, 1, []).isOk
+  doAssert w.registerStep(mainNim, 3, []).isOk
+  doAssert w.registerStep(mainNim, 4, [VariableValue(varnameId: x,
+    data: cborOf(ValueRecord(kind: vrkInt, intVal: 42,
+      intTypeId: TypeId(intT))))]).isOk
+  doAssert w.registerStep(mathUtils, 10, [VariableValue(varnameId: msg,
+    data: cborOf(ValueRecord(kind: vrkString, text: "hello",
+      strTypeId: TypeId(strT))))]).isOk
+  doAssert w.registerReturn().isOk
 
   doAssert w.close().isOk
+  doAssert w.closeCtfs().isOk
   echo "Fixture written to: ", outputPath
 
 main()

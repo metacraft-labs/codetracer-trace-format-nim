@@ -248,7 +248,7 @@ proc test_reserved_root_blocks_are_not_member_data() {.raises: [].} =
   for i in 0 ..< 8:
     corrupted[layout.entryStart + 8 + i] = byte((pointer shr (8*i)) and 255)
   let refused = readInternalFile(corrupted, "file1", blockSize=1024, maxEntries=128)
-  doAssert refused.isErr and "overlaps reserved root directory blocks" in refused.error
+  doAssert refused.isErr and "root region" in refused.error, refused.error
   var tail = good
   for i in 0 ..< 17: tail.add(0xAA'u8)
   let tailRead = readInternalFile(tail, "file1", blockSize=1024, maxEntries=128)

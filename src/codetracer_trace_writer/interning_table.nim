@@ -34,7 +34,7 @@ proc initInterningTableWriter*(ctfs: var Ctfs, baseName: string): Result[Interni
   ## Creates baseName.dat and baseName.off files.
   let tableRes = initVariableRecordTableWriter(ctfs, baseName)
   if tableRes.isErr:
-    return err(tableRes.error)
+    return err(tableRes.unsafeError)
   ok(InterningTableWriter(
     table: tableRes.get(),
     lookup: initTable[string, uint64](),
@@ -68,25 +68,26 @@ proc ensureQualifiedId*(ctfs: var Ctfs, it: var InterningTableWriter,
   ## different qualifiers gets two distinct ids, while a genuine repeat of the
   ## same ``(qualifier, name)`` dedups to one id. An empty qualifier stores the
   ## bare name and is byte-identical to the old ``ensureId`` output.
-  let payload = qualifiedPayload(qualifier, name)
-  let existing = it.lookup.getOrDefault(payload, high(uint64))
-  if existing != high(uint64):
-    return ok(existing)
-
-  let id = it.nextId
-  it.nextId += 1
-
-  # Convert payload to bytes and append to the variable record table
-  var payloadBytes = newSeq[byte](payload.len)
-  for i in 0 ..< payload.len:
-    payloadBytes[i] = byte(payload[i])
-
-  let appendRes = ctfs.append(it.table, payloadBytes)
-  if appendRes.isErr:
-    return err(appendRes.error)
-
-  it.lookup[payload] = id
-  ok(id)
+  template ensurePayload(payload: string): Result[uint64, string] =
+    let existing = it.lookup.getOrDefault(payload, high(uint64))
+    if existing != high(uint64):
+      ok(existing)
+    else:
+      let id = it.nextId
+      it.nextId += 1
+      let appendRes = ctfs.append(it.table,
+        payload.toOpenArrayByte(0, payload.len - 1))
+      if appendRes.isErr:
+        err(appendRes.unsafeError)
+      else:
+        it.lookup[payload] = id
+        ok(id)
+  # An empty qualifier's payload is the name itself, looked up without a copy.
+  if qualifier.len == 0:
+    ensurePayload(name)
+  else:
+    let payload = qualifiedPayload(qualifier, name)
+    ensurePayload(payload)
 
 proc ensureId*(ctfs: var Ctfs, it: var InterningTableWriter, name: string): Result[uint64, string] =
   ## Return the ID for name. If name hasn't been seen, append it to the table
@@ -165,7 +166,7 @@ proc ensurePathIdColumnAware*(ctfs: var Ctfs, it: var InterningTableWriter,
 
   let appendRes = ctfs.append(it.table, record)
   if appendRes.isErr:
-    return err(appendRes.error)
+    return err(appendRes.unsafeError)
 
   it.lookup[path] = id
   ok(id)
@@ -224,7 +225,7 @@ proc appendQualifiedPathWithLineCount*(ctfs: var Ctfs,
 
   let appendRes = ctfs.append(it.table, record)
   if appendRes.isErr:
-    return err(appendRes.error)
+    return err(appendRes.unsafeError)
 
   it.lookup[payload] = id
   ok(id)
@@ -283,7 +284,7 @@ proc ensureQualifiedPathIdWithLineCount*(ctfs: var Ctfs,
 
   let appendRes = ctfs.append(it.table, record)
   if appendRes.isErr:
-    return err(appendRes.error)
+    return err(appendRes.unsafeError)
 
   it.lookup[payload] = id
   ok(id)
@@ -296,20 +297,30 @@ proc initInterningTableReader*(ctfsBytes: openArray[byte], baseName: string,
                                 blockSize: uint32 = DefaultBlockSize,
                                 maxEntries: uint32 = DefaultMaxRootEntries): Result[InterningTableReader, string] =
   ## Initialize a reader from raw CTFS container bytes.
-  let tableRes = initVariableRecordTableReader(ctfsBytes, baseName, blockSize, maxEntries)
+  var tableRes = initVariableRecordTableReader(ctfsBytes, baseName, blockSize, maxEntries)
   if tableRes.isErr:
-    return err(tableRes.error)
-  ok(InterningTableReader(table: tableRes.get()))
+    return err(tableRes.unsafeError)
+  ok(InterningTableReader(table: move tableRes.get()))
+
+proc initInterningTableReader*(image: ContainerImage, baseName: string,
+                                blockSize: uint32 = DefaultBlockSize,
+                                maxEntries: uint32 = DefaultMaxRootEntries): Result[InterningTableReader, string] =
+  ## Initialize a reader over a container image it shares, reading the
+  ## table's members in place.
+  var tableRes = initVariableRecordTableReader(image, baseName, blockSize, maxEntries)
+  if tableRes.isErr:
+    return err(tableRes.unsafeError)
+  ok(InterningTableReader(table: move tableRes.get()))
 
 proc readById*(r: InterningTableReader, id: uint64): Result[string, string] =
   ## Read the interned string by its ID.
   let dataRes = r.table.read(id)
   if dataRes.isErr:
-    return err(dataRes.error)
+    return err(dataRes.unsafeError)
   let data = dataRes.get()
   var s = newString(data.len)
-  for i in 0 ..< data.len:
-    s[i] = char(data[i])
+  if data.len > 0:
+    copyMem(addr s[0], unsafeAddr data[0], data.len)
   ok(s)
 
 proc readRawById*(r: InterningTableReader,

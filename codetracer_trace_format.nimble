@@ -45,22 +45,91 @@ task test, "Run all tests":
   # stream. -d:release because one fixture is a 512-block two-level file.
   exec "nim c -r -d:release tests/test_write_null_data_block.nim"
   exec "nim c -r tests/test_streaming.nim"
+  # The live coordination page (`ctfs-container.md` §6): its seqlock against a
+  # hostile byte-splitting writer, and its lifetime (create, attach, close,
+  # a killed writer's page reaped, another file's identity refused).
+  exec "nim c -r -d:release -p:src tests/test_live_page_torn.nim"
+  exec "nim c -r -d:release -p:src tests/test_live_page_lifetime.nim"
+  # The sweep of pages no process opens: a killed writer's page removed
+  # without opening its container; live, other-pid- or time-namespace,
+  # unstated-namespace, creating and unclaimed pages kept, and a live writer
+  # in another time namespace kept (Linux; elsewhere it skips).
+  exec "nim c -r -d:release -p:src tests/test_live_page_sweep.nim"
+  # A reader in another time namespace than its writer: a live hosted writer
+  # whose boot clock is ahead, or whose monotonic clock is behind, and a quiet
+  # in-guest one are not reaped; a killed one is reaped once its heartbeat
+  # (on the machine clock) is 10 s old. Arms: start times compared across
+  # time namespaces; the heartbeat on the raw clock (Linux; elsewhere it skips).
+  exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_live_page_timens.nim"
+  # A live writer owned by another user: its start time reads, a slot naming
+  # it is alive, the same pid with another start time is dead, and a reaped
+  # pid and a zombie are gone (macOS; elsewhere it skips).
+  exec "nim c -r -d:release -p:src tests/test_live_page_other_user.nim"
+  # The in-guest writer: no thread, its heartbeat stored only at its seals,
+  # judged alive by pid and start time; a quiet guest is followed, not
+  # reaped; the file-only form hosts no page. Arms: a heartbeat thread
+  # started anyway; the in-guest slot left on the heartbeat rule.
+  exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_live_page_in_guest.nim"
+  # Explicit publication dependencies precede dependent members at every
+  # file/live-page write prefix, including real kills and write failures.
+  exec "nim c -r -d:release -p:src tests/test_root_publication_order.nim"
+  # A publication writes the entries that changed, never the header again.
+  # The keyed tests carry their mutation arms, so they build with them.
+  exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_root_publication_writes_changed_entries.nim"
+  # B1 and the page store (`ctfs-keyed-families.md` §5.8.3;
+  # `CTFS-Binary-Format.md` §2.6): every write prefix, real kills, a follower.
+  exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_keyed_b1.nim"
+  exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_page_store.nim"
+  exec "nim c -r -p:src tests/test_growth_refuses_with_keyed_member.nim"
+  # The other keyed families (`ctfs-keyed-families.md` §5.8): C1 with keyed
+  # streams (MCR's threads), D1/D2 (snapshots, bundled files) and M1, H1 with
+  # V2 extents and S3 (MCR's live correlation index); each with every write
+  # prefix, 200 real kills and its mutation arms.
+  exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_keyed_threads.nim"
+  exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_keyed_snapshots.nim"
+  exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_keyed_corrmark.nim"
+  # A namespace committed live (`ctfs-container.md` §8).
+  exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_namespace_live_commit.nim"
+  # Dead space and the canonical repack (`ctfs-keyed-families.md` §8.3 O-12).
+  exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_dead_space.nim"
+  # The per-seal log observer (`CTFS-Binary-Format.md` §2.15.2).
+  exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_seal_observer.nim"
+  # Readers refuse a block number in [1, root_blocks); block caches keep
+  # only what §6 lets them; closed-container appends; data before index;
+  # salvage of an abandoned page.
+  exec "nim c -r -d:release -p:src tests/test_root_region_pointer_refused.nim"
+  exec "nim c -r -d:release -p:src tests/test_block_caches.nim"
+  exec "nim c -r -d:release -p:src tests/test_follower_attaches.nim"
+  exec "nim c -r -d:release -d:ctfsAppendFaultInjection -p:src tests/test_container_append_batch_refusal.nim"
+  exec "nim c -r -d:release -p:src tests/test_data_before_index.nim"
+  exec "nim c -r -d:release -p:src tests/test_ctfs_salvage.nim"
+  exec "nim c -r -d:release -p:src tests/test_live_page_writers.nim"
   # Durability: a recording read while its writer is still open (what a
   # killed process leaves) has meta.dat, every sealed chunk and every interning
   # record registered before the seal.
   exec "nim c -r -d:release -p:src tests/test_durability_publishes_sealed_chunks.nim"
   exec "nim c -r tests/test_root_directory_overflow.nim"
+  exec "nim c -r tests/test_root_directory_grows.nim"
+  # A header declaring `MaxRootEntries = 0` is the auto-filled root
+  # (`ctfs-container.md` §1): every reader scans the slots that fill block 0.
+  exec "nim c -r -p:src tests/test_root_auto_fill.nim"
   exec "nim c -r tests/test_sharded_root_layout.nim"
   exec "nim c -r tests/test_chunk_index.nim"
   exec "nim c -r tests/test_fixed_record_table.nim"
   exec "nim c -r tests/test_variable_record_table.nim"
+  exec "nim c -r -p:src tests/test_member_view.nim"
+  exec "nim c -r -p:src tests/test_member_names_are_encodable.nim"
   exec "nim c -r tests/test_seekable_zstd.nim"
   exec "nim c -r tests/test_chunked_compressed_table.nim"
   exec "nim c -r tests/test_trace_types.nim"
   exec "nim c -r tests/test_varint.nim"
   exec "nim c -r tests/test_split_binary.nim"
-  exec "nim c -r tests/test_trace_writer.nim"
   exec "nim c -r tests/test_trace_reader.nim"
+  # The reader's entry points stay callable from GC-safe code: a forward
+  # declaration with no effects stated makes every caller above it lose its
+  # inferred GC-safety. refc too, because consumers build with it.
+  exec "nim c -r -p:src tests/test_reader_is_gcsafe.nim"
+  exec "nim c -r -p:src --mm:refc tests/test_reader_is_gcsafe.nim"
   # The same §5d bound in the *other* Nim transcription of the §4 walk:
   # `codetracer_trace_reader.nim`'s own `readInternalFile`. It bounded byte
   # offsets only, and read a null mapping root as a walk through block 0 —
@@ -75,28 +144,42 @@ task test, "Run all tests":
   exec "nim c -r -d:release tests/test_corrmark_builder.nim"
   exec "nim c -r tests/test_correlation_marker_api.nim"
   exec "nim c -r tests/test_close_publishes_entry_sizes.nim"
-  # Reading a combined-stream bundle written by the sibling Rust
-  # `CtfsTraceWriter`: it prefixes `events.log` with the 8-byte CodeTracer
-  # file header the Nim writer omits, and its chunks are streaming-encoder
-  # frames that do not pledge a decompressed size.
-  exec "nim c -r -p:src tests/test_rust_written_events_log.nim"
+  # A failed final flush or close (EFBIG under RLIMIT_FSIZE in a forked
+  # child) is reported by every writer that finishes a file. Linux only: the
+  # case relies on glibc's stdio buffering to make the flush the one write
+  # that fails.
+  when defined(linux):
+    exec "nim c -r -p:src tests/test_close_reports_final_flush_failure.nim"
+  # The codetracer-ci sender writes each object by the route its upload
+  # session names, into a real MinIO with a Python stand-in of codetracer-ci's
+  # upload routes (the dev shell provides `minio` and `python3`). POSIX only:
+  # the test interposes `connect` through dlfcn and signals itself.
+  when not defined(windows):
+    exec "nim c -r -d:release -p:src tests/test_managed_sender_ci_routes.nim"
   exec "nim c -r tests/test_meta_dat.nim"
+  # The writer writes the MCR, replay-launch and layout blocks it is given.
+  exec "nim c -r tests/test_writer_meta_blocks.nim"
   exec "nim c -r tests/test_namespace_descriptor.nim"
   exec "nim c -d:release -r tests/test_sub_block_pool.nim"
   exec "nim c -d:release -r tests/test_btree.nim"
   exec "nim c -r -d:release -p:src tests/test_cow_btree.nim"
   exec "nim c -r -d:release -p:src tests/test_bulk_load_cow_btree.nim"
+  exec "nim c -r -p:src tests/test_namespace_images_refuse_malformed_input.nim"
   exec "nim c -r -d:release -p:src tests/test_namespace.nim"
   exec "nim c -r -d:release -p:src tests/test_ct_space.nim"
   exec "nim c -r -d:release -p:src tests/test_shard_writer.nim"
   exec "nim c -r -p:src tests/test_step_encoding.nim"
   exec "nim c -r -p:src tests/test_interning_table.nim"
+  exec "nim c -r -p:src tests/test_interning_table_set.nim"
   exec "nim c -r -p:src tests/test_qualified_interning.nim"
   exec "nim c -r -p:src tests/test_exec_stream.nim"
   # The normative AbsoluteStep/DeltaStep rule and the reader's refusal of a
   # delta before a chunk's first AbsoluteStep.
   exec "nim c -r -d:release -p:src tests/test_step_encoding_rule.nim"
   exec "nim c -r -p:src tests/test_value_stream.nim"
+  # The value reader's `typeId` is read off the CBOR without decoding it; it
+  # must answer what a full decode does, for every kind.
+  exec "nim c -r -p:src tests/test_cbor_top_level_type_id.nim"
   exec "nim c -r -p:src tests/test_call_stream.nim"
   exec "nim c -r -p:src tests/test_io_event_stream.nim"
   # RS-M1: spans.dat / spans.idx / spantype.ns writer + reader, and the
@@ -167,11 +250,12 @@ task test, "Run all tests":
   # recorded lines. `include`s codetracer_trace_writer_ffi to drive
   # ct_reader_open, so it needs --mm:arc and the FFI's --nimMainPrefix.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_older_versions_are_refused.nim"
-  # The same rule in the other direction, for the version AFTER 5: a container
-  # declaring the version-6 header (a profile and a whole-file compression
-  # scheme, both closed sets -- ctfs-container.md §1a, §1b) is refused by name,
-  # and the two fields' parsers refuse an unknown or absent value rather than
-  # reading it as the permissive default. Carries its control: the same reader
+  # The same rule in the other direction, for the version AFTER 5: the doors
+  # that read version 5 only (the legacy reader, the native-bundle detector)
+  # refuse a container declaring the version-6 header by name, and the two
+  # fields' parsers (a profile and a whole-file compression scheme, both closed
+  # sets -- ctfs-container.md §1a, §1b) refuse an unknown or absent value
+  # rather than reading it as the permissive default. Carries its control: the same reader
   # opens a FULL container of the same recording and succeeds.
   exec "nim c -r -d:release -p:src tests/test_compact_profile_header_refusal.nim"
   # The compact profile's BODY (ctfs-container.md §1d): the reference encoder
@@ -183,18 +267,20 @@ task test, "Run all tests":
   # container of the same recording and required to FAIL. Also prints CCP-2's
   # deliverable-4 overhead figures against a VERSION-5 baseline.
   exec "nim c -r -d:release -p:src tests/test_compact_container_layout.nim"
-  # CCP-4: the writer chooses the profile from a measured RAW-BYTE threshold.
-  # The default is 1 MiB of raw stream bytes; the switchover to the streaming
-  # full profile replays the buffered prefix, which is the one place in this
-  # campaign where a bug is SILENT (a valid full container missing part of the
-  # recording), so the arm compares against the same recording written always
-  # full and carries a PLANTED DROP that must make it fail; the boundary is
-  # asserted one event under and one event over; two recordings of equal RAW
-  # size and 1,452x different compressibility must take the same path, with a
-  # compressed-size rule shown to SPLIT them; and a writer-produced compact
-  # container is asserted to carry NO zstd frame, with its raw events.log equal
-  # to the full profile's own events.log inflated.
+  # The writer chooses the profile from a measured RAW-BYTE threshold
+  # (ctfs-container.md §1e), over the split-stream writer: it records the full
+  # profile and converts at close, every frame inflated (§1f). The quantity is
+  # the compact container's member bytes; the boundary is asserted from both
+  # sides against the same recording written full, with a one-step-shorter
+  # recording shown to answer differently; a stored-size rule is shown to
+  # choose differently; and every chunk of the compact container is the full
+  # container's frame inflated, with the full container's frames as control.
   exec "nim c -r -d:release -p:src tests/test_profile_threshold_choice.nim"
+  # NewTraceReader reads version 6 in both profiles and under whole-file zstd:
+  # one recording in five forms answers every query alike, a compact container
+  # carrying frames does not (the control), and the version-6 header's values
+  # are refused by name.
+  exec "nim c -r -d:release -p:src tests/test_version_6_containers_read.nim"
   # The column-aware step encoding end to end: the writer's opt-in, the
   # DeltaColumn round-trip, Layout A paths.dat, the position decoder, and the
   # meta.dat unknown-flag-bit rejection that keeps the extension clean.
@@ -202,6 +288,7 @@ task test, "Run all tests":
   # A function declared in a file no step visited is written at close, with its
   # path in the space its address is computed in (and in meta.dat's list).
   exec "nim c -r -d:release -p:src tests/test_function_in_a_file_with_no_steps.nim"
+  exec "nim c -r -d:release -p:src tests/test_function_declared_before_a_version.nim"
   # A funcs.dat/types.dat record that is a bare name (the pre-b891a0f writer's
   # shape) is refused with a message that says so.
   exec "nim c -r -d:release -p:src tests/test_name_only_funcs_refusal.nim"
@@ -224,6 +311,9 @@ task test, "Run all tests":
   # the canonical Rust IoEventStreamReader (skips cleanly if the sibling Rust
   # repo or its toolchain is absent).
   exec "nim c -r -d:release -p:src tests/test_nim_io_event_stream_crossread.nim"
+  # The Nim and Rust step-map readers answer every lookup alike, a lookup of
+  # line 0 (answered as line 1) included.
+  exec "nim c -r -d:release -p:src tests/test_nim_step_map_crossread.nim"
   exec "nim c -r -p:src tests/test_streaming_value_encoder.nim"
   exec "nim c -r -p:src tests/test_value_ref.nim"
   exec "nim c -r -d:release -p:src tests/test_multi_stream_writer.nim"
@@ -250,19 +340,24 @@ task test, "Run all tests":
   exec "nim c -r -p:src tests/test_split_trace.nim"
   exec "nim c -r -p:src tests/test_trace_storage_config.nim"
   exec "nim c -r -p:src tests/test_path_filter.nim"
-  exec "nim c -r -d:release -p:src -p:tests tests/test_ct_print_events_log_fallback.nim"
-  # A Rust-written `events.log` carries an 8-byte stream header this repo's
-  # legacy reader used to mistake for a chunk header, making every such
-  # container unreadable by `ct-print`.
-  exec "nim c -r -d:release -p:src tests/test_rust_events_log_header.nim"
-  # An `events.log` chunk compressed by a STREAMING encoder pledges no
-  # content size, so `ZSTD_getFrameContentSize` answers CONTENTSIZE_UNKNOWN.
-  # This reader tested only for CONTENTSIZE_ERROR and converted the UNKNOWN
-  # sentinel to `int`, killing `ct-print` with a RangeDefect.
-  exec "nim c -r -d:release -p:src tests/test_events_log_unpledged_frame.nim"
+  # `events.log` / `events.fmt` are not part of the trace format: every
+  # reader (library, legacy TraceReader, C ABI, ct-print) refuses a container
+  # carrying either, by name, and the C ABI refuses the formats that wrote one.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src -p:tests tests/test_retired_streams_are_refused.nim"
+  # A refresh follows a container being written incrementally (`ctfs-container.md` §6).
+  exec "nim c -r -p:src tests/test_follow_is_incremental.nim"
+  # Every container is read in the spec stream layout whatever its presence
+  # bits say; one in the retired record-table layout is refused by name.
+  exec "nim c -r -p:src tests/test_spec_layout_always.nim"
   # ct-print reports a step position it cannot resolve instead of emitting
   # the plausible wrong (path, line) the unchecked inverse produces.
   exec "nim c -r -d:release -p:src tests/test_ct_print_unresolvable_position.nim"
+  # ct-print's native MCR decoder, on a container built with this library's
+  # writers (meta.dat with MCR fields, paths.dat, tNNNN streams, eventlog.*):
+  # the decoded document, its golden, and the refusals — a corrupted header,
+  # the retired `event_log.*` words, a lone event-log member, an unassigned
+  # event-log kind.
+  exec "nim c -r -d:release -p:src tests/test_ct_print_native.nim"
   # Line-only orphan pending-value carry-forward (92fce3a regression).
   # `include`s codetracer_trace_writer_ffi, so it needs --mm:arc and the
   # --nimMainPrefix the FFI's NimMain importc expects (see buildStaticLib).
@@ -285,6 +380,30 @@ task test, "Run all tests":
   # only shape where the ordering is decided by the assembler rather than by
   # the step index.
   exec "nim c -r -d:release -p:src -p:tests tests/test_ct_print_agreement.nim"
+  # `ct-print --full` prints an address, type id, exception type id or thread
+  # id of 2^63 or more as its unsigned decimal value instead of aborting the
+  # whole dump with RangeDefect; below 2^63 each stays an ordinary integer.
+  # Builds ct-print through `tests/ct_print_binary.nim`, hence `-p:tests`.
+  exec "nim c -r -d:release -p:src -p:tests tests/test_ct_print_full_large_unsigned.nim"
+  # `ct-print --full` / `--events` / `--json` / `--json-events`, on
+  # split-stream and native containers, stream their output in memory
+  # proportional to the trace and finish in seconds on a Python-shaped
+  # container (~280 K exec records, ~37 K calls), byte-identical to the
+  # in-process rendering.
+  # They used to hold the whole document twice and scan every call per step:
+  # 32 GB and ~20 minutes on an 11 MB trace. Builds ct-print through
+  # `tests/ct_print_binary.nim`, hence `-p:tests`.
+  exec "nim c -r -d:release -p:src -p:tests tests/test_ct_print_full_streams.nim"
+  # `NewTraceReader.callForStep` / `enclosingCallKey` answer exactly their
+  # definition on every step of a deep and wide call tree (shared exit steps
+  # at close, a drained entry past the last step, stepless callees), checked
+  # against a brute-force reading of it. The answer now comes from an index
+  # instead of a walk back over every returned sibling.
+  exec "nim c -r -d:release -p:src tests/test_call_for_step_matches_reference.nim"
+  # A step count is the number of step records: raise, catch and thread
+  # records are exec records but not steps, in the reader, the C ABI and
+  # every ct-print view.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src -p:tests tests/test_logical_step_count.nim"
   # The reader C FFI exports. Like the two tests above it `include`s the FFI
   # module, so it needs --mm:arc and the --nimMainPrefix. It had never been
   # listed here either: its fixture declared a container it had not written,
@@ -306,6 +425,7 @@ task test, "Run all tests":
   # and the flow view rendered program output one source line too high.
   # Same FFI-`include` compile requirements as the two tests above.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_io_event_pending_step_attribution.nim"
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_linehits_and_correlation_index.nim"
   # The C ABI's view of the paths.dat layout question: meta.dat bit 4 decides,
   # `ct_reader_column_aware_paths_suspected` reports a record set that also
   # decodes as Layout A, and `ct_reader_open_assume_column_aware_paths` is the
@@ -334,6 +454,7 @@ task test, "Run all tests":
   # not to a thread-switch record after it, even across a value-chunk boundary.
   # Same FFI-`include` compile requirements as the tests above.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_trailing_values_attach_to_the_last_step.nim"
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_exceptions_reach_the_container.nim"
   # A reload marker written through the C ABI follows the step registered
   # before it (the pending step is flushed first). Same FFI-`include` compile
   # requirements as the tests above.
@@ -341,6 +462,10 @@ task test, "Run all tests":
   # A call registered through the C ABI begins at the next step, never at the
   # step pending when it arrived.
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_call_entry_is_the_next_step.nim"
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_refused_column_stays_with_its_step.nim"
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_block_size_is_one_of_three.nim"
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_meta_text_is_utf8.nim"
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_assignment_refuses_unknown_kinds.nim"
   # Every class of C ABI entry point reports its failure to the caller, and
   # the guard that does it is on every exported proc. Then the two mutation
   # builds, each removing one half of the guard: the test must FAIL under both,
@@ -374,6 +499,10 @@ task test, "Run all tests":
   # over src/ with `--os:any --cpu:wasm32 --compileOnly` and reads the emitted
   # C, so it needs no cross toolchain.
   exec "nim c -r -d:release -p:src tests/test_freestanding_writer_surface.nim"
+  # Every src/ module passes `nim check` under -d:nimPreviewSlimSystem, as
+  # the Nim fork's compiler-linked tools (nimony's nifler) build it. Drives
+  # the compiler over src/ with its own temporary nimcache.
+  exec "nim c -r tests/test_library_compiles_under_slim_system.nim"
   # Every `trace_writer_*` entry point the FFI exports is DECLARED in the C
   # header hosts vendor, or is on a named backlog. "Exported but undeclared"
   # breaks no build and fails no test — it just silently removes a capability
@@ -408,6 +537,9 @@ task buildCtPrint, "Build ct-print utility":
 
 task buildCtSpace, "Build ct-space utility":
   exec "nim c -d:release --mm:arc -p:src -o:ct-space src/codetracer_ct_space.nim"
+
+task buildCtfsSalvage, "Build ctfs-salvage utility":
+  exec "nim c -d:release --mm:arc -p:src -o:ctfs-salvage src/codetracer_ctfs_salvage.nim"
 
 task testReader, "Run trace reader tests":
   exec "nim c -r -p:src tests/test_trace_reader.nim"
@@ -446,7 +578,9 @@ task testFfiThreads, "C hosts: close after the recording thread exited; concurre
       for v in ["ship", "tls", "nolock"]:
         exec "gcc -O1 -o " & dir & "/" & t & "-" & v & " tests/test_ffi_" & t & ".c " & dir & "/lib-" & v & ".a -lzstd -lm -lpthread -I include" & extra
     exec "gcc -O1 -o " & dir & "/host_guard tests/ffi_host_guard.c"
-    proc guardedHost(name: string): int =
+    # `runner` prefixes the guardian's command line (an `env` assignment); the
+    # guardian hands its environment on to the host it runs.
+    proc guardedHost(name: string; runner = ""): int =
       let (reserved, reserveCode) = gorgeEx(dir & "/host_guard --reserve " & dir)
       let receipt = reserved.strip()
       let prefix = dir & "/guardian-result-"
@@ -456,7 +590,7 @@ task testFfiThreads, "C hosts: close after the recording thread exited; concurre
       for ch in receipt[prefix.len ..< receipt.len]:
         if ch notin {'a'..'z', 'A'..'Z', '0'..'9'}:
           raise newException(AssertionDefect, "FFI guardian receipt name refused")
-      let (output, code) = gorgeEx(dir & "/host_guard " & dir & "/" & name & " " & receipt)
+      let (output, code) = gorgeEx(runner & dir & "/host_guard " & dir & "/" & name & " " & receipt)
       echo output
       let terminalProof = "FFI-GUARD-RESULT-v1\nnatural\n" & $code & "\n"
       if code == 125 or code == 126 or not fileExists(receipt) or
@@ -469,10 +603,47 @@ task testFfiThreads, "C hosts: close after the recording thread exited; concurre
       if code != 0:
         raise newException(AssertionDefect,
           "shipped FFI host failed: " & name & " (exit " & $code & ")")
-    let tlsCode = guardedHost("worker_thread_exit-tls")
+    # The host unmaps the dead worker's stack so the dead heap's descriptor,
+    # which Nim keeps in thread-local storage, is gone when the main thread
+    # frees into it. That holds on glibc, which places TLS inside the thread's
+    # stack. macOS does not: dyld allocates a thread's TLS block with malloc
+    # and frees it to malloc at thread exit, so the memory stays mapped, the
+    # free into it is silently accepted, and the control passed 5/5 runs on
+    # aarch64-darwin. Guard Malloc (libgmalloc(3)) unmaps every freed block,
+    # which makes the use of the dead descriptor fault deterministically
+    # (SIGSEGV, 3/3), while the shipped archive passes under it. A same-thread
+    # close against the same --threads:on archive also passes under it, so
+    # the fault is the cross-thread free and not Guard Malloc itself.
+    # https://developer.apple.com/library/archive/documentation/Performance/Conceptual/ManagingMemory/Articles/MallocDebug.html
+    var tlsRunner = ""
+    when hostOS == "macosx":
+      const gmalloc = "/usr/lib/libgmalloc.dylib"
+      if not fileExists(gmalloc):
+        raise newException(AssertionDefect, "testFfiThreads needs Guard Malloc (" &
+          gmalloc & ") to make the --threads:on control fault on macOS")
+      tlsRunner = "env DYLD_INSERT_LIBRARIES=" & gmalloc & " "
+      # The positive control under the same environment: the shipped archive
+      # must still pass under Guard Malloc. Without it, a Guard Malloc that
+      # crashed every program would make the --threads:on control below pass
+      # without having reached the cross-thread free at all.
+      let shipCode = guardedHost("worker_thread_exit-ship", tlsRunner)
+      if shipCode != 0:
+        raise newException(AssertionDefect, "the worker-thread host FAILED " &
+          "against the shipped archive under Guard Malloc (exit " & $shipCode &
+          "), so a crash of the --threads:on control would prove nothing")
+    # The guardian refuses a host that never ran or did not terminate
+    # naturally (no receipt, or exit 125/126), so a nonzero exit here is the
+    # host's own: it cannot pass this control vacuously.
+    let tlsCode = guardedHost("worker_thread_exit-tls", tlsRunner)
     if tlsCode == 0:
       raise newException(AssertionDefect, "the worker-thread host PASSED against a --threads:on " &
         "archive: the test no longer reaches the cross-thread free it guards")
+    # Unlocked concurrent entry into one heap is a data race, and it does not
+    # always crash: on 2026-10-18 this host deadlocked on futexes with no CPU
+    # time for 35 minutes. A hang is the same failure as a crash, but the
+    # guardian reports its own timeout (125) as a harness failure rather than
+    # as a caught race, so a hang fails the suite instead of stalling it or
+    # passing the control vacuously.
     var lockCaught = false
     for attempt in 0 ..< 5:
       let code = guardedHost("concurrent_writers-nolock")

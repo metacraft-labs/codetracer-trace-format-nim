@@ -40,10 +40,8 @@
 ## offset[chunk+1])` (or to end for the last chunk), and index `N mod chunkSize`
 ## within it — O(1), no whole-stream decompression.
 ##
-## This storage replaces the pre-M20 `calls.dat` + `calls.off`
-## VariableRecordTable layout (which the Rust seekable reader could not index),
-## so a Nim-written split bundle is now SEEKABLE by the db-backend's
-## `CallStreamReader` exactly like a Rust-writer one. The PUBLIC reader/writer
+## A Nim-written container is seekable by the Rust `CallStreamReader` exactly
+## like a Rust-written one. The PUBLIC reader/writer
 ## API (`initCallStreamWriter`, `writeCall`, `finalizeCallStream`,
 ## `initCallStreamReader`, `readCall`, `count`) is unchanged so callers
 ## (`multi_stream_writer`, `new_trace_reader`) need only the close-time
@@ -54,9 +52,9 @@ import results
 import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
 import ../codetracer_ctfs/streaming
-import ../codetracer_ctfs/variable_record_table
 import ../codetracer_ctfs/zstd_bindings
 import ./varint
+import ./record_chunk
 
 const
   VoidReturnMarker*: byte = 0xFF  ## 1-byte marker for void returns
@@ -102,23 +100,10 @@ type
     finalized: bool
 
   CallStreamReader* = object
-    ## Reads the dedicated call stream. Supports BOTH on-disk layouts so a
-    ## reader works on any bundle, old or new:
-    ##   * NEW (M20): chunked-Zstd `calls.dat` + companion `calls.idx`
-    ##     (Rust-`CallStreamReader`-compatible, seekable). Selected when
-    ##     `calls.idx` is present.
-    ##   * LEGACY (pre-M20): `calls.dat` + `calls.off` VariableRecordTable.
-    ##     Selected when `calls.idx` is absent. This keeps bundles recorded by
-    ##     the pre-M20 Nim writer (flag clear) reading byte-for-byte unchanged.
-    chunkSize: int
-    chunkOffsets: seq[uint64]      ## byte offset of each chunk within calls.dat
-    dat: seq[byte]                 ## raw calls.dat content (new format)
+    ## Reads the dedicated call stream: chunked-Zstd `calls.dat` and its
+    ## companion `calls.idx`.
+    spec: ChunkedRecords
     recordCount: uint64
-    cachedChunk: int               ## -1 = none
-    cachedRecords: seq[seq[byte]]  ## decompressed records of cachedChunk
-    legacy: Option[VariableRecordTableReader]
-      ## Present iff the bundle uses the legacy `calls.dat` + `calls.off`
-      ## VariableRecordTable layout (no `calls.idx`).
 
 # ---------------------------------------------------------------------------
 # Record encode/decode (unchanged wire format)
@@ -156,63 +141,87 @@ proc encodeCallRecord*(rec: CallRecord): seq[byte] {.raises: [].} =
 
   buf
 
-proc decodeCallRecord*(data: openArray[byte]): Result[CallRecord, string] {.raises: [].} =
-  ## Decode a CallRecord from its wire format.
+type
+  CallHead = object
+    ## A call record's fixed-size fields, decoded before the record is built.
+    functionId: uint64
+    parentCallKey: int64
+    entryStep: uint64
+    exitStep: uint64
+    depth: uint32
+
+proc decodeCallFields(data: openArray[byte], head: var CallHead,
+    args: var seq[CallArg], returnValue, exception: var seq[byte],
+    children: var seq[uint64], why: var string): bool =
+  ## Every field of a call record's wire format. False, with `why` set, where
+  ## the record does not decode: one walker answering `bool`, so a refusal
+  ## costs one `Result` for the record rather than one per field.
   var pos = 0
-  var rec: CallRecord
+  template varint(): uint64 = varintOrFail(data, pos, why)
+  template refuse(message: string) =
+    why = message
+    return false
+  template blob(dest: var seq[byte], what: string) =
+    let n = int(varint())
+    if n < 0 or pos + n > data.len:
+      refuse("truncated " & what & " data")
+    dest = fieldBytes(data, pos, n)
+    pos += n
 
-  rec.functionId = ?decodeVarint(data, pos)
-  rec.parentCallKey = ?decodeSignedVarint(data, pos)
-  rec.entryStep = ?decodeVarint(data, pos)
-  rec.exitStep = ?decodeVarint(data, pos)
-  rec.depth = uint32(?decodeVarint(data, pos))
+  head.functionId = varint()
+  head.parentCallKey = signedVarintOrFail(data, pos, why)
+  head.entryStep = varint()
+  head.exitStep = varint()
+  head.depth = uint32(varint())
 
-  # args
-  let argsCount = int(?decodeVarint(data, pos))
-  rec.args = newSeq[CallArg](argsCount)
-  for i in 0 ..< argsCount:
-    let varnameId = ?decodeVarint(data, pos)
-    let argLen = int(?decodeVarint(data, pos))
-    if pos + argLen > data.len:
-      return err("truncated arg data")
-    var value = newSeq[byte](argLen)
-    for j in 0 ..< argLen:
-      value[j] = data[pos + j]
-    pos += argLen
-    rec.args[i] = CallArg(varnameId: varnameId, value: value)
+  # The lists grow as they are read, sized at most by the bytes left: a count
+  # read from a damaged record must not size an allocation by itself.
+  let argsCount = varint()
+  args = newSeqOfCap[CallArg](int(min(argsCount, uint64(data.len - pos))))
+  for i in 0'u64 ..< argsCount:
+    var arg = CallArg(varnameId: varint())
+    blob(arg.value, "arg")
+    args.add(move arg)
+  blob(returnValue, "return value")
+  blob(exception, "exception")
 
-  # return value
-  let retLen = int(?decodeVarint(data, pos))
-  if pos + retLen > data.len:
-    return err("truncated return value data")
-  rec.returnValue = newSeq[byte](retLen)
-  for j in 0 ..< retLen:
-    rec.returnValue[j] = data[pos + j]
-  pos += retLen
-
-  # exception
-  let excLen = int(?decodeVarint(data, pos))
-  if pos + excLen > data.len:
-    return err("truncated exception data")
-  rec.exception = newSeq[byte](excLen)
-  for j in 0 ..< excLen:
-    rec.exception[j] = data[pos + j]
-  pos += excLen
-
-  # children
-  let childrenCount = int(?decodeVarint(data, pos))
-  rec.children = newSeq[uint64](childrenCount)
-  for i in 0 ..< childrenCount:
-    rec.children[i] = ?decodeVarint(data, pos)
+  let childrenCount = varint()
+  children = newSeqOfCap[uint64](
+    int(min(childrenCount, uint64(data.len - pos))))
+  for i in 0'u64 ..< childrenCount:
+    children.add(varint())
 
   # `trace-events.md` §"Call Stream": a record's fields fill its
   # `record_len` exactly. Bytes left over mean the record is not the one its
   # frame claims, and the fields decoded above are not trustworthy either.
   if pos != data.len:
-    return err("call record's fields end at byte " & $pos & " of its " &
+    refuse("call record's fields end at byte " & $pos & " of its " &
       $data.len & "-byte frame")
+  true
 
-  ok(rec)
+template decodeCallInto(data: openArray[byte], refusalPrefix: string) =
+  ## Decode a call record into the enclosing proc's
+  ## `Result[CallRecord, string]`, or its refusal, prefixed. The record is
+  ## built once, from its decoded fields, in the result: a call record is 104
+  ## bytes (72 on wasm32), and building it any other way zeroes it first,
+  ## which a WebAssembly build makes a call into the host.
+  var head: CallHead
+  var args: seq[CallArg]
+  var returnValue, exception: seq[byte]
+  var children: seq[uint64]
+  var why: string
+  if decodeCallFields(data, head, args, returnValue, exception, children, why):
+    result.ok(CallRecord(functionId: head.functionId,
+      parentCallKey: head.parentCallKey, entryStep: head.entryStep,
+      exitStep: head.exitStep, depth: head.depth, args: move args,
+      returnValue: move returnValue, exception: move exception,
+      children: move children))
+  else:
+    result = err(refusalPrefix & why)
+
+proc decodeCallRecord*(data: openArray[byte]): Result[CallRecord, string] {.raises: [].} =
+  ## Decode a CallRecord from its wire format.
+  decodeCallInto(data, "")
 
 # ---------------------------------------------------------------------------
 # Zstd helpers
@@ -238,25 +247,6 @@ proc zstdCompress(src: openArray[byte], level: int): Result[seq[byte], string] {
   dst.setLen(int(written))
   ok(dst)
 
-proc zstdDecompress(src: openArray[byte]): Result[seq[byte], string] {.raises: [].} =
-  ## Decompress a single Zstd frame.
-  if src.len == 0:
-    return ok(newSeq[byte](0))
-  let contentSize = ZSTD_getFrameContentSize(unsafeAddr src[0], csize_t(src.len))
-  if contentSize == ZSTD_CONTENTSIZE_ERROR:
-    return err("zstd: invalid frame")
-  if contentSize == ZSTD_CONTENTSIZE_UNKNOWN:
-    return err("zstd: unknown frame content size")
-  if contentSize == 0:
-    return ok(newSeq[byte](0))
-  var dst = newSeq[byte](int(contentSize))
-  let written = ZSTD_decompress(addr dst[0], csize_t(dst.len),
-                                unsafeAddr src[0], csize_t(src.len))
-  if ZSTD_isError(written) != 0:
-    return err("zstd decompress failed: " & $ZSTD_getErrorName(written))
-  dst.setLen(int(written))
-  ok(dst)
-
 # ---------------------------------------------------------------------------
 # Writer
 # ---------------------------------------------------------------------------
@@ -272,10 +262,10 @@ proc initCallStreamWriter*(ctfs: var Ctfs,
   let cs = max(chunkSize, 1)
   let datFileRes = ctfs.addFile("calls.dat")
   if datFileRes.isErr:
-    return err("failed to create calls.dat: " & datFileRes.error)
+    return err("failed to create calls.dat: " & datFileRes.unsafeError)
   let idxFileRes = ctfs.addFile("calls.idx")
   if idxFileRes.isErr:
-    return err("failed to create calls.idx: " & idxFileRes.error)
+    return err("failed to create calls.idx: " & idxFileRes.unsafeError)
 
   var w = CallStreamWriter(
     datFile: datFileRes.get(),
@@ -293,7 +283,7 @@ proc initCallStreamWriter*(ctfs: var Ctfs,
   writeU32LE(hdr, 0, uint32(cs))
   let hdrRes = ctfs.writeToFile(w.indexFile, hdr)
   if hdrRes.isErr:
-    return err("failed to write calls.idx header: " & hdrRes.error)
+    return err("failed to write calls.idx header: " & hdrRes.unsafeError)
   ctfs.syncEntry(w.indexFile)
 
   ok(w)
@@ -313,14 +303,14 @@ proc flushChunk(ctfs: var Ctfs, w: var CallStreamWriter): Result[void, string] {
   # 1. Chunk body.
   let writeRes = ctfs.writeToFile(w.datFile, compressed)
   if writeRes.isErr:
-    return err("calls.dat chunk write failed: " & writeRes.error)
+    return err("calls.dat chunk write failed: " & writeRes.unsafeError)
 
   # 2. Its offset, then the publish.
   var offBuf: array[8, byte]
   writeU64LE(offBuf, 0, chunkStart)
   let idxRes = ctfs.writeToFile(w.indexFile, offBuf)
   if idxRes.isErr:
-    return err("calls.idx offset write failed: " & idxRes.error)
+    return err("calls.idx offset write failed: " & idxRes.unsafeError)
   ctfs.syncEntry(w.indexFile)
 
   w.datOffset += uint64(compressed.len)
@@ -365,35 +355,14 @@ proc count*(w: CallStreamWriter): uint64 = w.recordCount
 # Reader
 # ---------------------------------------------------------------------------
 
-proc parseCallsIdx(idx: openArray[byte]): Result[(int, seq[uint64]), string] {.raises: [].} =
-  ## Parse calls.idx → (chunkSize, chunkOffsets).
-  if idx.len < 4:
-    return err("calls.idx: too short for chunk_size header")
-  let chunkSize = int(uint32(idx[0]) or (uint32(idx[1]) shl 8) or
-                      (uint32(idx[2]) shl 16) or (uint32(idx[3]) shl 24))
-  if chunkSize == 0:
-    return err("calls.idx: chunk_size is zero")
-  var offsets: seq[uint64] = @[]
-  var pos = 4
-  while pos + 8 <= idx.len:
-    offsets.add(readU64LE(idx, pos))
-    pos += 8
-  ok((chunkSize, offsets))
-
-proc decodeChunkRecords(raw: openArray[byte]): Result[seq[seq[byte]], string] {.raises: [].} =
-  ## Split a decompressed chunk into its length-prefixed records.
-  var records: seq[seq[byte]] = @[]
-  var pos = 0
-  while pos < raw.len:
-    let recLen = int(?decodeVarint(raw, pos))
-    if pos + recLen > raw.len:
-      return err("calls.dat: record extends past end of chunk")
-    var rec = newSeq[byte](recLen)
-    for i in 0 ..< recLen:
-      rec[i] = raw[pos + i]
-    records.add(rec)
-    pos += recLen
-  ok(records)
+proc openCallStream(dat: sink MemberView, idx: openArray[byte],
+    stored: bool): Result[CallStreamReader, string] =
+  # A reader of a container still being written can meet a partial index
+  # entry after the last whole one; it is not read.
+  var spec = ? openChunkedRecords(dat, idx, "calls", "call", stored,
+    trailingIndexBytes = true)
+  let count = spec.count
+  ok(CallStreamReader(spec: move spec, recordCount: count))
 
 proc initCallStreamReader*(ctfsBytes: openArray[byte],
     blockSize: uint32 = DefaultBlockSize,
@@ -401,79 +370,63 @@ proc initCallStreamReader*(ctfsBytes: openArray[byte],
   ## Initialize a seekable reader from raw CTFS container bytes. Reads
   ## calls.dat + calls.idx. Computes the total record count by decoding only
   ## the last chunk.
-  let datRes = readInternalFile(ctfsBytes, "calls.dat", blockSize, maxEntries)
+  var datRes = readInternalFile(ctfsBytes, "calls.dat", blockSize, maxEntries)
   if datRes.isErr:
-    return err("failed to read calls.dat: " & datRes.error)
+    return err("failed to read calls.dat: " & datRes.unsafeError)
   let idxRes = readInternalFile(ctfsBytes, "calls.idx", blockSize, maxEntries)
   if idxRes.isErr:
-    # No calls.idx ⇒ a pre-M20 legacy bundle whose calls.dat is a
-    # VariableRecordTable (calls.dat + calls.off). Fall back to the legacy
-    # reader so old (flag-clear) bundles keep reading byte-for-byte unchanged.
-    let legacyRes = initVariableRecordTableReader(ctfsBytes, "calls",
-        blockSize, maxEntries)
-    if legacyRes.isErr:
-      return err("failed to read legacy calls table: " & legacyRes.error)
-    let lr = legacyRes.get()
-    return ok(CallStreamReader(
-      chunkSize: 1,
-      recordCount: lr.count(),
-      cachedChunk: -1,
-      legacy: some(lr)))
+    return err("failed to read calls.idx: " & idxRes.unsafeError)
+  openCallStream(viewBytes(move datRes.get()), idxRes.get(),
+    isCompactContainer(ctfsBytes))
 
-  let parsed = ?parseCallsIdx(idxRes.get())
-  let (chunkSize, chunkOffsets) = parsed
-  let dat = datRes.get()
+proc initCallStreamReader*(image: ContainerImage,
+    blockSize: uint32 = DefaultBlockSize,
+    maxEntries: uint32 = DefaultMaxRootEntries): Result[CallStreamReader, string] =
+  ## As above, over a container image it shares: `calls.dat` is read in place.
+  var datRes = viewMember(image, "calls.dat", blockSize, maxEntries)
+  if datRes.isErr:
+    return err("failed to read calls.dat: " & datRes.unsafeError)
+  let idxRes = viewMember(image, "calls.idx", blockSize, maxEntries)
+  if idxRes.isErr:
+    return err("failed to read calls.idx: " & idxRes.unsafeError)
+  openCallStream(move datRes.get(), ? idxRes.get().contents(),
+    isCompactContainer(image.bytes))
 
-  var recordCount: uint64 = 0
-  if chunkOffsets.len > 0:
-    let lastChunk = chunkOffsets.len - 1
-    let start = int(chunkOffsets[lastChunk])
-    if start > dat.len:
-      return err("calls.idx: last chunk offset past end of calls.dat")
-    let raw = ?zstdDecompress(dat.toOpenArray(start, dat.len - 1))
-    let lastRecords = ?decodeChunkRecords(raw)
-    recordCount = uint64(lastChunk * chunkSize + lastRecords.len)
+proc refresh*(r: var CallStreamReader, image: ContainerImage,
+    blockSize: uint32 = DefaultBlockSize,
+    maxEntries: uint32 = DefaultMaxRootEntries): Result[void, string] =
+  ## Extend the reader by the chunks the container in `image` has published
+  ## since it was opened or last refreshed (`ctfs-container.md` §6).
+  let dat = viewMember(image, "calls.dat", blockSize, maxEntries)
+  if dat.isErr:
+    return err("failed to read calls.dat: " & dat.unsafeError)
+  let idx = viewMember(image, "calls.idx", blockSize, maxEntries)
+  if idx.isErr:
+    return err("failed to read calls.idx: " & idx.unsafeError)
+  ? r.spec.refresh(dat.unsafeGet(), ? idx.unsafeGet().contents(), "calls")
+  r.recordCount = r.spec.count
+  ok()
 
-  ok(CallStreamReader(
-    chunkSize: chunkSize,
-    chunkOffsets: chunkOffsets,
-    dat: dat,
-    recordCount: recordCount,
-    cachedChunk: -1,
-    cachedRecords: @[],
-  ))
+template readCallInto*(r: var CallStreamReader, callKey: uint64) =
+  ## `readCall`'s body, for a proc returning `Result[CallRecord, string]` that
+  ## reads a call record and returns it: the record is built in that proc's
+  ## `result` rather than in each layer it would pass through.
+  block readCallBody:
+    if callKey >= r.recordCount:
+      result = err("call_key " & $callKey & " out of range (count " &
+        $r.recordCount & ")")
+      break readCallBody
+    var within: int
+    var whyNot: string
+    if not r.spec.locate(callKey, within, whyNot):
+      result = err(whyNot)
+      break readCallBody
+    decodeCallInto(r.spec.record(within), "calls.dat record " & $callKey & ": ")
 
 proc readCall*(r: var CallStreamReader,
     callKey: uint64): Result[CallRecord, string] =
   ## Read the call record at the given call_key, decompressing only its chunk.
-  ## A one-chunk cache avoids re-decompressing clustered reads. Legacy bundles
-  ## read directly from the VariableRecordTable.
-  if r.legacy.isSome:
-    let dataRes = r.legacy.get().read(callKey)
-    if dataRes.isErr:
-      return err(dataRes.error)
-    return decodeCallRecord(dataRes.get())
-  if callKey >= r.recordCount:
-    return err("call_key " & $callKey & " out of range (count " & $r.recordCount & ")")
-  let chunkNumber = int(callKey) div r.chunkSize
-  let within = int(callKey) mod r.chunkSize
-
-  if r.cachedChunk != chunkNumber:
-    let start = int(r.chunkOffsets[chunkNumber])
-    let endOff =
-      if chunkNumber + 1 < r.chunkOffsets.len: int(r.chunkOffsets[chunkNumber + 1])
-      else: r.dat.len
-    if start > endOff or endOff > r.dat.len:
-      return err("calls.dat: chunk offsets out of range")
-    let raw = ?zstdDecompress(r.dat.toOpenArray(start, endOff - 1))
-    r.cachedRecords = ?decodeChunkRecords(raw)
-    r.cachedChunk = chunkNumber
-
-  if within >= r.cachedRecords.len:
-    return err("call record " & $within & " missing in chunk " & $chunkNumber)
-  let rec = decodeCallRecord(r.cachedRecords[within])
-  if rec.isErr:
-    return err("calls.dat record " & $callKey & ": " & rec.error)
-  rec
+  ## A one-chunk cache avoids re-decompressing clustered reads.
+  r.readCallInto(callKey)
 
 proc count*(r: CallStreamReader): uint64 = r.recordCount

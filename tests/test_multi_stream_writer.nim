@@ -55,9 +55,9 @@ proc test_basic_round_trip() {.raises: [].} =
 
     var vals: seq[VariableValue]
     if i < 50:
-      vals = @[VariableValue(varnameId: 0, typeId: 0, data: ($i).toBytes)]
+      vals = @[VariableValue(varnameId: 0, data: ($i).toBytes)]
     else:
-      vals = @[VariableValue(varnameId: 1, typeId: 1,
+      vals = @[VariableValue(varnameId: 1,
         data: ("val_" & $i).toBytes)]
 
     let res = w.registerStep(pathId, line, vals)
@@ -299,7 +299,7 @@ proc test_raise_catch() {.raises: [].} =
 
   # Step 0: normal step
   let s0 = w.registerStep(0, 1, @[VariableValue(
-    varnameId: 0, typeId: 0, data: "42".toBytes)])
+    varnameId: 0, data: "42".toBytes)])
   doAssert s0.isOk
 
   # Step 1: raise

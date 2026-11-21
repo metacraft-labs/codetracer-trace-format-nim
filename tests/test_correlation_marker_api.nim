@@ -30,7 +30,7 @@
 ## trigger was reading the container after `close()` without `closeCtfs()`,
 ## which this test used to do.
 
-import std/[os, strutils]
+import std/[os, strutils, options]
 import results
 import ../src/codetracer_ctfs/container
 import ../src/codetracer_trace_writer/multi_stream_writer
@@ -375,7 +375,63 @@ proc test_payload_step_and_index_geid_are_one_number() =
   removeFile(path)
   echo "PASS: test_payload_step_and_index_geid_are_one_number"
 
+proc test_zero_geid_is_a_resume_coordinate() =
+  ## Exercise the real writer, sealed container, index reader and ct-print
+  ## decoder. No mocks: a zero coordinate must survive every boundary, even
+  ## for an empty recording, while zero clocks retain their unset encoding.
+  for scenario in 0 .. 4:
+    let path = getTempDir() / ("test_corrmark_zero_" & $scenario & ".ct")
+    removeFile(path)
+    defer: removeFile(path)
+    var w = initMultiStreamWriter(path, "zero_coordinate", chunkSize = 4,
+      recordingId = "01949fcc-7d92-7e9c-aaaa-444444444444").get()
+    doAssert w.registerPath("/src/app.py").isOk
+    # 0: no steps ever; 1: marker before the first step; 2: first step;
+    # 3: second step; 4: explicitly supplied buffered step takes precedence.
+    let stepsBefore = if scenario == 2: 1 elif scenario >= 3: 2 else: 0
+    for line in 1 .. stepsBefore:
+      doAssert w.registerStep(0, uint64(line), []).isOk
+    let explicitStep = if scenario == 4: some(7'u64) else: none(uint64)
+    let expectedGeid = if scenario == 4: 7'u64
+      elif scenario == 3: 1'u64 else: 0'u64
+    let mid = w.ensureMarkerId("zero-coordinate").get()
+    doAssert w.registerCorrelationMarkerById(
+      "send", mid, "zero-coordinate", "key", stepId = explicitStep).isOk
+    doAssert w.registerSpanCoverageHex(DemoTraceIdHex, DemoSpanIdHex,
+      0, 0, stepId = explicitStep).isOk
+    if scenario == 1:
+      doAssert w.registerStep(0, 1, []).isOk
+    doAssert w.close().isOk
+    doAssert w.closeCtfs().isOk
+
+    let data = readCtfsFromFile(path).get()
+    var idx = openCorrmarkIndex(readNamespace(data).get()).get()
+    let boundary = idx.lookupBoundary(mid, "key").get()
+    let span = idx.lookup(decodeHexId(DemoTraceIdHex, 16).get(),
+      decodeHexId(DemoSpanIdHex, 8).get()).get()
+    doAssert boundary.len == 1 and span.len == 1
+    doAssert boundary[0].geid == expectedGeid,
+      "boundary coordinate lost in scenario " & $scenario
+    doAssert span[0].geid == expectedGeid,
+      "span coordinate lost in scenario " & $scenario
+    doAssert span[0].wallTimeUnixNs == 0 and span[0].monotonicTimeNs == 0
+
+    var reader = openNewTrace(path).get()
+    let doc = buildFullDocument(reader, FullOpts(stripPaths: false))
+    let expectedSteps = if scenario == 1: 1 else: stepsBefore
+    doAssert doc["counts"]["steps"].getInt() == expectedSteps,
+      "a correlation declaration must never mint a step"
+    var markerCount = 0
+    for event in doc["events"]:
+      if isCorrelationMarker(event):
+        inc markerCount
+        doAssert event["step_id"].getBiggestInt() == int64(expectedGeid),
+          "payload and index must carry the same resume coordinate"
+    doAssert markerCount == 1, "the boundary payload must survive even without steps"
+  echo "PASS: test_zero_geid_is_a_resume_coordinate"
+
 when isMainModule:
+  test_zero_geid_is_a_resume_coordinate()
   test_marker_payload_decodes_through_ct_print()
   test_marker_mints_no_step()
   test_marker_is_indexed_in_corrmark_ns()
