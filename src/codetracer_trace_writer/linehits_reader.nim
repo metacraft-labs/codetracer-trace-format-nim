@@ -46,6 +46,18 @@ proc hasLinehits*(ctfsBytes: openArray[byte],
   ## recorder never called ``enableLinehits`` has none, which is not an error.
   hasInternalFile(ctfsBytes, LinehitsFileName, maxEntries)
 
+proc decodeStepList(list: openArray[byte]): Result[seq[uint64], string] =
+  var pos = 0
+  var steps: seq[uint64] = @[]
+  while pos < list.len:
+    steps.add(?decodeVarint(list, pos))
+  ok(steps)
+
+proc openLinehitsImage*(image: openArray[byte]): Result[LinehitsReader, string] =
+  ## Open a ``linehits.tc`` image already read out of its container.
+  let tree = ?loadCowBTree(image, cltTypeB)
+  ok(LinehitsReader(image: @image, tree: tree))
+
 proc initLinehitsReader*(ctfsBytes: openArray[byte],
     blockSize: uint32 = DefaultBlockSize,
     maxEntries: uint32 = DefaultMaxRootEntries):
@@ -55,9 +67,7 @@ proc initLinehitsReader*(ctfsBytes: openArray[byte],
   let raw = readInternalFile(ctfsBytes, LinehitsFileName, blockSize, maxEntries)
   if raw.isErr:
     return err("failed to read " & LinehitsFileName & ": " & raw.error)
-  let image = raw.get()
-  let tree = ?loadCowBTree(image, cltTypeB)
-  ok(LinehitsReader(image: image, tree: tree))
+  openLinehitsImage(raw.get())
 
 proc positionCount*(r: LinehitsReader): uint64 =
   ## Number of distinct positions the index carries a hit list for.
@@ -77,16 +87,18 @@ proc hits*(r: LinehitsReader,
   if desc.len != LinehitsDescriptorSize:
     return err("linehits descriptor for position " & $positionIndex &
       " is " & $desc.len & " bytes, expected " & $LinehitsDescriptorSize)
-  let off = int(readU64LE(desc, 0))
-  let size = int(readU64LE(desc, 8))
-  if off < 0 or size < 0 or off > r.image.len or off + size > r.image.len:
+  let off = readU64LE(desc, 0)
+  let size = readU64LE(desc, 8)
+  let imageLen = uint64(r.image.len)
+  if off > imageLen or size > imageLen - off:
     return err("linehits payload for position " & $positionIndex &
       " is out of bounds")
-  var pos = off
-  let endPos = off + size
-  var steps: seq[uint64] = @[]
-  while pos < endPos:
-    steps.add(?decodeVarint(r.image, pos))
-  ok(steps)
+  # Decoded within the descriptor's bytes alone, so a step id whose varint
+  # runs past them is refused rather than completed from the next list.
+  let steps = decodeStepList(r.image.toOpenArray(int(off), int(off + size) - 1))
+  if steps.isErr:
+    return err("linehits payload for position " & $positionIndex & ": " &
+      steps.error)
+  steps
 
 {.pop.}

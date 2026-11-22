@@ -39,18 +39,6 @@
 ##   2. Decompress chunk at offsets[chunk]
 ##   3. Decode forward, scanning N % chunk_size events to the target
 ##
-## # Backward compatibility (legacy Nim-v4 bundles)
-##
-## Bundles written by the pre-M24a-1 Nim writer carry a different framing:
-## ``steps.idx`` had a ``total_events`` placeholder after the chunk_size header
-## plus a ``total_events`` trailer, and each chunk's uncompressed data started
-## with a ``u32 LE`` event count.  Those bundles never set the ``meta.dat``
-## ``has_step_stream`` flag (bit 9), so the FFI reader distinguishes the two
-## layouts by that flag: flag set ⇒ SPEC layout, flag clear ⇒ legacy layout.
-## ``initExecStreamReader`` accepts an explicit ``legacy`` parameter for this;
-## standalone callers that only ever read freshly-written bundles get the SPEC
-## layout by default.
-
 import std/bitops
 import results
 import ../codetracer_ctfs/types
@@ -58,6 +46,8 @@ import ../codetracer_ctfs/container
 import ../codetracer_ctfs/streaming
 import ../codetracer_ctfs/zstd_bindings
 import ../codetracer_ctfs/chunk_cache
+import ../codetracer_ctfs/member_view
+import ./record_chunk
 import ./step_encoding
 import ./gdh2_arms
 import ./varint
@@ -68,16 +58,44 @@ const
 
 type
   ExecChunkMeta = object
-    ## Per-chunk derived state cached alongside the decompressed payload.
-    eventCount: uint32
+    ## Per-chunk derived state cached alongside the decompressed payload,
+    ## built as far as reads reach.
+    ##
+    ## Step records are variable-length varints, so the only way to reach
+    ## record *k* is to decode records 0..k-1. Each record is decoded once on
+    ## the way, which notes where every `StartStride`-th one starts, so a walk
+    ## over the chunk decodes every record once, a read near the chunk's start
+    ## decodes no further than it, and a read of a record already passed
+    ## decodes fewer than `StartStride` records before it. The cursor position
+    ## after each record is resolved when one is asked for (`eventPosition`,
+    ## `chunkPositions`), as far as it is asked: a walk that reads records
+    ## alone keeps no position per record.
     starts: seq[int32]
-      ## Byte offset of every encoded record inside the decompressed chunk.
-      ## Step records are variable-length varints, so without this table the
-      ## only way to reach record *k* is to decode records 0..k-1 — which made
-      ## a random ``readEvent`` O(chunkSize) and a walk over a chunk O(n²).
-      ## The table is filled by the single forward pass the reader already had
-      ## to make to count the chunk's records, so it costs no extra decoding.
-    startsBuilt: bool
+      ## Byte offset inside the decompressed chunk of record
+      ## `k * StartStride`, for those below `known`.
+    positions: seq[uint64]
+      ## The cursor position after record `k` (`trace-events.md` §"Encoding
+      ## Rules", "Reading"), `k < resolved`.
+    known: int
+      ## How many records have been decoded.
+    resolved: int
+      ## How many records' positions are in `positions`: the records before
+      ## the first refused one, as far as positions have been asked for.
+    resolvePos: int
+      ## Where record `resolved` starts.
+    nextPos: int
+      ## Where record `known` starts.
+    complete: bool
+      ## Every record of the chunk has been decoded: `known` is its count.
+    eventCount: uint32
+      ## The chunk's record count, once `complete`.
+    cursor: uint64
+    anchored: bool
+    posRefusedAt: int
+      ## The first record whose position is refused (a delta before the
+      ## chunk's first `AbsoluteStep`, or a negative position); `high(int)`
+      ## when none has been.
+    posRefusal: string
 
   ExecStreamWriter* = object
     dataFile: CtfsInternalFile
@@ -97,14 +115,11 @@ type
       ## starts without a cursor (`trace-events.md` §"Encoding Rules").
 
   ExecStreamReader* = object
-    data: seq[byte]            ## raw steps.dat content
+    data: MemberView           ## steps.dat, in place
+    frameScratch: seq[byte]    ## a chunk's frame when it straddles two runs
     chunkSize*: uint32
     offsets: seq[uint64]       ## chunk byte offsets from steps.idx
     totalEventsVal: uint64
-    legacy: bool               ## true ⇒ legacy Nim-v4 framing (u32 count
-                               ## header per chunk + total_events trailer);
-                               ## false ⇒ SPEC layout (header-less chunks,
-                               ## no trailer).  See module docs.
     cache: ChunkCache[ExecChunkMeta]
       ## Decompressed chunks, LRU by byte budget.  This used to be a single
       ## "last chunk" slot: a reader jumping between steps in different chunks
@@ -126,10 +141,15 @@ type
       ## accepted only where the header says it may appear.  Default
       ## FALSE, so a caller that has not been taught about the flag
       ## refuses the tag rather than decoding it.
-    payloadStart: int          ## byte offset within a decompressed chunk where
-                               ## the first encoded event begins: 4 in legacy
-                               ## mode (past the u32 count header), 0 in SPEC
-                               ## mode.
+    stored: bool
+      ## The chunks are stored as their content rather than as zstd frames:
+      ## the container is compact (`ctfs-container.md` §1f).
+    heldChunk: int
+      ## One more than the chunk the last read reached, 0 before any read;
+      ## `heldSlot` is its cache slot. Every slot is found through
+      ## `chunkSlot`, which sets both, and the cache evicts only inside it,
+      ## so the chunk named here is resident: a read in it skips the cache.
+    heldSlot: int
 
 proc initExecStreamWriter*(ctfs: var Ctfs,
     chunkSize: int = DefaultExecChunkSize): Result[ExecStreamWriter, string] =
@@ -140,11 +160,11 @@ proc initExecStreamWriter*(ctfs: var Ctfs,
 
   let datRes = ctfs.addFile("steps.dat")
   if datRes.isErr:
-    return err("failed to create steps.dat: " & datRes.error)
+    return err("failed to create steps.dat: " & datRes.unsafeError)
 
   let idxRes = ctfs.addFile("steps.idx")
   if idxRes.isErr:
-    return err("failed to create steps.idx: " & idxRes.error)
+    return err("failed to create steps.idx: " & idxRes.unsafeError)
 
   var writer = ExecStreamWriter(
     dataFile: datRes.get(),
@@ -165,7 +185,7 @@ proc initExecStreamWriter*(ctfs: var Ctfs,
     hdr[i] = csLE[i]
   let hdrRes = ctfs.writeToFile(writer.indexFile, hdr)
   if hdrRes.isErr:
-    return err("failed to write idx header: " & hdrRes.error)
+    return err("failed to write idx header: " & hdrRes.unsafeError)
   ctfs.syncEntry(writer.indexFile)
 
   ok(writer)
@@ -200,7 +220,7 @@ proc flushChunk(ctfs: var Ctfs, w: var ExecStreamWriter): Result[void, string] =
   let datRes = ctfs.writeToFile(w.dataFile,
       compressed.toOpenArray(0, int(compressedSize) - 1))
   if datRes.isErr:
-    return err("failed to write compressed chunk: " & datRes.error)
+    return err("failed to write compressed chunk: " & datRes.unsafeError)
 
   var offBytes: array[8, byte]
   let offLE = toBytesLE(chunkStart)
@@ -208,7 +228,7 @@ proc flushChunk(ctfs: var Ctfs, w: var ExecStreamWriter): Result[void, string] =
     offBytes[i] = offLE[i]
   let idxRes = ctfs.writeToFile(w.indexFile, offBytes)
   if idxRes.isErr:
-    return err("failed to write offset to idx: " & idxRes.error)
+    return err("failed to write offset to idx: " & idxRes.unsafeError)
   ctfs.syncEntry(w.indexFile)
 
   w.dataOffset += uint64(compressedSize)
@@ -310,32 +330,14 @@ proc totalEvents*(w: ExecStreamWriter): uint64 = w.totalEvents
 # Reader
 # ---------------------------------------------------------------------------
 
-proc decodeSpecChunkRecordCount(compressed: openArray[byte],
+proc countSpecChunkRecords(raw: openArray[byte],
     allowSourceReload: bool): Result[int, string] =
-  ## Decompress a SPEC-layout chunk (header-less payload) and count its
-  ## records by decoding forward to the end of the chunk.  Used to recover the
-  ## last chunk's record count (the SPEC ``steps.idx`` carries no
-  ## ``total_events``), mirroring the Rust ``StepStreamReader::open`` logic.
-  if compressed.len == 0:
-    return err("step chunk has zero compressed size")
-  let frameSize = ZSTD_getFrameContentSize(
-    unsafeAddr compressed[0], csize_t(compressed.len))
-  if frameSize == ZSTD_CONTENTSIZE_UNKNOWN or frameSize == ZSTD_CONTENTSIZE_ERROR:
-    return err("cannot determine decompressed size for last step chunk")
-  var raw = newSeq[byte](int(frameSize))
-  let decompSize = ZSTD_decompress(
-    addr raw[0], csize_t(frameSize),
-    unsafeAddr compressed[0], csize_t(compressed.len))
-  if ZSTD_isError(decompSize) != 0:
-    return err("zstd decompress failed for last step chunk: " &
-      $ZSTD_getErrorName(decompSize))
-  raw.setLen(int(decompSize))
   var pos = 0
   var count = 0
   while pos < raw.len:
     let ev = decodeStepEvent(raw, pos, allowSourceReload)
     if ev.isErr:
-      return err("failed to count records in last step chunk: " & ev.error)
+      return err("failed to count records in last step chunk: " & ev.unsafeError)
     # FALSIFIER (``gdh2FalsifyUncountedMarker``,
     # gdh2_reload_marker_round_trips): treat the reload marker as "not a
     # record" while still consuming its bytes.  This is the SHORTER,
@@ -351,38 +353,38 @@ proc decodeSpecChunkRecordCount(compressed: openArray[byte],
       inc count
   ok(count)
 
-proc initExecStreamReader*(ctfsBytes: openArray[byte],
-    blockSize: int = 4096,
-    maxEntries: int = 170,
-    legacy: bool = false,
-    cacheBytes: uint64 = DefaultStreamChunkCacheBytes,
-    allowSourceReload: bool = false): Result[ExecStreamReader, string] =
-  ## Read an execution stream from CTFS bytes.
-  ##
-  ## ``legacy`` selects the on-disk framing (see module docs):
-  ##   * ``false`` (default) — SPEC layout: ``steps.idx`` is
-  ##     ``[chunk_size: u32][offset_0: u64]...`` (no ``total_events``) and each
-  ##     chunk's uncompressed payload is header-less.  Byte-compatible with the
-  ##     Rust ``StepStreamReader``.
-  ##   * ``true`` — legacy Nim-v4 layout: ``steps.idx`` has a ``total_events``
-  ##     placeholder after the header plus a trailing ``total_events`` u64, and
-  ##     each chunk's uncompressed data starts with a ``u32`` event count.
-  ##
-  ## The FFI reader passes ``legacy = not meta.hasStepStream``: pre-M24a-1
-  ## bundles never set the ``has_step_stream`` flag, so a clear flag selects the
-  ## legacy reader and a set flag the SPEC reader.
-  let datRes = readInternalFile(ctfsBytes, "steps.dat",
-      uint32(blockSize), uint32(maxEntries))
-  if datRes.isErr:
-    return err("failed to read steps.dat: " & datRes.error)
-  let datData = datRes.get()
+proc decodeSpecChunkRecordCount(compressed: openArray[byte],
+    allowSourceReload: bool, stored: bool): Result[int, string] =
+  ## Count a SPEC-layout chunk's (header-less payload) records by decoding
+  ## forward to the end of the chunk, decompressing it first unless it is
+  ## ``stored`` as its content (a compact container, `ctfs-container.md`
+  ## §1f).  Used to recover the last chunk's record count (the SPEC
+  ## ``steps.idx`` carries no ``total_events``), mirroring the Rust
+  ## ``StepStreamReader::open`` logic.
+  if stored:
+    if compressed.len == 0:
+      return err("step chunk is empty")
+    return countSpecChunkRecords(compressed, allowSourceReload)
+  if compressed.len == 0:
+    return err("step chunk has zero compressed size")
+  let frameSize = ZSTD_getFrameContentSize(
+    unsafeAddr compressed[0], csize_t(compressed.len))
+  if frameSize == ZSTD_CONTENTSIZE_UNKNOWN or frameSize == ZSTD_CONTENTSIZE_ERROR:
+    return err("cannot determine decompressed size for last step chunk")
+  var raw = newSeqUninit[byte](int(frameSize))  # written by the inflate
+  let decompSize = zstdDecompressShared(
+    if raw.len > 0: addr raw[0] else: nil, csize_t(frameSize),
+    unsafeAddr compressed[0], csize_t(compressed.len))
+  if ZSTD_isError(decompSize) != 0:
+    return err("zstd decompress failed for last step chunk: " &
+      $ZSTD_getErrorName(decompSize))
+  raw.setLen(int(decompSize))
+  countSpecChunkRecords(raw, allowSourceReload)
 
-  let idxRes = readInternalFile(ctfsBytes, "steps.idx",
-      uint32(blockSize), uint32(maxEntries))
-  if idxRes.isErr:
-    return err("failed to read steps.idx: " & idxRes.error)
-  let idxData = idxRes.get()
-
+proc openExecStream(datData: sink MemberView, idxData: seq[byte],
+    stored: bool, cacheBytes: uint64,
+    allowSourceReload: bool): Result[ExecStreamReader, string] =
+  ## The reader of a `steps.dat` (held in place) and its parsed `steps.idx`.
   if idxData.len < 4:
     return err("index file too small for chunk_size header")
 
@@ -395,71 +397,136 @@ proc initExecStreamReader*(ctfsBytes: openArray[byte],
 
   var offsets: seq[uint64]
   var totalEvents: uint64
-  let payloadStart = if legacy: 4 else: 0  ## per-chunk payload offset
+  # Index layout: [chunk_size: u32][offset_0: u64]...
+  let offsetRegionBytes = idxData.len - 4
+  if offsetRegionBytes mod 8 != 0:
+    return err("index file has trailing bytes in offset region")
+  let numChunks = offsetRegionBytes div 8
+  offsets = newSeq[uint64](numChunks)
+  for i in 0 ..< numChunks:
+    var o8: array[8, byte]
+    for j in 0 ..< 8:
+      o8[j] = idxData[4 + i * 8 + j]
+    offsets[i] = fromBytesLE(uint64, o8)
 
-  if legacy:
-    # Legacy index layout:
-    #   [0..3]   u32 chunk_size
-    #   [4..11]  u64 total_events placeholder (ignored)
-    #   [12..]   u64 offsets...
-    #   [last 8] u64 total_events trailer
-    if idxData.len < 12:
-      return err("index file too small for legacy header")
-    let payloadBytes = idxData.len - 12  # after chunk_size + placeholder total
-    if payloadBytes < 8:
-      return err("index file too small for trailer")
-    let trailerStart = idxData.len - 8
-    var te8: array[8, byte]
-    for i in 0 ..< 8:
-      te8[i] = idxData[trailerStart + i]
-    totalEvents = fromBytesLE(uint64, te8)
-    let offsetRegionBytes = trailerStart - 12
-    if offsetRegionBytes mod 8 != 0:
-      return err("index file has trailing bytes in offset region")
-    let numChunks = offsetRegionBytes div 8
-    offsets = newSeq[uint64](numChunks)
-    for i in 0 ..< numChunks:
-      var o8: array[8, byte]
-      for j in 0 ..< 8:
-        o8[j] = idxData[12 + i * 8 + j]
-      offsets[i] = fromBytesLE(uint64, o8)
+  # Recover total_events: all chunks but the last hold exactly chunk_size
+  # records; the last holds whatever decodes out of it (Rust parity).
+  if numChunks == 0:
+    totalEvents = 0
   else:
-    # SPEC index layout: [chunk_size: u32][offset_0: u64]...  (no trailer).
-    let offsetRegionBytes = idxData.len - 4
-    if offsetRegionBytes mod 8 != 0:
-      return err("index file has trailing bytes in offset region")
-    let numChunks = offsetRegionBytes div 8
-    offsets = newSeq[uint64](numChunks)
-    for i in 0 ..< numChunks:
-      var o8: array[8, byte]
-      for j in 0 ..< 8:
-        o8[j] = idxData[4 + i * 8 + j]
-      offsets[i] = fromBytesLE(uint64, o8)
+    let lastChunk = numChunks - 1
+    let startOff = int(offsets[lastChunk])
+    if startOff > datData.len:
+      return err("last chunk offset past end of steps.dat")
+    var frameScratch: seq[byte]
+    let endOff = ? chunkEnd(datData, offsets, lastChunk, stored, frameScratch)
+    if startOff > endOff:
+      return err("last chunk offset past end of steps.dat")
+    var scratch: seq[byte]
+    var lastCount = 0
+    datData.ensureLoaded(startOff, endOff - startOff)
+    datData.withSpan(startOff, endOff - startOff, scratch, frame):
+      lastCount = ?decodeSpecChunkRecordCount(frame, allowSourceReload,
+        stored)
+    totalEvents = uint64(lastChunk) * uint64(chunkSize) + uint64(lastCount)
 
-    # Recover total_events: all chunks but the last hold exactly chunk_size
-    # records; the last holds whatever decodes out of it (Rust parity).
-    if numChunks == 0:
-      totalEvents = 0
-    else:
-      let lastChunk = numChunks - 1
-      let startOff = int(offsets[lastChunk])
-      let endOff = datData.len
-      if startOff > endOff:
-        return err("last chunk offset past end of steps.dat")
-      let lastCount = ?decodeSpecChunkRecordCount(
-        datData.toOpenArray(startOff, endOff - 1), allowSourceReload)
-      totalEvents = uint64(lastChunk) * uint64(chunkSize) + uint64(lastCount)
-
+  # Sized before `offsets` is handed to the reader: a field initialiser that
+  # reads `offsets` after the one that takes it may see it moved out, and a
+  # cache sized for no chunks misses on every read.
+  var cache = initChunkCache[ExecChunkMeta](offsets.len, cacheBytes)
   ok(ExecStreamReader(
-    data: datData,
+    data: move datData,
     chunkSize: chunkSize,
-    offsets: offsets,
+    offsets: move offsets,
     totalEventsVal: totalEvents,
-    legacy: legacy,
-    cache: initChunkCache[ExecChunkMeta](offsets.len, cacheBytes),
+    cache: move cache,
     allowSourceReload: allowSourceReload,
-    payloadStart: payloadStart,
+    stored: stored,
   ))
+
+proc initExecStreamReader*(ctfsBytes: openArray[byte],
+    blockSize: int = 4096,
+    maxEntries: int = 170,
+    cacheBytes: uint64 = DefaultStreamChunkCacheBytes,
+    allowSourceReload: bool = false): Result[ExecStreamReader, string] =
+  ## Read an execution stream from CTFS bytes.
+  ##
+  ## `steps.idx` is ``[chunk_size: u32][offset_0: u64]...`` and each chunk's
+  ## uncompressed payload is header-less.
+  var datRes = readInternalFile(ctfsBytes, "steps.dat",
+      uint32(blockSize), uint32(maxEntries))
+  if datRes.isErr:
+    return err("failed to read steps.dat: " & datRes.unsafeError)
+  let idxRes = readInternalFile(ctfsBytes, "steps.idx",
+      uint32(blockSize), uint32(maxEntries))
+  if idxRes.isErr:
+    return err("failed to read steps.idx: " & idxRes.unsafeError)
+  openExecStream(viewBytes(move datRes.get()), idxRes.get(),
+    isCompactContainer(ctfsBytes), cacheBytes, allowSourceReload)
+
+proc initExecStreamReader*(image: ContainerImage,
+    blockSize: int = 4096,
+    maxEntries: int = 170,
+    cacheBytes: uint64 = DefaultStreamChunkCacheBytes,
+    allowSourceReload: bool = false): Result[ExecStreamReader, string] =
+  ## As above, over a container image it shares: `steps.dat` is read in place.
+  var datRes = viewMember(image, "steps.dat", uint32(blockSize),
+    uint32(maxEntries))
+  if datRes.isErr:
+    return err("failed to read steps.dat: " & datRes.unsafeError)
+  let idxRes = viewMember(image, "steps.idx", uint32(blockSize),
+    uint32(maxEntries))
+  if idxRes.isErr:
+    return err("failed to read steps.idx: " & idxRes.unsafeError)
+  openExecStream(move datRes.get(), ? idxRes.get().contents(),
+    isCompactContainer(image.bytes), cacheBytes, allowSourceReload)
+
+proc refresh*(r: var ExecStreamReader, image: ContainerImage,
+    blockSize: int = 4096, maxEntries: int = 170): Result[void, string] =
+  ## Extend the reader by the chunks the container in `image` has published
+  ## since it was opened or last refreshed (`ctfs-container.md` §6). Only the
+  ## new last chunk is decoded, to count its records; every chunk already
+  ## inflated stays resident. An index that does not extend the one already
+  ## read is refused.
+  let dat = viewMember(image, "steps.dat", uint32(blockSize), uint32(maxEntries))
+  if dat.isErr:
+    return err("failed to read steps.dat: " & dat.unsafeError)
+  let idxView = viewMember(image, "steps.idx", uint32(blockSize),
+    uint32(maxEntries))
+  if idxView.isErr:
+    return err("failed to read steps.idx: " & idxView.unsafeError)
+  let idx = ? idxView.unsafeGet().contents()
+  if idx.len < 4:
+    return err("steps.idx too small for chunk_size header")
+  let chunkSize = int(uint32(idx[0]) or (uint32(idx[1]) shl 8) or
+    (uint32(idx[2]) shl 16) or (uint32(idx[3]) shl 24))
+  if (idx.len - 4) mod 8 != 0:
+    return err("steps.idx has trailing bytes in offset region")
+  let numChunks = (idx.len - 4) div 8
+  var offsets = newSeqUninit[uint64](numChunks)
+  for i in 0 ..< numChunks:
+    var v = 0'u64
+    for j in 0 ..< 8:
+      v = v or (uint64(idx[4 + i * 8 + j]) shl (8 * j))
+    offsets[i] = v
+  var data = dat.unsafeGet()
+  ? checkExtends("steps", int(r.chunkSize), r.offsets, chunkSize, offsets,
+    data.len)
+  if numChunks != r.offsets.len:
+    let last = numChunks - 1
+    let startOff = int(offsets[last])
+    let endOff = ? chunkEnd(data, offsets, last, r.stored, r.frameScratch)
+    var lastCount = 0
+    data.ensureLoaded(startOff, endOff - startOff)
+    data.withSpan(startOff, endOff - startOff, r.frameScratch, frame):
+      lastCount = ? decodeSpecChunkRecordCount(frame, r.allowSourceReload,
+        r.stored)
+    inc r.chunkDecompressions
+    r.totalEventsVal = uint64(last) * uint64(chunkSize) + uint64(lastCount)
+    r.cache.grow(numChunks)
+  r.data = move data
+  r.offsets = move offsets
+  ok()
 
 proc totalEvents*(r: ExecStreamReader): uint64 = r.totalEventsVal
 
@@ -467,29 +534,82 @@ proc chunkDecompressions*(r: ExecStreamReader): uint64 = r.chunkDecompressions
   ## Distinct Zstd chunk inflations performed so far (bounded-decompression
   ## probe; see the ``chunkDecompressions`` field).
 
+proc positionRefusal(chunkIdx, i: int, what: string): string {.noinline.} =
+  ## A refusal of record `i` of a steps chunk's position, for `what`.
+  "steps.dat chunk " & $chunkIdx & ": record " & $i & what
+
+proc advanceCursor(ev: StepEvent, i: int, chunkIdx: int, cursor: var uint64,
+    anchored: var bool, why: var string): bool =
+  ## Move a chunk's cursor past record `i`, `ev` (`trace-events.md`
+  ## §"Encoding Rules", "Reading"). False, with `why` set, where the record
+  ## has no position to move to. Called once per record decoded, so it builds
+  ## no `Result`.
+  case ev.kind
+  of sekAbsoluteStep:
+    cursor = ev.globalLineIndex
+    anchored = true
+  of sekDeltaStep, sekDeltaColumn:
+    if not anchored:
+      why = positionRefusal(chunkIdx, i, " is a " &
+        (if ev.kind == sekDeltaStep: "DeltaStep" else: "DeltaColumn") &
+        " before the chunk's first AbsoluteStep, so it has no position to " &
+        "be relative to")
+      return false
+    let d = if ev.kind == sekDeltaStep: ev.lineDelta else: ev.columnDelta
+    let p = int64(cursor) + d
+    if p < 0:
+      why = positionRefusal(chunkIdx, i, " resolves to a negative position")
+      return false
+    cursor = uint64(p)
+  else:
+    discard
+  true
+
+proc commitChunk(r: var ExecStreamReader, slot: int,
+    chunkIdx: int): Result[int, string] =
+  ## Make the chunk just put in ``slot`` resident, nothing of it decoded yet.
+  template m: untyped = r.cache.meta(slot)
+  m.nextPos = 0
+  m.resolvePos = 0
+  m.posRefusedAt = high(int)
+  m.complete = r.cache.data(slot).len == 0
+
+  r.cache.commit(slot, chunkIdx)
+  r.heldChunk = chunkIdx + 1
+  r.heldSlot = slot
+  ok(slot)
+
 proc chunkSlot(r: var ExecStreamReader,
     chunkIdx: int): Result[int, string] =
   ## Return the cache slot holding chunk ``chunkIdx``, inflating it first if it
-  ## is not resident.
+  ## is not resident, and note it as the chunk held.
   let hit = r.cache.find(chunkIdx)
   if hit >= 0:
+    r.heldChunk = chunkIdx + 1
+    r.heldSlot = hit
     return ok(hit)
 
-  if chunkIdx >= r.offsets.len:
+  if chunkIdx < 0 or chunkIdx >= r.offsets.len:
     return err("chunk index out of range: " & $chunkIdx)
 
   let startOff = r.offsets[chunkIdx]
-  let endOff =
-    if chunkIdx + 1 < r.offsets.len:
-      r.offsets[chunkIdx + 1]
-    else:
-      uint64(r.data.len)
+  let endOff = uint64(? chunkEnd(r.data, r.offsets, chunkIdx,
+    r.stored, r.frameScratch))
+  if startOff > endOff or endOff > uint64(r.data.len):
+    return err("chunk " & $chunkIdx & " offsets out of range")
   let compressedLen = endOff - startOff
   if compressedLen == 0:
     return err("chunk " & $chunkIdx & " has zero compressed size")
+  r.data.ensureLoaded(int(startOff), int(compressedLen))
+  let frame = r.data.span(int(startOff), int(compressedLen), r.frameScratch)
 
-  let frameSize = ZSTD_getFrameContentSize(
-    unsafeAddr r.data[int(startOff)], csize_t(compressedLen))
+  if r.stored:
+    let slot = r.cache.acquire()
+    r.cache.prepare(slot, int(compressedLen))
+    copyMem(addr r.cache.data(slot)[0], frame, int(compressedLen))
+    return r.commitChunk(slot, chunkIdx)
+
+  let frameSize = ZSTD_getFrameContentSize(frame, csize_t(compressedLen))
   if frameSize == ZSTD_CONTENTSIZE_UNKNOWN or frameSize == ZSTD_CONTENTSIZE_ERROR:
     return err("cannot determine decompressed size for chunk " & $chunkIdx)
   if frameSize == 0:
@@ -502,7 +622,7 @@ proc chunkSlot(r: var ExecStreamReader,
   r.cache.prepare(slot, int(frameSize))
   let decompSize = zstdDecompressShared(
     addr r.cache.data(slot)[0], csize_t(frameSize),
-    unsafeAddr r.data[int(startOff)], csize_t(compressedLen))
+    frame, csize_t(compressedLen))
 
   if ZSTD_isError(decompSize) != 0:
     # The slot was never committed, so it stays free for the next acquire.
@@ -513,85 +633,99 @@ proc chunkSlot(r: var ExecStreamReader,
   # Account a distinct chunk inflation: we only reach here on a cache miss, so
   # each increment is a genuinely new inflation.
   r.chunkDecompressions += 1
+  r.commitChunk(slot, chunkIdx)
 
-  if r.legacy:
-    # Legacy chunk: the first 4 bytes are a u32 LE event count, records follow.
-    if r.cache.data(slot).len < 4:
-      return err("decompressed chunk too small for event count header")
-    var ec4: array[4, byte]
-    for i in 0 ..< 4:
-      ec4[i] = r.cache.data(slot)[i]
-    r.cache.meta(slot).eventCount = fromBytesLE(uint32, ec4)
-    # The record count is authoritative here, so the start table is built
-    # lazily — a caller that only ever asks for the count never pays for it.
-    r.cache.meta(slot).startsBuilt = false
-  else:
-    # SPEC chunk: header-less payload — count records by decoding forward, and
-    # record where each one starts while we are already walking them.
-    var pos = 0
-    var count = 0
-    var starts: seq[int32] = @[]
-    while pos < r.cache.data(slot).len:
-      starts.add(int32(pos))
-      let ev = decodeStepEvent(r.cache.data(slot), pos, r.allowSourceReload)
-      if ev.isErr:
-        return err("failed to count records in chunk " & $chunkIdx & ": " &
-          ev.error)
-      # FALSIFIER (``gdh2FalsifyUncountedMarker``) — see
-      # decodeSpecChunkRecordCount above.
-      when gdh2Arm(gdh2FalsifyUncountedMarker):
-        if ev.get().kind != sekSourceReload:
-          inc count
-      else:
-        inc count
-    r.cache.meta(slot).eventCount = uint32(count)
-    r.cache.meta(slot).starts = starts
-    r.cache.meta(slot).startsBuilt = true
+const StartStride = 16
+  ## Every how many records a chunk notes where one starts.
 
-  r.cache.commit(slot, chunkIdx)
-  ok(slot)
+proc decodeNext(r: var ExecStreamReader, slot: int,
+    chunkIdx: int): Result[StepEvent, string] {.inline.} =
+  ## Decode the next record of the chunk in ``slot`` — record ``known`` — and
+  ## note where it starts. The chunk must not be ``complete``.
+  let mp = addr r.cache.meta(slot)
+  template m: untyped = mp[]
+  let i = m.known
+  var pos = m.nextPos
+  # Decoded into the result, which is returned as it is.
+  result = decodeStepEventHot(r.cache.data(slot), pos, r.allowSourceReload)
+  if result.isErr:
+    return err("failed to decode event " & $i & " of chunk " & $chunkIdx &
+      ": " & result.unsafeError)
+  if i mod StartStride == 0:
+    m.starts.add(int32(m.nextPos))
+  m.nextPos = pos
+  m.known = i + 1
+  if pos >= r.cache.data(slot).len:
+    m.complete = true
+    m.eventCount = uint32(m.known)
 
-proc ensureRecordStarts(r: var ExecStreamReader, slot: int,
-    chunkIdx: int): Result[void, string] =
-  ## Make sure the chunk in ``slot`` has its record start table.  Only the
-  ## legacy framing can reach here with the table missing (the SPEC path builds
-  ## it during the count pass it has to make anyway).
-  if r.cache.meta(slot).startsBuilt:
-    return ok()
-  let count = int(r.cache.meta(slot).eventCount)
-  var starts = newSeqOfCap[int32](count)
-  var pos = r.payloadStart
-  for i in 0 ..< count:
-    starts.add(int32(pos))
-    let ev = decodeStepEvent(r.cache.data(slot), pos, r.allowSourceReload)
-    if ev.isErr:
-      return err("failed to decode event " & $i & " while scanning chunk " &
-        $chunkIdx & ": " & ev.error)
-  r.cache.meta(slot).starts = starts
-  r.cache.meta(slot).startsBuilt = true
+proc decodeThrough(r: var ExecStreamReader, slot: int, chunkIdx: int,
+    i: int): Result[void, string] =
+  ## Decode the chunk in ``slot`` until record ``i`` has been, or the chunk
+  ## ends first.
+  while r.cache.meta(slot).known <= i and not r.cache.meta(slot).complete:
+    discard ? r.decodeNext(slot, chunkIdx)
   ok()
+
+proc resolveThrough(r: var ExecStreamReader, slot: int, chunkIdx: int,
+    i: int): Result[void, string] {.noinline.} =
+  ## Resolve the positions of the chunk in ``slot`` through record ``i``, or
+  ## to the first refused one: each record is decoded again from where it was
+  ## noted to start, and the cursor moved past it (`advanceCursor`). Record
+  ## ``i`` must have been decoded.
+  let mp = addr r.cache.meta(slot)
+  template m: untyped = mp[]
+  if m.positions.len <= i:
+    m.positions.setLenUninit(max(i + 1, min(2 * m.positions.len, m.known)))
+  while m.resolved <= i and m.posRefusedAt == high(int):
+    let k = m.resolved
+    var pos = m.resolvePos
+    # Record `k` was decoded before, so it decodes again.
+    let ev = decodeStepEvent(r.cache.data(slot), pos, r.allowSourceReload)
+    if advanceCursor(ev.unsafeGet(), k, chunkIdx, m.cursor, m.anchored,
+        m.posRefusal):
+      m.positions[k] = m.cursor
+      m.resolved = k + 1
+      m.resolvePos = pos
+    else:
+      m.posRefusedAt = k
+  ok()
+
+proc chunkRecordCount(r: var ExecStreamReader, slot: int,
+    chunkIdx: int): Result[int, string] =
+  ## How many records the chunk in ``slot`` holds, decoding all of them.
+  ? r.decodeThrough(slot, chunkIdx, high(int) - 1)
+  ok(r.cache.meta(slot).known)
 
 proc readEvent*(r: var ExecStreamReader,
     eventIndex: uint64): Result[StepEvent, string] =
   ## Read a single event by its global index.
   ##
-  ## O(1) in the chunk's record count: the containing chunk's record start
-  ## table (built once, when the chunk is inflated) gives the record's byte
-  ## offset directly, instead of re-decoding every preceding record.
+  ## Decodes its chunk only as far as the event: a walk in order decodes each
+  ## record once, and a read of a record already passed decodes that record
+  ## alone, from where it was noted to start.
   if eventIndex >= r.totalEventsVal:
     return err("event index out of range: " & $eventIndex & " >= " & $r.totalEventsVal)
 
   let chunkIdx = int(eventIndex div uint64(r.chunkSize))
   let eventInChunk = int(eventIndex mod uint64(r.chunkSize))
 
-  let slot = ?r.chunkSlot(chunkIdx)
-  ?r.ensureRecordStarts(slot, chunkIdx)
-
-  if eventInChunk >= r.cache.meta(slot).starts.len:
+  let slot =
+    if r.heldChunk == chunkIdx + 1: r.heldSlot
+    else: ? r.chunkSlot(chunkIdx)
+  let mp = addr r.cache.meta(slot)
+  template m: untyped = mp[]
+  if eventInChunk < m.known:
+    # From the nearest noted start, stepping over the records between.
+    var pos = int(m.starts[eventInChunk div StartStride])
+    for _ in 0 ..< eventInChunk mod StartStride:
+      discard decodeStepEvent(r.cache.data(slot), pos, r.allowSourceReload)
+    return decodeStepEvent(r.cache.data(slot), pos, r.allowSourceReload)
+  if eventInChunk > m.known:
+    ? r.decodeThrough(slot, chunkIdx, eventInChunk - 1)
+  if m.complete:
     return err("event " & $eventIndex & " past the end of chunk " & $chunkIdx)
-
-  var pos = int(r.cache.meta(slot).starts[eventInChunk])
-  decodeStepEvent(r.cache.data(slot), pos, r.allowSourceReload)
+  r.decodeNext(slot, chunkIdx)
 
 proc readChunkEvents*(r: var ExecStreamReader,
     chunkIdx: int,
@@ -610,18 +744,18 @@ proc readChunkEvents*(r: var ExecStreamReader,
   let slot = ?r.chunkSlot(chunkIdx)
 
   let firstEventIdx = uint64(chunkIdx) * uint64(r.chunkSize)
-  let eventCount = int(r.cache.meta(slot).eventCount)
+  let eventCount = ? r.chunkRecordCount(slot, chunkIdx)
   output.setLen(0)
   if eventCount == 0:
     return ok(firstEventIdx)
   output = newSeqOfCap[StepEvent](eventCount)
 
-  var pos = r.payloadStart
+  var pos = 0
   for i in 0 ..< eventCount:
     let evRes = decodeStepEvent(r.cache.data(slot), pos, r.allowSourceReload)
     if evRes.isErr:
       return err("failed to decode event " & $i & " while streaming chunk " &
-        $chunkIdx & ": " & evRes.error)
+        $chunkIdx & ": " & evRes.unsafeError)
     output.add(evRes.get())
 
   ok(firstEventIdx)
@@ -637,27 +771,51 @@ proc resolveChunkPositions*(events: openArray[StepEvent], chunkIdx: int,
   output.setLen(events.len)
   var cursor = 0'u64
   var anchored = false
+  var why: string
   for i in 0 ..< events.len:
-    let ev = events[i]
-    case ev.kind
-    of sekAbsoluteStep:
-      cursor = ev.globalLineIndex
-      anchored = true
-    of sekDeltaStep, sekDeltaColumn:
-      if not anchored:
-        return err("steps.dat chunk " & $chunkIdx & ": record " & $i & " is a " &
-          (if ev.kind == sekDeltaStep: "DeltaStep" else: "DeltaColumn") &
-          " before the chunk's first AbsoluteStep, so it has no position to " &
-          "be relative to")
-      let d = if ev.kind == sekDeltaStep: ev.lineDelta else: ev.columnDelta
-      let p = int64(cursor) + d
-      if p < 0:
-        return err("steps.dat chunk " & $chunkIdx & ": record " & $i &
-          " resolves to a negative position")
-      cursor = uint64(p)
-    else:
-      discard
+    if not advanceCursor(events[i], i, chunkIdx, cursor, anchored, why):
+      return err(why)
     output[i] = cursor
+  ok()
+
+proc eventPosition*(r: var ExecStreamReader,
+    eventIndex: uint64): Result[uint64, string] =
+  ## The cursor position after event ``eventIndex``: `resolveChunkPositions`
+  ## over its chunk, as far as the event. A position refused at or before the
+  ## event (a delta before its chunk's first `AbsoluteStep`) is refused.
+  if eventIndex >= r.totalEventsVal:
+    return err("step " & $eventIndex & " is past the end of its exec chunk")
+  let chunkIdx = int(eventIndex div uint64(r.chunkSize))
+  let i = int(eventIndex mod uint64(r.chunkSize))
+  let slot = ?r.chunkSlot(chunkIdx)
+  template m: untyped = r.cache.meta(slot)
+  if i >= m.known:
+    ? r.decodeThrough(slot, chunkIdx, i)
+    if i >= m.known:
+      return err("step " & $eventIndex & " is past the end of its exec chunk")
+  ? r.resolveThrough(slot, chunkIdx, i)
+  if i >= m.posRefusedAt:
+    return err(m.posRefusal)
+  ok(m.positions[i])
+
+proc chunkPositions*(r: var ExecStreamReader, chunkIdx: int,
+    output: var seq[uint64]): Result[void, string] =
+  ## `resolveChunkPositions` over chunk `chunkIdx`'s records, decoded in one
+  ## pass over the inflated chunk rather than collected into a sequence of
+  ## events first.
+  if chunkIdx < 0 or chunkIdx >= r.offsets.len:
+    return err("chunk index out of range: " & $chunkIdx)
+  let slot = ?r.chunkSlot(chunkIdx)
+  let count = ? r.chunkRecordCount(slot, chunkIdx)
+  if count > 0:
+    ? r.resolveThrough(slot, chunkIdx, count - 1)
+  template m: untyped = r.cache.meta(slot)
+  if m.posRefusedAt < count:
+    output.setLen(0)
+    return err(m.posRefusal)
+  output.setLenUninit(count)  # every entry is written below
+  for i in 0 ..< count:
+    output[i] = m.positions[i]
   ok()
 
 proc chunkIndexFor*(r: ExecStreamReader, eventIndex: uint64): int =

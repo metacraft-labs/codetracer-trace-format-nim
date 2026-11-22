@@ -558,19 +558,15 @@ proc verifyCorpus*(data: seq[byte]): int32 =
   0'i32
 
 # ---------------------------------------------------------------------------
-# The legacy Nim-v4 framing
+# A container in a stream layout that is not part of the trace format
 # ---------------------------------------------------------------------------
 #
-# A pre-M24a bundle is a SPLIT container — no `events.log` — whose meta.dat
-# leaves the three stream bits clear, so the reader picks its framing from the
-# flags rather than from the bytes.  That makes it the one shape where a wrong
-# answer is guaranteed to look right: the container opens, the counts are
-# plausible and the positions are in range whichever framing is chosen.
-#
-# `verifyLegacyCorpus` therefore checks decoded CONTENT against the corpus
-# definition, and `LegacyMisframedExpectation` below pins what happens when the
-# flags LIE — see `trace_reader_corpus_build.nim` for how that container is
-# produced.
+# Values, I/O events and calls stored as uncompressed variable-size record
+# tables (`values.off`, `events.off`, `calls.off`) with their presence bits
+# clear in `meta.dat`. A reader reads every container in the spec layout and
+# refuses one that carries such a member, naming it -- whatever its `meta.dat`
+# flags claim. `trace_reader_corpus_build.nim` builds the container, once with
+# the flags clear and once claiming the spec layout.
 
 const
   LegacyRecordingId* = "0192f8a0-1234-7abc-8def-0123456789ad"
@@ -578,9 +574,6 @@ const
 
   LegacySteps* = 40
   LegacyChunkSize* = 8
-    ## Five chunks, so the legacy per-chunk `u32 count` header is crossed
-    ## several times and the `total_events` trailer is not the only thing that
-    ## has to be right.
 
   LegacyPath0* = "/legacy/v4/alpha.nim"
   LegacyPath1* = "/legacy/v4/beta.nim"
@@ -592,29 +585,15 @@ const
   LegacyValueByte* = 0x5A'u8
 
 proc legacyStepGli*(i: int): uint64 =
-  ## The `global_position_index` of step `i` in the legacy corpus.
-  ##
-  ## The corpus writes these integers into `steps.dat` directly and reads
-  ## them back as integers, so what matters is only that the sequence is
-  ## fixed and that its deltas straddle the ±63 DeltaStep window — some
-  ## steps inside it, some outside — which exercises both encodings. It is
-  ## not run through `globalIndex`, so it asserts nothing about how a file
-  ## id and a line are apportioned into an address; the whole sequence sits
-  ## inside path 0's slot in a `DefaultLinesPerFile` space.
+  ## The `global_position_index` of step `i` in the container: deltas that
+  ## straddle the ±63 DeltaStep window, so both encodings are written.
   1000'u64 + uint64(i) * 3'u64
 
 proc legacyValueBytes*(i: int): seq[byte] =
-  ## A minimal CBOR-ish payload; the legacy value record carries a verbatim
-  ## type id alongside it, which is exactly what the SPEC framing dropped.
   @[0x18'u8, byte((int(LegacyValueByte) + i) and 0xFF)]
 
 proc legacyIoOrdinal*(i: int): uint8 =
-  ## The legacy record's kind byte: the old four-value API ordinal.
   uint8(i mod 4)
-
-proc legacyIoKind*(i: int): EventLogKind =
-  ## The EventLogKind a reader reports for `legacyIoOrdinal(i)`.
-  [elkWrite, elkWriteOther, elkReadFile, elkError][i mod 4]
 
 proc legacyIoStep*(i: int): uint64 =
   uint64(i * 5 + 1)
@@ -624,114 +603,30 @@ proc legacyIoData*(i: int): seq[byte] =
     result.add(byte((0x40 + i * 11 + k) and 0xFF))
 
 proc verifyLegacyCorpus*(data: seq[byte]): int32 =
-  ## Codes 200..249.  Open a LEGACY-framed v4 container and check what the
-  ## reader decodes, against values the corpus definition computes.
+  ## Codes 200..209. 0 when the reader refuses the container, naming the
+  ## member of the layout it carries.
   if data.len == 0: return 200
-
   let rr = openNewTraceFromBytes(data)
-  if rr.isErr: return 201
-  var r = rr.get()
-
-  # The framing discriminator itself.  If any of these is set the container is
-  # not the legacy shape and the rest of this proc would be testing the SPEC
-  # reader under a legacy name.
-  if r.meta.hasStepStream: return 202
-  if r.meta.hasValueStream: return 203
-  if r.meta.hasIoEventStream: return 204
-  # A legacy bundle is line-only.  The reader speculatively parses paths.dat
-  # as column-aware Layout A and PROMOTES the flag when that parse succeeds;
-  # a promotion here would silently reinterpret every position as a byte
-  # offset, so it is checked rather than assumed.
-  if r.meta.hasColumnAwareSteps: return 205
-
-  if r.pathCount() != 2'u64: return 210
-  let p0 = r.path(0'u64)
-  if p0.isErr or p0.get() != LegacyPath0: return 211
-  let p1 = r.path(1'u64)
-  if p1.isErr or p1.get() != LegacyPath1: return 212
-  let lf0 = r.function(0'u64)
-  if lf0.isErr or lf0.get() != LegacyFunc0: return 213
-  let lt0 = r.typeName(0'u64)
-  if lt0.isErr or lt0.get() != LegacyType0: return 214
-  let lv0 = r.varname(0'u64)
-  if lv0.isErr or lv0.get() != LegacyVar0: return 215
-
-  let sc = r.stepCount()
-  if sc.isErr: return 220
-  if sc.get() != uint64(LegacySteps): return 221
-
-  for i in 0 ..< LegacySteps:
-    let gliRes = r.stepAbsoluteGlobalLineIndex(uint64(i))
-    if gliRes.isErr: return 222
-    if gliRes.get() != legacyStepGli(i): return int32(223)
-
-  var bulk = newSeq[uint64](LegacySteps)
-  let nb = r.stepAbsoluteGlobalLineIndices(0'u64, uint64(LegacySteps), bulk)
-  if nb.isErr or nb.get() != uint64(LegacySteps): return 224
-  for i in 0 ..< LegacySteps:
-    if bulk[i] != legacyStepGli(i): return int32(225)
-
-  # Legacy `.off` VRT values: one record per step, carrying a verbatim type id.
-  for i in 0 ..< LegacySteps:
-    let vRes = r.values(uint64(i))
-    if vRes.isErr: return 230
-    let vs = vRes.get()
-    if vs.len != 1: return 231
-    if vs[0].varnameId != 0'u64: return 232
-    if vs[0].typeId != 0'u64: return 233
-    let want = legacyValueBytes(i)
-    if vs[0].data.len != want.len: return 234
-    for k in 0 ..< want.len:
-      if vs[0].data[k] != want[k]: return 235
-
-  # Legacy `.off` VRT IO events: the kind byte is the IOEventKind ordinal, not
-  # an EventLogKind ordinal, and there is no metadata field at all.
-  let ioCnt = r.ioEventCount()
-  if ioCnt.isErr: return 240
-  if ioCnt.get() != uint64(LegacyIoCount): return 241
-  for i in 0 ..< LegacyIoCount:
-    let evRes = r.ioEvent(uint64(i))
-    if evRes.isErr: return 242
-    let ev = evRes.get()
-    if ev.kind != legacyIoKind(i): return 243
-    if ev.stepId != legacyIoStep(i): return 244
-    if ev.metadata.len != 0: return 245
-    let want = legacyIoData(i)
-    if ev.data.len != want.len: return 246
-    for k in 0 ..< want.len:
-      if ev.data[k] != want[k]: return 247
-
-  0'i32
+  if rr.isOk: return 201
+  const needle = "values.off"
+  let why = rr.unsafeError
+  for at in 0 .. why.len - needle.len:
+    if why.toOpenArray(at, at + needle.len - 1) == needle.toOpenArray(0, needle.len - 1):
+      return 0'i32
+  202
 
 proc probeMisframedLegacy*(data: seq[byte]): int32 =
-  ## Read a legacy-framed container whose meta.dat CLAIMS the SPEC framing.
-  ##
-  ## This is not a container any writer produces; it is the mis-discrimination
-  ## itself, isolated.  The question it answers is the one that matters for a
-  ## browser: when the flag and the bytes disagree, does the reader FAIL, or
-  ## does it hand back a step count and positions that look like a trace?
-  ##
-  ## Returns a bit set, so one call distinguishes the outcomes:
-  ##   1 — the container opened
-  ##   2 — a step count came back
-  ##   4 — that step count was WRONG (the legacy value is `LegacySteps`)
-  ##   8 — step 0's position resolved at all
-  ##  16 — that position was WRONG
-  ## A reader that fails loudly returns 1 or 3; a reader that returns
-  ## wrong-but-plausible data sets bits 4 and/or 16.
+  ## The same container with `meta.dat` claiming the spec layout. The flags
+  ## decide nothing: the container is refused just the same. Returns 0 then,
+  ## or a bit set of what it answered instead: 1 it opened, 2 a step count
+  ## came back, 8 step 0's position resolved.
   let rr = openNewTraceFromBytes(data)
   if rr.isErr: return 0
   var r = rr.get()
   result = 1
-  let sc = r.stepCount()
-  if sc.isOk:
+  if r.stepCount().isOk:
     result = result or 2
-    if sc.get() != uint64(LegacySteps):
-      result = result or 4
-  let gli = r.stepAbsoluteGlobalLineIndex(0'u64)
-  if gli.isOk:
+  if r.stepAbsoluteGlobalLineIndex(0'u64).isOk:
     result = result or 8
-    if gli.get() != legacyStepGli(0):
-      result = result or 16
 
 {.pop.}

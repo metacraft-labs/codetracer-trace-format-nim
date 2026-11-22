@@ -154,7 +154,41 @@ proc test_lookup_cost_at_scale() =
          "  lookup=", formatFloat(perLookupUs, ffDecimal, 3), " us"
   echo "PASS: test_lookup_cost_at_scale"
 
+proc test_boundary_entry_reserved_bytes_are_zero() =
+  ## A kind-1 entry's identity is `marker_id || key_fingerprint || reserved[8]`
+  ## and the reserved bytes are written as zero; the B-tree key is not stored
+  ## in the entry.
+  let m = initBoundaryMarker(7, "order-42", isRecv = true, geid = 3)
+  let image = serializeCorrmarkNamespace([m])
+  doAssert image.isOk, image.error
+  var idx = openCorrmarkIndex(image.get()).get()
+  let entries = idx.allEntries().get()
+  doAssert entries.len == 1
+  for i in 0 ..< 8:
+    doAssert entries[0].spanId[i] == 0,
+      "reserved byte " & $(16 + i) & " of a kind-1 identity is not zero"
+  doAssert entries[0].markerIdOf() == 7
+  doAssert entries[0].keyFingerprintOf() == keyFingerprint("order-42")
+  let hits = idx.lookupBoundary(7, "order-42").get()
+  doAssert hits.len == 1 and hits[0].geid == 3 and hits[0].flags == MarkerFlagExit
+  echo "PASS: test_boundary_entry_reserved_bytes_are_zero"
+
+proc test_boundary_lookup_ignores_reserved_bytes() =
+  ## A reader confirms a kind-1 entry by `marker_id` and the fingerprint only,
+  ## so an entry whose reserved bytes are not zero is still found.
+  var m = initBoundaryMarker(9, "k", isRecv = false, geid = 5)
+  for i in 0 ..< 8:
+    m.spanId[i] = byte(0xA0 + i)
+  let image = serializeCorrmarkNamespace([m]).get()
+  var idx = openCorrmarkIndex(image).get()
+  doAssert idx.lookupBoundary(9, "k").get().len == 1
+  doAssert idx.lookupBoundary(9, "other").get().len == 0
+  doAssert idx.lookupBoundary(8, "k").get().len == 0
+  echo "PASS: test_boundary_lookup_ignores_reserved_bytes"
+
 when isMainModule:
+  test_boundary_entry_reserved_bytes_are_zero()
+  test_boundary_lookup_ignores_reserved_bytes()
   test_roundtrip_and_miss()
   test_empty_index_is_valid_and_answers_miss()
   test_collision_returns_the_right_span()

@@ -9,7 +9,7 @@ alias fmt := format
 # Build every shipping artifact: the `ct-print` / `ct-space` inspectors and
 # the C-FFI static library the sibling Rust crate
 # (`codetracer-trace-format/codetracer_trace_writer_nim`) links against.
-build: build-ct-print build-ct-space build-static-lib
+build: build-ct-print build-ct-space build-ctfs-salvage build-static-lib
 
 # `ct-print` lands at the repo root on purpose — downstream recorder tests
 # resolve it at the fixed sibling path `../codetracer-trace-format-nim/ct-print`.
@@ -18,6 +18,11 @@ build-ct-print:
 
 build-ct-space:
     nimble buildCtSpace
+
+# `ctfs-salvage`: copies an abandoned live coordination page's root entries into
+# the file after every writer died (`ctfs-container.md` §6, "Every writer dies").
+build-ctfs-salvage:
+    nimble buildCtfsSalvage
 
 # `libcodetracer_trace_writer.a` — what `codetracer_trace_writer_nim`'s
 # build.rs compiles and links. Building it here proves this repo alone can
@@ -39,6 +44,14 @@ test: test-nim test-ffi
 # sibling Rust reader through `cargo test`).
 test-nim:
     nimble test
+
+# The codetracer-ci sender writes each object by the route its upload session
+# names, into a real MinIO with a stand-in of codetracer-ci's upload routes
+# (`tests/test_managed_sender_ci_routes.nim`; the dev shell provides `minio`
+# and `python3`). The nimble `test` task (so `just test`) runs it on every host
+# but Windows; this recipe runs it alone.
+test-managed-sender-ci-routes:
+    nim c -r -d:release -p:src -o:build/test-bin/test_managed_sender_ci_routes tests/test_managed_sender_ci_routes.nim
 
 # The C-FFI smoke test: build the static library, compile `tests/test_ffi.c`
 # against it and run it.
@@ -63,7 +76,6 @@ lint-nim:
     set -euo pipefail
     for m in src/codetracer_ctfs.nim \
               src/codetracer_trace_types.nim \
-              src/codetracer_trace_writer.nim \
               src/codetracer_profile_writer.nim \
               src/codetracer_trace_reader.nim \
               src/codetracer_ct_print_lib.nim; do
@@ -95,3 +107,8 @@ nix-build:
 # `test`, which runs inside the shell.
 test-dev-shell:
     bash tests/test_dev_shell_writes_nothing_elsewhere.sh
+
+# Check refs with hermetic scanner controls before the network observation.
+check-ci-refs:
+    ci/check-ci-refs.sh --self-test
+    ci/check-ci-refs.sh

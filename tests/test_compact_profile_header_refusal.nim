@@ -116,7 +116,7 @@ proc writeFullContainer(): seq[byte] {.raises: [].} =
       ev = StepEvent(kind: sekDeltaStep, lineDelta: 1)
     doAssert ctfs.writeEvent(execW, ev).isOk, "writeEvent step"
     doAssert ctfs.writeStepValues(valW, @[
-      VariableValue(varnameId: 0, typeId: 0, data: toBytes($i))]).isOk,
+      VariableValue(varnameId: 0, data: toBytes($i))]).isOk,
       "writeStepValues"
 
   doAssert ctfs.writeCall(callW, call_stream.CallRecord(

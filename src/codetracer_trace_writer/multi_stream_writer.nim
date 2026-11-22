@@ -36,7 +36,8 @@ import ./step_map_builder
 import ./uuid_v7
 import ../codetracer_trace_types
 
-export results, value_stream.VariableValue, io_event_stream.EventLogKind,
+export results, value_stream.VariableValue, value_stream.typeId,
+       io_event_stream.EventLogKind,
        codetracer_trace_types.FilterProvenance, uuid_v7
 
 # The line-only address-space stride, re-exported for the consumers that
@@ -174,14 +175,10 @@ type
       ## True once at least one span has been registered, which is also when
       ## `spans.dat` / `spans.idx` were added to the container.
       ##
-      ## The span stream is the ONLY stream this writer does not always emit.
-      ## `meta.dat` bit 13 is a REJECTING flag for readers that predate it
-      ## (`KnownFlags`), so stamping it unconditionally would make every
-      ## container this writer produces unreadable by older readers, for a
-      ## feature almost no recording uses.  Gating on actual span registration
-      ## keeps a span-free container byte-for-byte identical to what this
-      ## writer produced before RS-M1 — same files, flag word unchanged — which
-      ## is the same back-compat contract `source_views.dat` (bit 5) follows.
+      ## The span stream is created lazily, so a span-free container carries
+      ## none of its members. `meta.dat` bit 13 stays clear either way: it is
+      ## written at the first record, before any span, and a reader finds the
+      ## stream by the presence of `spans.dat`.
     interning: TraceInterningTables
       ## The writer's OWN interning tables.  Used only when
       ## ``sharedInterning`` is nil (the classic owned/standalone path, and an
@@ -214,32 +211,27 @@ type
       ## (100000 lines of 1024), held as its rule rather than spelled out;
       ## on a line-only writer every entry is empty and unused.
     pathLineCounts: seq[uint64]
-    pendingFuncs: seq[tuple[path: string, line: uint64, name: string]]
-      ## `funcs.dat` records, held until `close`.
+    pendingFuncs: seq[tuple[path: string, line: uint64, name: string,
+        pathId: Option[uint64]]]
+      ## Every function registered, by id. Records `0 ..< funcsWritten` are in
+      ## `funcs.dat`; the rest wait for their declaration path.
       ##
-      ## THE TABLE IS DEFERRED BECAUSE ITS RECORD NEEDS AN ADDRESS THAT DOES NOT
-      ## EXIST YET. `internal-files.md:46` gives the record as
-      ## `global_line_index: varint, name_len: varint, name`, and that address is
-      ## the declaration site's position in the trace's global space — which is
-      ## only computable once the path is interned and, for a line-count or
-      ## column-aware trace, once its size is known. At `registerFunction` time
-      ## neither is guaranteed.
+      ## A record is written as soon as it and every function before it can
+      ## be: at registration when its path is registered, else when the path
+      ## is, else at `close`, which registers it.
       ##
-      ## The alternative was to intern the path here, and it is DISQUALIFIED by
-      ## measurement rather than taste: `registerPath` would intern it with an
-      ## EMPTY per-line length table, and this table is write-once, so the real
-      ## lengths arriving later could not correct it. That silently corrupts
-      ## column-aware addressing for the file.
-      ##
-      ## Deferring costs bounded writer memory and nothing else. Interning
-      ## tables are NOT streamed: `trace-events.md:109` lists them as
-      ## "Loaded at startup", `internal-files.md:49` as "loaded at reader startup
-      ## (typically 1-5 MB total)". A reader reads them whole before anything
-      ## else, so holding them until close does not weaken the streaming property
-      ## that `steps.dat`, `values.dat`, `calls.dat` and `events.dat` rely on.
-      ## At 64 bytes of path, 32 of name and 8 of line, 10,000 functions is about
-      ## 1 MB and 100,000 about 10 MB — the same order as the table the reader
-      ## loads regardless.
+      ## A record waits because its address — the declaration site's position
+      ## in the trace's line space (`internal-files.md`, `funcs.dat`) — needs
+      ## its file's place in that space, known only once the path is interned
+      ## and, for a line-count or column-aware trace, sized. Interning the path
+      ## at `registerFunction` instead is disqualified: it would intern it with
+      ## an EMPTY per-line length table, and that table is write-once, so the
+      ## real lengths arriving later could not correct it.
+    funcsWritten: int
+      ## How many of `pendingFuncs` are in `funcs.dat`.
+    funcLineBases: seq[uint64]
+      ## `funcLineBases[i]` is file `i`'s base in the line space a function's
+      ## declaration address is in; extended as declarations reach new files.
     funcIds: Table[string, uint64]
       ## Name -> id for the deferred table, keeping the id space name-keyed as
       ## the C ABI's `trace_writer_ensure_function_id` requires.
@@ -346,6 +338,14 @@ type
       ## implement trace filters but ended up with a zero-length chain
       ## (spec § 7 distinguishes "no provenance recorded" from
       ## "provenance recorded but empty").
+
+    # The other flag-gated `meta.dat` blocks (`internal-files.md`
+    # §"Extended Fields"): MCR fields (bit 0), replay-launch fields (bit 1)
+    # and a layout snapshot (bit 2). Each is written when it is set, and is
+    # set before the first record, as the provenance chain is.
+    mcrFields*: Option[McrMetaFields]
+    replayLaunchFields*: Option[ReplayLaunchFields]
+    layoutSnapshotFields*: Option[LayoutSnapshotFields]
 
     # P6.3 / P6.4 — column-aware step mode.  When set:
     #  * `writeColumnStep` is permitted (emits tag 0x07, sekDeltaColumn);
@@ -491,9 +491,8 @@ proc rebuildGli(w: var MultiStreamTraceWriter) =
   ## differently there shifts the base of every file after it. Under the
   ## line-count table the reader recovers the sizes from the container;
   ## without it, neither the sizes nor the rule are recorded.
-  w.gli = buildGlobalLineIndex(
-    positionSpaceCounts(w.pathLineLengths, w.pathLineCounts,
-      w.paths.len, w.columnAwareSteps))
+  w.gli = positionSpace(w.pathLineLengths, w.pathLineCounts,
+    w.paths.len, w.columnAwareSteps)
   w.gliDirty = false
 
 proc extendGli(w: var MultiStreamTraceWriter) =
@@ -562,14 +561,14 @@ proc toGlobalLineIndex(w: var MultiStreamTraceWriter,
     if w.isConventionalPath(pathId):
       # Every line has the same length, so the sum is a product.
       let upTo = max(min(int64(line) - 1, int64(DefaultLinesPerFile)), 0'i64)
-      return w.gli.prefixSum[int(pathId)] +
+      return w.gli.fileBase(int(pathId)) +
         uint64(upTo) * uint64(ConventionalLineLength)
     let lls = w.pathLineLengths[int(pathId)]
     var lineOffset: uint64 = 0
     let upTo = min(int(line) - 1, lls.len)
     for i in 0 ..< upTo:
       lineOffset += uint64(lls[i])
-    return w.gli.prefixSum[int(pathId)] + lineOffset
+    return w.gli.fileBase(int(pathId)) + lineOffset
   w.gli.globalIndex(int(pathId), line)
 
 proc checkLineWithinFile(w: var MultiStreamTraceWriter,
@@ -640,6 +639,9 @@ proc commitMeta(w: var MultiStreamTraceWriter): Result[void, string] =
   var metaFile = metaFileRes.get()
   let metaRes = w.container.writeMetaDat(
     metaFile, w.metadata,
+    mcrFields = w.mcrFields,
+    replayLaunchFields = w.replayLaunchFields,
+    layoutSnapshotFields = w.layoutSnapshotFields,
     filterProvenance = w.filterProvenance,
     emitFilterProvenance = w.recordEmptyFilterProvenance,
     columnAwareSteps = w.columnAwareSteps,
@@ -1020,6 +1022,30 @@ proc addFilterProvenance*(w: var MultiStreamTraceWriter,
   w.filterProvenance.add(entry)
   ok()
 
+proc setMcrFields*(w: var MultiStreamTraceWriter,
+    fields: McrMetaFields): Result[void, string] =
+  ## Write the MCR fields block (`meta.dat` flag bit 0). Refused once
+  ## ``meta.dat`` is written.
+  ? w.refuseAfterCommit("setMcrFields")
+  w.mcrFields = some(fields)
+  ok()
+
+proc setReplayLaunchFields*(w: var MultiStreamTraceWriter,
+    fields: ReplayLaunchFields): Result[void, string] =
+  ## Write the replay-launch fields block (`meta.dat` flag bit 1). Refused
+  ## once ``meta.dat`` is written.
+  ? w.refuseAfterCommit("setReplayLaunchFields")
+  w.replayLaunchFields = some(fields)
+  ok()
+
+proc setLayoutSnapshot*(w: var MultiStreamTraceWriter,
+    fields: LayoutSnapshotFields): Result[void, string] =
+  ## Write the layout snapshot block (`meta.dat` flag bit 2). Refused once
+  ## ``meta.dat`` is written.
+  ? w.refuseAfterCommit("setLayoutSnapshot")
+  w.layoutSnapshotFields = some(fields)
+  ok()
+
 proc recordEmptyFilterProvenanceBlock*(w: var MultiStreamTraceWriter):
     Result[void, string] =
   ## Emit a present-but-empty provenance block. Refused once ``meta.dat`` is
@@ -1035,6 +1061,9 @@ proc linehits*(w: var MultiStreamTraceWriter): var LinehitsBuilder =
 # ---------------------------------------------------------------------------
 # Path registration
 # ---------------------------------------------------------------------------
+
+proc writeReadyFuncs(w: var MultiStreamTraceWriter,
+    atClose = false): Result[void, string]
 
 proc registerPath*(w: var MultiStreamTraceWriter,
     path: string,
@@ -1114,6 +1143,7 @@ proc registerPath*(w: var MultiStreamTraceWriter,
     # ``positionSpaceCounts`` reads that as the pre-table convention.
     w.pathLineCounts.add(if w.lineCountTable: lineCount else: 0'u64)
     w.extendGli()
+    ?w.writeReadyFuncs()
   ok(id)
 
 # ---------------------------------------------------------------------------
@@ -1287,6 +1317,7 @@ proc registerPathVersion*(w: var MultiStreamTraceWriter,
       w.extendGli()
 
   w.currentPathVersions[gdh1VersionKey(path)] = id
+  ?w.writeReadyFuncs()
   ok(id)
 
 proc currentPathId*(w: MultiStreamTraceWriter,
@@ -1321,13 +1352,25 @@ proc pathIdIfRegistered*(w: MultiStreamTraceWriter,
   let current = w.currentPathId(path)
   if current.isSome:
     return current
-  # Reverse scan so that, if a version was ever appended without going
-  # through `currentPathVersions`, the NEWEST record still wins — the
-  # same rule `registerStep` follows.
-  for i in countdown(w.paths.len - 1, 0):
-    if w.paths[i] == path:
-      return some(uint64(i))
-  none(uint64)
+  # The NEWEST record of the name wins, even for a version appended
+  # without going through `currentPathVersions` — the same rule
+  # `registerStep` follows.
+  when gdh1Arm(gdh1FalsifyPrepend):
+    # The falsifier inserts at index 0 and so moves every recorded index.
+    for i in countdown(w.paths.len - 1, 0):
+      if w.paths[i] == path:
+        return some(uint64(i))
+    none(uint64)
+  else:
+    # A file with one version is found by the interning table's own hash,
+    # under the key it was registered with (the bare path when column-aware).
+    let key =
+      if w.columnAwareSteps: path
+      else: qualifiedPayload(w.qualifier, path)
+    let tables =
+      if w.sharedInterning != nil: w.sharedInterning
+      else: unsafeAddr w.interning
+    tables[].paths.lookupId(key)
 
 proc pathIdForStep*(w: var MultiStreamTraceWriter,
     path: string): Result[uint64, string] =
@@ -1389,20 +1432,73 @@ proc registerSourceView*(w: var MultiStreamTraceWriter,
 # Function / Type / Varname registration (interning)
 # ---------------------------------------------------------------------------
 
+proc funcLineBase(w: var MultiStreamTraceWriter, pathId: uint64): uint64 =
+  ## File `pathId`'s base in the line space of declaration addresses: every
+  ## earlier file sized by its recorded line count, or `DefaultLinesPerFile`
+  ## where it records none. Every file below `pathId` is registered, and a
+  ## file's size never changes once it is.
+  if w.funcLineBases.len == 0:
+    w.funcLineBases.add(0'u64)
+  while uint64(w.funcLineBases.len) <= pathId:
+    let i = w.funcLineBases.len - 1
+    let count =
+      if w.lineCountTable and i < w.pathLineCounts.len and w.pathLineCounts[i] > 0:
+        w.pathLineCounts[i]
+      else:
+        DefaultLinesPerFile
+    w.funcLineBases.add(w.funcLineBases[^1] + count)
+  w.funcLineBases[int(pathId)]
+
+proc writeReadyFuncs(w: var MultiStreamTraceWriter,
+    atClose = false): Result[void, string] =
+  ## Append the `funcs.dat` records that can be written now, in id order,
+  ## stopping at the first whose declaration path is not registered.
+  ## `atClose` writes a function with no declaration path at file 0.
+  while w.funcsWritten < w.pendingFuncs.len:
+    let i = w.funcsWritten
+    var pathId: uint64
+    if w.pendingFuncs[i].pathId.isSome:
+      pathId = w.pendingFuncs[i].pathId.get()
+    elif w.pendingFuncs[i].path.len > 0:
+      let current = w.pathIdIfRegistered(w.pendingFuncs[i].path)
+      if current.isNone:
+        break
+      pathId = current.get()
+    elif atClose:
+      pathId = 0'u64
+    else:
+      break
+    # A LINE ADDRESS, NOT THE COLUMN-AWARE POSITION ADDRESS: the column
+    # extension re-interprets the address carried by STEP records and says
+    # nothing about `funcs.dat` (`internal-files.md`), and a declaration site
+    # is a line, not a cursor position.
+    let line = max(w.pendingFuncs[i].line, 1'u64)
+    let gli = w.funcLineBase(pathId) + (line - 1)
+    let rec = encodeFuncRecord(gli, w.pendingFuncs[i].name)
+    discard ?w.container.appendRecord(w.interningPtr[].funcs, rec)
+    w.funcsWritten += 1
+  ok()
+
 proc registerFunctionAt*(w: var MultiStreamTraceWriter,
     path: string, line: uint64, name: string): Result[uint64, string] =
   ## Register a function at its declaration site and return its interned ID.
   ##
-  ## The record is BUFFERED, not written: see `pendingFuncs` for why the address
-  ## it needs cannot be computed here. The id is allocated immediately, so a
-  ## caller can reference the function straight away.
+  ## The record is written now when its declaration path and every earlier
+  ## function's are registered, and otherwise waits (see `pendingFuncs`). The
+  ## id is allocated immediately, so a caller can reference the function
+  ## straight away.
   let key = qualifiedPayload(w.qualifier, name)
   let existing = w.funcIds.getOrDefault(key, high(uint64))
   if existing != high(uint64):
     return ok(existing)
   let id = uint64(w.pendingFuncs.len)
-  w.pendingFuncs.add((path: path, line: line, name: key))
+  # The declaration file's id is the version current NOW, when the path is
+  # registered already (`internal-files.md` §"`paths.dat` path versions"); a
+  # version registered later must not move the function into its range.
+  let pathId = if path.len > 0: w.pathIdIfRegistered(path) else: none(uint64)
+  w.pendingFuncs.add((path: path, line: line, name: key, pathId: pathId))
   w.funcIds[key] = id
+  ?w.writeReadyFuncs()
   ok(id)
 
 proc registerFunction*(w: var MultiStreamTraceWriter,
@@ -1878,11 +1974,16 @@ proc markCurrentCallAsEntry*(w: var MultiStreamTraceWriter): Result[void, string
   ok()
 
 proc registerReturn*(w: var MultiStreamTraceWriter,
-    returnValue: seq[byte] = @[]): Result[void, string] =
+    returnValue: seq[byte] = @[],
+    exception: seq[byte] = @[]): Result[void, string] =
   ## Register a function return. Pops the call stack and buffers the
   ## CallRecord under its entry-allocated call_key. The buffer flushes
   ## (in call_key order) once `callStack` becomes empty, ensuring the
   ## record position in the call stream equals its entry-order call_key.
+  ##
+  ## `exception` is the CBOR value of the exception the call exited by,
+  ## when it exited by one (`trace-events.md` §"Call Stream Records",
+  ## `exception`); empty when it returned.
   if w.closed:
     return err("writer is closed")
   ? w.commitMeta()
@@ -1931,7 +2032,7 @@ proc registerReturn*(w: var MultiStreamTraceWriter,
     depth: pending.depth,
     args: pending.args,
     returnValue: retVal,
-    exception: @[],
+    exception: exception,
     children: pending.children,
   )
 
@@ -2296,6 +2397,10 @@ proc registerCorrelationMarkerById*(w: var MultiStreamTraceWriter,
   ## `stepCount - 1` names the previous one (issue #601, the same accounting
   ## `trace_writer_register_special_event` documents).
   ##
+  ## Before any step, `none` resolves to 0: resume replay from the start,
+  ## even if this recording never emits a step. Zero is a coordinate, never
+  ## an unset sentinel, and registering the marker still mints no step.
+  ##
   ## `keyText` and `showText` are the NAMES the two values were read under —
   ## `key_text` is the textual form of the `key=<expr>` declaration, and
   ## `showText` is the binding the shown value came from. `showText` is
@@ -2391,7 +2496,8 @@ proc registerSpanCoverage*(w: var MultiStreamTraceWriter,
   ## from — and follows the same rule as a boundary marker's: `none` means the
   ## last step this writer emitted, and a caller that buffers its steps (the C
   ## ABI) passes the id explicitly. No step is minted, for the reason in
-  ## §11a.6.
+  ## §11a.6. Before any step, `none` resolves to 0 (resume from the start),
+  ## even when the recording closes without steps; zero is never unset.
   if w.closed:
     return err("writer is closed")
   ? w.commitMeta()
@@ -2709,65 +2815,22 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
   # it at its first record.
   ? w.commitMeta()
 
-  # FLUSH THE DEFERRED `funcs.dat` FIRST, while the container is still open and
-  # every path this trace will ever register is already interned. That is the
-  # whole point of deferring: the record's `global_line_index` is computable now
-  # and was not computable when the function was registered.
-  #
-  # A declaration path that was never interned is a real possibility — a
-  # function in a file no step ever visited — and it is interned HERE rather
-  # than refused. Doing it now is safe in the way doing it early was not: no
-  # further step can arrive to contradict an empty per-line length table,
-  # because the writer is closing.
-  #
-  # THE LINE SPACE IS BUILT HERE AND IS NOT `w.gli`. In a column-aware trace
-  # `w.gli` is the BYTE-OFFSET position space the step stream addresses through,
-  # and using it gave a function in the second file address 8 where the Rust
-  # writer gave 100000. A per-file line count of `DefaultLinesPerFile` where the
-  # trace records no real one is the same convention the Rust writer's
-  # `LinePositionSpace` uses, and both constants are 100,000.
-  # EVERY DECLARATION PATH IS REGISTERED BEFORE THE SPACE IS SIZED. A function
-  # whose file no step visited brings a path nothing else interned; sizing the
-  # space from the paths interned so far and interning afterwards addressed that
-  # file past the end of the space (an IndexDefect inside `close()`). And it is
-  # registered through `registerPath`, the route every other path takes, so the
-  # record has the table's layout and the path reaches `meta.dat`'s list. Under
-  # the line-count table such a path has no recorded size and is refused there,
-  # by name: laying it out at an assumed size is what the table exists to stop.
-  var funcPathIds = newSeq[uint64](w.pendingFuncs.len)
-  for i, pf in w.pendingFuncs:
-    if pf.path.len > 0:
-      let idRes = w.registerPath(pf.path)
+  # The function records still waiting for their declaration path, first,
+  # while the container is open. A declaration path that was never interned —
+  # a function in a file no step visited — is interned here rather than
+  # refused: no later step can arrive to contradict its table, because the
+  # writer is closing. Under the line-count table such a path has no recorded
+  # size and `registerPath` refuses it, by name.
+  while w.funcsWritten < w.pendingFuncs.len:
+    let i = w.funcsWritten
+    if w.pendingFuncs[i].pathId.isNone and w.pendingFuncs[i].path.len > 0 and
+        w.pathIdIfRegistered(w.pendingFuncs[i].path).isNone:
+      let idRes = w.registerPath(w.pendingFuncs[i].path)
       if idRes.isErr:
-        return err("close: function " & pf.name & " is declared at " &
-          pf.path & ", which could not be registered: " & idRes.error)
-      funcPathIds[i] = idRes.get()
-
-  var lineCounts: seq[uint64] = @[]
-  let pathCount = w.interningPtr[].paths.count()
-  for i in 0 ..< int(pathCount):
-    if w.lineCountTable and i < w.pathLineCounts.len and w.pathLineCounts[i] > 0:
-      lineCounts.add(w.pathLineCounts[i])
-    else:
-      lineCounts.add(DefaultLinesPerFile)
-  var lineSpace = buildGlobalLineIndex(lineCounts)
-
-  for i, pf in w.pendingFuncs:
-    let pathId = funcPathIds[i]
-    # A LINE ADDRESS, NOT THE COLUMN-AWARE POSITION ADDRESS, and the difference
-    # is not academic: `toGlobalLineIndex` returns a byte offset in a
-    # column-aware trace, so using it here gave a function in the second file
-    # address 8 where the Rust writer gave 100000, for the same function in the
-    # same trace.
-    #
-    # `internal-files.md` settles it: the column extension re-interprets the
-    # address carried by STEP records and says nothing about `funcs.dat`, and a
-    # declaration site is a line rather than a cursor position — there is no
-    # column at which a function is declared.
-    let gli = lineSpace.globalIndex(int(pathId), max(pf.line, 1))
-    let rec = encodeFuncRecord(gli, pf.name)
-    discard ?w.container.appendRecord(w.interningPtr[].funcs, rec)
-  w.pendingFuncs.setLen(0)
+        return err("close: function " & w.pendingFuncs[i].name &
+          " is declared at " & w.pendingFuncs[i].path &
+          ", which could not be registered: " & idRes.error)
+    ?w.writeReadyFuncs(atClose = true)
 
   # Finalize linehits if enabled
   if w.linehitsBuilder.isSome:
@@ -2845,8 +2908,7 @@ proc close*(w: var MultiStreamTraceWriter): Result[void, string] =
 
   # RS-M1: flush the last partial spans.dat chunk and emit the spantype.ns
   # span-type index.  Skipped entirely when no span was ever registered, so a
-  # span-free container gains no new files and keeps bit 13 clear.  Must run
-  # before meta.dat so the has_span_stream flag below is accurate.
+  # span-free container gains no span members.
   if w.hasSpans:
     let spanFlushRes = span_stream.flush(w.container, w.spanWriter)
     if spanFlushRes.isErr:
@@ -2991,8 +3053,14 @@ proc isClosed*(w: MultiStreamTraceWriter): bool =
   w.closed
 
 proc toBytes*(w: var MultiStreamTraceWriter): seq[byte] =
-  ## Get the serialized CTFS bytes. Must call close() first.
+  ## The container image as it stands. Must call close() first. A caller that
+  ## hands the bytes on as a recording takes them through `finish` instead.
   w.container.toBytes()
+
+proc finish*(w: var MultiStreamTraceWriter): Result[seq[byte], string] =
+  ## The finished container's bytes, after close(): `finishCtfs`, which
+  ## refuses a container carrying some but not all of the interning tables.
+  finishCtfs(w.container)
 
 proc closeCtfs*(w: var MultiStreamTraceWriter): Result[void, string]
     {.discardable.} =

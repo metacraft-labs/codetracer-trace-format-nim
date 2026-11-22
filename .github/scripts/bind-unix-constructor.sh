@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Acquire committed source before the owning shell can run its guarded installer.
+# Acquire committed source before the owning shell installs its hooks.
 # No working-tree flake, release fallback, host config write or token receipt.
-source_ref='git+https://github.com/metacraft-labs/reprobuild?rev=064daf5b154ea6a0758ddb2dcbcbc07685216e44&shallow=1'
-expected_revision='064daf5b154ea6a0758ddb2dcbcbc07685216e44'
+source_ref='git+https://github.com/metacraft-labs/reprobuild?rev=9979846112d606818f13f5952d808cb4da5bba0b&shallow=1'
+expected_revision='9979846112d606818f13f5952d808cb4da5bba0b'
 proof_root="$GITHUB_WORKSPACE/.repro/constructor-binding"
 test ! -L "$GITHUB_WORKSPACE/.repro"
 test ! -L "$proof_root"
 mkdir -p "$GITHUB_WORKSPACE/.repro"
 mkdir "$proof_root"
-mkdir "$proof_root/guard-stderr"
 printf '%s\n' 'Committed-source constructor prerequisite; platform tests and monitoring are separate.' > "$proof_root/scope.txt"
 
 if test -n "${GH_TOKEN:-}"; then
@@ -38,4 +37,3 @@ nix hash file --type sha256 --base16 "$package/libexec/reprobuild-nix-daemon" > 
 "$package/bin/repro" hooks protocol --require=2 > "$proof_root/protocol.txt"
 printf 'REPROBUILD_REPRO=%s/bin/repro\n' "$package" >> "$GITHUB_ENV"
 printf '%s/bin\n' "$package" >> "$GITHUB_PATH"
-printf 'TRACE_NIM_GUARD_DIAGNOSTIC_ROOT=%s/guard-stderr\n' "$proof_root" >> "$GITHUB_ENV"

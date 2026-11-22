@@ -12,12 +12,9 @@
 ##
 ##   trace_reader_native <corpus.ct> <legacy.ct> <misframed.ct>
 ##
-## `legacy.ct` is the pre-M24a Nim-v4 framing, which the writer in `src/`
-## cannot emit (`close()` stamps the three stream bits unconditionally) and is
-## therefore laid out by hand — see `trace_reader_corpus_build.nim`.
-## `misframed.ct` is those same bytes with meta.dat claiming the SPEC framing:
-## not a container anything produces, but the isolated form of the question
-## "what does the reader do when the discriminator and the bytes disagree?"
+## `legacy.ct` is a container in the retired record-table layout, laid out by
+## hand (`trace_reader_corpus_build.nim`); `misframed.ct` is the same container
+## with meta.dat claiming the spec layout. The reader refuses both.
 
 import std/[os, strutils]
 import results
@@ -102,11 +99,12 @@ when isMainModule:
   let misBytes = misBuilt.get()
   writeContainer(paramStr(3), misBytes)
 
-  # Measured on the HOST, and asserted identical on wasm. The value is not
-  # predicted here: what a mis-discriminated container does is a property of
-  # the reader, and the claim being made is that the target agrees with the
-  # host about it — not that either outcome is the desired one.
+  # The flags decide nothing: the container that claims the spec layout is
+  # refused like the other, here and on wasm.
   let misframedBits = probeMisframedLegacy(misBytes)
+  if misframedBits != 0:
+    quit("native probeMisframedLegacy answered instead of refusing: " &
+      $misframedBits, 1)
 
   var probes: seq[string] = @[]
   for i in ProbeIndices:
@@ -180,20 +178,6 @@ when isMainModule:
       ",\"last\":" & $steps[^1] &
       ",\"sum\":" & $total & "}")
 
-  var legacyGli: seq[uint64] = @[]
-  for i in 0 ..< LegacySteps:
-    legacyGli.add(legacyStepGli(i))
-
-  var legacyValues: seq[string] = @[]
-  for i in 0 ..< LegacySteps:
-    legacyValues.add("\"" & hex(legacyValueBytes(i)) & "\"")
-
-  var legacyIo: seq[string] = @[]
-  for i in 0 ..< LegacyIoCount:
-    legacyIo.add("{\"kind\":" & $ord(legacyIoKind(i)) &
-      ",\"step\":" & $legacyIoStep(i) &
-      ",\"dataHex\":\"" & hex(legacyIoData(i)) & "\"}")
-
   echo "{",
     "\"bytes\":", bytes.len,
     ",\"steps\":", CorpusSteps,
@@ -211,16 +195,6 @@ when isMainModule:
     ",\"linehitPositions\":", corpusLinehitPositionCount(),
     ",\"linehitProbes\":[", linehitProbes.join(","), "]",
     ",\"linehitAbsent\":", LinehitAbsentPosition,
-    ",\"legacy\":{",
-      "\"bytes\":", legacyBytes.len,
-      ",\"steps\":", LegacySteps,
-      ",\"paths\":[\"", jsonEscape(LegacyPath0), "\",\"", jsonEscape(LegacyPath1), "\"]",
-      ",\"function\":\"", jsonEscape(LegacyFunc0), "\"",
-      ",\"type\":\"", jsonEscape(LegacyType0), "\"",
-      ",\"varname\":\"", jsonEscape(LegacyVar0), "\"",
-      ",\"gli\":", jsonArrayU64(legacyGli),
-      ",\"valuesHex\":[", legacyValues.join(","), "]",
-      ",\"io\":[", legacyIo.join(","), "]",
-    "}",
+    ",\"legacyBytes\":", legacyBytes.len,
     ",\"misframedBits\":", misframedBits,
     "}"

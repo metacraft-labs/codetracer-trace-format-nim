@@ -58,34 +58,19 @@
 ##
 ## The Rust ``StepValues`` pair is ``(name_id, CBOR value)`` — there is NO
 ## separate ``type_id`` field, because the type id is already embedded inside
-## the CBOR ``ValueRecord``.  The Nim ``VariableValue`` keeps a convenience
-## ``typeId`` field; on read it is reconstructed from the CBOR value's
-## top-level ``type_id`` (``topLevelTypeId``).  Recorders pass a ``typeId`` that
-## equals the value's own top-level type id, so the round-trip is lossless for
-## the production path; the redundant field is simply dropped from the wire.
+## the CBOR ``ValueRecord``.  The Nim ``VariableValue`` is the same pair; its
+## ``typeId`` accessor reads the CBOR value's top-level ``type_id`` when it is
+## asked for, and the reader does not derive it while it decodes.
 ##
-## # Backward compatibility (legacy Nim-v4 bundles)
-##
-## Bundles written by the pre-M24a-2 Nim writer used a ``VariableRecordTable``
-## (``values.dat`` + ``values.off`` — an uncompressed variable-size record table
-## with a u64 offset table), and a different per-record format (``varint count``,
-## then ``varint varnameId, varint typeId, varint dataLen, data`` per value).
-## Those bundles never set the ``meta.dat`` ``has_value_stream`` flag (bit 10),
-## so the FFI reader distinguishes the two layouts by that flag: flag set ⇒ SPEC
-## chunked layout, flag clear ⇒ legacy ``.off`` VRT layout.
-## ``initValueStreamReader`` accepts an explicit ``legacy`` parameter for this;
-## standalone callers that only ever read freshly-written bundles get the SPEC
-## layout by default.
-
 import results
 import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
 import ../codetracer_ctfs/streaming
-import ../codetracer_ctfs/variable_record_table
 import ../codetracer_ctfs/zstd_bindings
 import ../codetracer_trace_types
 import ./cbor
 import ./varint
+import ./record_chunk
 
 const
   DefaultValuesChunkSize* = 256
@@ -154,8 +139,11 @@ const
 
 type
   VariableValue* = object
+    ## One variable's value at a step: its interned name and its CBOR
+    ## ``ValueRecord``, the ``(name_id, CBOR)`` pair Rust's ``StepValues``
+    ## carries. The value's type id is inside the CBOR; ``typeId`` reads it
+    ## when asked, so a reader that never asks never pays for it.
     varnameId*: uint64
-    typeId*: uint64
     data*: seq[byte]  ## CBOR-encoded value bytes
 
   AssignmentEventEntry* = object
@@ -198,15 +186,7 @@ type
       ## compression until a later step makes it final.
 
   ValueStreamReader* = object
-    data: seq[byte]            ## raw values.dat content (SPEC mode)
-    chunkSize: uint32
-    offsets: seq[uint64]       ## chunk byte offsets from values.idx (SPEC mode)
-    totalRecordsVal: uint64
-    legacy: bool               ## true ⇒ legacy .off VRT layout; false ⇒ SPEC
-    legacyTable: VariableRecordTableReader  ## only valid when legacy == true
-    # Cache for last decompressed SPEC chunk: the decoded per-record byte slices.
-    cachedChunkIdx: int        ## -1 means no cache
-    cachedRecords: seq[seq[byte]]
+    spec: ChunkedRecords       ## values.dat + values.idx (SPEC mode)
     lastSkippedTags*: seq[uint8]  ## tags >= 10 skipped in the most recent readStepValues / readStepAssignments
     skippedTags*: seq[uint8]      ## distinct tags >= 10 skipped across all reads
     skippedTagCounts*: seq[(uint8, int)] ## cumulative count per tag
@@ -239,17 +219,13 @@ proc topLevelTypeId*(v: ValueRecord): uint64 =
   of vrkEnum: uint64(v.enumTypeId)
   of vrkCell, vrkValueRef: 0'u64
 
-proc decodeCborTopLevelTypeId(data: openArray[byte]): uint64 =
-  ## Decode the CBOR ``ValueRecord`` in ``data`` and return its top-level
-  ## ``type_id``.  Returns 0 on any decode failure (the data is still surfaced
-  ## verbatim; only the convenience type id is unavailable).
-  if data.len == 0:
-    return 0
-  var dec = CborDecoder.init(data)
-  let recRes = dec.decodeCborValueRecord()
-  if recRes.isErr:
-    return 0
-  topLevelTypeId(recRes.get())
+proc typeId*(v: VariableValue): uint64 =
+  ## The top-level ``type_id`` of ``v``'s CBOR ``ValueRecord``, read without
+  ## decoding the value (``cborTopLevelTypeId``). 0 when it has none or does
+  ## not parse (``data`` is still the value's bytes verbatim). It is read on
+  ## every call; a caller that asks for one value's type more than once keeps
+  ## the answer.
+  cborTopLevelTypeId(v.data)
 
 # ---------------------------------------------------------------------------
 # Per-record encode/decode (SPEC tag-0 StepValues, parallel-indexed by step)
@@ -422,131 +398,188 @@ type
       itemIndex*: uint64
       itemPlace*: int64
 
+type
+  WalkTarget = enum
+    ## What the one walker below builds out of a record.
+    wtEvents   ## every event, as a `DecodedValueEvent`
+    wtValues   ## only the tag-0 `StepValues` values, appended as they are read
+
+template refuse(message: string) {.dirty.} =
+  ## `return err(message)`, for a decoder that answers `bool` and names its
+  ## refusal in `why`.
+  why = message
+  return false
+
 proc decodeOneValueEvent(data: openArray[byte], pos: var int, tag: uint8,
-    events: var seq[DecodedValueEvent],
-    skippedTags: var seq[uint8]): Result[void, string] =
+    target: static WalkTarget,
+    events: var seq[DecodedValueEvent], values: var seq[VariableValue],
+    skippedTags: var seq[uint8], why: var string): bool =
   ## Decode the fields of one tagged value-stream event, its tag already read.
+  ## False, with `why` set, where the event does not decode. Called once per
+  ## event of every record read, so it builds no `Result`.
+  ## Every field is read and checked whatever `target` is; `target` decides
+  ## only what is built: with `wtValues` an event that is not `StepValues` is
+  ## stepped over without copying its payload, and a `StepValues` event's
+  ## values go straight into `values`.
   case tag
   of TagStepValues:
-    let count = int(?decodeVarint(data, pos))
-    var values = newSeq[VariableValue](count)
-    for i in 0 ..< count:
-      let vnId = ?decodeVarint(data, pos)
-      let dLen = int(?decodeVarint(data, pos))
-      if pos + dLen > data.len:
-        return err("truncated value data in StepValues record")
-      var d = newSeq[byte](dLen)
-      for j in 0 ..< dLen:
-        d[j] = data[pos + j]
+    let count = int(varintOrFail(data, pos, why))
+    # Every value takes at least two bytes, which bounds a count read from a
+    # damaged record before anything is sized by it.
+    if count < 0 or count > (data.len - pos) div 2:
+      refuse("StepValues count " & $count & " exceeds the record")
+    # The values are added to a list reserved for them rather than stored
+    # into one lengthened first: a lengthening zeroes the slots, and on
+    # wasm32 a zeroing of a size not known at compile time is a call into the
+    # host.
+    when target == wtValues:
+      template vals: untyped = values
+      if values.len == 0:
+        values = newSeqOfCap[VariableValue](count)
+    else:
+      var vals = newSeqOfCap[VariableValue](count)
+    for _ in 0 ..< count:
+      let vnId = varintOrFail(data, pos, why)
+      let dLen = int(varintOrFail(data, pos, why))
+      if dLen < 0 or dLen > data.len - pos:
+        refuse("truncated value data in StepValues record")
+      vals.add(VariableValue(varnameId: vnId,
+        data: fieldBytes(data, pos, dLen)))
       pos += dLen
-      values[i] = VariableValue(
-        varnameId: vnId,
-        typeId: decodeCborTopLevelTypeId(d),
-        data: d)
-    events.add(DecodedValueEvent(kind: veStepValues, values: values))
+    when target == wtEvents:
+      events.add(DecodedValueEvent(kind: veStepValues, values: vals))
   of TagBindVariable, TagVariableCell:
-    let vid = ?decodeVarint(data, pos)
-    let place = ?decodeSignedVarint(data, pos)
-    if tag == TagBindVariable:
-      events.add(DecodedValueEvent(kind: veBindVariable,
-        variableId: vid, variablePlace: place))
-    else:
-      events.add(DecodedValueEvent(kind: veVariableCell,
-        variableId: vid, variablePlace: place))
+    let vid = varintOrFail(data, pos, why)
+    let place = signedVarintOrFail(data, pos, why)
+    when target == wtEvents:
+      if tag == TagBindVariable:
+        events.add(DecodedValueEvent(kind: veBindVariable,
+          variableId: vid, variablePlace: place))
+      else:
+        events.add(DecodedValueEvent(kind: veVariableCell,
+          variableId: vid, variablePlace: place))
   of TagCellValue, TagCompoundValue, TagAssignCell:
-    let place = ?decodeSignedVarint(data, pos)
-    let vLen = ?decodeVarint(data, pos)
+    let place = signedVarintOrFail(data, pos, why)
+    let vLen = varintOrFail(data, pos, why)
     if vLen > uint64(data.len - pos):
-      return err("truncated CBOR value in value-stream event tag " & $tag)
-    let blob = @(data.toOpenArray(pos, pos + int(vLen) - 1))
+      refuse("truncated CBOR value in value-stream event tag " & $tag)
+    when target == wtEvents:
+      let blob = fieldBytes(data, pos, int(vLen))
+      case tag
+      of TagCellValue:
+        events.add(DecodedValueEvent(kind: veCellValue, place: place,
+          valueCbor: blob))
+      of TagCompoundValue:
+        events.add(DecodedValueEvent(kind: veCompoundValue, place: place,
+          valueCbor: blob))
+      else:
+        events.add(DecodedValueEvent(kind: veAssignCell, place: place,
+          valueCbor: blob))
     pos += int(vLen)
-    case tag
-    of TagCellValue:
-      events.add(DecodedValueEvent(kind: veCellValue, place: place,
-        valueCbor: blob))
-    of TagCompoundValue:
-      events.add(DecodedValueEvent(kind: veCompoundValue, place: place,
-        valueCbor: blob))
-    else:
-      events.add(DecodedValueEvent(kind: veAssignCell, place: place,
-        valueCbor: blob))
   of TagAssignCompoundItem:
-    let place = ?decodeSignedVarint(data, pos)
-    let index = ?decodeVarint(data, pos)
-    let itemPlace = ?decodeSignedVarint(data, pos)
-    events.add(DecodedValueEvent(kind: veAssignCompoundItem,
-      compoundPlace: place, itemIndex: index, itemPlace: itemPlace))
+    let place = signedVarintOrFail(data, pos, why)
+    let index = varintOrFail(data, pos, why)
+    let itemPlace = signedVarintOrFail(data, pos, why)
+    when target == wtEvents:
+      events.add(DecodedValueEvent(kind: veAssignCompoundItem,
+        compoundPlace: place, itemIndex: index, itemPlace: itemPlace))
   of TagDropVariable:
-    let id = ?decodeVarint(data, pos)
-    events.add(DecodedValueEvent(kind: veDropVariable, droppedId: id))
+    let id = varintOrFail(data, pos, why)
+    when target == wtEvents:
+      events.add(DecodedValueEvent(kind: veDropVariable, droppedId: id))
   of TagDropVariables:
-    let count = int(?decodeVarint(data, pos))
-    var ids = newSeq[uint64](count)
-    for i in 0 ..< count:
-      ids[i] = ?decodeVarint(data, pos)
-    events.add(DecodedValueEvent(kind: veDropVariables, droppedIds: ids))
+    let count = int(varintOrFail(data, pos, why))
+    if count < 0 or count > data.len - pos:
+      refuse("DropVariables count " & $count & " exceeds the record")
+    when target == wtEvents:
+      var ids = newSeq[uint64](count)
+      for i in 0 ..< count:
+        ids[i] = varintOrFail(data, pos, why)
+      events.add(DecodedValueEvent(kind: veDropVariables, droppedIds: ids))
+    else:
+      for i in 0 ..< count:
+        discard varintOrFail(data, pos, why)
   of TagAssignment:
-    let vnId = ?decodeVarint(data, pos)
+    let vnId = varintOrFail(data, pos, why)
     if pos >= data.len:
-      return err("truncated pass_by in Assignment value-stream event")
+      refuse("truncated pass_by in Assignment value-stream event")
     let passBy = data[pos]
     inc pos
-    let fromLen = int(?decodeVarint(data, pos))
-    if pos + fromLen > data.len:
-      return err("truncated RValue payload in Assignment value-stream event")
-    var blob = newSeq[byte](fromLen)
-    for j in 0 ..< fromLen:
-      blob[j] = data[pos + j]
+    let fromLen = int(varintOrFail(data, pos, why))
+    if fromLen < 0 or fromLen > data.len - pos:
+      refuse("truncated RValue payload in Assignment value-stream event")
+    when target == wtEvents:
+      let blob = fieldBytes(data, pos, fromLen)
+      events.add(DecodedValueEvent(kind: veAssignment,
+        assignment: AssignmentEventEntry(
+          varnameId: vnId, passBy: passBy, rvalueCbor: blob)))
+    else:
+      discard (vnId, passBy)
     pos += fromLen
-    events.add(DecodedValueEvent(kind: veAssignment,
-      assignment: AssignmentEventEntry(
-        varnameId: vnId, passBy: passBy, rvalueCbor: blob)))
   else:
     when defined(oldReaderPreForwardCompat):
-      return err("unsupported value-stream event tag " & $tag &
+      refuse("unsupported value-stream event tag " & $tag &
         " in Nim value record (this reader predates the tag; rebuild ct-print " &
         "from codetracer-trace-format-nim)")
     else:
       if tag >= 10:
-        let payloadLen = int(?decodeVarint(data, pos))
-        if pos + payloadLen > data.len:
-          return err("truncated payload in value-stream event tag " & $tag &
+        let payloadLen = int(varintOrFail(data, pos, why))
+        if payloadLen < 0 or payloadLen > data.len - pos:
+          refuse("truncated payload in value-stream event tag " & $tag &
             " (expected " & $payloadLen & " bytes, only " & $(data.len - pos) & " remain)")
         pos += payloadLen
         skippedTags.add(tag)
       else:
-        return err("unsupported value-stream event tag " & $tag &
+        refuse("unsupported value-stream event tag " & $tag &
           " in Nim value record (this reader predates the tag; rebuild ct-print " &
           "from codetracer-trace-format-nim)")
-  ok()
+  true
 
-proc decodeRecordEvents*(data: openArray[byte],
-    skippedTags: var seq[uint8]): Result[seq[DecodedValueEvent], string] =
-  ## Decode one SPEC value record — "the concatenation of zero-or-more tagged
-  ## value-stream events" — into those events, in wire order.
+proc walkRecord(data: openArray[byte], target: static WalkTarget,
+    events: var seq[DecodedValueEvent], values: var seq[VariableValue],
+    skippedTags: var seq[uint8], why: var string): bool =
+  ## THE ONLY WALKER over one SPEC value record — "the concatenation of
+  ## zero-or-more tagged value-stream events" — in wire order.
   ##
-  ## THIS IS THE ONLY WALKER.  Every accessor below filters its result rather
-  ## than walking the bytes itself, because tags below 10 are NOT
-  ## self-delimiting: a reader that does not know a tag's field layout cannot
-  ## skip it, so each walker has to handle EVERY tag correctly just to reach
-  ## the events it does care about.  Independent walkers made that a promise
-  ## repeated once per accessor, and one of them getting a tag wrong mis-frames
-  ## the whole rest of the record with nothing to show for it.
+  ## Every accessor below goes through it rather than walking the bytes
+  ## itself, because tags below 10 are NOT self-delimiting: a reader that does
+  ## not know a tag's field layout cannot skip it, so each walker has to
+  ## handle EVERY tag correctly just to reach the events it does care about.
+  ## Independent walkers made that a promise repeated once per accessor, and
+  ## one of them getting a tag wrong mis-frames the whole rest of the record
+  ## with nothing to show for it.
   ##
   ## Forward-compatibility (HX-S-5 / HX-OQ-8):
   ## Tags >= 10 are self-delimited by a varint length prefix following the tag,
   ## so they can be skipped without knowing their layout; their tags are
   ## recorded in ``skippedTags``.  Unknown tags < 10 are refused by name.
+  ##
+  ## False, with `why` set, where the record does not decode.
   var pos = 0
-  var events: seq[DecodedValueEvent] = @[]
   while pos < data.len:
     let tag = data[pos]
     inc pos
     let tagStart = pos - 1
-    let r = decodeOneValueEvent(data, pos, tag, events, skippedTags)
-    if r.isErr:
-      return err("value-stream event tag " & $tag & " at byte " & $tagStart &
-        ": " & r.error)
+    if not decodeOneValueEvent(data, pos, tag, target, events, values,
+        skippedTags, why):
+      refuse("value-stream event tag " & $tag & " at byte " & $tagStart &
+        ": " & why)
+  true
+
+proc walkRecord(data: openArray[byte], target: static WalkTarget,
+    events: var seq[DecodedValueEvent], values: var seq[VariableValue],
+    skippedTags: var seq[uint8]): Result[void, string] =
+  ## `walkRecord`, its refusal as a `Result`.
+  var why: string
+  if walkRecord(data, target, events, values, skippedTags, why): ok()
+  else: err(why)
+
+proc decodeRecordEvents*(data: openArray[byte],
+    skippedTags: var seq[uint8]): Result[seq[DecodedValueEvent], string] =
+  ## Decode one SPEC value record into its events, in wire order.
+  var events: seq[DecodedValueEvent] = @[]
+  var noValues: seq[VariableValue]
+  ? walkRecord(data, wtEvents, events, noValues, skippedTags)
   ok(events)
 
 proc decodeRecordEvents*(data: openArray[byte]):
@@ -554,15 +587,24 @@ proc decodeRecordEvents*(data: openArray[byte]):
   var dummy: seq[uint8] = @[]
   decodeRecordEvents(data, dummy)
 
+proc decodeRecordInto*(data: openArray[byte], values: var seq[VariableValue],
+    skippedTags: var seq[uint8]): Result[void, string] =
+  ## Append the variable values of one record — its tag-0 ``StepValues``
+  ## events, concatenated — to ``values``. The other events are checked and
+  ## stepped over, not built. On a refusal ``values`` is left as it was.
+  var noEvents: seq[DecodedValueEvent]
+  let before = values.len
+  result = walkRecord(data, wtValues, noEvents, values, skippedTags)
+  if result.isErr:
+    values.setLen(before)
+
 proc decodeRecord*(data: openArray[byte],
     skippedTags: var seq[uint8]): Result[seq[VariableValue], string] =
   ## The variable values of one record: its tag-0 ``StepValues`` events,
   ## concatenated.  A record that carries none — whether it is empty or holds
   ## only other event kinds — yields an empty sequence.
   var values: seq[VariableValue] = @[]
-  for ev in ?decodeRecordEvents(data, skippedTags):
-    if ev.kind == veStepValues:
-      values.add(ev.values)
+  ? decodeRecordInto(data, values, skippedTags)
   ok(values)
 
 proc decodeRecord*(data: openArray[byte]): Result[seq[VariableValue], string] =
@@ -636,10 +678,10 @@ proc initValueStreamWriter*(ctfs: var Ctfs,
 
   let datRes = ctfs.addFile("values.dat")
   if datRes.isErr:
-    return err("failed to add values.dat: " & datRes.error)
+    return err("failed to add values.dat: " & datRes.unsafeError)
   let idxRes = ctfs.addFile("values.idx")
   if idxRes.isErr:
-    return err("failed to add values.idx: " & idxRes.error)
+    return err("failed to add values.idx: " & idxRes.unsafeError)
 
   var writer = ValueStreamWriter(
     dataFile: datRes.get(),
@@ -662,7 +704,7 @@ proc initValueStreamWriter*(ctfs: var Ctfs,
     hdr[i] = csLE[i]
   let hdrRes = ctfs.writeToFile(writer.indexFile, hdr)
   if hdrRes.isErr:
-    return err("failed to write values.idx header: " & hdrRes.error)
+    return err("failed to write values.idx header: " & hdrRes.unsafeError)
   ctfs.syncEntry(writer.indexFile)
 
   ok(writer)
@@ -691,7 +733,7 @@ proc writeChunk(ctfs: var Ctfs, w: var ValueStreamWriter,
   let datRes = ctfs.writeToFile(w.dataFile,
       compressed.toOpenArray(0, int(compressedSize) - 1))
   if datRes.isErr:
-    return err("failed to write value chunk: " & datRes.error)
+    return err("failed to write value chunk: " & datRes.unsafeError)
 
   var offBytes: array[8, byte]
   let offLE = toBytesLE(chunkStart)
@@ -699,7 +741,7 @@ proc writeChunk(ctfs: var Ctfs, w: var ValueStreamWriter,
     offBytes[i] = offLE[i]
   let offRes = ctfs.writeToFile(w.indexFile, offBytes)
   if offRes.isErr:
-    return err("failed to write values.idx offset: " & offRes.error)
+    return err("failed to write values.idx offset: " & offRes.unsafeError)
   ctfs.syncEntry(w.indexFile)
 
   w.dataOffset += uint64(compressedSize)
@@ -832,175 +874,67 @@ proc totalRecords*(w: ValueStreamWriter): uint64 = w.totalRecords
 # Reader
 # ---------------------------------------------------------------------------
 
-proc decompressChunkRecords(compressed: openArray[byte]):
-    Result[seq[seq[byte]], string] =
-  ## Decompress one SPEC chunk and split it into its length-prefixed records.
-  if compressed.len == 0:
-    return ok(newSeq[seq[byte]]())
-  let frameSize = ZSTD_getFrameContentSize(
-    unsafeAddr compressed[0], csize_t(compressed.len))
-  if frameSize == ZSTD_CONTENTSIZE_UNKNOWN or frameSize == ZSTD_CONTENTSIZE_ERROR:
-    return err("cannot determine decompressed size for value chunk")
-  var raw = newSeq[byte](int(frameSize))
-  if frameSize > 0:
-    let decompSize = ZSTD_decompress(
-      addr raw[0], csize_t(frameSize),
-      unsafeAddr compressed[0], csize_t(compressed.len))
-    if ZSTD_isError(decompSize) != 0:
-      return err("zstd decompress failed for value chunk: " &
-        $ZSTD_getErrorName(decompSize))
-    raw.setLen(int(decompSize))
-
-  var records: seq[seq[byte]] = @[]
-  var pos = 0
-  while pos < raw.len:
-    let recLen = int(?decodeVarint(raw, pos))
-    if pos + recLen > raw.len:
-      return err("value record length extends past chunk")
-    var rec = newSeq[byte](recLen)
-    for j in 0 ..< recLen:
-      rec[j] = raw[pos + j]
-    pos += recLen
-    records.add(rec)
-  ok(records)
-
 proc initValueStreamReader*(ctfsBytes: openArray[byte],
     blockSize: uint32 = DefaultBlockSize,
-    maxEntries: uint32 = DefaultMaxRootEntries,
-    legacy: bool = false): Result[ValueStreamReader, string] =
+    maxEntries: uint32 = DefaultMaxRootEntries): Result[ValueStreamReader, string] =
   ## Initialize a reader from raw CTFS container bytes.
   ##
-  ## ``legacy`` selects the on-disk framing (see module docs):
-  ##   * ``false`` (default) — SPEC chunked layout (``values.dat`` chunked Zstd +
-  ##     ``values.idx`` = ``[chunk_size: u32][offset: u64]...``).  Byte-compatible
-  ##     with the Rust ``ValueStreamReader``.
-  ##   * ``true`` — legacy Nim-v4 ``.off`` VariableRecordTable layout
-  ##     (``values.dat`` + ``values.off``, per-record ``varint count`` +
-  ##     ``varnameId/typeId/dataLen/data``).
-  ##
-  ## The FFI reader passes ``legacy = not meta.hasValueStream``: pre-M24a-2
-  ## bundles never set the ``has_value_stream`` flag, so a clear flag selects the
-  ## legacy reader and a set flag the SPEC reader.
-  if legacy:
-    let tableRes = initVariableRecordTableReader(ctfsBytes, "values",
-        blockSize, maxEntries)
-    if tableRes.isErr:
-      return err(tableRes.error)
-    return ok(ValueStreamReader(
-      legacy: true,
-      legacyTable: tableRes.get(),
-      cachedChunkIdx: -1))
-
-  let datRes = readInternalFile(ctfsBytes, "values.dat", blockSize, maxEntries)
+  ## ``values.dat`` is chunked Zstd and ``values.idx`` is
+  ## ``[chunk_size: u32][offset: u64]...``, byte-compatible with the Rust
+  ## ``ValueStreamReader``.
+  var datRes = readInternalFile(ctfsBytes, "values.dat", blockSize, maxEntries)
   if datRes.isErr:
-    return err("failed to read values.dat: " & datRes.error)
-  let datData = datRes.get()
-
+    return err("failed to read values.dat: " & datRes.unsafeError)
   let idxRes = readInternalFile(ctfsBytes, "values.idx", blockSize, maxEntries)
   if idxRes.isErr:
-    return err("failed to read values.idx: " & idxRes.error)
-  let idxData = idxRes.get()
+    return err("failed to read values.idx: " & idxRes.unsafeError)
+  ok(ValueStreamReader(spec: ? openChunkedRecords(viewBytes(move datRes.get()),
+    idxRes.get(), "values", "value", isCompactContainer(ctfsBytes))))
 
-  if idxData.len < 4:
-    return err("values.idx too small for chunk_size header")
-  var cs4: array[4, byte]
-  for i in 0 ..< 4:
-    cs4[i] = idxData[i]
-  let chunkSize = fromBytesLE(uint32, cs4)
-  if chunkSize == 0:
-    return err("chunkSize in values.idx is 0")
+proc initValueStreamReader*(image: ContainerImage,
+    blockSize: uint32 = DefaultBlockSize,
+    maxEntries: uint32 = DefaultMaxRootEntries): Result[ValueStreamReader, string] =
+  ## As above, over a container image it shares: `values.dat` is read in
+  ## place.
+  var datRes = viewMember(image, "values.dat", blockSize, maxEntries)
+  if datRes.isErr:
+    return err("failed to read values.dat: " & datRes.unsafeError)
+  let idxRes = viewMember(image, "values.idx", blockSize, maxEntries)
+  if idxRes.isErr:
+    return err("failed to read values.idx: " & idxRes.unsafeError)
+  ok(ValueStreamReader(spec: ? openChunkedRecords(move datRes.get(),
+    ? idxRes.get().contents(), "values", "value",
+    isCompactContainer(image.bytes))))
 
-  let offsetRegionBytes = idxData.len - 4
-  if offsetRegionBytes mod 8 != 0:
-    return err("values.idx has trailing bytes in offset region")
-  let numChunks = offsetRegionBytes div 8
-  var offsets = newSeq[uint64](numChunks)
-  for i in 0 ..< numChunks:
-    var o8: array[8, byte]
-    for j in 0 ..< 8:
-      o8[j] = idxData[4 + i * 8 + j]
-    offsets[i] = fromBytesLE(uint64, o8)
+proc refresh*(r: var ValueStreamReader, image: ContainerImage,
+    blockSize: uint32 = DefaultBlockSize,
+    maxEntries: uint32 = DefaultMaxRootEntries): Result[void, string] =
+  ## Extend the reader by the chunks the container in `image` has published
+  ## since it was opened or last refreshed (`ctfs-container.md` §6).
+  let dat = viewMember(image, "values.dat", blockSize, maxEntries)
+  if dat.isErr:
+    return err("failed to read values.dat: " & dat.unsafeError)
+  let idx = viewMember(image, "values.idx", blockSize, maxEntries)
+  if idx.isErr:
+    return err("failed to read values.idx: " & idx.unsafeError)
+  r.spec.refresh(dat.unsafeGet(), ? idx.unsafeGet().contents(), "values")
 
-  # Recover total record count: all chunks but the last hold exactly chunk_size
-  # records; the last holds whatever decodes out of it (Rust parity).
-  var totalRecords: uint64 = 0
-  if numChunks > 0:
-    let lastChunk = numChunks - 1
-    let startOff = int(offsets[lastChunk])
-    let endOff = datData.len
-    if startOff > endOff:
-      return err("last value chunk offset past end of values.dat")
-    let lastRecs = ?decompressChunkRecords(
-      datData.toOpenArray(startOff, endOff - 1))
-    totalRecords = uint64(lastChunk) * uint64(chunkSize) + uint64(lastRecs.len)
+proc count*(r: ValueStreamReader): uint64 = r.spec.count
 
-  ok(ValueStreamReader(
-    legacy: false,
-    data: datData,
-    chunkSize: chunkSize,
-    offsets: offsets,
-    totalRecordsVal: totalRecords,
-    cachedChunkIdx: -1,
-    cachedRecords: @[]))
-
-proc count*(r: ValueStreamReader): uint64 =
-  if r.legacy:
-    r.legacyTable.count()
-  else:
-    r.totalRecordsVal
-
-proc readLegacyRecord(data: openArray[byte]): Result[seq[VariableValue], string] =
-  ## Decode a legacy ``.off`` VRT value record (pre-M24a-2 framing):
-  ## ``varint count, count × (varint varnameId, varint typeId, varint dataLen,
-  ## data)``.
-  if data.len == 0:
-    return ok(newSeq[VariableValue]())
-  var pos = 0
-  let count = int(?decodeVarint(data, pos))
-  var values = newSeq[VariableValue](count)
-  for i in 0 ..< count:
-    let vnId = ?decodeVarint(data, pos)
-    let tId = ?decodeVarint(data, pos)
-    let dLen = int(?decodeVarint(data, pos))
-    if pos + dLen > data.len:
-      return err("truncated legacy value data")
-    var d = newSeq[byte](dLen)
-    for j in 0 ..< dLen:
-      d[j] = data[pos + j]
-    pos += dLen
-    values[i] = VariableValue(varnameId: vnId, typeId: tId, data: d)
-  ok(values)
 
 proc cacheRecordFor(r: var ValueStreamReader,
     stepIndex: uint64): Result[int, string] =
-  ## Decompress whichever chunk holds ``stepIndex`` into ``r.cachedRecords``
+  ## Inflate whichever chunk holds ``stepIndex``
   ## (reusing the cache when it already holds that chunk) and return the
   ## record's index WITHIN the chunk.
   ##
   ## Shared by the three per-step accessors so they cannot disagree about
   ## which bytes a step's record occupies — each one then differs only in
   ## which tagged events it decodes out of those bytes.
-  if stepIndex >= r.totalRecordsVal:
+  if stepIndex >= r.spec.count:
     return err("value step index " & $stepIndex & " out of range (count " &
-      $r.totalRecordsVal & ")")
-  let chunkNumber = int(stepIndex div uint64(r.chunkSize))
-  let within = int(stepIndex mod uint64(r.chunkSize))
-
-  if r.cachedChunkIdx != chunkNumber:
-    let startOff = int(r.offsets[chunkNumber])
-    let endOff =
-      if chunkNumber + 1 < r.offsets.len: int(r.offsets[chunkNumber + 1])
-      else: r.data.len
-    if startOff > endOff or endOff > r.data.len:
-      return err("value chunk offsets out of range")
-    let recs = ?decompressChunkRecords(
-      r.data.toOpenArray(startOff, endOff - 1))
-    r.cachedRecords = recs
-    r.cachedChunkIdx = chunkNumber
-
-  if within >= r.cachedRecords.len:
-    return err("value record " & $within & " missing in chunk " & $chunkNumber)
-  ok(within)
+      $r.spec.count & ")")
+  r.spec.locate(stepIndex)
 
 proc noteSkippedTags(r: var ValueStreamReader, skipped: seq[uint8]) =
   ## Fold the tags one decode walked over into the reader's cumulative
@@ -1026,31 +960,36 @@ proc noteSkippedTags(r: var ValueStreamReader, skipped: seq[uint8]) =
 proc readStepValues*(r: var ValueStreamReader,
     stepIndex: uint64): Result[seq[VariableValue], string] =
   ## Read all variable values for a given step (record N ↔ step N).
-  if r.legacy:
-    let dataRes = r.legacyTable.read(stepIndex)
-    if dataRes.isErr:
-      return err(dataRes.error)
-    return readLegacyRecord(dataRes.get())
 
-  let within = ?r.cacheRecordFor(stepIndex)
-  var skipped: seq[uint8] = @[]
-  let res = decodeRecord(r.cachedRecords[within], skipped)
+  if stepIndex >= r.spec.count:
+    return err("value step index " & $stepIndex & " out of range (count " &
+      $r.spec.count & ")")
+  # Read once per step by a walk, so no `Result` is built on the way to the
+  # one returned.
+  var within: int
+  var why: string
+  if not r.spec.locate(stepIndex, within, why):
+    return err(why)
+  var skipped: seq[uint8]
+  var noEvents: seq[DecodedValueEvent]
+  # The values are walked into the result in place: built in a local and
+  # returned, the result was copied out of memory just written field by
+  # field, a load the CPU cannot forward from those stores.
+  result.ok(newSeq[VariableValue]())
+  if not walkRecord(r.spec.record(within), wtValues, noEvents,
+      result.unsafeGet(), skipped, why):
+    result = err(why)
   r.noteSkippedTags(skipped)
-  res
 
 proc readStepDropVariable*(r: var ValueStreamReader,
     stepIndex: uint64): Result[seq[uint64], string] =
   ## Read the tag-2 ``DropVariable`` events recorded for a given step
-  ## (record N ↔ step N), one interned varname id each.  Legacy ``.off`` VRT
-  ## bundles never carried them, so they report an empty sequence rather than
-  ## an error.
+  ## (record N ↔ step N), one interned varname id each.
   r.lastSkippedTags.setLen(0)
-  if r.legacy:
-    return ok(newSeq[uint64]())
 
   let within = ?r.cacheRecordFor(stepIndex)
   var skipped: seq[uint8] = @[]
-  let res = decodeRecordDropVariable(r.cachedRecords[within], skipped)
+  let res = decodeRecordDropVariable(r.spec.record(within), skipped)
   r.noteSkippedTags(skipped)
   res
 
@@ -1058,30 +997,24 @@ proc readStepDropVariables*(r: var ValueStreamReader,
     stepIndex: uint64): Result[seq[seq[uint64]], string] =
   ## Read the tag-3 ``DropVariables`` events recorded for a given step
   ## (record N ↔ step N), one ``seq[uint64]`` of interned varname ids per
-  ## event.  Legacy ``.off`` VRT bundles never carried them, so they report an
-  ## empty sequence rather than an error.
+  ## event.
   r.lastSkippedTags.setLen(0)
-  if r.legacy:
-    return ok(newSeq[seq[uint64]]())
 
   let within = ?r.cacheRecordFor(stepIndex)
   var skipped: seq[uint8] = @[]
-  let res = decodeRecordDropVariables(r.cachedRecords[within], skipped)
+  let res = decodeRecordDropVariables(r.spec.record(within), skipped)
   r.noteSkippedTags(skipped)
   res
 
 proc readStepAssignments*(r: var ValueStreamReader,
     stepIndex: uint64): Result[seq[AssignmentEventEntry], string] =
   ## Read the tag-9 ``Assignment`` events recorded for a given step
-  ## (record N ↔ step N).  Legacy ``.off`` VRT bundles never carried them, so
-  ## they report an empty sequence rather than an error.
+  ## (record N ↔ step N).
   r.lastSkippedTags.setLen(0)
-  if r.legacy:
-    return ok(newSeq[AssignmentEventEntry]())
 
   let within = ?r.cacheRecordFor(stepIndex)
   var skipped: seq[uint8] = @[]
-  let res = decodeRecordAssignments(r.cachedRecords[within], skipped)
+  let res = decodeRecordAssignments(r.spec.record(within), skipped)
   r.noteSkippedTags(skipped)
   res
 
@@ -1089,17 +1022,12 @@ proc readStepEvents*(r: var ValueStreamReader,
     stepIndex: uint64): Result[seq[DecodedValueEvent], string] =
   ## Every value-stream event of a step's record, tags 0-9, in wire order.
   r.lastSkippedTags.setLen(0)
-  if r.legacy:
-    let vals = ? r.readStepValues(stepIndex)
-    if vals.len == 0:
-      return ok(newSeq[DecodedValueEvent]())
-    return ok(@[DecodedValueEvent(kind: veStepValues, values: vals)])
   let within = ?r.cacheRecordFor(stepIndex)
   var skipped: seq[uint8] = @[]
-  let res = decodeRecordEvents(r.cachedRecords[within], skipped)
+  let res = decodeRecordEvents(r.spec.record(within), skipped)
   r.noteSkippedTags(skipped)
   if res.isErr:
-    return err("values.dat record " & $stepIndex & ": " & res.error)
+    return err("values.dat record " & $stepIndex & ": " & res.unsafeError)
   res
 
 proc lastSkippedTags*(r: ValueStreamReader): seq[uint8] =

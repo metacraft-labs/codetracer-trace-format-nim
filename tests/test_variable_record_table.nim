@@ -89,7 +89,7 @@ proc test_variable_record_table_edge_cases() {.raises: [].} =
   # -- Zero-length record --
   block:
     var ctfs = createCtfs()
-    let writerRes = initVariableRecordTableWriter(ctfs, "empty_rec")
+    let writerRes = initVariableRecordTableWriter(ctfs, "emptyrec")
     doAssert writerRes.isOk
     var writer = writerRes.get()
 
@@ -99,7 +99,7 @@ proc test_variable_record_table_edge_cases() {.raises: [].} =
     doAssert writer.count == 1
 
     let rawBytes = ctfs.toBytes()
-    let readerRes = initVariableRecordTableReader(rawBytes, "empty_rec")
+    let readerRes = initVariableRecordTableReader(rawBytes, "emptyrec")
     doAssert readerRes.isOk
     let reader = readerRes.get()
     doAssert reader.count == 1
@@ -112,7 +112,7 @@ proc test_variable_record_table_edge_cases() {.raises: [].} =
   # -- Large record (larger than one block) --
   block:
     var ctfs = createCtfs()
-    let writerRes = initVariableRecordTableWriter(ctfs, "large_rec")
+    let writerRes = initVariableRecordTableWriter(ctfs, "largerec")
     doAssert writerRes.isOk
     var writer = writerRes.get()
 
@@ -124,7 +124,7 @@ proc test_variable_record_table_edge_cases() {.raises: [].} =
     doAssert r.isOk, "append large record failed: " & r.error
 
     let rawBytes = ctfs.toBytes()
-    let readerRes = initVariableRecordTableReader(rawBytes, "large_rec")
+    let readerRes = initVariableRecordTableReader(rawBytes, "largerec")
     doAssert readerRes.isOk
     let reader = readerRes.get()
     doAssert reader.count == 1
@@ -141,7 +141,7 @@ proc test_variable_record_table_edge_cases() {.raises: [].} =
   block:
     const numTiny = 100_000
     var ctfs = createCtfs()
-    let writerRes = initVariableRecordTableWriter(ctfs, "tiny_recs")
+    let writerRes = initVariableRecordTableWriter(ctfs, "tinyrecs")
     doAssert writerRes.isOk
     var writer = writerRes.get()
 
@@ -155,7 +155,7 @@ proc test_variable_record_table_edge_cases() {.raises: [].} =
       "tiny count mismatch: " & $writer.count
 
     let rawBytes = ctfs.toBytes()
-    let readerRes = initVariableRecordTableReader(rawBytes, "tiny_recs")
+    let readerRes = initVariableRecordTableReader(rawBytes, "tinyrecs")
     doAssert readerRes.isOk
     let reader = readerRes.get()
     doAssert reader.count == uint64(numTiny),

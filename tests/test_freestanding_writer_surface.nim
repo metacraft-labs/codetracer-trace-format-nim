@@ -123,7 +123,11 @@ suite "freestanding writer surface":
           emitted.add readFile(p)
       check emitted.len > 0
 
+      # A whole identifier, not a substring: `ct_reader_open` is a prefix of
+      # `ct_reader_open_bytes`, which a freestanding build keeps.
       let missing = names.filterIt(not hasCIdentifier(emitted, it)).sorted()
+      # What a freestanding host opens a reader with instead.
+      check hasCIdentifier(emitted, "ct_reader_open_bytes")
       echo "freestanding C ABI: ", names.len - missing.len, " of ", names.len,
         " exportc functions present; ", missing.len, " missing"
       if missing != @ExpectedMissing.sorted():

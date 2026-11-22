@@ -103,13 +103,13 @@ proc main() {.raises: [].} =
       step(ln, [])  # value-less step (empty record)
     elif ln mod 3 == 0:
       step(ln, [
-        VariableValue(varnameId: vnX, typeId: tInt, data: encInt(int64(ln), tInt)),
-        VariableValue(varnameId: vnS, typeId: tStr,
+        VariableValue(varnameId: vnX, data: encInt(int64(ln), tInt)),
+        VariableValue(varnameId: vnS,
           data: encStr("v" & $ln, tStr)),
       ])
     else:
       step(ln, [
-        VariableValue(varnameId: vnX, typeId: tInt, data: encInt(int64(ln), tInt)),
+        VariableValue(varnameId: vnX, data: encInt(int64(ln), tInt)),
       ])
 
   let closeRes = w.close()

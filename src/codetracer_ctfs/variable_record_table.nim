@@ -14,6 +14,9 @@ import results
 import ./types
 import ./container
 import ./fixed_record_table
+import ./member_view
+
+export member_view.ContainerImage, member_view.newContainerImage
 
 type
   VariableRecordTableWriter* = object
@@ -23,8 +26,9 @@ type
     recordCount: uint64                 ## number of records written
 
   VariableRecordTableReader* = object
-    data: seq[byte]        ## raw baseName.dat content
-    offsets: seq[uint64]   ## parsed from baseName.off (each is u64 LE)
+    data: MemberView       ## baseName.dat, in place
+    offsets: MemberView    ## baseName.off: u64 LE offsets, read where they
+                           ## are used rather than parsed up front
 
 proc initVariableRecordTableWriter*(ctfs: var Ctfs,
     baseName: string): Result[VariableRecordTableWriter, string] =
@@ -32,11 +36,11 @@ proc initVariableRecordTableWriter*(ctfs: var Ctfs,
   ## Creates baseName.dat (data) and baseName.off (offsets).
   let dataFileRes = ctfs.addFile(baseName & ".dat")
   if dataFileRes.isErr:
-    return err("failed to create data file: " & dataFileRes.error)
+    return err("failed to create data file: " & dataFileRes.unsafeError)
 
   let offsetWriterRes = initFixedRecordTableWriter(ctfs, baseName & ".off", 8)
   if offsetWriterRes.isErr:
-    return err("failed to create offset file: " & offsetWriterRes.error)
+    return err("failed to create offset file: " & offsetWriterRes.unsafeError)
 
   var writer = VariableRecordTableWriter(
     dataFile: dataFileRes.get(),
@@ -50,7 +54,7 @@ proc initVariableRecordTableWriter*(ctfs: var Ctfs,
   writeU64LE(offsetBytes, 0, 0'u64)
   let appendRes = ctfs.append(writer.offsetWriter, offsetBytes)
   if appendRes.isErr:
-    return err("failed to write initial offset: " & appendRes.error)
+    return err("failed to write initial offset: " & appendRes.unsafeError)
 
   ok(writer)
 
@@ -60,7 +64,7 @@ proc append*(ctfs: var Ctfs, w: var VariableRecordTableWriter,
   if record.len > 0:
     let writeRes = ctfs.writeToFile(w.dataFile, record)
     if writeRes.isErr:
-      return err("data write failed: " & writeRes.error)
+      return err("data write failed: " & writeRes.unsafeError)
 
   w.currentOffset += uint64(record.len)
   w.recordCount += 1
@@ -70,47 +74,60 @@ proc append*(ctfs: var Ctfs, w: var VariableRecordTableWriter,
   writeU64LE(offsetBytes, 0, w.currentOffset)
   let appendRes = ctfs.append(w.offsetWriter, offsetBytes)
   if appendRes.isErr:
-    return err("offset write failed: " & appendRes.error)
+    return err("offset write failed: " & appendRes.unsafeError)
 
   ok()
 
 proc count*(w: VariableRecordTableWriter): uint64 = w.recordCount
+
+proc checkOffsets(offsetLen: int): Result[void, string] =
+  if offsetLen mod 8 != 0:
+    return err("offset file size not a multiple of 8")
+  if offsetLen < 8:
+    return err("offset file too small (needs at least initial offset)")
+  ok()
 
 proc initVariableRecordTableReader*(ctfsBytes: openArray[byte],
     baseName: string,
     blockSize: uint32 = DefaultBlockSize,
     maxEntries: uint32 = DefaultMaxRootEntries): Result[VariableRecordTableReader, string] =
   ## Initialize a reader from raw CTFS container bytes.
-  ## Reads both baseName.dat and baseName.off.
-  let dataRes = readInternalFile(ctfsBytes, baseName & ".dat", blockSize, maxEntries)
+  ## Reads both baseName.dat and baseName.off, copied out of `ctfsBytes`.
+  var dataRes = readInternalFile(ctfsBytes, baseName & ".dat", blockSize, maxEntries)
   if dataRes.isErr:
-    return err("failed to read data file: " & dataRes.error)
+    return err("failed to read data file: " & dataRes.unsafeError)
 
-  let offsetDataRes = readInternalFile(ctfsBytes, baseName & ".off", blockSize, maxEntries)
+  var offsetDataRes = readInternalFile(ctfsBytes, baseName & ".off", blockSize, maxEntries)
   if offsetDataRes.isErr:
-    return err("failed to read offset file: " & offsetDataRes.error)
+    return err("failed to read offset file: " & offsetDataRes.unsafeError)
 
-  let offsetData = offsetDataRes.get()
-  if offsetData.len mod 8 != 0:
-    return err("offset file size not a multiple of 8")
-  if offsetData.len < 8:
-    return err("offset file too small (needs at least initial offset)")
-
-  let numOffsets = offsetData.len div 8
-  var offsets = newSeq[uint64](numOffsets)
-  for i in 0 ..< numOffsets:
-    offsets[i] = readU64LE(offsetData, i * 8)
-
+  ? checkOffsets(offsetDataRes.get().len)
   ok(VariableRecordTableReader(
-    data: dataRes.get(),
-    offsets: offsets,
+    data: viewBytes(move dataRes.get()),
+    offsets: viewBytes(move offsetDataRes.get()),
   ))
+
+proc initVariableRecordTableReader*(image: ContainerImage,
+    baseName: string,
+    blockSize: uint32 = DefaultBlockSize,
+    maxEntries: uint32 = DefaultMaxRootEntries): Result[VariableRecordTableReader, string] =
+  ## Initialize a reader over a container image it shares: both members are
+  ## read in place, nothing is copied.
+  var dataRes = viewMember(image, baseName & ".dat", blockSize, maxEntries)
+  if dataRes.isErr:
+    return err("failed to read data file: " & dataRes.unsafeError)
+  var offsetsRes = viewMember(image, baseName & ".off", blockSize, maxEntries)
+  if offsetsRes.isErr:
+    return err("failed to read offset file: " & offsetsRes.unsafeError)
+  ? checkOffsets(offsetsRes.get().len)
+  ok(VariableRecordTableReader(data: move dataRes.get(),
+    offsets: move offsetsRes.get()))
 
 proc count*(r: VariableRecordTableReader): uint64 =
   ## Number of records. There are N+1 offsets for N records.
-  if r.offsets.len == 0:
+  if r.offsets.len < 8:
     return 0
-  uint64(r.offsets.len - 1)
+  uint64(r.offsets.len div 8 - 1)
 
 proc read*(r: VariableRecordTableReader,
     index: uint64): Result[seq[byte], string] =
@@ -118,18 +135,10 @@ proc read*(r: VariableRecordTableReader,
   if index >= r.count:
     return err("index out of range: " & $index)
 
-  let startOff = r.offsets[index]
-  let endOff = r.offsets[index + 1]
-  let length = int(endOff - startOff)
-
-  if length == 0:
-    return ok(newSeq[byte](0))
-
-  let start = int(startOff)
-  if start + length > r.data.len:
+  r.offsets.ensureLoaded(int(index) * 8, 16)
+  let startOff = r.offsets.readU64LE(int(index) * 8)
+  let endOff = r.offsets.readU64LE(int(index + 1) * 8)
+  if endOff < startOff or endOff > uint64(r.data.len):
     return err("record data out of bounds")
-
-  var record = newSeq[byte](length)
-  for i in 0 ..< length:
-    record[i] = r.data[start + i]
-  ok(record)
+  r.data.ensureLoaded(int(startOff), int(endOff - startOff))
+  ok(r.data.copyOut(int(startOff), int(endOff - startOff)))

@@ -100,9 +100,14 @@ choice the sibling Nim repos `io-mon`, `nim-stackable-hooks` and
   published by a single rewrite of block 0, which is what makes a
   half-attached set of streams unobservable.
 - `src/codetracer_trace_types.nim` — the shared record/value types.
-- `src/codetracer_trace_writer.nim` — the multi-stream production writer
-  (`steps.dat`, `values.dat`, `calls.dat`, `events.dat`, line-hit and
-  mem-write builders).
+- `src/codetracer_trace_writer/multi_stream_writer.nim` — the production
+  writer (`steps.dat`, `values.dat`, `calls.dat`, `events.dat`, the interning
+  tables and `meta.dat`), delegating the encoding to the per-stream modules
+  beside it (`exec_stream`, `value_stream`, `call_stream`,
+  `io_event_stream`, ...); the line-hit and mem-write builders are there too.
+  The single-stream writer that was `src/codetracer_trace_writer.nim` is
+  gone, and every reader refuses the `events.log` / `events.fmt` members it
+  wrote.
 - `src/codetracer_trace_reader.nim` — the reader side.
 - `src/codetracer_trace_writer_ffi.nim` — the C FFI surface; compiled to
   `libcodetracer_trace_writer.a`. Its entry points are declared with
@@ -124,7 +129,22 @@ choice the sibling Nim repos `io-mon`, `nim-stackable-hooks` and
 ## Testing notes
 
 - The corpus is declared in the `.nimble` `test` task, not discovered. Adding
-  a test file means adding it there (and to `repro.nim`'s `testSpecs`).
+  a test file means adding it there **and** a `TestSpec` with the same flags
+  to `repro.nim`'s `testSpecs`. `tests/test_every_test_is_listed.nim` fails
+  on either omission, and on a `TestSpec` whose source no longer exists.
+  A test that `include`s `codetracer_trace_writer_ffi` gets
+  `--nimMainPrefix:codetracerTraceWriter` from `tests/config.nims` under
+  both runners; the nimble line still spells it too.
+- **Every `src/` module must compile under `-d:nimPreviewSlimSystem`.** The
+  CodeTracer Nim fork links this library into its compiler, and the tools
+  built from compiler modules with slim-system on (nimony's `nifler`, which
+  `koch nimsuggest` builds first) fail at the first module that uses
+  `File`/`readFile`/`stderr`, `doAssert` or `$` of a float through `system`.
+  Such a module starts with
+  `when defined(nimPreviewSlimSystem): import std/[syncio, assertions]`
+  (plus `formatfloat` where it needs it).
+  `tests/test_library_compiles_under_slim_system.nim` `nim check`s every
+  module under the define and fails on any error located in `src/`.
 - **Benchmarks live in the `bench` task, correctness in `test`.** The two
   ChunkedCompressedTable microbenchmarks (`perLookupNs < 50000` per random
   lookup; `> 20M` records/sec write throughput) are in
@@ -238,11 +258,9 @@ choice the sibling Nim repos `io-mon`, `nim-stackable-hooks` and
   change, not a local one. The profile is recorded in
   `Value-Origin-Tracking.milestones.org` § M34c's watch-item update.
 - `tests/test_reader_ffi.nim` and
-  `tests/test_pending_value_after_delta_column.nim` are **not** in the corpus
-  (not in the `.nimble` task, not in CI, not in `repro.nim`). They predate the
-  SPEC-canonical step-stream migration and fail their own asserts. That is
-  known product/test drift in an off-corpus FFI reader path, tracked
-  separately — it is not a provisioning gap and must not be papered over.
+  `tests/test_pending_value_after_delta_column.nim` sat unlisted for months
+  and failed their own asserts once run. Both have since been fixed and are
+  in the nimble `test` task and in `repro.nim`; both pass.
 
 ## Specs
 

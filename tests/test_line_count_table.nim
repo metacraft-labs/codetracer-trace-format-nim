@@ -119,9 +119,9 @@ proc test_the_space_is_the_sum_of_the_recorded_counts() =
     "the space must be the sum of the recorded counts (" &
     $(CountA + CountB) & "); got " & $space.totalLines &
     " — the counts were ignored and the stride used instead"
-  doAssert space.prefixSum[1] == CountA,
+  doAssert space.fileBase(1) == CountA,
     "file 1's base must be file 0's line count (" & $CountA & "); got " &
-    $space.prefixSum[1]
+    $space.fileBase(1)
 
   for (p, l) in registered:
     let addr0 = space.globalIndex(int(p), l)
@@ -391,9 +391,9 @@ proc test_a_writer_that_cannot_count_records_the_ceiling_it_used() =
   doAssert space.totalLines == DefaultLinesPerFile + CountB,
     "the space must be the sum of the two recorded counts; got " &
     $space.totalLines
-  doAssert space.prefixSum[1] == DefaultLinesPerFile,
+  doAssert space.fileBase(1) == DefaultLinesPerFile,
     "file 1's base must be file 0's recorded count; got " &
-    $space.prefixSum[1]
+    $space.fileBase(1)
 
   # The writer-side refusal applies to a recorded ceiling exactly as it
   # does to a real count — which is the original defect: a file with more

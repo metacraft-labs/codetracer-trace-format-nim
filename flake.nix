@@ -135,39 +135,10 @@
             cp ${inputs.nim-packages-index}/packages.json $out/packages_official.json
           '';
 
-          legacyPreCommit = inputs.pre-commit-hooks.lib.${system}.run {
-            src = ./.;
-            hooks = {
-              lint = {
-                enable = true;
-                name = "Lint";
-                entry = "just lint";
-                language = "system";
-                pass_filenames = false;
-              };
-            };
-          };
           standardHooks = import (inputs.standard-hooks-src + "/git-hooks/standard-hooks.nix") {
             inherit pkgs;
             lib = pkgs.lib;
             src = inputs.standard-hooks-src;
-          };
-          priorStandardPreCommit = inputs.pre-commit-hooks.lib.${system}.run {
-            src = ./.;
-            default_stages = [
-              "pre-commit"
-              "pre-push"
-            ];
-            hooks = standardHooks // {
-              lint = {
-                enable = true;
-                name = "Lint";
-                entry = "just lint";
-                language = "system";
-                pass_filenames = false;
-                stages = [ "pre-commit" ];
-              };
-            };
           };
           preCommit = inputs.pre-commit-hooks.lib.${system}.run {
             src = ./.;
@@ -187,52 +158,6 @@
               };
             };
           };
-          nativeHookFactory =
-            configuration:
-            pkgs.runCommand "trace-nim-native-hook-factory"
-              {
-                nativeBuildInputs = [
-                  pkgs.git
-                  pkgs.bash
-                  configuration.config.package
-                ];
-              }
-              ''
-                export PRE_COMMIT_HOME="$TMPDIR/trace-nim-native-hook-cache"
-                export XDG_CACHE_HOME="$TMPDIR/trace-nim-native-factory-cache"
-                export GIT_CONFIG_GLOBAL="$TMPDIR/trace-nim-native-factory-gitconfig"
-                export GIT_CONFIG_NOSYSTEM=1
-                : > "$GIT_CONFIG_GLOBAL"
-                mkdir -p "$PRE_COMMIT_HOME" "$XDG_CACHE_HOME" fixture
-                cd fixture
-                git init --template= >/dev/null
-                if git config --get core.hooksPath; then
-                  echo 'Unexpected native factory hooksPath authority' >&2
-                  exit 1
-                fi
-                test "$(git rev-parse --path-format=absolute --git-path hooks)" = "$PWD/.git/hooks"
-                ln -s ${configuration.config.configFile} ${configuration.config.configPath}
-                mkdir -p "$out"
-                for hook in pre-commit pre-push; do
-                  ${pkgs.lib.getExe configuration.config.package} install -c ${configuration.config.configPath} -t "$hook"
-                  install -m 0755 ".git/hooks/$hook" "$out/$hook"
-                done
-              '';
-          expectedNativeHook = nativeHookFactory preCommit;
-          expectedLegacyNativeHook = nativeHookFactory legacyPreCommit;
-          expectedPriorStandardNativeHook = nativeHookFactory priorStandardPreCommit;
-          hookOwnershipGuard = ./nix/hook-ownership-guard.py;
-          hookTransaction = ./nix/hook-transaction.py;
-          actualNativeInstaller = pkgs.writeShellScript "trace-nim-native-hook-installer" preCommit.shellHook;
-          guardedHookInstall = ''
-            ${pkgs.python3}/bin/python3 ${hookTransaction} "$ct_tfn_root" ${hookOwnershipGuard} ${expectedNativeHook} ${pkgs.git}/share/git-core/templates ${expectedLegacyNativeHook} ${preCommit.config.configFile} ${legacyPreCommit.config.configFile} ${actualNativeInstaller} ${pkgs.git}/bin/git ${pkgs.bash}/bin/bash ${expectedPriorStandardNativeHook} ${priorStandardPreCommit.config.configFile} >&2
-            _trace_hook_status=$?
-            if [ "$_trace_hook_status" -ne 0 ]; then
-              unset _trace_hook_status
-              exit 1
-            fi
-            unset _trace_hook_status
-          '';
 
         in
         {
@@ -268,6 +193,14 @@
               toolchainsPkgs.rust-stable
               pkgs.capnproto
 
+              # `tests/test_managed_sender_ci_routes.nim` uploads through the
+              # codetracer-ci sender into a real MinIO, with codetracer-ci's
+              # upload routes played by a Python stand-in
+              # (`tests/support/ci_upload_standin.py`, standard library only).
+              # Without them the test fails; it has no SKIP arm.
+              pkgs.minio
+              pkgs.python3
+
               # Build automation, formatters and hook runner.
               pkgs.just
               pkgs.nixfmt-rfc-style
@@ -289,11 +222,16 @@
             # pcre directly instead of relying on a run-time library search.
             CT_PCRE_LIB_DIR = "${pkgs.pcre.out}/lib";
 
+            # Consumed by `repro.nim`'s `test_managed_sender_ci_routes` edge, which
+            # hands them to the test as `MINIO_BIN` / `PYTHON3_BIN`: a test action's
+            # PATH holds only the provisioned tools, not this shell's packages.
+            CT_MINIO_BIN = "${pkgs.minio}/bin/minio";
+            CT_PYTHON3_BIN = "${pkgs.python3}/bin/python3";
+
             # EVERYTHING THIS HOOK WRITES IS ANCHORED TO THIS REPOSITORY, never
             # to the directory the shell happens to be entered from.
-            # git-hooks.nix's `shellHook` installs `.pre-commit-config.yaml`
-            # and a pre-commit hook into whatever git repository encloses
-            # `$PWD`: entered from a sibling checkout (`nix develop
+            # A git-hooks installer writes its pre-commit hook into whatever
+            # git repository encloses `$PWD`: entered from a sibling checkout (`nix develop
             # ../codetracer-trace-format-nim`, or a captured `print-dev-env`
             # sourced elsewhere) it planted this repo's `just lint` hook in
             # that sibling and blocked its commits. So it runs only when the
@@ -306,7 +244,42 @@
                 && [ -f "$ct_tfn_root/codetracer_trace_format.nimble" ] \
                 && [ -f "$ct_tfn_root/src/codetracer_trace_writer_ffi.nim" ] \
                 && [ "$(${pkgs.coreutils}/bin/sha256sum "$ct_tfn_root/flake.nix" | ${pkgs.coreutils}/bin/cut -d' ' -f1)" = "${builtins.hashFile "sha256" ./flake.nix}" ]; then
-                ( cd "$ct_tfn_root" && ${guardedHookInstall} ) || exit 1
+                # The committed `.pre-commit-config.yaml` is the hook, run by the
+                # flake's pre-commit: the flake provides the tools, the committed
+                # config provides the rules. git-hooks.nix's own installer refuses
+                # to replace a committed config and then installs nothing.
+                ( cd "$ct_tfn_root" && bash ${./scripts/install-git-hooks.sh} ${pkgs.lib.getExe pkgs.pre-commit} ) || exit $?
+                # A clone where git-hooks.nix's own installer once ran keeps its RELATIVE
+                # core.hooksPath `.git/hooks`, in the config every worktree shares. A linked
+                # worktree cannot resolve it (there `.git` is a file), so git silently runs
+                # no hooks there. Point it at the common hooks directory instead.
+                if [ "$(git -C "$ct_tfn_root" config --local --get core.hooksPath 2>/dev/null)" = .git/hooks ]; then
+                  git -C "$ct_tfn_root" config --local core.hooksPath "$(git -C "$ct_tfn_root" rev-parse --path-format=absolute --git-common-dir)/hooks"
+                fi
+                # `pre-commit install` (and git-hooks.nix's installer, where it once ran)
+                # moves each Reprobuild hook dispatcher aside to `<hook>.legacy` and puts
+                # its shim in the slot, so the managed hook (for pre-push, the publication
+                # gate) runs only by accident. Put the dispatcher back and chain the shim as
+                # `<hook>.repro-local`, which the dispatcher runs: the layout
+                # `repro hooks ensure --vcs` produces.
+                _hooks="$(git -C "$ct_tfn_root" rev-parse --path-format=absolute --git-path hooks 2>/dev/null || true)"
+                for _legacy in "$_hooks"/*.legacy; do
+                  [ -f "$_legacy" ] && grep -q 'reprobuild hook dispatcher' "$_legacy" || continue
+                  _slot="''${_legacy%.legacy}"
+                  if [ -f "$_slot" ] && grep -q 'reprobuild hook dispatcher' "$_slot"; then
+                    rm -f "$_legacy"
+                  elif [ ! -e "$_slot" ] || grep -Eq '^# File generated by (pre-commit|prek)' "$_slot"; then
+                    if [ -f "$_slot.repro-local" ] && ! grep -Eq '^# File generated by (pre-commit|prek)' "$_slot.repro-local"; then
+                      echo "git-hooks: $_slot.repro-local is your own hook; run 'repro hooks ensure --vcs' to reconcile." >&2
+                      continue
+                    fi
+                    if [ -e "$_slot" ]; then mv -f "$_slot" "$_slot.repro-local"; fi
+                    mv -f "$_legacy" "$_slot"
+                  else
+                    echo "git-hooks: $_slot is not a pre-commit shim; run 'repro hooks ensure --vcs' to reconcile." >&2
+                  fi
+                done
+                unset _hooks _legacy _slot
               else
                 ct_tfn_root=""
               fi

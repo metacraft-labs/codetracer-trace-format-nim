@@ -47,33 +47,19 @@
 ## The on-disk ``kind`` byte is the recorder's exact ``EventLogKind`` ordinal
 ## (``trace-events.md`` §"EventLogKind (u8 enum)"), and it round-trips exactly:
 ## the writer stores the ordinal its caller gave and the reader reports it as
-## that kind. Values 14-255 are unassigned and refused on both sides, by value.
+## that kind. Values 24-255 are unassigned and refused on both sides, by value.
 ## ``metadata`` is carried verbatim; ``data`` is the record's ``content``.
 ##
-## # Backward compatibility (legacy Nim-v4 bundles)
-##
-## Bundles written by the pre-M24a-3 Nim writer used a ``VariableRecordTable``
-## (``events.dat`` + ``events.off`` — an uncompressed variable-size record table
-## with a u64 offset table), and a different per-record format
-## (``u8 kind, varint stepId, varint data_len, data`` — NO metadata, and ``kind``
-## was the 4-value ``IOEventKind`` ordinal, NOT the ``EventLogKind`` ordinal).
-## Those bundles never set the ``meta.dat`` ``has_io_event_stream`` flag (bit
-## 11), so the FFI reader distinguishes the two layouts by that flag: flag set ⇒
-## SPEC chunked layout, flag clear ⇒ legacy ``.off`` VRT layout.
-## ``initIOEventStreamReader`` accepts an explicit ``legacy`` parameter for this;
-## standalone callers that only ever read freshly-written bundles get the SPEC
-## layout by default.
-
 import results
 import ../codetracer_ctfs/types
 import ../codetracer_ctfs/container
 import ../codetracer_ctfs/streaming
-import ../codetracer_ctfs/variable_record_table
 import ../codetracer_ctfs/zstd_bindings
 import ./varint
+import ./record_chunk
 import ../codetracer_trace_types
 
-export codetracer_trace_types.EventLogKind
+export codetracer_trace_types.EventLogKind, codetracer_trace_types.eventLogKindName
 
 const
   DefaultEventsChunkSize* = 64
@@ -103,37 +89,11 @@ type
     dataOffset: uint64         ## running byte offset in events.dat
 
   IOEventStreamReader* = object
-    data: seq[byte]            ## raw events.dat content (SPEC mode)
-    chunkSize: uint32
-    offsets: seq[uint64]       ## chunk byte offsets from events.idx (SPEC mode)
-    totalRecordsVal: uint64
-    legacy: bool               ## true ⇒ legacy .off VRT layout; false ⇒ SPEC
-    legacyTable: VariableRecordTableReader  ## only valid when legacy == true
-    # Cache for last decompressed SPEC chunk: the decoded per-record byte slices.
-    cachedChunkIdx: int        ## -1 means no cache
-    cachedRecords: seq[seq[byte]]
-
-proc eventLogKindName*(k: EventLogKind): string =
-  ## The kind's name as `trace-events.md` §"EventLogKind (u8 enum)" spells it.
-  case k
-  of elkWrite: "Write"
-  of elkWriteFile: "WriteFile"
-  of elkWriteOther: "WriteOther"
-  of elkRead: "Read"
-  of elkReadFile: "ReadFile"
-  of elkReadOther: "ReadOther"
-  of elkReadDir: "ReadDir"
-  of elkOpenDir: "OpenDir"
-  of elkCloseDir: "CloseDir"
-  of elkSocket: "Socket"
-  of elkOpen: "Open"
-  of elkError: "Error"
-  of elkTraceLogEvent: "TraceLogEvent"
-  of elkEvmEvent: "EvmEvent"
+    spec: ChunkedRecords       ## events.dat + events.idx (SPEC mode)
 
 proc eventLogKindFromOrdinal*(ord: uint64): Result[EventLogKind, string] =
   ## The ``EventLogKind`` an on-disk or caller-supplied ordinal names; an
-  ## unassigned value (14 and up) is refused by value, never mapped onto a
+  ## unassigned value (24 and up) is refused by value, never mapped onto a
   ## kind (``trace-events.md`` §"EventLogKind (u8 enum)").
   if ord > uint64(high(EventLogKind)):
     return err("event kind " & $ord & " is not an assigned EventLogKind " &
@@ -199,36 +159,6 @@ proc decodeIOEvent*(data: openArray[byte]): Result[IOEvent, string] {.raises: []
     data: evData))
 
 # ---------------------------------------------------------------------------
-# Legacy per-record decode (pre-M24a-3 .off VRT framing)
-# ---------------------------------------------------------------------------
-
-proc decodeLegacyIOEvent(data: openArray[byte]): Result[IOEvent, string] {.raises: [].} =
-  ## Decode a legacy ``.off`` VRT IO event record (pre-M24a-3 framing):
-  ## ``u8 kind, varint stepId, varint data_len, data`` — the ``kind`` byte was
-  ## the 4-value ``IOEventKind`` ordinal (NOT an ``EventLogKind`` ordinal) and
-  ## there was no metadata field.
-  if data.len < 1:
-    return err("legacy IO event data too short")
-  var pos = 0
-  let kindByte = data[pos]
-  pos += 1
-  # The legacy 4-value API ordinal: stdout, stderr, file op, error.
-  let kind = case kindByte
-    of 0: elkWrite
-    of 1: elkWriteOther
-    of 2: elkReadFile
-    of 3: elkError
-    else: return err("invalid legacy IO event kind: " & $kindByte)
-  let stepId = ?decodeVarint(data, pos)
-  let dataLen = int(?decodeVarint(data, pos))
-  if pos + dataLen > data.len:
-    return err("truncated legacy IO event data")
-  var evData = newSeq[byte](dataLen)
-  for i in 0 ..< dataLen:
-    evData[i] = data[pos + i]
-  ok(IOEvent(kind: kind, stepId: stepId, metadata: @[], data: evData))
-
-# ---------------------------------------------------------------------------
 # Writer (SPEC chunked layout)
 # ---------------------------------------------------------------------------
 
@@ -240,10 +170,10 @@ proc initIOEventStreamWriter*(ctfs: var Ctfs,
 
   let datRes = ctfs.addFile("events.dat")
   if datRes.isErr:
-    return err("failed to add events.dat: " & datRes.error)
+    return err("failed to add events.dat: " & datRes.unsafeError)
   let idxRes = ctfs.addFile("events.idx")
   if idxRes.isErr:
-    return err("failed to add events.idx: " & idxRes.error)
+    return err("failed to add events.idx: " & idxRes.unsafeError)
 
   var writer = IOEventStreamWriter(
     dataFile: datRes.get(),
@@ -262,7 +192,7 @@ proc initIOEventStreamWriter*(ctfs: var Ctfs,
     hdr[i] = csLE[i]
   let hdrRes = ctfs.writeToFile(writer.indexFile, hdr)
   if hdrRes.isErr:
-    return err("failed to write events.idx header: " & hdrRes.error)
+    return err("failed to write events.idx header: " & hdrRes.unsafeError)
   ctfs.syncEntry(writer.indexFile)
 
   ok(writer)
@@ -293,7 +223,7 @@ proc flushChunk(ctfs: var Ctfs, w: var IOEventStreamWriter): Result[void, string
   let datRes = ctfs.writeToFile(w.dataFile,
       compressed.toOpenArray(0, int(compressedSize) - 1))
   if datRes.isErr:
-    return err("failed to write io event chunk: " & datRes.error)
+    return err("failed to write io event chunk: " & datRes.unsafeError)
 
   var offBytes: array[8, byte]
   let offLE = toBytesLE(chunkStart)
@@ -301,7 +231,7 @@ proc flushChunk(ctfs: var Ctfs, w: var IOEventStreamWriter): Result[void, string
     offBytes[i] = offLE[i]
   let offRes = ctfs.writeToFile(w.indexFile, offBytes)
   if offRes.isErr:
-    return err("failed to write events.idx offset: " & offRes.error)
+    return err("failed to write events.idx offset: " & offRes.unsafeError)
   ctfs.syncEntry(w.indexFile)
 
   w.dataOffset += uint64(compressedSize)
@@ -336,154 +266,62 @@ proc count*(w: IOEventStreamWriter): uint64 = w.totalRecords
 # Reader
 # ---------------------------------------------------------------------------
 
-proc decompressChunkRecords(compressed: openArray[byte]):
-    Result[seq[seq[byte]], string] =
-  ## Decompress one SPEC chunk and split it into its length-prefixed records.
-  if compressed.len == 0:
-    return ok(newSeq[seq[byte]]())
-  let frameSize = ZSTD_getFrameContentSize(
-    unsafeAddr compressed[0], csize_t(compressed.len))
-  if frameSize == ZSTD_CONTENTSIZE_UNKNOWN or frameSize == ZSTD_CONTENTSIZE_ERROR:
-    return err("cannot determine decompressed size for io event chunk")
-  var raw = newSeq[byte](int(frameSize))
-  if frameSize > 0:
-    let decompSize = ZSTD_decompress(
-      addr raw[0], csize_t(frameSize),
-      unsafeAddr compressed[0], csize_t(compressed.len))
-    if ZSTD_isError(decompSize) != 0:
-      return err("zstd decompress failed for io event chunk: " &
-        $ZSTD_getErrorName(decompSize))
-    raw.setLen(int(decompSize))
-
-  var records: seq[seq[byte]] = @[]
-  var pos = 0
-  while pos < raw.len:
-    let recLen = int(?decodeVarint(raw, pos))
-    if pos + recLen > raw.len:
-      return err("io event record length extends past chunk")
-    var rec = newSeq[byte](recLen)
-    for j in 0 ..< recLen:
-      rec[j] = raw[pos + j]
-    pos += recLen
-    records.add(rec)
-  ok(records)
-
 proc initIOEventStreamReader*(ctfsBytes: openArray[byte],
     blockSize: uint32 = DefaultBlockSize,
-    maxEntries: uint32 = DefaultMaxRootEntries,
-    legacy: bool = false): Result[IOEventStreamReader, string] =
+    maxEntries: uint32 = DefaultMaxRootEntries): Result[IOEventStreamReader, string] =
   ## Initialize a reader from raw CTFS container bytes.
   ##
-  ## ``legacy`` selects the on-disk framing (see module docs):
-  ##   * ``false`` (default) — SPEC chunked layout (``events.dat`` chunked Zstd +
-  ##     ``events.idx`` = ``[chunk_size: u32][offset: u64]...``).  Byte-compatible
-  ##     with the Rust ``IoEventStreamReader``.
-  ##   * ``true`` — legacy Nim-v4 ``.off`` VariableRecordTable layout
-  ##     (``events.dat`` + ``events.off``, per-record
-  ##     ``u8 kind, varint stepId, varint data_len, data``).
-  ##
-  ## The FFI reader passes ``legacy = not meta.hasIoEventStream``: pre-M24a-3
-  ## bundles never set the ``has_io_event_stream`` flag, so a clear flag selects
-  ## the legacy reader and a set flag the SPEC reader.
-  if legacy:
-    let tableRes = initVariableRecordTableReader(ctfsBytes, "events",
-        blockSize, maxEntries)
-    if tableRes.isErr:
-      return err(tableRes.error)
-    return ok(IOEventStreamReader(
-      legacy: true,
-      legacyTable: tableRes.get(),
-      cachedChunkIdx: -1))
-
-  let datRes = readInternalFile(ctfsBytes, "events.dat", blockSize, maxEntries)
+  ## ``events.dat`` is chunked Zstd and ``events.idx`` is
+  ## ``[chunk_size: u32][offset: u64]...``, byte-compatible with the Rust
+  ## ``IoEventStreamReader``.
+  var datRes = readInternalFile(ctfsBytes, "events.dat", blockSize, maxEntries)
   if datRes.isErr:
-    return err("failed to read events.dat: " & datRes.error)
-  let datData = datRes.get()
-
+    return err("failed to read events.dat: " & datRes.unsafeError)
   let idxRes = readInternalFile(ctfsBytes, "events.idx", blockSize, maxEntries)
   if idxRes.isErr:
-    return err("failed to read events.idx: " & idxRes.error)
-  let idxData = idxRes.get()
+    return err("failed to read events.idx: " & idxRes.unsafeError)
+  ok(IOEventStreamReader(spec: ? openChunkedRecords(
+    viewBytes(move datRes.get()), idxRes.get(), "events", "io event",
+    isCompactContainer(ctfsBytes))))
 
-  if idxData.len < 4:
-    return err("events.idx too small for chunk_size header")
-  var cs4: array[4, byte]
-  for i in 0 ..< 4:
-    cs4[i] = idxData[i]
-  let chunkSize = fromBytesLE(uint32, cs4)
-  if chunkSize == 0:
-    return err("chunkSize in events.idx is 0")
+proc initIOEventStreamReader*(image: ContainerImage,
+    blockSize: uint32 = DefaultBlockSize,
+    maxEntries: uint32 = DefaultMaxRootEntries): Result[IOEventStreamReader, string] =
+  ## As above, over a container image it shares: `events.dat` is read in
+  ## place.
+  var datRes = viewMember(image, "events.dat", blockSize, maxEntries)
+  if datRes.isErr:
+    return err("failed to read events.dat: " & datRes.unsafeError)
+  let idxRes = viewMember(image, "events.idx", blockSize, maxEntries)
+  if idxRes.isErr:
+    return err("failed to read events.idx: " & idxRes.unsafeError)
+  ok(IOEventStreamReader(spec: ? openChunkedRecords(move datRes.get(),
+    ? idxRes.get().contents(), "events", "io event",
+    isCompactContainer(image.bytes))))
 
-  let offsetRegionBytes = idxData.len - 4
-  if offsetRegionBytes mod 8 != 0:
-    return err("events.idx has trailing bytes in offset region")
-  let numChunks = offsetRegionBytes div 8
-  var offsets = newSeq[uint64](numChunks)
-  for i in 0 ..< numChunks:
-    var o8: array[8, byte]
-    for j in 0 ..< 8:
-      o8[j] = idxData[4 + i * 8 + j]
-    offsets[i] = fromBytesLE(uint64, o8)
+proc refresh*(r: var IOEventStreamReader, image: ContainerImage,
+    blockSize: uint32 = DefaultBlockSize,
+    maxEntries: uint32 = DefaultMaxRootEntries): Result[void, string] =
+  ## Extend the reader by the chunks the container in `image` has published
+  ## since it was opened or last refreshed (`ctfs-container.md` §6).
+  let dat = viewMember(image, "events.dat", blockSize, maxEntries)
+  if dat.isErr:
+    return err("failed to read events.dat: " & dat.unsafeError)
+  let idx = viewMember(image, "events.idx", blockSize, maxEntries)
+  if idx.isErr:
+    return err("failed to read events.idx: " & idx.unsafeError)
+  r.spec.refresh(dat.unsafeGet(), ? idx.unsafeGet().contents(), "events")
 
-  # Recover total record count: all chunks but the last hold exactly chunk_size
-  # records; the last holds whatever decodes out of it (Rust parity).
-  var totalRecords: uint64 = 0
-  if numChunks > 0:
-    let lastChunk = numChunks - 1
-    let startOff = int(offsets[lastChunk])
-    let endOff = datData.len
-    if startOff > endOff:
-      return err("last io event chunk offset past end of events.dat")
-    let lastRecs = ?decompressChunkRecords(
-      datData.toOpenArray(startOff, endOff - 1))
-    totalRecords = uint64(lastChunk) * uint64(chunkSize) + uint64(lastRecs.len)
-
-  ok(IOEventStreamReader(
-    legacy: false,
-    data: datData,
-    chunkSize: chunkSize,
-    offsets: offsets,
-    totalRecordsVal: totalRecords,
-    cachedChunkIdx: -1,
-    cachedRecords: @[]))
-
-proc count*(r: IOEventStreamReader): uint64 =
-  if r.legacy:
-    r.legacyTable.count()
-  else:
-    r.totalRecordsVal
+proc count*(r: IOEventStreamReader): uint64 = r.spec.count
 
 proc readEvent*(r: var IOEventStreamReader,
     index: uint64): Result[IOEvent, string] =
   ## Read the IO event record at the given index, decompressing only its chunk.
-  if r.legacy:
-    let dataRes = r.legacyTable.read(index)
-    if dataRes.isErr:
-      return err(dataRes.error)
-    return decodeLegacyIOEvent(dataRes.get())
-
-  if index >= r.totalRecordsVal:
+  if index >= r.spec.count:
     return err("io event index " & $index & " out of range (count " &
-      $r.totalRecordsVal & ")")
-  let chunkNumber = int(index div uint64(r.chunkSize))
-  let within = int(index mod uint64(r.chunkSize))
-
-  if r.cachedChunkIdx != chunkNumber:
-    let startOff = int(r.offsets[chunkNumber])
-    let endOff =
-      if chunkNumber + 1 < r.offsets.len: int(r.offsets[chunkNumber + 1])
-      else: r.data.len
-    if startOff > endOff or endOff > r.data.len:
-      return err("io event chunk offsets out of range")
-    let recs = ?decompressChunkRecords(
-      r.data.toOpenArray(startOff, endOff - 1))
-    r.cachedRecords = recs
-    r.cachedChunkIdx = chunkNumber
-
-  if within >= r.cachedRecords.len:
-    return err("io event record " & $within & " missing in chunk " &
-      $chunkNumber)
-  let ev = decodeIOEvent(r.cachedRecords[within])
+      $r.spec.count & ")")
+  let within = ? r.spec.locate(index)
+  let ev = decodeIOEvent(r.spec.record(within))
   if ev.isErr:
-    return err("events.dat record " & $index & ": " & ev.error)
+    return err("events.dat record " & $index & ": " & ev.unsafeError)
   ev

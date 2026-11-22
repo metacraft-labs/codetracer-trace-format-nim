@@ -206,21 +206,11 @@ proc encodeStepEvent*(event: StepEvent, output: var seq[byte]) =
       encodeVarint(ch.generation, output)
     encodeVarint(event.inFlightFrames, output)
 
-proc decodeStepEvent*(data: openArray[byte], pos: var int,
-    allowSourceReload: bool = false): Result[StepEvent, string] =
-  ## Decode one step event from data starting at pos.
-  ##
-  ## ``allowSourceReload`` mirrors the container's declaration: tag 0x08
-  ## (``TagSourceReload``) is accepted only when ``meta.dat`` carries
-  ## ``FlagExtHasSourceReload``.  The default is FALSE so that every
-  ## caller that has not been taught to consult the flag refuses the tag
-  ## rather than decoding it — the strict-rejection contract bit 13's
-  ## documentation states (``meta_dat.nim``), applied one layer down.
-  ##
-  ## The alternative — SKIPPING an unknown tag — is what this signature
-  ## exists to make impossible.  A skip cannot know the record's length,
-  ## so the payload varints are re-read as further events and the stream
-  ## decodes SHORTER and plausibly: wrong bytes instead of an error.
+proc decodeOtherStepEvent(data: openArray[byte], pos: var int,
+    allowSourceReload: bool): Result[StepEvent, string] {.noinline.} =
+  ## `decodeStepEvent` for every record it does not decode inline, and every
+  ## refusal, the position steps' included. Kept out of line so the walk over
+  ## a chunk's position steps, nearly every record, calls a small proc.
   if pos >= data.len:
     return err("unexpected end of step stream")
   let tag = data[pos]
@@ -249,14 +239,14 @@ proc decodeStepEvent*(data: openArray[byte], pos: var int,
       "decode shorter and plausibly instead of failing")
   case tag
   of TagAbsoluteStep:
-    let gli = ?decodeVarint(data, pos)
+    let gli = varintOrReturn(data, pos)
     ok(StepEvent(kind: sekAbsoluteStep, globalLineIndex: gli))
   of TagDeltaStep:
-    let delta = ?decodeSignedVarint(data, pos)
+    let delta = signedVarintOrReturn(data, pos)
     ok(StepEvent(kind: sekDeltaStep, lineDelta: delta))
   of TagRaise:
-    let typeId = ?decodeVarint(data, pos)
-    let msgLen = ?decodeVarint(data, pos)
+    let typeId = varintOrReturn(data, pos)
+    let msgLen = varintOrReturn(data, pos)
     if pos + int(msgLen) > data.len:
       return err("raise message truncated")
     var msg = newSeq[byte](int(msgLen))
@@ -265,23 +255,23 @@ proc decodeStepEvent*(data: openArray[byte], pos: var int,
     pos += int(msgLen)
     ok(StepEvent(kind: sekRaise, exceptionTypeId: typeId, message: msg))
   of TagCatch:
-    let typeId = ?decodeVarint(data, pos)
+    let typeId = varintOrReturn(data, pos)
     ok(StepEvent(kind: sekCatch, catchExceptionTypeId: typeId))
   of TagThreadSwitch:
-    let tid = ?decodeVarint(data, pos)
+    let tid = varintOrReturn(data, pos)
     ok(StepEvent(kind: sekThreadSwitch, threadId: tid))
   of TagThreadStart:
-    let tid = ?decodeVarint(data, pos)
+    let tid = varintOrReturn(data, pos)
     ok(StepEvent(kind: sekThreadStart, startThreadId: tid))
   of TagThreadExit:
-    let tid = ?decodeVarint(data, pos)
+    let tid = varintOrReturn(data, pos)
     ok(StepEvent(kind: sekThreadExit, exitThreadId: tid))
   of TagDeltaColumn:
-    let delta = ?decodeSignedVarint(data, pos)
+    let delta = signedVarintOrReturn(data, pos)
     ok(StepEvent(kind: sekDeltaColumn, columnDelta: delta))
   of TagSourceReload:
-    let ordinal = ?decodeVarint(data, pos)
-    let count = ?decodeVarint(data, pos)
+    let ordinal = varintOrReturn(data, pos)
+    let count = varintOrReturn(data, pos)
     # A count is a length prefix read off the wire, so it is bounded
     # against the bytes that remain before anything is allocated: the
     # smallest possible change record is three one-byte varints.
@@ -291,13 +281,67 @@ proc decodeStepEvent*(data: openArray[byte], pos: var int,
         " bytes of the chunk can hold")
     var changed = newSeq[SourceReloadChange](int(count))
     for i in 0 ..< int(count):
-      let oldId = ?decodeVarint(data, pos)
-      let newId = ?decodeVarint(data, pos)
-      let gen = ?decodeVarint(data, pos)
+      let oldId = varintOrReturn(data, pos)
+      let newId = varintOrReturn(data, pos)
+      let gen = varintOrReturn(data, pos)
       changed[i] = SourceReloadChange(
         oldPathId: oldId, newPathId: newId, generation: gen)
-    let inFlight = ?decodeVarint(data, pos)
+    let inFlight = varintOrReturn(data, pos)
     ok(StepEvent(kind: sekSourceReload, reloadOrdinal: ordinal,
       changed: changed, inFlightFrames: inFlight))
   else:
     err("unknown step event tag: " & $tag)
+
+template decodeStepEventBody(data: openArray[byte], pos: var int,
+    allowSourceReload: bool) {.dirty.} =
+  ## The body of `decodeStepEvent` and `decodeStepEventHot`, for a proc
+  ## returning `Result[StepEvent, string]`.
+  if pos >= 0 and pos < data.len:
+    let tag = data[pos]
+    if tag in {TagAbsoluteStep, TagDeltaStep, TagThreadSwitch, TagThreadStart,
+        TagThreadExit, TagCatch, TagDeltaColumn}:
+      var p = pos + 1
+      var v: uint64
+      if readVarint(data, p, v):
+        pos = p
+        template signed(): int64 =
+          if (v and 1) == 0: int64(v shr 1) else: not int64(v shr 1)
+        return
+          case tag
+          of TagAbsoluteStep: ok(StepEvent(kind: sekAbsoluteStep, globalLineIndex: v))
+          of TagDeltaStep: ok(StepEvent(kind: sekDeltaStep, lineDelta: signed()))
+          of TagThreadSwitch: ok(StepEvent(kind: sekThreadSwitch, threadId: v))
+          of TagThreadStart: ok(StepEvent(kind: sekThreadStart, startThreadId: v))
+          of TagThreadExit: ok(StepEvent(kind: sekThreadExit, exitThreadId: v))
+          of TagCatch: ok(StepEvent(kind: sekCatch, catchExceptionTypeId: v))
+          else: ok(StepEvent(kind: sekDeltaColumn, columnDelta: signed()))
+  result = decodeOtherStepEvent(data, pos, allowSourceReload)
+
+proc decodeStepEvent*(data: openArray[byte], pos: var int,
+    allowSourceReload: bool = false): Result[StepEvent, string] =
+  ## Decode one step event from data starting at pos.
+  ##
+  ## A record whose payload is one varint (a position step, a thread switch,
+  ## start or exit, a catch, a column step), when the varint decodes, is
+  ## decoded here; every other record, and every record that does not decode,
+  ## by `decodeOtherStepEvent`, which names the refusal.
+  ##
+  ## ``allowSourceReload`` mirrors the container's declaration: tag 0x08
+  ## (``TagSourceReload``) is accepted only when ``meta.dat`` carries
+  ## ``FlagExtHasSourceReload``.  The default is FALSE so that every
+  ## caller that has not been taught to consult the flag refuses the tag
+  ## rather than decoding it — the strict rejection ``readMetaDat`` applies
+  ## to an unknown flag bit (``KnownFlags`` in ``meta_dat.nim``), applied one
+  ## layer down.
+  ##
+  ## The alternative — SKIPPING an unknown tag — is what this signature
+  ## exists to make impossible.  A skip cannot know the record's length,
+  ## so the payload varints are re-read as further events and the stream
+  ## decodes SHORTER and plausibly: wrong bytes instead of an error.
+  decodeStepEventBody(data, pos, allowSourceReload)
+
+proc decodeStepEventHot*(data: openArray[byte], pos: var int,
+    allowSourceReload: bool): Result[StepEvent, string] {.inline.} =
+  ## `decodeStepEvent`, inlined: for the walk that decodes every record of a
+  ## chunk in turn. Everywhere else the call keeps the module small.
+  decodeStepEventBody(data, pos, allowSourceReload)

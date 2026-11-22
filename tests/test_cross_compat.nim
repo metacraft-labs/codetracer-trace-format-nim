@@ -5,17 +5,15 @@
 ##
 ##   - CTFS magic, version, block size match Rust defaults
 ##   - Internal file names match base40 encoding expected by Rust
-##   - events.fmt = "split-binary"
-##   - meta.json / paths.json are valid JSON with required fields
-##   - Chunk headers in events.log use the expected 16-byte format
+##   - meta.dat carries the program, args and workdir, paths.dat the paths
 ##   - Split-binary tag bytes match the Rust enum discriminant ordering
 ##   - Fixed-size events have exact byte layouts matching Rust spec
 ##   - CBOR-payload events have correct envelope structure
 
-import std/[os, json, strutils]
+import std/[os, strutils]
 import results
 import codetracer_ctfs
-import codetracer_trace_writer
+import codetracer_trace_writer/multi_stream_writer
 import codetracer_trace_writer/meta_dat
 import codetracer_trace_writer/split_binary
 
@@ -104,6 +102,21 @@ proc readU64LELocal(data: openArray[byte], offset: int): uint64 =
     (uint64(data[offset + 6]) shl 48) or
     (uint64(data[offset + 7]) shl 56)
 
+
+proc writeSplitTrace(path, program: string, args: seq[string] = @[],
+    workdir = "", paths: seq[string] = @["/src/x.nim"]) =
+  ## A small recording through the split-stream writer.
+  var w = initMultiStreamWriter(path, program).get()
+  w.metadata.args = args
+  w.metadata.workdir = workdir
+  var first = 0'u64
+  for i, p in paths:
+    let id = w.registerPath(p).get()
+    if i == 0: first = id
+  doAssert w.registerStep(first, 1, []).isOk
+  doAssert w.close().isOk
+  doAssert w.closeCtfs().isOk
+
 # ---------------------------------------------------------------------------
 # Test: CTFS container structure matches Rust expectations
 # ---------------------------------------------------------------------------
@@ -113,12 +126,7 @@ proc test_ctfs_magic_version_blocksize() =
   let path = getTmpPath("test_cross_compat_structure.ct")
   cleanupFile(path)
 
-  var writerRes = newTraceWriter(path, "cross_test", @["--arg1"],
-                                  workdir = "/tmp/test")
-  doAssert writerRes.isOk, "newTraceWriter failed"
-  var w = writerRes.get()
-  doAssert w.writeStep(0, 1).isOk
-  doAssert w.close().isOk
+  writeSplitTrace(path, "cross_test", @["--arg1"], workdir = "/tmp/test")
 
   let readRes = readCtfsFromFile(path)
   doAssert readRes.isOk, "failed to read .ct file"
@@ -159,15 +167,9 @@ proc test_ctfs_magic_version_blocksize() =
 
 proc test_base40_file_names() =
   ## Verify base40 encoding of internal file names matches Rust's base40.
-  ## Rust expects: events.log, events.fmt, meta.json, paths.json
   let path = getTmpPath("test_cross_compat_names.ct")
   cleanupFile(path)
-
-  var writerRes = newTraceWriter(path, "test", @[])
-  doAssert writerRes.isOk
-  var w = writerRes.get()
-  doAssert w.writeStep(0, 1).isOk
-  doAssert w.close().isOk
+  writeSplitTrace(path, "test")
 
   let readRes = readCtfsFromFile(path)
   doAssert readRes.isOk
@@ -175,7 +177,7 @@ proc test_base40_file_names() =
 
   # Every internal file this writer emits must be present and findable by
   # base40 name.  The legacy `meta.json` / `paths.json` sidecars are retired.
-  let expectedFiles = ["events.log", "events.fmt", "meta.dat"]
+  let expectedFiles = ["steps.dat", "steps.idx", "meta.dat", "paths.dat"]
   for name in expectedFiles:
     let (fileSize, mapBlock) = findInternalFile(data, name)
     doAssert mapBlock != 0,
@@ -183,9 +185,9 @@ proc test_base40_file_names() =
     doAssert fileSize > 0,
       "internal file has zero size: " & name
 
-  # base40 must still round-trip the retired names: containers written before
-  # the retirement remain decodable, they just carry nothing we read.
-  for name in @expectedFiles & @["meta.json", "paths.json"]:
+  # base40 must still round-trip the retired names: a reader has to be able to
+  # find them in order to refuse a container that carries one.
+  for name in @expectedFiles & @["meta.json", "paths.json", "events.log", "events.fmt"]:
     let encoded = base40Encode(name)
     let decoded = base40Decode(encoded)
     doAssert decoded == name,
@@ -193,32 +195,6 @@ proc test_base40_file_names() =
 
   cleanupFile(path)
   echo "PASS: test_base40_file_names"
-
-# ---------------------------------------------------------------------------
-# Test: events.fmt = "split-binary"
-# ---------------------------------------------------------------------------
-
-proc test_events_fmt_split_binary() =
-  ## Rust reader expects events.fmt to contain exactly "split-binary".
-  let path = getTmpPath("test_cross_compat_fmt.ct")
-  cleanupFile(path)
-
-  var writerRes = newTraceWriter(path, "test", @[])
-  doAssert writerRes.isOk
-  var w = writerRes.get()
-  doAssert w.writeStep(0, 1).isOk
-  doAssert w.close().isOk
-
-  let readRes = readCtfsFromFile(path)
-  doAssert readRes.isOk
-  let data = readRes.get()
-
-  let fmtStr = readInternalFileStr(data, "events.fmt")
-  doAssert fmtStr == "split-binary",
-    "events.fmt should be 'split-binary', got: '" & fmtStr & "'"
-
-  cleanupFile(path)
-  echo "PASS: test_events_fmt_split_binary"
 
 # ---------------------------------------------------------------------------
 # Test: meta.dat carries the fields a cross-language reader needs
@@ -233,16 +209,9 @@ proc test_meta_dat_structure() =
   let path = getTmpPath("test_cross_meta_dat.ct")
   cleanupFile(path)
 
-  var writerRes = newTraceWriter(path, "cross_program",
-                                 @["--a", "b.txt"],
-                                 workdir = "/w")
-  doAssert writerRes.isOk
-  var w = writerRes.get()
   let testPaths = @["/src/a.nim", "/src/b.nim"]
-  for tp in testPaths:
-    doAssert w.writePath(tp).isOk
-  doAssert w.writeStep(0, 1).isOk
-  doAssert w.close().isOk
+  writeSplitTrace(path, "cross_program", @["--a", "b.txt"], workdir = "/w",
+    paths = testPaths)
 
   let readRes = readCtfsFromFile(path)
   doAssert readRes.isOk
@@ -267,66 +236,6 @@ proc test_meta_dat_structure() =
 
   cleanupFile(path)
   echo "PASS: test_meta_dat_structure"
-
-proc test_chunk_header_format() =
-  ## Rust reader expects chunk headers in events.log:
-  ##   [4 bytes compressed_size LE][4 bytes event_count LE][8 bytes first_geid LE]
-  ## Total: 16 bytes per chunk header (ChunkIndexEntrySize).
-  let path = getTmpPath("test_cross_compat_chunks.ct")
-  cleanupFile(path)
-
-  var writerRes = newTraceWriter(path, "test", @[],
-                                  chunkThreshold = 50)
-  doAssert writerRes.isOk
-  var w = writerRes.get()
-
-  # Write 150 step events to get 3 chunks
-  for i in 0 ..< 150:
-    doAssert w.writeStep(uint64(i mod 5), int64(i)).isOk
-
-  doAssert w.close().isOk
-
-  let readRes = readCtfsFromFile(path)
-  doAssert readRes.isOk
-  let data = readRes.get()
-
-  let eventsData = readInternalFileData(data, "events.log")
-  doAssert eventsData.len > 0, "events.log is empty"
-
-  # Verify ChunkIndexEntrySize = 16 (must match Rust)
-  doAssert ChunkIndexEntrySize == 16,
-    "ChunkIndexEntrySize should be 16, got: " & $ChunkIndexEntrySize
-
-  # Parse first chunk header manually to verify byte layout
-  doAssert eventsData.len >= 16, "events.log too small for chunk header"
-
-  # Bytes 0..3: compressed_size (u32 LE)
-  let compressedSize = readU32LELocal(eventsData, 0)
-  doAssert compressedSize > 0, "first chunk compressed_size is 0"
-
-  # Bytes 4..7: event_count (u32 LE)
-  let eventCount = readU32LELocal(eventsData, 4)
-  doAssert eventCount == 50, "first chunk event_count should be 50, got: " & $eventCount
-
-  # Bytes 8..15: first_geid (u64 LE)
-  let firstGeid = readU64LELocal(eventsData, 8)
-  doAssert firstGeid == 0, "first chunk first_geid should be 0, got: " & $firstGeid
-
-  # Verify second chunk starts at offset 16 + compressedSize
-  let chunk2Offset = 16 + int(compressedSize)
-  doAssert eventsData.len >= chunk2Offset + 16,
-    "events.log too small for second chunk header"
-
-  let eventCount2 = readU32LELocal(eventsData, chunk2Offset + 4)
-  doAssert eventCount2 == 50,
-    "second chunk event_count should be 50, got: " & $eventCount2
-
-  let firstGeid2 = readU64LELocal(eventsData, chunk2Offset + 8)
-  doAssert firstGeid2 == 50,
-    "second chunk first_geid should be 50, got: " & $firstGeid2
-
-  cleanupFile(path)
-  echo "PASS: test_chunk_header_format"
 
 # ---------------------------------------------------------------------------
 # Test: Split-binary tag bytes match Rust enum discriminant ordering
@@ -590,86 +499,14 @@ proc test_encode_decode_roundtrip() =
   echo "PASS: test_encode_decode_roundtrip"
 
 # ---------------------------------------------------------------------------
-# Test: Full end-to-end .ct file is Rust-readable
-# ---------------------------------------------------------------------------
-
-proc test_full_ct_file_structure() =
-  ## Generate a complete .ct file and verify all structural invariants
-  ## that the Rust reader depends on, in one comprehensive check.
-  let path = getTmpPath("test_cross_compat_full.ct")
-  cleanupFile(path)
-
-  var writerRes = newTraceWriter(path, "cross_compat_test",
-    @["--flag", "value"], workdir = "/workspace")
-  doAssert writerRes.isOk
-  var w = writerRes.get()
-
-  # Write a realistic trace
-  doAssert w.writePath("/src/main.rs").isOk
-  doAssert w.writePath("/src/lib.rs").isOk
-  doAssert w.writeFunction(0, 1, "main").isOk
-  doAssert w.writeStep(0, 1).isOk
-  doAssert w.writeCall(0).isOk
-  doAssert w.writeStep(1, 10).isOk
-  doAssert w.writeReturn().isOk
-  doAssert w.writeStep(0, 2).isOk
-
-  doAssert w.close().isOk
-
-  let readRes = readCtfsFromFile(path)
-  doAssert readRes.isOk
-  let data = readRes.get()
-
-  # 1. Magic + version
-  doAssert hasCtfsMagic(data)
-  doAssert data[5] == 5'u8
-
-  # 2. All internal files present
-  for name in ["events.log", "events.fmt", "meta.dat"]:
-    let (sz, mb) = findInternalFile(data, name)
-    doAssert mb != 0, "missing: " & name
-    doAssert sz > 0, "empty: " & name
-
-  # 2b. The legacy JSON sidecars are retired.
-  for name in ["meta.json", "paths.json"]:
-    doAssert findInternalFile(data, name) == (0'u64, 0'u64),
-      "legacy JSON sidecar was written: " & name
-
-  # 3. events.fmt
-  doAssert readInternalFileStr(data, "events.fmt") == "split-binary"
-
-  # 4. meta.dat carries the metadata; paths.dat the paths
-  let metaParsed = readMetaDat(readInternalFileData(data, "meta.dat"))
-  doAssert metaParsed.isOk, "meta.dat did not parse: " & metaParsed.error
-  let meta = metaParsed.get()
-  doAssert meta.program == "cross_compat_test"
-  doAssert meta.args.len == 2
-  doAssert meta.workdir == "/workspace"
-  doAssert readInternalFileStr(data, "paths.dat") == "/src/main.rs/src/lib.rs"
-
-  # 6. events.log has valid chunk(s)
-  let eventsData = readInternalFileData(data, "events.log")
-  doAssert eventsData.len >= ChunkIndexEntrySize
-  let firstChunk = decodeChunkHeader(eventsData, 0)
-  doAssert firstChunk.compressedSize > 0
-  doAssert firstChunk.eventCount > 0
-  doAssert firstChunk.firstGeid == 0
-
-  cleanupFile(path)
-  echo "PASS: test_full_ct_file_structure"
-
-# ---------------------------------------------------------------------------
 # Run all tests
 # ---------------------------------------------------------------------------
 
 test_ctfs_magic_version_blocksize()
 test_base40_file_names()
-test_events_fmt_split_binary()
 test_meta_dat_structure()
-test_chunk_header_format()
 test_split_binary_tag_ordering()
 test_fixed_size_event_layouts()
 test_cbor_payload_envelope()
 test_encode_decode_roundtrip()
-test_full_ct_file_structure()
 echo "ALL PASS: test_cross_compat"

@@ -53,6 +53,9 @@
 import std/[tables, algorithm]
 import results
 import ../codetracer_ctfs/zstd_bindings
+import ../codetracer_ctfs/container
+import ../codetracer_ctfs/compact
+import ../codetracer_ctfs/types
 import ./varint
 
 export results
@@ -89,10 +92,9 @@ proc recordStep*(b: var StepMapBuilder, pathId: uint64, line: uint64,
   ## the recorder registered, which are also the coordinates a breakpoint
   ## request arrives as.  `line` is narrowed to the u32 wire width of the
   ## `STMP` line field.
-  var byLine = addr b.byPath.mgetOrPut(pathId)
-  if byLine[].len == 0:
-    # Most newly recorded paths start with one line; grow for further lines.
-    byLine[] = initTable[uint32, seq[int64]](1)
+  # `default`, not `initTable`: the default is evaluated on every call, and
+  # an empty table allocates nothing until its first insert.
+  var byLine = addr b.byPath.mgetOrPut(pathId, default(Table[uint32, seq[int64]]))
   let line = if line == 0: 1'u32 else: uint32(line)
   var ids = addr byLine[].mgetOrPut(line, newSeq[int64]())
   ids[].add(int64(stepId))
@@ -229,14 +231,35 @@ type
 
   StepMapReader* = object
     ## A version 2 `step-map.ns`, opened over its bytes. `lookup` inflates one
-    ## chunk; `loadAll` inflates every chunk and verifies the header's counts.
+    ## chunk and keeps it for the next lookup; `loadAll` inflates every chunk
+    ## and verifies the header's counts.
     data: seq[byte]
     chunks: seq[StepMapChunkRef]
     pathCount*: uint32
     lineCount*: uint32
     stepCount*: uint64
+    stored: bool
+      ## Chunks are stored as their content, not as zstd frames: the map is a
+      ## member of a compact container (`ctfs-container.md` §1f).
+    held: int            ## the chunk `raw` holds, -1 when none
+    raw: seq[byte]       ## its inflated content
+    heldKeys: seq[StepMapKey]
+      ## Every line record of the held chunk, in key order: the index the
+      ## first lookup into the chunk builds while it checks the whole chunk.
+    heldStarts: seq[int]
+      ## Where each of those records' `count` field starts in `raw`.
 
   StepMapLine* = tuple[pathId: uint64, line: uint32, steps: seq[int64]]
+
+  StepMapKey = (uint64, uint32)
+
+  StepMapIndex* = object
+    ## Every line of a `step-map.ns` and its step ids, as `loadAll` reads
+    ## them: the keys in order, and every line's ids in one list, each line's
+    ## ending where the next begins. One allocation holds every id.
+    keys: seq[StepMapKey]
+    ends: seq[int]      ## where each line's ids end in `ids`
+    ids: seq[int64]
 
 proc rdU16(d: openArray[byte], o: int): uint16 =
   uint16(d[o]) or (uint16(d[o + 1]) shl 8)
@@ -247,8 +270,13 @@ proc rdU32(d: openArray[byte], o: int): uint32 =
 proc rdU64(d: openArray[byte], o: int): uint64 =
   for i in 0 ..< 8: result = result or (uint64(d[o + i]) shl (8 * i))
 
-proc openStepMap*(data: openArray[byte]): Result[StepMapReader, string] =
+proc openStepMap*(data: sink seq[byte],
+    stored = false): Result[StepMapReader, string] =
   ## Parse a `step-map.ns` header and chunk table. Refuses any version but 2.
+  ## The reader keeps `data`; pass it by its last use and it is not copied.
+  ## `stored` says the chunks are their content rather than zstd frames, as
+  ## in a compact container (`ctfs-container.md` §1f); `openStepMapIn` reads
+  ## the member and the profile out of a container.
   if data.len < StepMapHeaderSize:
     return err("step-map.ns: " & $data.len & " bytes, shorter than the " &
       $StepMapHeaderSize & "-byte header")
@@ -258,8 +286,8 @@ proc openStepMap*(data: openArray[byte]): Result[StepMapReader, string] =
   if version != StepMapVersion:
     return err("step-map.ns: version " & $version & " is not supported; " &
       "this reader reads version " & $StepMapVersion & " only")
-  var r = StepMapReader(data: @data)
   let n = int(rdU32(data, 6))
+  var r = StepMapReader(held: -1, stored: stored)
   r.pathCount = rdU32(data, 10)
   r.lineCount = rdU32(data, 14)
   r.stepCount = rdU64(data, 18)
@@ -287,17 +315,42 @@ proc openStepMap*(data: openArray[byte]): Result[StepMapReader, string] =
     return err("step-map.ns: no chunks, but the header counts " &
       $r.pathCount & " paths, " & $r.lineCount & " lines, " & $r.stepCount &
       " steps")
+  r.data = data
   ok(r)
 
-proc inflateChunk(r: StepMapReader, c: int): Result[seq[byte], string] =
+proc openStepMap*(data: openArray[byte],
+    stored = false): Result[StepMapReader, string] =
+  ## As above, over a copy of `data`.
+  openStepMap(@data, stored)
+
+proc openStepMapIn*(container: openArray[byte]): Result[StepMapReader, string] =
+  ## The `step-map.ns` of a container, in either profile, and stored under a
+  ## whole-file scheme or not (`ctfs-container.md` §1a).
+  if container.len > V6CompressionOffset and container[5] == CtfsVersionV6 and
+      container[V6CompressionOffset] != uint8(ord(wfcNone)):
+    var image = ? reconstructImage(container)
+    image[V6CompressionOffset] = uint8(ord(wfcNone))
+    return openStepMapIn(image)
+  var bytes = readInternalFile(container, StepMapFileName)
+  if bytes.isErr:
+    return err(StepMapFileName & ": " & bytes.unsafeError)
+  openStepMap(move bytes.get(), isCompactContainer(container))
+
+proc inflateChunk(r: StepMapReader, c: int,
+    raw: var seq[byte]): Result[void, string] =
+  ## Inflate chunk `c` into `raw` — or copy it, when it is stored as content.
   let ch = r.chunks[c]
+  if r.stored:
+    raw.setLenUninit(ch.frameEnd - ch.frameStart)
+    copyMem(addr raw[0], unsafeAddr r.data[ch.frameStart], raw.len)
+    return ok()
   let src = unsafeAddr r.data[ch.frameStart]
   let srcLen = csize_t(ch.frameEnd - ch.frameStart)
   let size = ZSTD_getFrameContentSize(src, srcLen)
   if size == ZSTD_CONTENTSIZE_UNKNOWN or size == ZSTD_CONTENTSIZE_ERROR:
     return err("step-map.ns: chunk " & $c & " frame does not declare its size")
-  var raw = newSeq[byte](int(size))
-  let got = ZSTD_decompress(if raw.len > 0: addr raw[0] else: nil,
+  raw.setLenUninit(int(size))  # every byte is written by the inflate
+  let got = zstdDecompressShared(if raw.len > 0: addr raw[0] else: nil,
     csize_t(raw.len), src, srcLen)
   if ZSTD_isError(got) != 0:
     return err("step-map.ns: chunk " & $c & " does not decode: " &
@@ -305,21 +358,62 @@ proc inflateChunk(r: StepMapReader, c: int): Result[seq[byte], string] =
   if int(got) != raw.len:
     return err("step-map.ns: chunk " & $c & " decodes to " & $got &
       " bytes, not its declared " & $raw.len)
-  ok(raw)
+  ok()
 
-proc decodeChunk(r: StepMapReader, c: int, prevKey: var (uint64, uint32),
-    havePrev: var bool,
-    sink: proc (pathId: uint64, line: uint32, ids: seq[int64]): bool {.raises: [].}):
-    Result[void, string] =
-  ## Decode chunk `c`, calling `sink` per line record until it returns true.
-  let raw = ? r.inflateChunk(c)
+proc runFits(prev: int64, gap, rep: uint64): bool {.inline.} =
+  ## Whether a run of `rep` ids `gap` apart after `prev` ends at or below
+  ## `high(int64)`, the largest id a step id list holds: `gap * rep` is at
+  ## most what is left above `prev`, compared without forming the product.
+  ## `gap` and `rep` are at least 1, `prev` at least -1.
+  # `high(int64) - prev`, in unsigned arithmetic, which wraps to 2^63 for
+  # the -1 a list starts from.
+  let room = uint64(high(int64)) - cast[uint64](prev)
+  gap <= room div rep
+
+proc fillRun(ids: var seq[int64], at: int, prev: var int64,
+    gap, rep: uint64) {.inline.} =
+  ## Write a run's `rep` ids, `gap` apart after `prev`, to `ids[at ..]`, and
+  ## leave `prev` at the last. The caller has sized `ids` and checked the run
+  ## with `runFits`, so the ids are written without a check per id; the sum is
+  ## wrapping only because `gap` may be 2^63, which `int64` cannot hold, and
+  ## lands on an id `runFits` allowed.
+  let dst = cast[ptr UncheckedArray[int64]](addr ids[at])
+  let g = cast[int64](gap)
+  var v = prev
+  for k in 0 ..< int(rep):
+    v = v +% g
+    dst[k] = v
+  prev = v
+
+proc lineRefusal(path: uint64, line: uint32, what: string): string =
+  ## A refusal of line `(path, line)`'s record, for `what` is wrong with it.
+  "step-map.ns: line (" & $path & ", " & $line & ")" & what
+
+proc varintRefusal(c, pos: int): string =
+  "step-map.ns: chunk " & $c & ": a varint at byte " & $pos &
+    " is truncated or longer than ten bytes"
+
+proc scanChunk(r: StepMapReader, c: int, raw: openArray[byte],
+    prevKey: var StepMapKey,
+    havePrev: var bool, collect: bool,
+    index: var StepMapIndex,
+    keys: var seq[StepMapKey], starts: var seq[int]): Result[void, string] =
+  ## Decode the inflated chunk `c`, checking everything the spec has a reader
+  ## refuse. With `collect`, every line record is appended to `index`.
+  ## Without it, no step id is written, and each record's key and the
+  ## position of its `count` field are appended to `keys` and `starts`: the
+  ## index `lookup` answers from.
   var pos = 0
+  template next(v: var uint64) =
+    if not readVarint(raw, pos, v):
+      return err(varintRefusal(c, pos))
   var path = r.chunks[c].firstPath
   var line = 0'u32
   var first = true
+  var dp, dl, count, gap, rep: uint64
   while pos < raw.len:
-    let dp = ? decodeVarint(raw, pos)
-    let dl = ? decodeVarint(raw, pos)
+    next(dp)
+    next(dl)
     if first:
       if dp != 0:
         return err("step-map.ns: chunk " & $c & "'s first record has a path " &
@@ -335,62 +429,148 @@ proc decodeChunk(r: StepMapReader, c: int, prevKey: var (uint64, uint32),
     else:
       line += uint32(dl)
     first = false
-    if havePrev and (path, line) <= prevKey:
+    let key = (path, line)
+    if havePrev and key <= prevKey:
       return err("step-map.ns: keys do not ascend strictly at (" & $path &
         ", " & $line & ")")
-    prevKey = (path, line)
+    prevKey = key
     havePrev = true
-    let count = ? decodeVarint(raw, pos)
+    if not collect:
+      keys.add(key)
+      starts.add(pos)
+    next(count)
     if count == 0:
-      return err("step-map.ns: line (" & $path & ", " & $line & ") has count 0")
-    var ids = newSeqOfCap[int64](int(min(count, 1_000_000'u64)))
+      return err(lineRefusal(path, line, " has count 0"))
+    let base = index.ids.len
+    var n = 0'u64
     var prev = -1'i64
-    while uint64(ids.len) < count:
-      let gap = ? decodeVarint(raw, pos)
-      let rep = ? decodeVarint(raw, pos)
+    while n < count:
+      next(gap)
+      next(rep)
       if gap == 0 or rep == 0:
-        return err("step-map.ns: line (" & $path & ", " & $line &
-          ") has a run with gap " & $gap & " and repeat " & $rep)
-      if uint64(ids.len) + rep > count:
-        return err("step-map.ns: line (" & $path & ", " & $line &
-          ")'s runs overshoot its count " & $count)
-      for k in 0'u64 ..< rep:
-        prev += int64(gap)
-        ids.add(prev)
-    if sink(path, line, ids):
-      return ok()
+        return err(lineRefusal(path, line, " has a run with gap " & $gap &
+          " and repeat " & $rep))
+      if rep > count - n:
+        return err(lineRefusal(path, line, "'s runs overshoot its count " &
+          $count))
+      if not runFits(prev, gap, rep):
+        return err(lineRefusal(path, line,
+          " has a run whose step ids pass " & $high(int64)))
+      if collect:
+        # Grown a run at a time: `rep` was just checked against what is left
+        # of `count`.
+        index.ids.setLenUninit(base + int(n + rep))
+        fillRun(index.ids, base + int(n), prev, gap, rep)
+      else:
+        # `runFits` bounds the product by 2^63, wrapping as `fillRun` does.
+        prev = prev +% cast[int64](gap * rep)
+      n += rep
+    if collect:
+      index.keys.add(key)
+      index.ends.add(index.ids.len)
   ok()
 
-proc loadAll*(r: StepMapReader): Result[seq[StepMapLine], string] =
+proc decodeIds(raw: openArray[byte], pos: int): seq[int64] =
+  ## The step ids of the record whose `count` field starts at `pos`, in a
+  ## chunk `scanChunk` has already checked.
+  var p = pos
+  var count, gap, rep: uint64
+  discard readVarint(raw, p, count)
+  # The scan checked that the runs' repeats add up to `count` exactly.
+  # A run at a time: the scan checked each run's ids against `high(int64)`.
+  result = newSeqUninit[int64](int(count))
+  var prev = -1'i64
+  var n = 0
+  while n < int(count):
+    discard readVarint(raw, p, gap)
+    discard readVarint(raw, p, rep)
+    fillRun(result, n, prev, gap, rep)
+    n += int(rep)
+
+proc len*(idx: StepMapIndex): int =
+  ## How many lines the index holds.
+  idx.keys.len
+
+proc pathId*(idx: StepMapIndex, i: int): uint64 = idx.keys[i][0]
+proc line*(idx: StepMapIndex, i: int): uint32 = idx.keys[i][1]
+
+proc ids*(idx: StepMapIndex): lent seq[int64] =
+  ## Every line's step ids, line after line in key order.
+  idx.ids
+
+proc stepsStart*(idx: StepMapIndex, i: int): int =
+  ## Where line `i`'s step ids begin in `ids`.
+  if i == 0: 0 else: idx.ends[i - 1]
+
+proc stepsEnd*(idx: StepMapIndex, i: int): int =
+  ## Where line `i`'s step ids end in `ids` (exclusive).
+  idx.ends[i]
+
+template steps*(idx: StepMapIndex, i: int): openArray[int64] =
+  ## Line `i`'s step ids, in place.
+  idx.ids.toOpenArray(idx.stepsStart(i), idx.stepsEnd(i) - 1)
+
+proc `[]`*(idx: StepMapIndex, i: int): StepMapLine =
+  ## Line `i`, its step ids copied out.
+  (idx.pathId(i), idx.line(i), @(idx.steps(i)))
+
+iterator items*(idx: StepMapIndex): StepMapLine =
+  ## Every line in key order, each one's step ids copied out.
+  for i in 0 ..< idx.len:
+    yield idx[i]
+
+proc find*(idx: StepMapIndex, pathId: uint64, line: uint64): int =
+  ## The position of `(pathId, line)` in the index, or -1. Line 0 is looked up
+  ## as line 1, as `lookup` does.
+  if line > high(uint32):
+    return -1
+  let key = (pathId, if line == 0: 1'u32 else: uint32(line))
+  var lo = 0
+  var hi = idx.keys.len
+  while lo < hi:
+    let mid = (lo + hi) div 2
+    if idx.keys[mid] < key: lo = mid + 1
+    else: hi = mid
+  if lo < idx.keys.len and idx.keys[lo] == key: lo else: -1
+
+proc loadAll*(r: StepMapReader): Result[StepMapIndex, string] =
   ## Every line's step ids, in key order. Refuses a map whose decoded counts
   ## disagree with the header.
-  var lines: seq[StepMapLine]
+  var index = StepMapIndex(
+    keys: newSeqOfCap[StepMapKey](int(r.lineCount)),
+    ends: newSeqOfCap[int](int(r.lineCount)),
+    # The header's count, as far as a list grown on demand would reach on
+    # its own: a count larger than the map holds is refused below, after
+    # the ids are read, and must not size an allocation first.
+    ids: newSeqOfCap[int64](int(min(r.stepCount, 1'u64 shl 20))))
   var prevKey = (0'u64, 0'u32)
   var havePrev = false
+  var raw: seq[byte]
+  var noKeys: seq[StepMapKey]
+  var noStarts: seq[int]
   for c in 0 ..< r.chunks.len:
-    ? r.decodeChunk(c, prevKey, havePrev,
-      proc (p: uint64, l: uint32, ids: seq[int64]): bool =
-        lines.add((p, l, ids))
-        false)
+    ? r.inflateChunk(c, raw)
+    ? r.scanChunk(c, raw, prevKey, havePrev, true, index, noKeys, noStarts)
   var paths = 0'u32
-  var steps = 0'u64
   var last = high(uint64)
-  for ln in lines:
-    if ln.pathId != last:
+  for key in index.keys:
+    if key[0] != last:
       inc paths
-      last = ln.pathId
-    steps += uint64(ln.steps.len)
-  if paths != r.pathCount or uint32(lines.len) != r.lineCount or
+      last = key[0]
+  let steps = uint64(index.ids.len)
+  if paths != r.pathCount or uint32(index.len) != r.lineCount or
       steps != r.stepCount:
-    return err("step-map.ns: decodes to " & $paths & " paths, " & $lines.len &
+    return err("step-map.ns: decodes to " & $paths & " paths, " & $index.len &
       " lines and " & $steps & " steps; the header says " & $r.pathCount &
       ", " & $r.lineCount & " and " & $r.stepCount)
-  ok(lines)
+  ok(index)
 
-proc lookup*(r: StepMapReader, pathId: uint64,
+proc lookup*(r: var StepMapReader, pathId: uint64,
     line: uint64): Result[seq[int64], string] =
   ## The step ids of one `(path_id, line)`, inflating only the chunk that can
-  ## hold it. Line 0 is looked up as line 1. Empty when no step has the key.
+  ## hold it; the chunk stays inflated for the next lookup. Line 0 is looked
+  ## up as line 1 (`internal-files.md` §"`step-map.ns`", "Reading"). Empty
+  ## when no step has the key.
   let key = (pathId, if line == 0: 1'u32 else: uint32(line))
   var lo = 0
   var hi = r.chunks.len
@@ -402,13 +582,30 @@ proc lookup*(r: StepMapReader, pathId: uint64,
       hi = mid
   if lo == 0:
     return ok(newSeq[int64]())
-  var found: seq[int64]
-  var prevKey = (0'u64, 0'u32)
-  var havePrev = false
-  ? r.decodeChunk(lo - 1, prevKey, havePrev,
-    proc (p: uint64, l: uint32, ids: seq[int64]): bool =
-      if (p, l) == key:
-        found = ids
-        return true
-      (p, l) > key)
-  ok(found)
+  let c = lo - 1
+  if r.held != c:
+    # The whole chunk is checked once, when it is inflated, and indexed; a
+    # defect anywhere in it refuses every lookup into it.
+    r.held = -1
+    r.heldKeys.setLen(0)
+    r.heldStarts.setLen(0)
+    ? r.inflateChunk(c, r.raw)
+    var prevKey = (0'u64, 0'u32)
+    var havePrev = false
+    var noLines: StepMapIndex
+    let scanned = r.scanChunk(c, r.raw, prevKey, havePrev, false, noLines,
+      r.heldKeys, r.heldStarts)
+    if scanned.isErr:
+      r.heldKeys.setLen(0)
+      r.heldStarts.setLen(0)
+      return err(scanned.unsafeError)
+    r.held = c
+  var a = 0
+  var b = r.heldKeys.len
+  while a < b:
+    let mid = (a + b) div 2
+    if r.heldKeys[mid] < key: a = mid + 1
+    else: b = mid
+  if a == r.heldKeys.len or r.heldKeys[a] != key:
+    return ok(newSeq[int64]())
+  ok(decodeIds(r.raw, r.heldStarts[a]))

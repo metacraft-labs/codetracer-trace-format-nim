@@ -57,15 +57,23 @@ when defined(nimPreviewSlimSystem):
 ##   - **Never overwrites.** CTFS is append-only; a name that already exists
 ##     is an error, because a stale-but-present stream is exactly the
 ##     "returns the wrong bytes" failure the format's consumers cannot see.
-##   - **The entry array must live in block 0.** Entry arrays may in principle
-##     spill past block 0; nothing this writer produces does, and growing one
-##     is not what an append is for.
+##   - **The entry array may span several blocks** (`ctfs-container.md` §1,
+##     `root_blocks`), and it does not grow: a batch the directory cannot hold
+##     whole is refused before anything is written, naming the first member
+##     that does not fit and the occupancy (§5). The append writes, in order:
+##     the tail, then the changed entries in one write. The header and every
+##     byte in `[root_blocks, previous end of file)` are never rewritten.
+##   - **Not while a seal observer watches the container**
+##     (`CTFS-Binary-Format.md` §2.15.2): the per-seal log has no item for an
+##     append, so it is refused, naming the container.
 
 from std/posix import fsync
+import std/oserrors
 import results
 import ./types
 import ./base40
 import ./container
+import ./checked_io
 
 export container
 
@@ -106,10 +114,9 @@ proc openClosedCtfs*(path: string): Result[Ctfs, string] =
       "internal file can be added"))
 
   let blockSize = readU32LE(data, 8)
-  let entryStart = rootEntryStart(readMaxShards(data))
-  if blockSize == 0'u32 or blockSize mod 8 != 0 or
-     int(blockSize) < entryStart + FileEntrySize:
-    return err(appendError(path, "declares an unusable block size of " & $blockSize))
+  let refusal = blockSizeRefusal(blockSize)
+  if refusal.len > 0:
+    return err(appendError(path, refusal))
   if data.len mod int(blockSize) != 0:
     return err(appendError(path,
       "is " & $data.len & " bytes, not a whole number of " & $blockSize &
@@ -119,42 +126,25 @@ proc openClosedCtfs*(path: string): Result[Ctfs, string] =
   if maxRootEntries == 0'u32:
     # A zero means "fill block 0" — `ctfs-container.md` §1's normative reading
     # of `MaxRootEntries`, which yields 170 entries at the default 4096-byte
-    # block ((4096 - 16) / 24).
-    #
-    # **The readers in this tree do not agree on that, so do not read the
-    # fallback below as the house convention.** Three readings coexist:
-    #
-    #   - auto-fill to 170, as here: the wasm recorder's independent Go reader
-    #     (`internal/ctfs/container.go`'s `locateEntryArray`) and the
-    #     cross-read checker `tests/check_ctfs_container.nim`;
-    #   - **no fallback at all** — `container.nim`'s `readInternalFile` and
-    #     `hasInternalFile` default `maxEntries` to `DefaultMaxRootEntries`
-    #     (31) and scan exactly that many slots, and
-    #     `codetracer_trace_reader.nim` passes the header's value straight
-    #     through, so a declared 0 makes it scan *nothing* and report every
-    #     internal file absent;
-    #   - outright refusal: `native_decoder.nim` errors on `maxRoot == 0`.
-    #
-    # The divergence is harmless *today* only because nothing ever writes a
-    # zero: `createCtfs`'s `maxRootEntries` parameter defaults to
-    # `DefaultMaxRootEntries` = 31 and every caller takes that default
-    # (`multi_stream_writer.nim`, `split_trace.nim`, `createCtfsStreaming`,
-    # and the FFI's `ct_container_create`), while the Rust writer's one
-    # production call site passes a literal 31. Every `.ct` in the workspace
-    # carries 31 in header bytes 12-15, so the branch below is unreachable for
-    # any container these writers produce — and 31 entries are read the same
-    # way by all three readings.
-    #
-    # It is reachable from a *foreign* producer, and the spec's own defaults
-    # table recommends exactly the 0 that half of this tree cannot read. That
-    # makes the split a latent interop hazard rather than a style difference,
-    # which is why it is written down here instead of quietly relied upon.
-    maxRootEntries = effectiveRootEntryCount(blockSize, maxRootEntries, readMaxShards(data))
-  if uint64(entryStart) + uint64(maxRootEntries) * uint64(FileEntrySize) > uint64(blockSize):
+    # block ((4096 - 16) / 24). Every reader in this library applies the same
+    # rule (`types.rootEntryCount`): `findFileEntry`, and through it
+    # `readInternalFile` and `hasInternalFile`, reads a declared `0` passed
+    # through from the header as the auto-filled root, and
+    # `codetracer_trace_reader`, `native_decoder`, ct-print and the space
+    # analyzer read the header through `headerRootEntryCount`. Until
+    # 2026-10-14 they did not: the first group scanned no slot and the
+    # `native_decoder` / ct-print pair refused the header, so a container
+    # from a producer that declares the spec's recommended `0` read as empty
+    # (`tests/test_root_auto_fill.nim`). No writer in this library declares
+    # `0` (`createCtfs` defaults to `DefaultMaxRootEntries`, 31), so no
+    # container written here was ever read differently.
+    maxRootEntries = uint32(
+      (int(blockSize) - HeaderSize - ExtHeaderSize) div FileEntrySize)
+  if uint64(data.len) < rootBlockCount(blockSize, maxRootEntries, readMaxShards(data)) *
+      uint64(blockSize):
     return err(appendError(path,
-      "declares " & $maxRootEntries & " root entries, which do not fit in its " &
-      $blockSize & "-byte block 0; an entry array that spills past block 0 " &
-      "cannot be extended by this writer"))
+      "declares " & $maxRootEntries & " root entries, whose root region is " &
+      "longer than the file"))
 
   var c: Ctfs
   c.data = data
@@ -176,18 +166,25 @@ proc findEntrySlot(c: Ctfs, encodedName: uint64): int =
       return i
   -1
 
-proc syncToDisk(f: File) =
-  ## Best-effort durability barrier between the two write phases.
+proc syncToDisk(f: File): Result[void, string] =
+  ## Durability barrier between the two write phases.
   ##
-  ## `flushFile` only drains the stdio buffer; the ordering guarantee the
-  ## append rests on ("the new blocks are on disk before block 0 points at
-  ## them") needs the page cache pushed out too. On platforms without
-  ## `fsync` the stdio flush is what there is, and the ordering still holds
-  ## against a process crash — which is the failure this protects against in
-  ## practice, since the container is written once and closed.
-  f.flushFile()
+  ## The stdio flush hands the buffered bytes to the operating system, and is
+  ## where a write `fwrite` only buffered fails (a full disk, a file-size
+  ## limit). The ordering guarantee the append rests on ("the new blocks are
+  ## on disk before block 0 points at them") needs the page cache pushed out
+  ## too, hence the `fsync`. On platforms without `fsync` the stdio flush is
+  ## what there is, and the ordering still holds against a process crash —
+  ## which is the failure this protects against in practice, since the
+  ## container is written once and closed.
+  ##
+  ## A failure of either is returned, so that the root region is never
+  ## rewritten to point at blocks that did not reach the file.
+  ? f.flushChecked()
   when defined(posix):
-    discard fsync(f.getFileHandle())
+    if fsync(f.getFileHandle()) != 0:
+      return err("fsync failed: " & osErrorMsg(osLastError()))
+  ok()
 
 when defined(ctfsAppendFaultInjection):
   var ctfsAppendStopAtMidpoint*: bool = false
@@ -214,13 +211,39 @@ when defined(ctfsAppendFaultInjection):
     ##
     ## See `tests/test_container_append_ordering.nim`.
 
-proc writeAppendedBlocks(c: Ctfs, path: string,
-                         firstNewBlock: uint64): Result[void, string] =
-  ## Write the appended tail, then block 0. Never touches anything between.
+proc closeAfterFailure(f: var File) {.raises: [].} =
+  ## Close `f` on the way out of a failed append. The failure already
+  ## reported is the one the caller needs; a close that fails as well adds
+  ## nothing to it.
+  discard f.closeChecked()
+
+when defined(ctfsAppendFaultInjection):
+  var ctfsAppendFailEntryWrite*: bool = false
+    ## Test-only: the entry write fails (as a full disk or an I/O error would
+    ## make it), after the tail is on disk. The append reports it, and the
+    ## container keeps its old entries.
+
+proc writeAppendedBlocks(c: Ctfs, path: string, firstNewBlock: uint64,
+                         oldRoot: seq[byte]): Result[void, string] =
+  ## Write the appended tail, then the changed entries in one write
+  ## (`ctfs-container.md` §5, "Write ordering" and "Batching"): the header is
+  ## not rewritten, and nothing in `[root_blocks, previous end of file)` is.
   let bs = int(c.blockSize)
   let tailStart = int(firstNewBlock) * bs
   if tailStart > c.data.len:
     return err(appendError(path, "internal error: the appended image shrank"))
+  # The changed entries: the one range of the root region the append writes.
+  var lo = -1
+  var hi = -1
+  for k in 0 ..< min(oldRoot.len, c.data.len):
+    if oldRoot[k] != c.data[k]:
+      if k < containerHeaderSize(c.data):
+        return err(appendError(path, "internal error: the append changed the header"))
+      if lo < 0: lo = k
+      hi = k
+  if lo >= 0:
+    lo = containerHeaderSize(c.data) + ((lo - containerHeaderSize(c.data)) div FileEntrySize) * FileEntrySize
+    hi = containerHeaderSize(c.data) + ((hi - containerHeaderSize(c.data)) div FileEntrySize + 1) * FileEntrySize
 
   var f: File
   if not open(f, path, fmReadWriteExisting):
@@ -230,32 +253,50 @@ proc writeAppendedBlocks(c: Ctfs, path: string,
       let n = c.data.len - tailStart
       f.setFilePos(int64(tailStart))
       if f.writeBuffer(unsafeAddr c.data[tailStart], n) != n:
-        close(f)
+        closeAfterFailure(f)
         return err(appendError(path, "short write appending " & $n & " bytes"))
-      syncToDisk(f)
+      let synced = syncToDisk(f)
+      if synced.isErr:
+        closeAfterFailure(f)
+        return err(appendError(path, "writing the appended blocks: " &
+          synced.error))
 
     # ---- the midpoint the durability argument turns on ----------------
     # Everything above is on disk; nothing below has run. A crash here is
     # the case `CTFS-Binary-Format.md` §5d describes: unreferenced trailing
-    # blocks, and block 0 still the old one. This statement sits *between*
-    # the two phases deliberately, so that swapping them moves the two
-    # writes around it rather than moving it along with either.
+    # blocks, and the old entries. This statement sits *between* the two
+    # phases deliberately, so that swapping them moves the two writes around
+    # it rather than moving it along with either.
     when defined(ctfsAppendFaultInjection):
       if ctfsAppendStopAtMidpoint:
-        close(f)
+        closeAfterFailure(f)
         return err(appendError(path,
-          "fault injection: abandoned between the tail write and block 0"))
+          "fault injection: abandoned between the tail write and the entries"))
 
-    # Only now does anything point at the blocks just written.
-    f.setFilePos(0)
-    if f.writeBuffer(unsafeAddr c.data[0], bs) != bs:
-      close(f)
-      return err(appendError(path, "short write rewriting block 0"))
-    syncToDisk(f)
+    # Only now does anything point at the blocks just written: the changed
+    # entries, in one write.
+    if lo >= 0:
+      when defined(ctfsAppendFaultInjection):
+        if ctfsAppendFailEntryWrite:
+          closeAfterFailure(f)
+          return err(appendError(path, "fault injection: the entry write failed"))
+      f.setFilePos(int64(lo))
+      if f.writeBuffer(unsafeAddr c.data[lo], hi - lo) != hi - lo:
+        closeAfterFailure(f)
+        return err(appendError(path, "short write of the appended entries"))
+      let synced = syncToDisk(f)
+      if synced.isErr:
+        closeAfterFailure(f)
+        return err(appendError(path, "writing the appended entries: " &
+          synced.error))
   except IOError, OSError:
-    close(f)
-    return err(appendError(path, "I/O error while appending"))
-  close(f)
+    closeAfterFailure(f)
+    return err(appendError(path, "I/O error while appending: " &
+      getCurrentExceptionMsg()))
+  let closed = f.closeChecked()
+  if closed.isErr:
+    return err(appendError(path, "closing the container after the append: " &
+      closed.error))
   ok()
 
 proc appendInternalFiles*(path: string, names: openArray[string],
@@ -267,6 +308,9 @@ proc appendInternalFiles*(path: string, names: openArray[string],
   ## once. There is deliberately no singular version of this call — attaching
   ## a related set of streams one at a time would make a half-attached
   ## container reachable, and every consumer would have to cope with it.
+  ##
+  ## A batch that would leave the container carrying some but not all of the
+  ## interning tables is refused, and the file is not touched.
   if names.len != contents.len:
     return err("ctfs append: " & $names.len & " name(s) for " &
       $contents.len & " content buffer(s)")
@@ -284,13 +328,36 @@ proc appendInternalFiles*(path: string, names: openArray[string],
       if encoded[j] == encoded[i]:
         return err("ctfs append: " & names[i] & " appears twice in one batch")
 
+  if hasSealObserver(path):
+    return err(appendError(path, "a seal observer is registered on this " &
+      "container; the per-seal log cannot observe an append " &
+      "(CTFS-Binary-Format.md §2.15.2)"))
   var c = ?openClosedCtfs(path)
   let firstNewBlock = c.nextFreeBlock
+  let oldRoot = c.data[0 ..< min(c.data.len, int(c.rootBlockCount()) * int(c.blockSize))]
 
   for i in 0 ..< names.len:
     if c.findEntrySlot(encoded[i]) >= 0:
       return err(appendError(path, "already contains an internal file named " &
         names[i] & "; CTFS is append-only and this writer will not overwrite it"))
+
+  # A batch the directory cannot hold whole is refused before anything is
+  # written, naming the first member that does not fit and the occupancy
+  # (`ctfs-container.md` §5): the root does not grow (§1, rule 2), and no part
+  # of a batch is attached.
+  var free = 0
+  var used = 0
+  for i in 0 ..< int(c.maxRootEntries):
+    let off = c.fileEntryOffset(i)
+    if off + FileEntrySize > c.data.len: break
+    if readU64LE(c.data, off) == 0 and readU64LE(c.data, off + 8) == 0 and
+        readU64LE(c.data, off + 16) == 0: inc free
+    else: inc used
+  if free < names.len:
+    return err(appendError(path, "the root directory cannot hold the batch " &
+      "whole: " & names[free] & " does not fit (" & $used & " of " &
+      $c.maxRootEntries & " entries used, " & $free & " free, " & $names.len &
+      " to add); a closed container's root does not grow"))
 
   for i in 0 ..< names.len:
     let handle = c.addFile(names[i])
@@ -301,4 +368,11 @@ proc appendInternalFiles*(path: string, names: openArray[string],
     if written.isErr:
       return err(appendError(path, "cannot write " & names[i] & ": " & written.error))
 
-  writeAppendedBlocks(c, path, firstNewBlock)
+  # The appended container is a finished one, so it carries the interning
+  # tables all four or none (`interningSetRefusal`). Refused before anything
+  # reaches the file, which keeps the container on disk as it was.
+  let partialSet = interningSetRefusal(c)
+  if partialSet.len > 0:
+    return err(appendError(path, partialSet))
+
+  writeAppendedBlocks(c, path, firstNewBlock, oldRoot)

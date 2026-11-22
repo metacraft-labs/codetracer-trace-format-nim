@@ -6,7 +6,19 @@ when defined(nimPreviewSlimSystem):
 ## CTFS type definitions, constants, and low-level helpers.
 
 import stew/endians2
+import ./live_page
 export endians2
+
+when not defined(gcDestructors):
+  # `setLenUninit` is a destructor-GC (arc/orc) seq routine; it is undeclared
+  # under refc AND under `--mm:none` — the mode the injected recorder shim
+  # (`libct_interpose[_lean].dylib`) builds with.  Provide an equivalent
+  # fallback so the CTFS reader modules compile for every consumer regardless of
+  # mm.  Every call site immediately overwrites the bytes it grew (via copyMem
+  # or a read loop), so `setLen`'s zero-init is discarded — same observable
+  # result, just without the uninitialized-grow optimization under a GC that
+  # does not support it.
+  template setLenUninit*[T](s: var seq[T]; newLen: int) = s.setLen(newLen)
 
 const
   CtfsMagic*: array[5, byte] = [0xC0'u8, 0xDE, 0x72, 0xAC, 0xE2]
@@ -19,17 +31,17 @@ const
     ## those eight bytes, so everything §2 says about `MapBlock`'s three forms
     ## holds in a version-6 full-profile container unchanged.
     ##
-    ## **This library does NOT read version 6, and that is deliberate.**
-    ## `CtfsVersion` is 5 and `ctfsVersionError` refuses everything else by
-    ## name, version 6 included. A version-6 container's `FileEntry` array
-    ## starts at `24 + R` rather than `16 + R`, so a reader that accepted the
-    ## version without implementing the body would resolve every entry out of
-    ## the reserved bytes — the same shape of defect as reading a
-    ## pre-correction container because its version stamp was trusted
-    ## (`meta_dat.nim`'s `LastShiftedGlobalIndexVersion`). The compact body is
-    ## the next milestone's work; the constant exists so the refusal, the
-    ## header offsets below and the parsers in `container.nim` all name one
-    ## number from one place.
+    ## **Which doors read it.** `readInternalFile` and `hasInternalFile` read
+    ## version 6 in both profiles, and so do the stream readers built on them
+    ## and `NewTraceReader`; their gate is `ctfsReadableVersionError`. The
+    ## doors that implement version 5 only — the legacy `events.log` reader,
+    ## the MCR native-bundle detector, the space analyzer — keep
+    ## `ctfsVersionError`, which refuses everything else by name. A reader that
+    ## accepted the version without implementing the body would resolve every
+    ## `FileEntry` out of the reserved bytes, since a version-6 container's
+    ## array starts at `24 + R` rather than `16 + R` — the same shape of defect
+    ## as reading a pre-correction container because its version stamp was
+    ## trusted (`meta_dat.nim`'s `LastShiftedGlobalIndexVersion`).
   V6HeaderSize* = 24
     ## Size of the version-6 container header, in bytes: the 16 bytes every
     ## earlier version has, plus `profile`, `compression` and six reserved
@@ -51,11 +63,20 @@ const
     ## two spellings of one state presents: neither writer was wrong against the
     ## text as it stood, so the text was pinned and both now write `0`.
   DefaultBlockSize*: uint32 = 4096
+
   DefaultMaxRootEntries*: uint32 = 31
   HeaderSize* = 8
   ExtHeaderSize* = 8
   FileEntrySize* = 24  # 8 (size) + 8 (mapBlock) + 8 (name)
   MaxChainLevels* = 5  ## Maximum depth of multi-level mapping
+
+
+proc blockSizeRefusal*(blockSize: uint32): string =
+  ## Empty for a block size a full container may declare — 1024, 2048 or 4096
+  ## (`ctfs-container.md` §1) — and otherwise the refusal, naming the value.
+  if blockSize in [1024'u32, 2048'u32, 4096'u32]: ""
+  else: "block size " & $blockSize & " is not one a CTFS container may " &
+    "declare (1024, 2048 or 4096)"
 
 type
   CtfsCompressionMethod* = enum
@@ -105,6 +126,56 @@ const
   DefaultChunkSize* = 4096   ## Default number of events per chunk
 
 type
+  WriteTap* = proc (offset: int64, bytes: openArray[byte]) {.closure, gcsafe,
+                                                           raises: [].}
+    ## Called with every write a streaming container hands the operating
+    ## system, before it is made (`Ctfs.writeTap`).
+
+  SealItemKind* = enum
+    ## The structural item kinds of `CTFS-Binary-Format.md` §2.15.4.
+    sikEntry    ## a root entry
+    sikRecord   ## a keyed record, new or a word of one
+    sikIndex    ## an index node, new or an in-place index word
+    sikStream   ## a keyed stream's growth
+    sikSemantic ## an annotator's semantic item (§2.15.2, item 2), opaque here
+
+  SealWord* = tuple[at: int, v: uint64]
+    ## An in-place word: its byte offset in the record or node, its value.
+
+  SealItem* = object
+    ## One publication of a seal, in the order the writer writes it.
+    kind*: SealItemKind
+    entry*: int           ## sikEntry: the root slot
+    name*: string         ## sikEntry: the member; otherwise the keyed member
+    size*: uint64         ## sikEntry, sikStream: the new `Size`
+    mapBlock*: uint64     ## sikEntry, sikStream: the new `MapBlock`
+    fromSize*: uint64     ## sikEntry, sikStream: the `Size` the file held
+    replace*: bool        ## sikEntry: truncated or rewritten below `fromSize`
+    masked*: int          ## sikEntry: in-place words zeroed in `[from, size)`
+    bytes*: seq[byte]     ## sikEntry: the bytes `[from, size)`, masked;
+                          ## sikRecord/sikIndex with `isNew`: the whole record
+                          ## or node, masked
+    record*: uint64       ## sikRecord: the record number;
+                          ## sikIndex: the node's byte offset in the member
+    isNew*: bool          ## sikRecord, sikIndex
+    words*: seq[SealWord] ## sikRecord, sikIndex: the in-place words written
+    semantic*: string     ## sikSemantic: the item as its annotator renders it
+
+  SealObserver* = ref object
+    ## `CTFS-Binary-Format.md` §2.15.2's library observer: `beforeSeal` before
+    ## a seal's first publication write, with every item in write order;
+    ## `afterSeal` after the writer's `seal_epoch` increments (`epoch` is the
+    ## writer slot's `seal_epoch`, or the seal's ordinal when there is no
+    ## page).
+    beforeSeal*: proc (ordinal: uint64, items: seq[SealItem]) {.closure,
+                                                                gcsafe, raises: [].}
+    afterSeal*: proc (ordinal: uint64, epoch: uint64) {.closure, gcsafe,
+                                                         raises: [].}
+    annotate*: proc (item: SealItem): seq[string] {.closure, gcsafe, raises: [].}
+      ## The recorder's annotator (§2.15.2, item 2): called once per
+      ## structural item; the semantic items it returns are placed directly
+      ## after that item.
+
   CtfsInternalFile* = object
     entryIndex*: int        ## Index in the file entry array
     writePos*: uint64       ## Current write position within the file
@@ -131,6 +202,49 @@ type
       ## Blocks written since the last `publish` (deferred mode).
     dirtyMark*: seq[bool]
       ## Indexed by block number: already in `dirtyBlocks`.
+    rootPublicationOrder*: seq[uint64]
+      ## Optional encoded member names whose changed root entries publish
+      ## first, in this order, before all other changed entries. Set through
+      ## `setRootPublicationOrder`: publication order is independent of member
+      ## creation order and persists through every sync/publication call.
+    rootGrowthLimit*: uint32
+      ## The largest `maxRootEntries` `growRootDirectory` may reach; 0 (the
+      ## default) is no limit beyond the u32 field.  A FAULT-INJECTION seam for
+      ## tests of what a writer does with a member it could not store (the
+      ## recorder's member-loss accounting): production code never sets it.
+    page*: LivePage
+      ## The live coordination page this writer hosts while it writes a
+      ## streaming container (`ctfs-container.md` §6): created with the
+      ## container, before its root region is first published, and closed by
+      ## `closeCtfs`. Every publication goes to it first and to the file
+      ## after. `nil` for a container built in memory, which has no file
+      ## identity for a reader to find a page by.
+    fileRoot*: seq[byte]
+      ## The root region as the file last received it. A publication writes
+      ## the entries that differ from it, each in one write, and never the
+      ## header again (`ctfs-container.md` §6, "Root publication").
+    writeTap*: WriteTap
+      ## A test seam: called with every write the container hands the
+      ## operating system, in order, before it is made.
+    ioFailure*: string
+      ## The first write that failed since the container was created. The
+      ## blocks it carried stay dirty, so the next publication retries them;
+      ## `closeCtfs` reports it when the final seal does not clear it.
+    keyedMembers*: seq[string]
+      ## The members that keyed families own (`ctfs-container.md` §7a). Root
+      ## growth refuses a container that holds one, naming it.
+    sealObserver*: SealObserver
+      ## The per-seal log observer (`CTFS-Binary-Format.md` §2.15.2), a test
+      ## API: `nil` unless a test or an armed recorder registered one.
+    inClose*: bool
+      ## Set while `closeCtfs` runs its final seal.
+    failedObservedSeal*: bool
+      ## An ordered root publication failed after its observer's intent was
+      ## emitted. The writer is terminal: retrying would emit a second intent
+      ## for the same ordinal, so later publishes/close never republish it.
+    sealOrdinal*: uint64
+      ## This writer's seals on this container (`ctfs-container.md` §6, "What
+      ## counts as a seal"), the ordinal the observer reports.
 
 proc entriesPerBlock*(c: Ctfs): uint64 =
   uint64(c.blockSize) div 8
@@ -139,51 +253,59 @@ proc usableEntries*(c: Ctfs): uint64 =
   ## Usable entries per mapping block (last entry reserved for chain pointer).
   c.entriesPerBlock() - 1
 
-proc rootEntryStart*(maxShards: uint8): int =
-  ## Version-5 full-profile header plus seven six-byte free-list roots per shard.
-  HeaderSize + ExtHeaderSize + 7 * int(maxShards) * 6
-
-proc effectiveRootEntryCount*(blockSize, declared: uint32, maxShards: uint8): uint32 =
-  ## A zero header count auto-fills the remainder of block 0 after the roots.
-  if declared != 0: return declared
-  let prefix = uint64(rootEntryStart(maxShards))
-  if uint64(blockSize) < prefix: return 0
-  uint32((uint64(blockSize) - prefix) div uint64(FileEntrySize))
+proc containerHeaderSize*(data: openArray[byte]): int =
+  ## The byte length of a full-profile container's header, which is where its
+  ## entry array starts (`ctfs-container.md` §1, "Block 0 Layout"): 24 when
+  ## byte 5 declares version 6 (§1a), 16 for versions 2 through 5.  An image
+  ## too short to carry byte 5 reads as the 16-byte layout; every reader
+  ## refuses such an image before it resolves an entry.
+  if data.len > 5 and data[5] == CtfsVersionV6: V6HeaderSize
+  else: HeaderSize + ExtHeaderSize
 
 proc fileEntryOffset*(c: Ctfs, index: int): int =
   ## Byte offset of a file entry from the start of the container.  The entry
-  ## array starts in block 0 and, when it is larger than block 0, continues
-  ## into the blocks after it (`rootBlockCount`), so this is a plain byte
-  ## offset and may lie past the end of block 0.
-  rootEntryStart(c.maxShards) + index * FileEntrySize
+  ## array starts right after the header (`containerHeaderSize`; there is no
+  ## free list root area between them, `ctfs-container.md` §1) and, when it is
+  ## larger than block 0, continues into the blocks after it
+  ## (`rootBlockCount`), so this is a plain byte offset and may lie past the
+  ## end of block 0.
+  containerHeaderSize(c.data) + index * FileEntrySize
 
 proc rootBlockCount*(blockSize: uint32, maxRootEntries: uint32,
-                     maxShards: uint8): uint64 =
+                     maxShards: uint8,
+                     headerSize: int = HeaderSize + ExtHeaderSize): uint64 =
   ## `ctfs-container.md` §1: the number of contiguous blocks, starting at
-  ## block 0, that hold the header, the free-list roots and the file-entry
-  ## array.
+  ## block 0, that hold the header and the file-entry array.
   ##
-  ##     R           = 7 * max_shards * 6
-  ##     root_blocks = ceil((16 + R + max_root_entries * 24) / block_size)
+  ##     root_blocks = ceil((header_size + max_root_entries * 24) / block_size)
+  ##
+  ## `headerSize` is 16 through version 5 and 24 at version 6
+  ## (`containerHeaderSize`); the default is the version-5 header that
+  ## `createCtfs` writes.
   ##
   ## Data block allocation begins at block `root_blocks`.  It is 1 whenever
   ## the entries fit block 0 (every container written before the overflow was
   ## implemented) and for `max_root_entries = 0` (auto-fill of block 0).
   ## 0 for a zero block size, which no reader accepts.
+  ##
+  ## `maxShards` does not enter the count.  Until 2026-10-08 §1 reserved a
+  ## free-list root area of `7 * max_shards * 6` bytes between the header and
+  ## the entries; "The free list root area is removed (2026-10-08)" makes it
+  ## 0 for every shard count (no writer ever wrote it, and nothing keeps state
+  ## there), so the entries start right after the header, at `fileEntryOffset`.
+  ## The parameter stays so every caller states the container it sizes.
   if blockSize == 0'u32:
     return 0
-  let rootBytes = uint64(rootEntryStart(maxShards)) +
+  let rootBytes = uint64(headerSize) +
     uint64(maxRootEntries) * uint64(FileEntrySize)
   max(1'u64, (rootBytes + uint64(blockSize) - 1) div uint64(blockSize))
 
 proc rootBlockCount*(c: Ctfs): uint64 =
-  rootBlockCount(c.blockSize, c.maxRootEntries, c.maxShards)
+  rootBlockCount(c.blockSize, c.maxRootEntries, c.maxShards,
+                 containerHeaderSize(c.data))
 
 proc readU64LE*(data: openArray[byte], offset: int): uint64 =
-  var arr: array[8, byte]
-  for i in 0 ..< 8:
-    arr[i] = data[offset + i]
-  fromBytesLE(uint64, arr)
+  fromBytesLE(uint64, data.toOpenArray(offset, offset + 7))
 
 proc writeU64LE*(data: var openArray[byte], offset: int, val: uint64) =
   let le = toBytesLE(val)
@@ -191,15 +313,35 @@ proc writeU64LE*(data: var openArray[byte], offset: int, val: uint64) =
     data[offset + i] = le[i]
 
 proc readU32LE*(data: openArray[byte], offset: int): uint32 =
-  var arr: array[4, byte]
-  for i in 0 ..< 4:
-    arr[i] = data[offset + i]
-  fromBytesLE(uint32, arr)
+  fromBytesLE(uint32, data.toOpenArray(offset, offset + 3))
 
 proc writeU32LE*(data: var openArray[byte], offset: int, val: uint32) =
   let le = toBytesLE(val)
   for i in 0 ..< 4:
     data[offset + i] = le[i]
+
+proc rootEntryCount*(blockSize, declared: uint32, headerSize: int): uint32 =
+  ## The number of root-directory slots a reader scans in a full-profile
+  ## container whose header is `headerSize` bytes (16 through version 5, 24
+  ## at version 6): `declared`, or for a declared `0` the auto-filled
+  ## remainder of block 0, `(BlockSize - headerSize) div 24` -- 170 at
+  ## version 5 and 169 at version 6 for a 4096-byte block
+  ## (`ctfs-container.md` §1, "Auto-fill", and §1a). A reader that read the
+  ## `0` as "no entries" would read an empty container and report success.
+  if declared != 0'u32:
+    return declared
+  if blockSize <= uint32(headerSize):
+    return 0
+  (blockSize - uint32(headerSize)) div uint32(FileEntrySize)
+
+proc headerRootEntryCount*(data: openArray[byte]): uint32 =
+  ## `rootEntryCount` for the header of the container image `data`: its
+  ## `BlockSize` and `MaxRootEntries`, and its version's header size. 0 for
+  ## an image too short to carry them.
+  if data.len < HeaderSize + ExtHeaderSize:
+    return 0
+  let headerSize = containerHeaderSize(data)
+  rootEntryCount(readU32LE(data, 8), readU32LE(data, 12), headerSize)
 
 proc blockOffset*(c: Ctfs, blockNum: uint64): int =
   ## Byte offset of a given block number.
@@ -214,6 +356,48 @@ proc directDataBlock*(mapBlock: uint64): uint64 {.inline.} =
   ## The data block a tagged `MapBlock` names.
   mapBlock and not CtfsDirect
 
+proc ctfsReadableVersionError*(data: openArray[byte]): string =
+  ## Empty when `data` carries a CTFS version a member can be read out of —
+  ## 5, or 6 in either profile (`ctfs-container.md` §1a); otherwise the
+  ## refusal, naming the version found and the ones read. The readers that
+  ## implement version 6 gate on this; `ctfsVersionError` is the gate of those
+  ## that read version 5 only.
+  if data.len < 6:
+    return "CTFS container too short for a header (" & $data.len & " bytes)"
+  if data[5] != CtfsVersion and data[5] != CtfsVersionV6:
+    return "CTFS container version " & $data[5] & " is not supported: this " &
+      "reader reads version " & $CtfsVersion & " and version " & $CtfsVersionV6 &
+      " (older containers are re-recorded; ctfs-container.md §2, \"Older " &
+      "versions are refused\")"
+  ""
+
+# TODO(ctfs-legacy-corpus): retire this note once the legacy published corpus is
+# re-produced.
+#
+# The refusal below is correct and stays. Worth recording beside it: for one
+# already-published corpus the version stamp is measurably misleading. Those
+# containers carry `meta.dat` 3 written with the CORRECTED packing under an
+# uncorrected stamp — measured two ways. Flipping only the version byte makes
+# every decoded position match the positions published alongside the containers,
+# with zero disagreements; and all 21 distinct (path, line) pairs land on the
+# one-line body of the function they name, never the signature above it.
+#
+# A per-read vouch for that case is UNBUILDABLE, noted so it is not re-proposed.
+# A caller-supplied "trust this stamp" flag is only half of what one needs,
+# because version 6 moved the LAYOUT and not just the gate: the header went 8 to
+# 12 bytes and the path list after `recorder_id` was removed. A version-3 header
+# therefore cannot be parsed under this layout at all. Forcing such a container
+# to container 5 / schema 6 and re-reading fails at every entry point with
+# "flags_ext carries bits this reader does not implement: 0x65303224", which
+# decodes as the recording-id string read as a flags word (varint length
+# 0x24 = 36, then ASCII "20e"). The parse never reaches the body, so no gate at
+# the version check rescues it.
+#
+# The way out is re-recording rather than a reader change, and it is already
+# proven for the larger half of that corpus (`aztec-avm-runtime` `c87b9cc`).
+# The consumer side carries the matching rule in
+# `blocktracer/client/hydrate/engine-pin.txt`: the engine pin and the published
+# data move together, and the pin is never bumped on its own.
 proc ctfsVersionError*(data: openArray[byte]): string =
   ## Empty when `data` carries the CTFS version this library reads (5);
   ## otherwise the refusal, naming the version found and the one read
@@ -227,19 +411,32 @@ proc ctfsVersionError*(data: openArray[byte]): string =
   ""
 
 proc rootDirectoryLayout*(data: openArray[byte]): tuple[entryStart: int, entryCount: uint32, error: string] =
-  ## Validate the version-5 header-derived directory before any entry traversal.
+  ## The root directory a full-profile container image declares, validated
+  ## from its header before any entry is traversed: the entries start right
+  ## after the header (`containerHeaderSize`; there is no free list root area,
+  ## `ctfs-container.md` §1, "The free list root area is removed
+  ## (2026-10-08)"), and there are `rootEntryCount` of them (a declared `0` is
+  ## the auto-filled rest of block 0). `error` is non-empty for an image whose
+  ## magic or version is not one a member can be read out of, a compact
+  ## container (which has no entry array), or one too short to hold the
+  ## declared entry array.
   if data.len < HeaderSize + ExtHeaderSize:
     return (0, 0'u32, "CTFS container too short for root layout")
   for i in 0 ..< CtfsMagic.len:
     if data[i] != CtfsMagic[i]: return (0, 0'u32, "invalid CTFS magic")
-  let versionErr = ctfsVersionError(data)
+  let versionErr = ctfsReadableVersionError(data)
   if versionErr.len > 0: return (0, 0'u32, versionErr)
+  if data[5] == CtfsVersionV6 and
+      (data.len <= V6ProfileOffset or data[V6ProfileOffset] != uint8(ord(cpFull))):
+    return (0, 0'u32, "CTFS container has no full-profile root directory")
+  let headerSize = containerHeaderSize(data)
+  if data.len < headerSize:
+    return (0, 0'u32, "CTFS container too short for root layout")
   let blockSize = readU32LE(data, 8)
   let declared = readU32LE(data, 12)
-  let prefix = rootEntryStart(data[7])
-  if blockSize == 0 or (declared == 0 and uint64(blockSize) < uint64(prefix)):
+  if blockSize == 0 or (declared == 0 and uint64(blockSize) <= uint64(headerSize)):
     return (0, 0'u32, "unusable CTFS auto-fill root layout")
-  let count = effectiveRootEntryCount(blockSize, declared, data[7])
-  if uint64(prefix) + uint64(count) * uint64(FileEntrySize) > uint64(data.len):
-    return (0, 0'u32, "truncated CTFS reserved root directory")
-  (prefix, count, "")
+  let count = rootEntryCount(blockSize, declared, headerSize)
+  if uint64(headerSize) + uint64(count) * uint64(FileEntrySize) > uint64(data.len):
+    return (0, 0'u32, "truncated CTFS root directory")
+  (headerSize, count, "")

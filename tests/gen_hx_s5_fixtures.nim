@@ -67,8 +67,8 @@ proc main() {.raises: [].} =
 
   for ln in 1'u64 .. 10'u64:
     let vals = @[
-      VariableValue(varnameId: vnX, typeId: tInt, data: encInt(int64(ln * 10), tInt)),
-      VariableValue(varnameId: vnS, typeId: tStr, data: encStr("step_" & $ln, tStr))
+      VariableValue(varnameId: vnX, data: encInt(int64(ln * 10), tInt)),
+      VariableValue(varnameId: vnS, data: encStr("step_" & $ln, tStr))
     ]
     var extra: seq[byte] = @[]
     if ln == 1'u64:
