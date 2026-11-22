@@ -15,6 +15,9 @@ import tempfile
 
 KEYS = ("CT_PCRE_LIB_DIR", "CT_ZSTD_INCLUDE_DIR", "CT_ZSTD_LIB_DIR",
         "CT_NIM_STEW_SRC", "CT_NIM_RESULTS_SRC", "CT_NIM_UNITTEST2_SRC")
+# Executables rather than directories: test_managed_sender_ci_routes receives
+# them as MINIO_BIN / PYTHON3_BIN and as execute inputs.
+FILE_KEYS = {"CT_MINIO_BIN": "MINIO_BIN", "CT_PYTHON3_BIN": "PYTHON3_BIN"}
 
 
 def select(environment, manifest):
@@ -34,6 +37,12 @@ def selection(raw):
 
 def assert_path(graph, key, alternate):
     actions = {action["id"]: action for action in graph["actions"]}
+    if key in FILE_KEYS:
+        execute_action = actions[
+            "codetracer-trace-format-nim.test_execute.test_managed_sender_ci_routes"]
+        assert FILE_KEYS[key] + "=" + str(alternate) in execute_action["env"], key
+        assert str(alternate) in execute_action["inputs"], key
+        return
     compile_action = actions["codetracer-trace-format-nim.test_build.test_path_filter"]
     if key in ("CT_PCRE_LIB_DIR", "CT_ZSTD_LIB_DIR"):
         assert "--passL:-L" + str(alternate) in compile_action["argv"], key
@@ -62,9 +71,12 @@ def main():
     checkout = Path(__file__).resolve().parent.parent
     repro = shutil.which("repro")
     assert repro, "enter the owning dev shell: repro is missing"
-    original = {key: os.environ[key] for key in KEYS}
+    original = {key: os.environ[key] for key in KEYS + tuple(FILE_KEYS)}
     for key, value in original.items():
-        assert Path(value).is_dir(), f"invalid shell input: {key}"
+        if key in FILE_KEYS:
+            assert Path(value).is_file(), f"invalid shell input: {key}"
+        else:
+            assert Path(value).is_dir(), f"invalid shell input: {key}"
 
     # Real re-entry of the owning shell must replace an inherited old default,
     # while preserving another project's variant assignments.
@@ -121,7 +133,7 @@ def main():
         assert_warm(graph())
         print("PASS: unchanged selection and contents reuse both graph caches", flush=True)
         alternates = {}
-        for key in KEYS:
+        for key in KEYS + tuple(FILE_KEYS):
             print(f"Checking {key} against warm graph caches", flush=True)
             alternate = scratch / key
             if key == "CT_ZSTD_INCLUDE_DIR":
@@ -130,7 +142,7 @@ def main():
                 (alternate.parent / "lib").mkdir()
                 (alternate.parent / "lib" / "pkgconfig").symlink_to(
                     Path(original[key]).parent / "lib" / "pkgconfig", target_is_directory=True)
-            alternate.symlink_to(original[key], target_is_directory=True)
+            alternate.symlink_to(original[key], target_is_directory=key not in FILE_KEYS)
             alternates[key] = alternate
             changed = dict(original, **{key: str(alternate)})
             write_paths(changed)

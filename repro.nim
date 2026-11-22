@@ -149,6 +149,15 @@ type
     ##     (``-p:tests`` on their nimble line).
     ##   * ``linuxOnly`` — the nimble task runs the file under
     ##     ``when defined(linux)``; the edge is declared on Linux hosts only.
+    ##   * ``posixOnly`` — the nimble task runs the file under
+    ##     ``when not defined(windows)``; the edge is declared on every host
+    ##     but Windows (Linux and macOS).
+    ##   * ``ciRoutes`` — the file starts a MinIO and a Python stand-in of
+    ##     codetracer-ci's upload routes (``test_managed_sender_ci_routes``).
+    ##     Its execute edge gets the owning dev shell's ``CT_MINIO_BIN`` and
+    ##     ``CT_PYTHON3_BIN`` as ``MINIO_BIN`` / ``PYTHON3_BIN``, and both
+    ##     binaries as inputs: a test action's ``PATH`` holds only the
+    ##     provisioned tools, so neither would be found on it.
     ##
     ## The C-ABI tests also need ``--nimMainPrefix:codetracerTraceWriter``,
     ## and ``buildNimUnittest.build`` has no parameter for an arbitrary
@@ -168,6 +177,8 @@ type
     mm: string
     extraPaths: seq[string]
     linuxOnly: bool
+    posixOnly: bool
+    ciRoutes: bool
 
 const
   CtPrintPool = "codetracer_trace_format_nim.ct-print-runtime-serial"
@@ -347,7 +358,8 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_managed_sender.nim", binary: "build/test-bin/test_managed_sender"),
   # Starts a MinIO and a Python stand-in of codetracer-ci's upload routes,
   # both from the dev shell (``flake.nix``).
-  TestSpec(source: "tests/test_managed_sender_ci_routes.nim", binary: "build/test-bin/test_managed_sender_ci_routes"),
+  # POSIX only: it interposes `connect` through dlfcn and signals itself.
+  TestSpec(source: "tests/test_managed_sender_ci_routes.nim", binary: "build/test-bin/test_managed_sender_ci_routes", posixOnly: true, ciRoutes: true),
   TestSpec(source: "tests/test_reader_v4.nim", binary: "build/test-bin/test_reader_v4"),
   TestSpec(source: "tests/test_source_views.nim", binary: "build/test-bin/test_source_views"),
   # GDH-M1 — versioned paths: a path may be registered more than once and
@@ -564,6 +576,24 @@ package codetracer_trace_format_nim:
         "owning typed builds require the declared PCRE library path"
       doAssert fileExists(zstdPkgConfigDir / "libzstd.pc"),
         "owning typed tests require the declared Zstd pkg-config input"
+    # ``test_managed_sender_ci_routes`` (``ciRoutes``) runs the owning dev
+    # shell's MinIO and python3. A test action's PATH holds only the
+    # provisioned tools, so the shell's binaries are bound here, by absolute
+    # path from the tool-path manifest, like the PCRE prefix above. Missing or
+    # wrong, construction stops here: the test has no SKIP arm, and a missing
+    # tool must not become one. The test is POSIX only (``posixOnly``), so
+    # Windows manifests do not carry the two fields.
+    let minioBin = (when defined(windows): ""
+                    else: declaredToolPath(toolPaths, "CT_MINIO_BIN"))
+    let python3Bin = (when defined(windows): ""
+                      else: declaredToolPath(toolPaths, "CT_PYTHON3_BIN"))
+    when not defined(windows):
+      doAssert minioBin.isAbsolute and fileExists(minioBin),
+        "owning typed tests require the declared MinIO binary (CT_MINIO_BIN=" &
+        minioBin & ")"
+      doAssert python3Bin.isAbsolute and fileExists(python3Bin),
+        "owning typed tests require the declared python3 binary " &
+        "(CT_PYTHON3_BIN=" & python3Bin & ")"
     let executeEnvironment = (when defined(windows): @[( "CT_ZSTD_INCLUDE_DIR", zstdIncludeDir),
         ("CT_ZSTD_LIBRARY_FILE", zstdLibraryFile)]
                               else: @[("PKG_CONFIG_PATH", zstdPkgConfigDir)])
@@ -577,6 +607,8 @@ package codetracer_trace_format_nim:
       # The nimble task runs a ``linuxOnly`` file under ``when
       # defined(linux)``; the edge follows the same host condition.
       if spec.linuxOnly and not defined(linux):
+        continue
+      if spec.posixOnly and defined(windows):
         continue
       let stem = splitFile(spec.binary).name
 
@@ -635,6 +667,7 @@ package codetracer_trace_format_nim:
       # source dependencies when they run, not only when they are built.
       let compilesCtPrint = spec.pool == CtPrintPool
       let testExecuteInputs = executeInputs &
+        (if spec.ciRoutes: @[minioBin, python3Bin] else: newSeq[string]()) &
         (if compilesCtPrint:
           @["src", "nim.cfg", "tests/ct_print_binary.nim",
             "tests/runtime_nim_compile.nim"] & nimDependencyDirs
@@ -642,7 +675,10 @@ package codetracer_trace_format_nim:
       let executeEdge = edge.testBinary.run(
         actionId = "codetracer-trace-format-nim.test_execute." & stem,
         pool = spec.pool,
-        extraEnv = executeEnvironment,
+        extraEnv = executeEnvironment &
+          (if spec.ciRoutes:
+            @[("MINIO_BIN", minioBin), ("PYTHON3_BIN", python3Bin)]
+           else: newSeq[(string, string)]()),
         extraInputs = testExecuteInputs,
         registerImplicitName = false)
       when defined(windows):

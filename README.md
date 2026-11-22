@@ -71,7 +71,9 @@ The manifest has this shape on Linux and macOS:
     "CT_PCRE_LIB_DIR": "/absolute/pcre/lib",
     "CT_NIM_STEW_SRC": "/absolute/stew",
     "CT_NIM_RESULTS_SRC": "/absolute/results",
-    "CT_NIM_UNITTEST2_SRC": "/absolute/unittest2"
+    "CT_NIM_UNITTEST2_SRC": "/absolute/unittest2",
+    "CT_MINIO_BIN": "/absolute/minio/bin/minio",
+    "CT_PYTHON3_BIN": "/absolute/python3/bin/python3"
   }
 }
 ```
@@ -79,6 +81,8 @@ The manifest has this shape on Linux and macOS:
 Windows prerequisite binders accumulate the same source fields and Zstd include
 directory, with `CT_ZSTD_LIBRARY_FILE` instead of the two POSIX library-directory
 fields. Windows may also supply an optional `CT_PCRE_LIB_DIR` linker search directory.
+The two executables, which only the POSIX-only `test_managed_sender_ci_routes`
+runs, are not Windows fields.
 Paths inside JSON may contain spaces or commas; the manifest's own path
 must contain neither commas nor newlines because variants are comma-delimited.
 The typed graph requires these fields and does not fall back to ambient `CT_*`

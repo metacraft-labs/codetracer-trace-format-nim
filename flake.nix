@@ -130,6 +130,8 @@
                 CT_ZSTD_INCLUDE_DIR = "${pkgs.zstd.dev}/include";
                 CT_ZSTD_LIB_DIR = "${pkgs.zstd.out}/lib";
                 CT_PCRE_LIB_DIR = "${pkgs.pcre.out}/lib";
+                CT_MINIO_BIN = "${pkgs.minio}/bin/minio";
+                CT_PYTHON3_BIN = "${pkgs.python3}/bin/python3";
               };
             }
           );
@@ -259,6 +261,14 @@
             # Consumed by `repro.nim`'s `test_path_filter` edge, which links
             # pcre directly instead of relying on a run-time library search.
             CT_PCRE_LIB_DIR = "${pkgs.pcre.out}/lib";
+
+            # The same two binaries `reproToolPaths` gives `repro.nim`'s
+            # `test_managed_sender_ci_routes` edge, which hands them to the test as
+            # `MINIO_BIN` / `PYTHON3_BIN`: a test action's PATH holds only the
+            # provisioned tools, not this shell's packages. CI validates these
+            # exports as store paths.
+            CT_MINIO_BIN = "${pkgs.minio}/bin/minio";
+            CT_PYTHON3_BIN = "${pkgs.python3}/bin/python3";
 
             # EVERYTHING THIS HOOK WRITES IS ANCHORED TO THIS REPOSITORY, never
             # to the directory the shell happens to be entered from.

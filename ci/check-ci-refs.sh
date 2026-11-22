@@ -9,8 +9,11 @@
 #   path:      ci/check-ci-refs.sh
 #   revision:  f09a2525b4818c0d23d960224838b4a2b175a1cc
 #
-# Local adaptations add process-only GitHub authentication, full branch-ref
-# parsing, and controls for multiline push filters. They are not yet upstream.
+# Local adaptations add process-only GitHub authentication (which replaces,
+# rather than duplicates, a header persisted by actions/checkout), full
+# branch-ref parsing, controls for multiline push filters, and a resolver that
+# tells an unreachable network apart from a remote that answered with an error
+# (with real-git self-tests against a local stub). They are not yet upstream.
 # The upstream revision above names
 # the source copied here, not a claim of byte identity. Everything repo-specific arrives through
 # $WORKFLOW_DIR and $SELF_REPO_URL (the latter defaulting to this repo's
@@ -79,17 +82,53 @@
 # NETWORK
 #   Unreachable network is a FAILURE when $CI is set and a SKIP otherwise, so
 #   the gate cannot be quietly satisfied by an offline runner.
+#   A remote that ANSWERS with an error (HTTP 400/401/403/404, "Repository
+#   not found", ...) is a FAILURE with or without $CI: the network is fine,
+#   so the offline SKIP does not apply. Every failure quotes git's own reason.
 
 set -uo pipefail
 
 # Authenticate private-ref queries in this process only. GitHub is the only
 # credential destination; no runner-global URL rewrite or credential file.
-if [ -n "${CI_REFS_GITHUB_TOKEN:-}" ]; then
-  auth_index="${GIT_CONFIG_COUNT:-0}"
-  export "GIT_CONFIG_KEY_${auth_index}=http.https://github.com/.extraheader"
-  export "GIT_CONFIG_VALUE_${auth_index}=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$CI_REFS_GITHUB_TOKEN" | base64 | tr -d '\n')"
-  export GIT_CONFIG_COUNT=$((auth_index + 1))
-fi
+#
+# `http.<url>.extraheader` is MULTI-VALUED: every value git finds is sent.
+# `actions/checkout` (default `persist-credentials: true`) writes its own
+# `AUTHORIZATION: basic ...` under the same key into .git/config, so simply
+# appending ours makes git send two Authorization headers, and GitHub answers
+# `remote: Duplicate header: "Authorization"` with HTTP 400 -- for public and
+# private repos alike. That is how this gate once failed every query on a
+# healthy runner. An EMPTY value resets the list collected so far
+# (https://git-scm.com/docs/git-config#Documentation/git-config.txt-httpextraHeader),
+# and GIT_CONFIG_KEY_n/VALUE_n entries are read after every config file, so
+# the reset-then-set pair below makes our header the only one, however this
+# script is invoked. (A *more specific* key such as
+# `http.https://github.com/owner/.extraheader` would still win over ours under
+# git's URL matching; nothing in this family writes one.)
+#
+# CI_REFS_GITHUB_HTTP_PREFIX exists only so the self-test can point the same
+# mechanism at a local HTTP stub; leave it unset otherwise.
+install_git_auth() {
+  [ -n "${CI_REFS_GITHUB_TOKEN:-}" ] || return 0
+  local key idx
+  key="http.${CI_REFS_GITHUB_HTTP_PREFIX:-https://github.com/}.extraheader"
+  idx="${GIT_CONFIG_COUNT:-0}"
+  export "GIT_CONFIG_KEY_${idx}=$key"
+  export "GIT_CONFIG_VALUE_${idx}="
+  idx=$((idx + 1))
+  export "GIT_CONFIG_KEY_${idx}=$key"
+  export "GIT_CONFIG_VALUE_${idx}=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$CI_REFS_GITHUB_TOKEN" | base64 | tr -d '\n')"
+  export GIT_CONFIG_COUNT=$((idx + 1))
+}
+install_git_auth
+
+# Never let a query block on an interactive credential prompt; a missing
+# credential must surface as a failure the gate can report.
+export GIT_TERMINAL_PROMPT=0
+# git's stderr is quoted in this gate's error messages, so a caller's
+# GIT_CURL_VERBOSE/GIT_TRACE_CURL must never dump the Authorization header
+# unredacted. git redacts by default; pin it so GIT_TRACE_REDACT=0 cannot
+# turn that off (https://git-scm.com/docs/git#Documentation/git.txt-GITTRACEREDACT).
+export GIT_TRACE_REDACT=1
 
 WORKFLOW_DIR="${WORKFLOW_DIR:-.github/workflows}"
 SELF_REPO_URL="${SELF_REPO_URL:-}"
@@ -105,54 +144,118 @@ info() { printf '%s\n' "$*"; }
 # --------------------------------------------------------------------------
 # Resolution
 #
+# Every resolver prints ONE line on stdout and always exits 0:
+#     present | absent                    (resolve_ref)
+#     ok<TAB><branch>                     (default_branch; branch may be empty)
+#     unreachable<TAB><reason>            the network could not be reached
+#     failed<TAB><reason>                 the remote ANSWERED, with an error
+#
+# The last two are deliberately different outcomes. "Could not reach GitHub"
+# is the only condition the offline-developer SKIP is meant for; "GitHub
+# answered 400/401/404" is a definite answer that this gate cannot verify the
+# reference, and labelling it "network unreachable" once hid a duplicated
+# Authorization header behind a message about connectivity.
+#
 # `CI_REFS_FAKE_RESOLVER` points at a table so the self-tests can exercise
 # every branch of the logic hermetically. Lines are:
-#     <url><TAB><ref><TAB>present|absent
+#     <url><TAB><ref><TAB>present|absent|unreachable|failed[<TAB><reason>]
 #     <url><TAB>@default<TAB><branch>
 # --------------------------------------------------------------------------
 
+classify_git_failure() {
+  # $1 = git's stderr. Prints "unreachable" only for transport failures that
+  # mean no answer came back; anything else is a remote (or local) error.
+  case "$1" in
+    *"Could not resolve host"*|*"Could not resolve proxy"*|\
+    *"Temporary failure in name resolution"*|*"Failed to connect"*|\
+    *"Couldn't connect to server"*|*"Connection refused"*|\
+    *"Connection timed out"*|*"Operation timed out"*|\
+    *"Network is unreachable"*|*"No route to host"*|\
+    *"Connection reset"*|*"Recv failure"*|*"Send failure"*)
+      echo unreachable ;;
+    *) echo failed ;;
+  esac
+}
+
+git_query() {
+  # $@ = arguments to `git ls-remote`. On success prints git's stdout and
+  # returns 0; on failure prints "<unreachable|failed><TAB><reason>" and
+  # returns 1. The reason is git's own stderr, flattened to one line, with
+  # any `user:secret@` in a URL masked.
+  local errf out rc reason
+  errf=$(mktemp) || { printf 'failed\tmktemp failed\n'; return 1; }
+  out=$(git ls-remote "$@" 2>"$errf"); rc=$?
+  reason=$(tr '\n' ' ' < "$errf" | sed -e 's#://[^/@ ]*@#://***@#g' -e 's/  */ /g' -e 's/ $//')
+  rm -f "$errf"
+  if [ $rc -ne 0 ]; then
+    printf '%s\t%s\n' "$(classify_git_failure "$reason")" \
+      "${reason:-git ls-remote exited $rc and printed nothing}"
+    return 1
+  fi
+  printf '%s\n' "$out"
+}
+
 resolve_ref() {
-  # $1 = repo url, $2 = ref. Prints "present" or "absent"; returns 2 if the
-  # network could not be reached at all.
-  local url="$1" ref="$2"
+  # $1 = repo url, $2 = ref. See the output contract above.
+  local url="$1" ref="$2" out
   if [ -n "${CI_REFS_FAKE_RESOLVER:-}" ]; then
     local hit
-    hit=$(awk -F'\t' -v u="$url" -v r="$ref" '$1==u && $2==r {print $3}' \
+    hit=$(awk -F'\t' -v u="$url" -v r="$ref" \
+          '$1==u && $2==r {print $3 "\t" ($4 == "" ? "fake resolver: " $3 : $4)}' \
           "$CI_REFS_FAKE_RESOLVER")
-    [ "$hit" = "unreachable" ] && return 2
-    [ "$hit" = "present" ] && { echo present; return 0; }
-    echo absent; return 0
+    case "${hit%%$'\t'*}" in
+      present) echo present ;;
+      unreachable|failed) printf '%s\n' "$hit" ;;
+      *) echo absent ;;
+    esac
+    return 0
   fi
 
-  local out rc
   # Query heads AND tags: a `uses:` ref is legitimately either.
-  out=$(git ls-remote "$url" "refs/heads/$ref" "refs/tags/$ref" 2>/dev/null)
-  rc=$?
-  if [ $rc -ne 0 ]; then
-    return 2                      # could not reach the remote
+  if ! out=$(git_query "$url" "refs/heads/$ref" "refs/tags/$ref"); then
+    printf '%s\n' "$out"; return 0
   fi
-  # THE POINT: judge the OUTPUT, not $rc. ls-remote exits 0 for a missing ref.
+  # THE POINT: judge the OUTPUT, not the status. ls-remote exits 0 for a
+  # missing ref.
   if [ -n "$out" ]; then echo present; else echo absent; fi
 }
 
 default_branch() {
-  # $1 = repo url. Prints the default branch name, empty if unknown.
-  local url="$1"
+  # $1 = repo url. See the output contract above.
+  local url="$1" out
   if [ -n "${CI_REFS_FAKE_RESOLVER:-}" ]; then
-    awk -F'\t' -v u="$url" '$1==u && $2=="@default" {print $3}' \
-      "$CI_REFS_FAKE_RESOLVER"
+    printf 'ok\t%s\n' "$(awk -F'\t' -v u="$url" '$1==u && $2=="@default" {print $3}' \
+      "$CI_REFS_FAKE_RESOLVER")"
     return 0
   fi
-  git ls-remote --symref "$url" HEAD 2>/dev/null \
-    | awk '/^ref:/{sub("refs/heads/","",$2); print $2; exit}'
+  if ! out=$(git_query --symref "$url" HEAD); then
+    printf '%s\n' "$out"; return 0
+  fi
+  printf 'ok\t%s\n' "$(printf '%s\n' "$out" \
+    | awk '/^ref:/{sub("refs/heads/","",$2); print $2; exit}')"
 }
 
 network_unreachable() {
+  # $1 = url, $2 = reason
   if [ -n "${CI:-}" ]; then
-    err "cannot reach the network to resolve refs, and \$CI is set. A gate that cannot resolve is not a gate that passes."
+    err "cannot reach the network to resolve refs in $1, and \$CI is set. A gate that cannot resolve is not a gate that passes. git said: $2"
   else
-    info "SKIP: network unreachable and \$CI is unset; not resolving refs."
+    info "SKIP: network unreachable and \$CI is unset; not resolving refs in $1 ($2)."
   fi
+}
+
+report_unresolved() {
+  # $1 = resolver output line, $2 = url. Returns 0 after reporting when the
+  # line is a failure; returns 1 (reporting nothing) when it is an answer.
+  local kind="${1%%$'\t'*}" reason="${1#*$'\t'}"
+  case "$kind" in
+    unreachable) network_unreachable "$2" "$reason"; return 0 ;;
+    failed)
+      # Fatal with or without $CI: the network is fine, the remote refused.
+      err "the remote answered with an error while resolving refs in $2, so this gate cannot tell whether the reference exists. git said: $reason"
+      return 0 ;;
+  esac
+  return 1
 }
 
 # --------------------------------------------------------------------------
@@ -169,8 +272,8 @@ check_pinned_ref() {
   esac
 
   refs_checked=$((refs_checked + 1))
-  state=$(resolve_ref "$url" "$ref"); local rc=$?
-  if [ $rc -eq 2 ]; then network_unreachable; return 1; fi
+  state=$(resolve_ref "$url" "$ref")
+  report_unresolved "$state" "$url" && return 1
 
   if [ "$state" = "absent" ]; then
     err "$where: '$ref' does not exist in $url — this reference is broken, not merely stale."
@@ -180,7 +283,12 @@ check_pinned_ref() {
   case "$ref" in
     main|master)
       deflt=$(default_branch "$url")
-      if [ -z "$deflt" ]; then network_unreachable; return 1; fi
+      report_unresolved "$deflt" "$url" && return 1
+      deflt=${deflt#ok$'\t'}
+      if [ -z "$deflt" ]; then
+        network_unreachable "$url" "the remote reported no default branch (HEAD symref)"
+        return 1
+      fi
       if [ "$deflt" != "$ref" ]; then
         err "$where: '$ref' resolves in $url but that repo's default is '$deflt'. A frozen legacy branch resolves cleanly and silently supplies a stale tree; pin '$deflt' or a SHA."
       fi
@@ -255,8 +363,8 @@ scan_push_filters() {
     for b in $list; do
       [ -z "$b" ] && continue
       total=$((total + 1))
-      state=$(resolve_ref "$self" "$b"); local rc=$?
-      if [ $rc -eq 2 ]; then network_unreachable; return 1; fi
+      state=$(resolve_ref "$self" "$b")
+      report_unresolved "$state" "$self" && return 1
       refs_checked=$((refs_checked + 1))
       if [ "$state" = "present" ]; then
         live=$((live + 1))
@@ -269,6 +377,137 @@ scan_push_filters() {
       err "$base: NOT ONE of its push-trigger branches ($list) exists. This workflow can never run on a push, so it reports nothing and its silence looks like success."
     fi
   done
+}
+
+# --------------------------------------------------------------------------
+# Real-git self-tests
+#
+# The table-driven cases above stub the resolver, so they cannot see a defect
+# in how git itself is driven -- which is exactly where the duplicated
+# Authorization header lived. These cases run the REAL resolver (real git,
+# real HTTP) against a local stub server instead of GitHub.
+#
+# Why a stub server is justified here: the behaviour under test is what git
+# puts on the wire and how the script classifies git's failures. The only
+# things standing in for GitHub are (a) serving a ref list over git's "dumb"
+# HTTP protocol and (b) answering a request carrying two Authorization
+# headers with HTTP 400 and `remote: Duplicate header`, the response GitHub
+# gives (observed 2026-11-21 with git 2.54 against github.com). Hitting the
+# real GitHub would make the self-test depend on the network and a token,
+# which is what the hermetic step is defined not to need.
+# --------------------------------------------------------------------------
+
+self_test_real_git() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    if [ -n "${CI:-}" ]; then
+      printf '  FAIL real-git cases need python3 for the stub server, and CI is set\n'
+      fail=$((fail + 1))
+    else
+      printf '  skip real-git cases: python3 not found\n'
+    fi
+    return 0
+  fi
+
+  cat > "$tmp/stub.py" <<'PYSTUB'
+import http.server, sys
+SHA = "1" * 40
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def send(self, code, body, ctype="text/plain"):
+        b = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+    def do_GET(self):
+        auth = self.headers.get_all("Authorization") or []
+        if len(auth) > 1:
+            # A text/plain error body: git prints it as `remote: ...`.
+            msg = 'Duplicate header: "Authorization"\n'
+            return self.send(400, msg)
+        if "/denied/" in self.path:
+            return self.send(403, "forbidden\n")
+        if self.path.split("?")[0].endswith("/info/refs"):
+            # Plain text/plain: git falls back to the dumb protocol.
+            return self.send(200, SHA + "\trefs/heads/dev\n")
+        self.send(404, "not found\n")
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+open(sys.argv[1], "w").write(str(srv.server_address[1]))
+srv.serve_forever()
+PYSTUB
+  python3 "$tmp/stub.py" "$tmp/port" & local stub_pid=$!
+  local port=""
+  for _ in $(seq 50); do
+    [ -s "$tmp/port" ] && { port=$(cat "$tmp/port"); break; }
+    sleep 0.1
+  done
+  if [ -z "$port" ]; then
+    kill "$stub_pid" 2>/dev/null
+    printf '  FAIL the local HTTP stub did not start\n'; fail=$((fail + 1)); return 0
+  fi
+  local base="http://127.0.0.1:$port/" me
+  # The cases below cd into a scratch checkout, so $0 must be absolute.
+  me="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+  # A checkout like the one actions/checkout leaves: a persisted extraheader
+  # under the exact key the script uses.
+  git init -q "$tmp/checkout"
+  git -C "$tmp/checkout" config http."$base".extraheader \
+    "AUTHORIZATION: basic $(printf 'x-access-token:persisted' | base64)"
+  mkdir -p "$tmp/realwf"
+  cat > "$tmp/realwf/w.yml" <<'Y'
+on:
+  push:
+    branches: [dev]
+jobs:
+  j:
+    steps:
+      - run: true
+Y
+
+  real_case() { # $1 desc, $2 expect(pass|fail), $3 want-regex, $4 self url, $5.. env
+    local desc="$1" expect="$2" want="$3" self="$4"; shift 4
+    # Drop any real token the caller exported: only the cases' own fake
+    # token may reach the stub (and the refused case must send none at all).
+    out=$(cd "$tmp/checkout" && env -u CI_REFS_FAKE_RESOLVER -u CI_REFS_GITHUB_TOKEN CI=1 \
+            CI_REFS_GITHUB_HTTP_PREFIX="$base" SELF_REPO_URL="$self" \
+            WORKFLOW_DIR="$tmp/realwf" "$@" "$me" 2>&1); rc=$?
+    if { { [ "$expect" = pass ] && [ $rc -eq 0 ]; } || \
+         { [ "$expect" = fail ] && [ $rc -ne 0 ]; }; } && \
+       printf '%s' "$out" | grep -qE "$want"; then
+      printf '  ok   %s\n' "$desc"; pass=$((pass + 1))
+    else
+      printf '  FAIL %s (rc=%d, expected %s)\n%s\n' "$desc" "$rc" "$expect" "$out"
+      fail=$((fail + 1))
+    fi
+  }
+
+  # Control: the stub really rejects a doubled header, so the next case is
+  # not passing vacuously. Appending without the reset reproduces the bug.
+  out=$(cd "$tmp/checkout" && GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=1 \
+        GIT_CONFIG_KEY_0="http.$base.extraheader" \
+        GIT_CONFIG_VALUE_0="AUTHORIZATION: basic eDp5" \
+        git ls-remote "${base}acme/self" refs/heads/dev 2>&1)
+  if printf '%s' "$out" | grep -q 'Duplicate header'; then
+    printf '  ok   control: a doubled Authorization header is rejected by the stub\n'
+    pass=$((pass + 1))
+  else
+    printf '  FAIL control: the stub accepted a doubled Authorization header\n%s\n' "$out"
+    fail=$((fail + 1))
+  fi
+
+  real_case "real git: token + persisted checkout header sends ONE header" pass \
+    'no broken references' "${base}acme/self" CI_REFS_GITHUB_TOKEN=selftest-token
+  real_case "real git: an HTTP 403 is reported as a remote error with git's reason" fail \
+    'remote answered with an error.*403' "${base}denied/self" CI_REFS_GITHUB_TOKEN=selftest-token
+
+  kill "$stub_pid" 2>/dev/null; wait "$stub_pid" 2>/dev/null
+
+  # The stub is gone, so the port now refuses connections: a transport
+  # failure, which must keep the "network" label and fail closed under CI.
+  real_case "real git: a refused connection is reported as an unreachable network" fail \
+    'cannot reach the network.*(refused|connect)' "${base}acme/self"
 }
 
 # --------------------------------------------------------------------------
@@ -292,6 +531,7 @@ https://github.com/acme/self	dev	present
 https://github.com/acme/self	main	absent
 https://github.com/acme/self	stable	present
 https://github.com/acme/offline	main	unreachable
+https://github.com/acme/denied	main	failed	remote: Duplicate header: "Authorization" fatal: unable to access 'https://github.com/acme/denied/': The requested URL returned error: 400
 https://github.com/acme/unknown	main	present
 TBL
 
@@ -301,7 +541,7 @@ TBL
               SELF_REPO_URL="https://github.com/acme/self" \
               WORKFLOW_DIR="$dir" "$@" "$0" 2>&1); rc=$?
     if { [ "$expect" = pass ] && [ $rc -eq 0 ]; } || \
-       { [ "$expect" = fail ] && [ $rc -ne 0 ]; }; then
+        { [ "$expect" = fail ] && [ $rc -ne 0 ]; }; then
       printf '  ok   %s\n' "$desc"; pass=$((pass + 1))
     else
       printf '  FAIL %s (rc=%d, expected %s)\n%s\n' "$desc" "$rc" "$expect" "$out"
@@ -486,6 +726,40 @@ jobs:
       - uses: acme/unknown/setup@main
 Y
   run_case "unknown default branch fails closed in CI" "$tmp/unknowndefault" fail CI=1
+
+  # J: a remote that ANSWERS with an error is not an unreachable network.
+  # It must fail even without $CI (the offline SKIP is not for it), and the
+  # message must carry git's reason instead of blaming connectivity.
+  mk denied <<'Y'
+on:
+  push:
+    branches: [dev]
+jobs:
+  j:
+    steps:
+      - uses: acme/denied/act@main
+Y
+  expect_output() { # $1 desc, $2 want-regex, $3 reject-regex ('' = none), $4.. env
+    local desc="$1" want="$2" reject="$3"; shift 3
+    out=$(env "$@" CI_REFS_FAKE_RESOLVER="$tmp/resolver" \
+              SELF_REPO_URL="https://github.com/acme/self" "$0" 2>&1); rc=$?
+    if [ $rc -ne 0 ] && printf '%s' "$out" | grep -qE "$want" && \
+       { [ -z "$reject" ] || ! printf '%s' "$out" | grep -qE "$reject"; }; then
+      printf '  ok   %s\n' "$desc"; pass=$((pass + 1))
+    else
+      printf '  FAIL %s (rc=%d)\n%s\n' "$desc" "$rc" "$out"; fail=$((fail + 1))
+    fi
+  }
+  expect_output "a remote HTTP error fails under CI, labelled as a remote error" \
+    'remote answered with an error.*Duplicate header' 'cannot reach the network' \
+    CI=1 WORKFLOW_DIR="$tmp/denied"
+  expect_output "a remote HTTP error fails without CI too (no offline skip)" \
+    'remote answered with an error.*returned error: 400' 'SKIP' \
+    -u CI WORKFLOW_DIR="$tmp/denied"
+  expect_output "an unreachable network is labelled as such, not as a remote error" \
+    'cannot reach the network' 'remote answered' CI=1 WORKFLOW_DIR="$tmp/h"
+
+  self_test_real_git
 
   printf 'self-test: %d passed, %d failed\n' "$pass" "$fail"
   [ "$fail" -eq 0 ]

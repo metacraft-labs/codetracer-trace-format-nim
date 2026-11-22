@@ -7,24 +7,24 @@ session can name.  It serves the routes as codetracer-ci documents them
 (codetracer-ci rewrite-docs/04-apis-events/http-api.md §4.4.1):
 
   POST /api/v1/tenants/{t}/traces/upload-session
-       answers sessionId, s3KeyPrefix (traces/{t}/{s}/slices/), no storage
-       pool, and `sliceUploadMethod` (--method; `absent` leaves the field out,
-       as a codetracer-ci from before the field did);
+        answers sessionId, s3KeyPrefix (traces/{t}/{s}/slices/), no storage
+        pool, and `sliceUploadMethod` (--method; `absent` leaves the field out,
+        as a codetracer-ci from before the field did);
   POST /api/v1/traces/{s}/slice-upload-url
-       builds the key {s3KeyPrefix}{fileName} and answers a presigned PUT URL
-       for it on the MinIO (AWS Signature Version 4, query form:
-       https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html),
-       or on the local store a file:// path, as codetracer-ci's local file
-       system provider does;
+        builds the key {s3KeyPrefix}{fileName} and answers a presigned PUT URL
+        for it on the MinIO (AWS Signature Version 4, query form:
+        https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html),
+        or on the local store a file:// path, as codetracer-ci's local file
+        system provider does;
   PUT  /api/v1/observability/storage-policy/tenants/{t}/local-storage/objects/{key}
-       writes the object into the local store; on the S3 store it answers
-       403 storage_policy_access_denied, as codetracer-ci does for a tenant
-       with no recorder storage credential (http-api.md §4.4.1);
+        writes the object into the local store; on the S3 store it answers
+        403 storage_policy_access_denied, as codetracer-ci does for a tenant
+        with no recorder storage credential (http-api.md §4.4.1);
   POST /api/v1/traces/{s}/finalize
-       reads every slice the manifest names back from the store (MinIO
-       through a presigned GET) and answers 204 only when each object's
-       length and SHA-256 are the manifest's, 409 slice_content_mismatch
-       otherwise, as codetracer-ci's finalize checks them.
+        reads every slice the manifest names back from the store (MinIO
+        through a presigned GET) and answers 204 only when each object's
+        length and SHA-256 are the manifest's, 409 slice_content_mismatch
+        otherwise, as codetracer-ci's finalize checks them.
 
 --fail-upload-urls N answers the first N slice-upload-url calls
 503 upload_session_busy (a transient refusal the sender retries).
@@ -41,7 +41,11 @@ per call, consumed in order; once it is used up, every finalize checks the
 store as above.  Steps: `slow:<seconds>` checks the store and answers after
 that long (a finalize slower than the sender's timeout: the sender has
 disconnected by then, and codetracer-ci then cancels the check, so this one
-answers nothing it would act on); `busy:<seconds>` answers
+answers nothing it would act on); `stall` answers nothing until the sender
+closes the connection (a finalize slower than any timeout the sender sets,
+with no duration of its own to race against that timeout; it gives up after
+`STALL_LIMIT_SECONDS`, so a sender that never disconnects still ends the
+test); `busy:<seconds>` answers
 503 upload_session_busy with `Retry-After: <seconds>`; `finalizing` answers
 409 upload_finalizing; `mismatch` answers 409 slice_content_mismatch without
 checking (http-api.md, "POST /api/v1/traces/{sessionId}/finalize").
@@ -98,6 +102,8 @@ from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
 REGION = "us-east-1"
+# How long a `stall` finalize waits for the client to disconnect at most.
+STALL_LIMIT_SECONDS = 120
 
 
 def _sign(key: bytes, message: str) -> bytes:
@@ -224,6 +230,20 @@ def make_handler(store: Store):
             self.end_headers()
             return True
 
+        def stall_until_disconnected(self) -> None:
+            """Waits, answering nothing, until the client closes the
+            connection: `recv` returns no bytes at end of stream (recv(2)).
+            The request has been read whole, so nothing else arrives on a
+            connection the client keeps open (the sender sends one request
+            per connection)."""
+            self.connection.settimeout(STALL_LIMIT_SECONDS)
+            try:
+                while self.connection.recv(4096):
+                    pass
+            except OSError:
+                pass  # a reset, or the limit: either way the wait is over
+            self.close_connection = True
+
         def authorized(self) -> bool:
             if self.headers.get("authorization") == f"Bearer {store.args.token}":
                 return True
@@ -301,7 +321,7 @@ def make_handler(store: Store):
                 if store.args.wrong_key:
                     key = session["prefix"] + "other-" + name
                 url = (store.s3_url("PUT", key) if store.args.method == "presigned-url"
-                       else Path(store.args.local_root, key).as_uri())
+                        else Path(store.args.local_root, key).as_uri())
                 if "store" in store.redirects:
                     url = f"http://127.0.0.1:{self.server.server_address[1]}/_store/{key}"
                 if store.args.bad_signature:
@@ -326,6 +346,9 @@ def make_handler(store: Store):
                     return
                 if kind == "mismatch":
                     self.problem(409, "slice_content_mismatch")
+                    return
+                if kind == "stall":
+                    self.stall_until_disconnected()
                     return
                 if kind == "slow":
                     time.sleep(float(arg))

@@ -997,8 +997,9 @@ void trace_writer_register_thread_switch(trace_writer_t handle, uint64_t thread_
 
 /* An exception of the interned type `exception_type_id` is raised, with
  * `message_len` bytes of message (`message` may be NULL when it is 0). */
-void trace_writer_register_raise(trace_writer_t handle, uint64_t exception_type_id,
-                                 const uint8_t* message, size_t message_len);
+void trace_writer_register_raise(
+    trace_writer_t handle, uint64_t exception_type_id,
+    const uint8_t* message, size_t message_len);
 /* An exception of the interned type `exception_type_id` is caught. */
 void trace_writer_register_catch(trace_writer_t handle, uint64_t exception_type_id);
 /* The innermost call exits by an exception: `exception_len` (> 0) bytes of
@@ -1168,8 +1169,9 @@ void ct_reader_close(ct_reader_t h);
 /* The recorded entry identity (entry.dat), checked against this image when
  * it was opened: 1 present (the three outputs written), 0 absent, -1 error.
  * Every output pointer must be non-NULL. */
-int ct_reader_recorded_entry(ct_reader_t h, uint64_t* call_key,
-                             uint64_t* function_id, uint64_t* entry_step);
+int ct_reader_recorded_entry(
+    ct_reader_t h, uint64_t* call_key,
+    uint64_t* function_id, uint64_t* entry_step);
 
 /* Counts.  0 on failure. */
 uint64_t ct_reader_step_count(ct_reader_t h);
@@ -1243,9 +1245,10 @@ int ct_reader_supports_column_motions(ct_reader_t h);
 /* Step N's variable values, one at a time.  `*out_data` is the value's CBOR.
  * ct_reader_step_value returns 0 on success. */
 uint64_t ct_reader_step_value_count(ct_reader_t h, uint64_t n);
-int ct_reader_step_value(ct_reader_t h, uint64_t n, uint64_t value_idx,
-                         uint64_t* out_varname_id, uint64_t* out_type_id,
-                         uint8_t** out_data, size_t* out_data_len);
+int ct_reader_step_value(
+    ct_reader_t h, uint64_t n, uint64_t value_idx,
+    uint64_t* out_varname_id, uint64_t* out_type_id,
+    uint8_t** out_data, size_t* out_data_len);
 
 /* Call `key`'s fields.  0 on success.  ct_reader_call_child returns the
  * child's key, UINT64_MAX on failure; ct_reader_call_arg's `*out_data` is
@@ -1256,17 +1259,20 @@ int ct_reader_call_fields(ct_reader_t h, uint64_t key,
                           uint32_t* out_depth, uint64_t* out_children_count);
 uint64_t ct_reader_call_child(ct_reader_t h, uint64_t key, uint64_t child_idx);
 uint64_t ct_reader_call_arg_count(ct_reader_t h, uint64_t key);
-int ct_reader_call_arg(ct_reader_t h, uint64_t key, uint64_t arg_idx,
-                       uint64_t* out_varname_id,
-                       uint8_t** out_data, size_t* out_data_len);
+int ct_reader_call_arg(
+    ct_reader_t h, uint64_t key, uint64_t arg_idx,
+    uint64_t* out_varname_id,
+    uint8_t** out_data, size_t* out_data_len);
 
 /* IO event `index`.  `*out_kind` is its EventLogKind (0-23).  0 on success.
  * An empty metadata slot is NULL with length 0, not a failure. */
-int ct_reader_event_fields(ct_reader_t h, uint64_t index,
-                           uint8_t* out_kind, uint64_t* out_step_id,
-                           uint8_t** out_data, size_t* out_data_len);
-int ct_reader_event_metadata(ct_reader_t h, uint64_t index,
-                             uint8_t** out_data, size_t* out_data_len);
+int ct_reader_event_fields(
+    ct_reader_t h, uint64_t index,
+    uint8_t* out_kind, uint64_t* out_step_id,
+    uint8_t** out_data, size_t* out_data_len);
+int ct_reader_event_metadata(
+    ct_reader_t h, uint64_t index,
+    uint8_t** out_data, size_t* out_data_len);
 
 #ifdef __cplusplus
 }

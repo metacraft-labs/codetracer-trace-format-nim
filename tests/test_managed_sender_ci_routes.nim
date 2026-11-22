@@ -56,7 +56,8 @@
 ##   the dev shell provides it), on a private bucket: an unsigned PUT to it is
 ##   refused (checked), so an accepted upload came through a valid signature.
 ## - codetracer-ci's three upload routes are a stand-in
-##   (tests/support/ci_upload_standin.py, run with `python3`). Justification:
+##   (tests/support/ci_upload_standin.py, run with `PYTHON3_BIN`, else
+##   `python3` on PATH; the dev shell provides it). Justification:
 ##   codetracer-ci is a .NET service this repository cannot build or run, and
 ##   what is under test here is the sender's side of the routes as
 ##   http-api.md defines them. The stand-in presigns with AWS Signature
@@ -67,7 +68,7 @@
 ##   calls slowly or with the refusals http-api.md defines for them
 ##   (`--finalize-script`). The timeout-retry case scripts the retry's 204
 ##   without reading storage: a real MinIO read is not the retry semantics
-##   under test and must not consume its 1 s request timeout. It then checks
+##   under test and must not consume its request timeout. It then checks
 ##   the actual accepted manifest against the real stored bytes separately,
 ##   with deliberately slow object reads and no request timeout on that check.
 ##   The ordinary route cases still validate storage before finalizing.
@@ -87,6 +88,10 @@
 ##   own `ManagedUploadCiTokenTests` check the method each store names.
 ##
 ## A missing MinIO or python3 fails the test; it never passes without them.
+## Under `repro test` the two variables are set from the `CT_MINIO_BIN` and
+## `CT_PYTHON3_BIN` fields of the dev shell's tool-path manifest
+## (`repro.nim`), because a test action's PATH holds only the provisioned
+## tools; a variable that names no file is an error, never a fallback to PATH.
 
 import std/[json, net, os, osproc, httpclient, options, random, streams, strtabs, strutils, times, unittest]
 from std/posix import nil
@@ -331,6 +336,19 @@ var handledSignals: int
 proc countSignal(sig: cint) {.noconv.} =
   inc handledSignals
 
+type SignalHandler = proc (sig: cint) {.noconv.}
+  ## C's `sighandler_t`.
+
+proc installSignalHandler(sig: cint, handler: SignalHandler): SignalHandler
+    {.importc: "signal", header: "<signal.h>".}
+  ## C's `signal()` itself (https://man7.org/linux/man-pages/man2/signal.2.html),
+  ## the call std/posix's `signal` makes. It is bound here rather than called
+  ## through std/posix because that binding's return type differs between the
+  ## Nim releases this repository builds with: Nim 2.2.4 (the compiler
+  ## `repro test --tool-provisioning=nix` provisions) declares it with no
+  ## result, so `discard posix.signal(...)` does not compile there, while 2.2.8
+  ## (the dev shell's) returns the previous handler.
+
 proc signalThisProcessAfter(ms: int): Process =
   ## A separate process sends this one SIGUSR1 `ms` milliseconds from now: a
   ## process-directed signal, as `kill` from a stop script is, delivered
@@ -471,12 +489,19 @@ try:
       check standin.finalizeTimes().len == 1
 
     test "a finalize slower than its timeout is retried, and the retry finalizes":
-      # Storage is intentionally slower than the 1 s finalize timeout.
-      # The successful retry is scripted; real byte verification follows
-      # outside that timeout, over the manifest the sender actually sent.
+      # The first finalize is answered only after the sender gives up on it
+      # (`stall`), so it outlasts the timeout whatever that is. The timeout
+      # is the one every other request of the sender has, not the negative
+      # control's 1 s: the retry must answer within it. The retry's 204 is
+      # scripted (`accept`) without reading storage, so object-store latency
+      # cannot cost it that timeout either (a loaded host once made its two
+      # MinIO reads take over 1 s: a third attempt, then a retry of the
+      # retry). Real byte verification follows outside any finalize timeout,
+      # over the manifest the sender actually sent, with storage reads made
+      # deliberately slow.
       let standin = startStandin("slow-retry", SliceUploadPresignedUrl,
-        finalizeScript = "slow:3,accept", slowObjectReads = 1.5)
-      let up = uploadTwoSlices(standin, "slow-retry", finalizeTimeoutMs = 1000)
+        finalizeScript = "stall,accept", slowObjectReads = 1.5)
+      let up = uploadTwoSlices(standin, "slow-retry", finalizeTimeoutMs = RequestTimeoutMs)
       var state = up.state
       let finalized = state.tryFinalizeManagedUpload(up.backend, finalizeRequest(receiptsOf(up)), quickRetries())
       check finalized.ok
@@ -564,9 +589,8 @@ try:
       check once.err.retryable
       check "HTTP 503" in once.err.message
   suite "codetracer-ci sender under a handled signal":
-    # Nim 2.2.4 declares signal without a return value; newer versions
-    # return the previous handler as discardable. A statement supports both.
-    posix.signal(posix.SIGUSR1, countSignal)
+    let previous = installSignalHandler(posix.SIGUSR1, countSignal)
+    doAssert previous != posix.SIG_ERR, "SIGUSR1 handler not installed"
 
     test "a slice write whose wait a signal interrupts is repeated, and the object is stored":
       # The stand-in answers the first write 2 s after it arrives; SIGUSR1

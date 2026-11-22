@@ -159,4 +159,3 @@ template signedVarintOrReturn*(data: openArray[byte], pos: var int): int64 =
   ## `?decodeSignedVarint(data, pos)`, as `varintOrReturn`.
   let z {.gensym.} = varintOrReturn(data, pos)
   if (z and 1) == 0: int64(z shr 1) else: not int64(z shr 1)
-
