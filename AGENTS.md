@@ -63,10 +63,11 @@ shell if you want a shared cache instead.
 
 | Command                     | What it does                                                          |
 | --------------------------- | --------------------------------------------------------------------- |
-| `just build`                | `ct-print` + `ct-space` + `libcodetracer_trace_writer.a`              |
+| `just build`                | `repro build`: `ct-print` + `ct-space` + `ctfs-salvage` + `libcodetracer_trace_writer.a` |
 | `just build-static-lib`     | Only the C-FFI static library the Rust crate links                    |
-| `just test`                 | `nimble test` (the full declared corpus) **+** the C-FFI smoke test   |
-| `just test-nim`             | Only `nimble test`                                                    |
+| `just test`                 | `repro test` (the declared corpus and the C-FFI hosts) **+** `just test-ffi-controls` |
+| `just test-ffi-controls`    | The must-fail controls the graph does not model: `nimble testFfiThreads` and the two mutation builds of `test_ffi_failures_reach_the_caller` |
+| `just test-nim`             | Only `nimble test`, run directly                                      |
 | `just test-ffi`             | `nimble testFfi` — compiles `tests/test_ffi.c` against the static lib |
 | `just lint`                 | `nim check` over the library entry points + `nixfmt --check`          |
 | `just test-repro-tool-paths` | Real provider compilation and warm graph invalidation for shell input paths (POSIX) |
@@ -162,7 +163,7 @@ choice the sibling Nim repos `io-mon`, `nim-stackable-hooks` and
   `test`, and do not "promote" `test_chunked_compressed_table.nim` to a
   release build — the corpus compiles it in **debug** on purpose.
   **Know the cost of that split:** `.github/workflows/ci-reprobuild.yml` runs
-  `just test` and nothing else, and `repro.nim` deliberately does not model
+  `repro test` and the FFI controls (the two halves of `just test`) and nothing else, and `repro.nim` deliberately does not model
   benchmarks, so **nothing in CI ever runs `just bench`**. A threshold in
   `bench` is documentation plus a manual command, not an enforced gate. Run
   `just bench` by hand when touching the reader or the writer's append path.

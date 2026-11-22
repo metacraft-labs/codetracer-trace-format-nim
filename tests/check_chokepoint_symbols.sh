@@ -16,7 +16,10 @@ lib="${1:-libcodetracer_trace_writer.a}"
 
 # nm marks exported text symbols 'T' (weak: 'W'); macOS prefixes an underscore.
 for s in trace_writer_register_step trace_writer_register_call trace_writer_register_return; do
-  if ! nm "$lib" 2>/dev/null | grep -Eq "[TW] _?${s}$"; then
+  # No `grep -q` here: it exits at the first match and `nm` then dies of SIGPIPE,
+  # which `pipefail` reports as the pipeline failing, so a symbol that IS
+  # exported was reported missing once the archive outgrew the pipe buffer.
+  if ! nm "$lib" 2>/dev/null | grep -E "[TW] _?${s}$" >/dev/null; then
     echo "chokepoint-symbols: '$s' is not an exported symbol in $lib"
     exit 1
   fi

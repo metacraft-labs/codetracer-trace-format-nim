@@ -24,6 +24,13 @@
 ##     consumers put on ``--path:src`` (the FFI static lib compiled by the
 ##     Rust sibling's ``codetracer_trace_writer_nim`` build.rs imports from
 ##     here).
+##   * The other shipping artifacts, in ``default`` beside ``ct-print``:
+##     ``ct-space``, ``ctfs-salvage`` (both at the repo root) and the C-ABI
+##     static library ``libcodetracer_trace_writer.a``.
+##   * The C-FFI host tests (``tests/test_ffi.c``, the worker-thread-exit and
+##     concurrent-writer hosts, the exported-symbol guard) as edges of
+##     ``test``. The must-fail controls of ``nimble testFfiThreads`` are not
+##     modelled; see the note at those edges.
 ##   * The repo's test corpus as per-file BUILD + EXECUTE edges (the
 ##     two-edge template from ``reprobuild-specs/Package-Model.md``
 ##     §"The test template"), collected into ``test-builds`` / ``test``.
@@ -70,6 +77,8 @@ import repro_dsl_stdlib/foreign_env
 # per-test compile edge) and ``edge.testBinary.run(...)`` (the execute
 # edge). It re-exports ``repro_project_dsl``.
 import ct_test_nim_unittest
+# ``shell(...)``: the typed ``sh -c`` edge the FFI test hosts below run through.
+import repro_dsl_stdlib/packages/sh
 
 import std/[os, json, strutils]
 import build_writer_artifacts
@@ -446,6 +455,12 @@ package codetracer_trace_format_nim:
     "nimble"
     when not defined(windows):
       "pkg-config"
+      # The FFI test edges: ``sh`` / ``bash`` run the symbol-export guard and
+      # the fixture-guardian protocol, ``nm`` is what the guard reads the
+      # archive with.
+      "sh >=1"
+      "bash >=4"
+      "nm"
     when defined(macosx):
       "clang"
     else:
@@ -504,7 +519,21 @@ package codetracer_trace_format_nim:
     let ctPrintBuild = buildCtPrint(".", nativeIncludeDir = zstdIncludeDir,
       nativeLibDir = zstdLibDir, nimDependencyDirs = nimDependencyDirs, nativeLibraryFile = zstdLibraryFile)
 
-    discard collect("default", @[ctPrintBuild])
+    # The other shipping artifacts the ``Justfile`` ``build`` recipe builds
+    # next to ``ct-print`` (``nimble buildCtSpace`` / ``buildCtfsSalvage`` /
+    # ``buildStaticLib``), from the same constructors module so each flag list
+    # is written once. ``ct-space`` and ``ctfs-salvage`` land at the repo
+    # root like ``ct-print``; the static library is the archive the Rust
+    # adapter crate links, and the FFI test edges below consume it.
+    let ctSpaceBuild = buildCtSpace(".", nativeIncludeDir = zstdIncludeDir,
+      nativeLibDir = zstdLibDir, nimDependencyDirs = nimDependencyDirs, nativeLibraryFile = zstdLibraryFile)
+    let ctfsSalvageBuild = buildCtfsSalvage(".", nativeIncludeDir = zstdIncludeDir,
+      nativeLibDir = zstdLibDir, nimDependencyDirs = nimDependencyDirs, nativeLibraryFile = zstdLibraryFile)
+    let staticLibBuild = buildStaticLib(".", nativeIncludeDir = zstdIncludeDir,
+      nativeLibDir = zstdLibDir, nimDependencyDirs = nimDependencyDirs, nativeLibraryFile = zstdLibraryFile)
+
+    discard collect("default",
+      @[ctPrintBuild, ctSpaceBuild, ctfsSalvageBuild, staticLibBuild])
 
     # Opt-in owning producer; no shipping/default or test corpus expansion.
     discard collect("sharedLib", @[buildSharedLib(".", nativeIncludeDir = zstdIncludeDir, nativeLibDir = zstdLibDir, nimDependencyDirs = nimDependencyDirs, nativeLibraryFile = zstdLibraryFile)])
@@ -626,6 +655,74 @@ package codetracer_trace_format_nim:
         else:
           appendRegisteredActionToolIdentityRefs(executeEdge.id, ["gcc"])
       testExecuteActions.add(executeEdge)
+
+    # ---- C-FFI host tests (``nimble testFfi`` / ``testFfiThreads``) --------
+    #
+    # Hosts written in C that drive the shipped static library through its C
+    # header, which is the interface the Rust adapter crate and the other
+    # native consumers use. POSIX only, like the nimble tasks (``testFfiThreads``
+    # uses pthreads and mmap). Each is a compile edge from ``buildFfiHost``
+    # (the library is a declared input, so a change to the writer re-links and
+    # re-runs the host) plus an execute edge keyed on the host's exit status.
+    # The ``NimUnittestBinary`` handle is only "a binary path to run"; its run
+    # edge is the generic direct-binary runner and does not care that the
+    # binary is C.
+    when not defined(windows):
+      let ffiLib = staticLibraryPath(".")
+      let ffiDir = "./build/ffi-test"
+
+      # The three replay-observation symbols are exported from the archive.
+      # The script reads only the archive and ``nm``; it builds nothing.
+      let chokepointEdge = shell(
+        command = "bash tests/check_chokepoint_symbols.sh " & ffiLib,
+        actionId = "codetracer-trace-format-nim.ffi_check.chokepoint_symbols",
+        after = @[staticLibBuild],
+        extraInputs = @["tests/check_chokepoint_symbols.sh", ffiLib])
+      appendRegisteredActionToolIdentityRefs(chokepointEdge.id, ["bash", "nm"])
+      testExecuteActions.add(chokepointEdge)
+
+      # ``tests/test_ffi.c``: the whole C ABI surface against the archive.
+      let ffiHostBuild = buildFfiHost(".", "tests/test_ffi.c",
+        ffiDir & "/test_ffi", archive = [staticLibBuild], archivePath = ffiLib,
+        nativeIncludeDir = zstdIncludeDir, nativeLibDir = zstdLibDir)
+      testBuildActions.add(ffiHostBuild)
+      testExecuteActions.add(NimUnittestBinary(path: ffiDir & "/test_ffi").run(
+        actionId = "codetracer-trace-format-nim.ffi_execute.test_ffi",
+        after = [ffiHostBuild, chokepointEdge], extraInputs = [ffiLib],
+        registerImplicitName = false))
+
+      # ``testFfiThreads``, the shipped-flags half: a writer recorded on a
+      # worker thread that exits before the close, and concurrent writers,
+      # both run under the fixture guardian (``tests/ffi_host_guard.c``),
+      # which reserves a receipt, runs the host with a timeout and writes the
+      # terminal verdict into the receipt. NOT MODELLED: the nimble task's
+      # CONTROLS, which rebuild the archive wrongly (``--threads:on``; no
+      # process lock) and require the host to FAIL. A graph node that must
+      # fail cannot be told from a broken one (see the corpus note above), so
+      # ``nimble testFfiThreads`` remains the authority for those.
+      let guardBuild = buildFfiHost(".", "tests/ffi_host_guard.c",
+        ffiDir & "/host_guard")
+      testBuildActions.add(guardBuild)
+      var threadHostBuilds: seq[BuildActionDef] = @[]
+      for host in ["worker_thread_exit", "concurrent_writers"]:
+        let hostBuild = buildFfiHost(".", "tests/test_ffi_" & host & ".c",
+          ffiDir & "/" & host, archive = [staticLibBuild], archivePath = ffiLib,
+          nativeIncludeDir = zstdIncludeDir, nativeLibDir = zstdLibDir,
+          threads = true)
+        testBuildActions.add(hostBuild)
+        threadHostBuilds.add(hostBuild)
+        let guarded = shell(
+          command = "r=$(" & ffiDir & "/host_guard --reserve " & ffiDir &
+            ") && " & ffiDir & "/host_guard " & ffiDir & "/" & host &
+            " \"$r\" && [ \"$(cat \"$r\")\" = \"$(printf 'FFI-GUARD-RESULT-v1\\nnatural\\n0\\n')\" ]",
+          actionId = "codetracer-trace-format-nim.ffi_execute.threads_" & host,
+          after = [guardBuild, hostBuild],
+          # Timing-bounded thread races: re-observe every run instead of
+          # replaying a cached pass.
+          cacheable = false,
+          extraInputs = @[ffiDir & "/host_guard", ffiDir & "/" & host])
+        appendRegisteredActionToolIdentityRefs(guarded.id, ["sh"])
+        testExecuteActions.add(guarded)
 
     discard collect("test", testExecuteActions)
     discard collect("test-builds", testBuildActions)

@@ -12,6 +12,23 @@ requires "nim >= 2.2.0"
 requires "stew >= 0.1.0"
 requires "results"
 
+# The two mutation builds of `test_ffi_failures_reach_the_caller`, each removing
+# one half of the guard: the test must FAIL under both. Shared by the `test` task
+# and `testFfiMutations`, which `just test-ffi-controls` runs because a build
+# graph cannot express a node that must fail.
+proc ffiMutationControls() =
+  for mutation in ["ffiGuardNoCatch", "ffiGuardNoLatch"]:
+    let (mutOut, mutCode) = gorgeEx("nim c -r -d:release -d:ffiFaultInjection -d:" &
+      mutation & " --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src " &
+      "-o:tests/test_ffi_failures_mutant_" & mutation &
+      " tests/test_ffi_failures_reach_the_caller.nim")
+    if mutCode == 0 or "ALL PASS" in mutOut:
+      echo mutOut
+      raise newException(AssertionDefect, "mutation " & mutation &
+        " left test_ffi_failures_reach_the_caller GREEN: the test does not " &
+        "detect the loss of the guard it exists for")
+    echo "PASS: mutation " & mutation & " turns test_ffi_failures_reach_the_caller red"
+
 task test, "Run all tests":
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_recorded_entry_identity.nim"
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_recorded_entry_hierarchy.nim"
@@ -477,17 +494,7 @@ task test, "Run all tests":
   # builds, each removing one half of the guard: the test must FAIL under both,
   # or it is not measuring the guard.
   exec "nim c -r -d:release -d:ffiFaultInjection --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_failures_reach_the_caller.nim"
-  for mutation in ["ffiGuardNoCatch", "ffiGuardNoLatch"]:
-    let (mutOut, mutCode) = gorgeEx("nim c -r -d:release -d:ffiFaultInjection -d:" &
-      mutation & " --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src " &
-      "-o:tests/test_ffi_failures_mutant_" & mutation &
-      " tests/test_ffi_failures_reach_the_caller.nim")
-    if mutCode == 0 or "ALL PASS" in mutOut:
-      echo mutOut
-      raise newException(AssertionDefect, "mutation " & mutation &
-        " left test_ffi_failures_reach_the_caller GREEN: the test does not " &
-        "detect the loss of the guard it exists for")
-    echo "PASS: mutation " & mutation & " turns test_ffi_failures_reach_the_caller red"
+  ffiMutationControls()
   # The C ABI's in-memory constructors: an embedder with no filesystem gets a
   # container's BYTES rather than a file. Carries its own positive control (the
   # file arm, in the same directory) and its own mutation control (one extra
@@ -678,3 +685,6 @@ task testFfi, "Build and run C FFI test":
   else:
     exec "gcc -o tests/test_ffi tests/test_ffi.c ./libcodetracer_trace_writer.a -lzstd -lm -I include"
   exec "./tests/test_ffi"
+
+task testFfiMutations, "Guard mutations of test_ffi_failures_reach_the_caller must turn it red":
+  ffiMutationControls()

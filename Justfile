@@ -6,10 +6,13 @@ alias fmt := format
 
 # --- Build ------------------------------------------------------------
 
-# Build every shipping artifact: the `ct-print` / `ct-space` inspectors and
-# the C-FFI static library the Rust adapter crate
-# (`codetracer_trace_writer_nim`) links against.
-build: build-ct-print build-ct-space build-ctfs-salvage build-static-lib
+# Build every shipping artifact through the reprobuild graph (`repro.nim`,
+# `default` collection): the `ct-print` / `ct-space` / `ctfs-salvage`
+# inspectors and the C-FFI static library the Rust adapter crate
+# (`codetracer_trace_writer_nim`) links against. CI runs the same command. The
+# `build-*` recipes below run one nimble task each, for a quick edit loop.
+build:
+    repro build
 
 # `ct-print` lands at the repo root on purpose — downstream recorder tests
 # resolve it at the fixed sibling path `../codetracer-trace-format-nim/ct-print`.
@@ -35,10 +38,29 @@ build-shared-lib:
 
 # --- Test -------------------------------------------------------------
 
-# The full suite.
-test: test-nim test-ffi
+# The full suite: the `test` collection of `repro.nim` (the nimble corpus and
+# the C-FFI hosts, one build edge and one execute edge each), then the part the
+# graph does not model, `test-ffi-controls`. CI runs the same two commands.
+test:
+    repro test
+    just test-ffi-controls
 
-# The repo's canonical corpus — the `test` task in
+# The must-fail controls the graph does not model. A graph node that has to fail
+# cannot be told from a broken one, so `repro.nim` leaves them out:
+#   * `nimble testFfiThreads`: the worker-thread host must CRASH against an
+#     archive built `--threads:on`, and the concurrent-writers host must FAIL
+#     against one built `-d:ffiNoProcessLock`. The task also rebuilds and
+#     re-runs the shipped halves, which the graph covers.
+#   * `nimble testFfiMutations`: the two mutation builds of
+#     `test_ffi_failures_reach_the_caller` (`-d:ffiGuardNoCatch` /
+#     `-d:ffiGuardNoLatch`) must turn it red, the check the nimble `test` task
+#     makes too.
+test-ffi-controls:
+    nimble testFfiThreads
+    nimble testFfiMutations
+
+# The nimble corpus, run directly (the graph runs the same files in `test`). It
+# is the `test` task in
 # `codetracer_trace_format.nimble` (every `tests/test_*.nim` the package
 # declares). The checks against the Rust implementation of the format live in
 # codetracer-trace-format-conformance.
@@ -69,8 +91,8 @@ test-repro-tool-paths:
 test-repro-tool-path-transport:
     pwsh -NoProfile -File tests/repro_tool_paths_transport.ps1
 
-# The C-FFI smoke test: build the static library, compile `tests/test_ffi.c`
-# against it and run it.
+# The C-FFI smoke tests run directly with nimble: build the static library,
+# compile `tests/test_ffi.c` against it and run it, then `testFfiThreads`.
 test-ffi:
     nimble testFfi
     nimble testFfiThreads

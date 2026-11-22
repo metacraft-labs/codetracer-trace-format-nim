@@ -310,14 +310,13 @@ jobs:
         run: dev-exec nim c -r '--cc:vcc' '--threads:off' '--mm:arc' '-d:release' '-p:src' '-o:build/test-bin/test_live_page_lifetime_msvc.exe' tests/test_live_page_lifetime.nim
 
       - name: repro build
-        # Builds the conventional `build` collection declared in
-        # `repro.nim`. Verifies the primary shipping artefact (the
-        # recorder binary or extension) materialises through the
-        # reprobuild engine identically to `just build`.
+        # Builds the `default` collection declared in `repro.nim` (the
+        # inspectors and the C-FFI static library). `just build` runs the
+        # same command.
         run: dev-exec repro build ${{ runner.os != 'Windows' && '--tool-provisioning=nix' || '' }}
 
       - name: repro test
-        # Materialises the `test` collection.
+        # Materialises the `test` collection. `just test` runs the same command.
         run: dev-exec repro test ${{ runner.os != 'Windows' && '--tool-provisioning=nix' || '' }}
 
       - name: Sibling ct-print consumer contract (no ambient compiler or zstd)
@@ -342,14 +341,14 @@ jobs:
         shell: pwsh
         run: dev-exec pwsh -NoProfile -File ./ci/inspect-gcc-header-boundary.ps1 -ProjectInclude (Join-Path $env:GITHUB_WORKSPACE "include") -ProjectHeader codetracer_crossing_state.h
 
-      - name: just build (cross-check)
-        # Re-runs the legacy `just build` path inside the same env so
-        # we catch silent divergences between `repro build` outputs
-        # and what the dev shell + Justfile produce today.
-        run: dev-exec just build
-
-      - name: just test (cross-check)
-        run: dev-exec just test
+      - name: FFI must-fail controls
+        # `just test` is `repro test` followed by this step's recipe. The
+        # controls (an archive built `--threads:on`, one without the process
+        # lock, and the two guard mutations of test_ffi_failures_reach_the_caller)
+        # must make their hosts fail, which a graph node cannot express.
+        # `nimble testFfiThreads` skips itself on Windows.
+        if: runner.os != 'Windows'
+        run: dev-exec just test-ffi-controls
 
       # Diagnostics on failure. Three things below are load-bearing:
       #

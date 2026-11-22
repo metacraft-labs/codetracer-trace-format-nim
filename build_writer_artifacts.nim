@@ -55,6 +55,12 @@
 ## host, ``buildSharedLib`` on POSIX. ``buildSharedLib``'s Windows refs, and
 ## what its Windows consumers declare, are unchanged.
 ##
+## ``buildCtSpace`` / ``buildCtfsSalvage`` (the other two inspectors) share
+## ``buildCtPrint``'s compile and its tool contract; ``buildStaticLib`` shares
+## ``buildSharedLib``'s, with ``--app:staticlib``. ``buildFfiHost`` compiles a
+## C host program against that archive; it needs the same tools as
+## ``buildSharedLib`` plus the platform C driver, and is POSIX-only.
+##
 ## Optional consumer-declared compiler SDK refs precede the canonical backend
 ## refs, so its measured compiler wrapper supplies native headers/link inputs.
 ## Empty SDK refs preserve the owning recipe and existing consumers unchanged.
@@ -174,21 +180,25 @@ proc nimSourceDependencyFlags*(nimDependencyDirs: openArray[string]): seq[string
       "declared Nim source dependency must be an existing absolute directory"
     result.add("--path:" & dependencyDir)
 
-proc buildSharedLib*(projectRoot: string;
-                     compilerSdkRefs: seq[string] = @[];
-                     nativeIncludeDir = ""; nativeLibDir = "";
-                     nimDependencyDirs: seq[string] = @[];
-                     nativeLibraryFile = ""): BuildActionDef =
-  ## Construct the typed ``nim c`` edge that compiles the C ABI writer shared
-  ## library from the checkout at ``projectRoot`` (relative, as for
-  ## ``buildCtPrint``). ``nimDependencyDirs`` has the meaning
-  ## ``buildCtPrint`` documents: when it is given, the compile resolves Nim
-  ## packages from those directories only. The consuming package must declare
-  ## ``SharedLibToolSelectors`` in its ``uses:`` block; see the module doc's
-  ## "Native tool contract".
+proc staticLibraryPath*(projectRoot: string): string =
+  ## The archive ``buildStaticLib(projectRoot)`` produces, where
+  ## ``build_ffi.nims`` writes it by default.
+  projectRoot / (when defined(windows): "codetracer_trace_writer.lib"
+                 else: "libcodetracer_trace_writer.a")
+
+proc buildFfiLibrary(constructor, app, actionId, nimcacheName, output,
+                     projectRoot: string;
+                     compilerSdkRefs: seq[string];
+                     nativeIncludeDir, nativeLibDir: string;
+                     nimDependencyDirs: seq[string];
+                     nativeLibraryFile: string): BuildActionDef =
+  ## The one typed ``nim c`` compile of the C ABI writer library, in either
+  ## form (``app`` is ``lib`` or ``staticlib``): the flags come from
+  ## ``build_ffi_flags.ffiCompilerFlags``, the same list ``build_ffi.nims``
+  ## (the nimble tasks, the flake, the Rust crate's build.rs) uses, so the
+  ## two forms cannot drift from each other or from the script.
   doAssert projectRoot.len > 0 and not projectRoot.isAbsolute
   const target = (when defined(windows): "msvc" else: "posix")
-  let output = sharedLibraryPath(projectRoot)
   let dependencyFlags = nimSourceDependencyFlags(nimDependencyDirs)
   var nativeFlags: seq[string] = @[]
   var nativeInputs: seq[string] = @[]
@@ -208,31 +218,172 @@ proc buildSharedLib*(projectRoot: string;
         "--passL:-L" & nativeLibDir, "--passL:-Wl,-rpath," & nativeLibDir]
       nativeInputs = @[nativeIncludeDir / "zstd.h", nativeLibDir]
   let call = publicCliCall("nim", "nim", "c", "nim.nim.c", @[
-    cliArgSeq("canonicalFlags", ffiCompilerFlags("lib", target),
+    cliArgSeq("canonicalFlags", ffiCompilerFlags(app, target),
               cpkPositional, 0),
     cliArgSeq("nimSourceDependencyFlags", dependencyFlags, cpkPositional, 0),
     cliArgSeq("nativeDependencyFlags", nativeFlags, cpkPositional, 0),
     cliArg("parallelBuild", 2, alias = "--parallelBuild:", format = cafConcat),
     cliArg("paths", projectRoot / "src", alias = "--path:", format = cafConcat),
-    cliArg("nimcache", projectRoot / ".repro/build/shared-writer/nimcache",
+    cliArg("nimcache", projectRoot / ".repro/build" / nimcacheName / "nimcache",
            alias = "--nimcache:", format = cafConcat),
     outputArg("output", output, alias = "--out:", format = cafConcat),
     inputArg("source", projectRoot / "src/codetracer_trace_writer_ffi.nim",
              cpkPositional, 1)
   ])
-  result = recordToolInvocation(
-    "codetracer-trace-format-nim.shared-writer.nim-c", call,
+  result = recordToolInvocation(actionId, call,
     extraInputs = @[projectRoot / "src", projectRoot / "include",
       projectRoot / "build_ffi_flags.nim", projectRoot / "build_ffi.nims",
       projectRoot / "build_writer_artifacts.nim", projectRoot / "nim.cfg",
       projectRoot / "config.nims", projectRoot / "codetracer_trace_format.nimble"] & nativeInputs & nimDependencyDirs,
     extraOutputs = @[output], dependencyPolicy = automaticMonitorPolicy())
-  registerNativeTools("buildSharedLib", "SharedLibToolSelectors", result.id,
+  registerNativeTools(constructor, "SharedLibToolSelectors", result.id,
     SharedLibBackendSelectors, SharedLibZstdSelectors, compilerSdkRefs,
     callerSuppliesZstd = nativeFlags.len > 0,
     # Its Windows contract names no zstd (``SharedLibZstdSelectors``), so its
     # Windows consumers are not checked, as before.
     checkUses = not defined(windows))
+
+proc buildSharedLib*(projectRoot: string;
+                     compilerSdkRefs: seq[string] = @[];
+                     nativeIncludeDir = ""; nativeLibDir = "";
+                     nimDependencyDirs: seq[string] = @[];
+                     nativeLibraryFile = ""): BuildActionDef =
+  ## Construct the typed ``nim c`` edge that compiles the C ABI writer shared
+  ## library from the checkout at ``projectRoot`` (relative, as for
+  ## ``buildCtPrint``). ``nimDependencyDirs`` has the meaning
+  ## ``buildCtPrint`` documents: when it is given, the compile resolves Nim
+  ## packages from those directories only. The consuming package must declare
+  ## ``SharedLibToolSelectors`` in its ``uses:`` block; see the module doc's
+  ## "Native tool contract".
+  buildFfiLibrary("buildSharedLib", "lib",
+    "codetracer-trace-format-nim.shared-writer.nim-c", "shared-writer",
+    sharedLibraryPath(projectRoot), projectRoot, compilerSdkRefs,
+    nativeIncludeDir, nativeLibDir, nimDependencyDirs, nativeLibraryFile)
+
+proc buildStaticLib*(projectRoot: string;
+                     compilerSdkRefs: seq[string] = @[];
+                     nativeIncludeDir = ""; nativeLibDir = "";
+                     nimDependencyDirs: seq[string] = @[];
+                     nativeLibraryFile = ""): BuildActionDef =
+  ## Construct the typed ``nim c`` edge that compiles the C ABI writer
+  ## STATIC library (``libcodetracer_trace_writer.a``) from the checkout at
+  ## ``projectRoot``: what ``nimble buildStaticLib`` produces and what the
+  ## Rust adapter crate links. Same contract as ``buildSharedLib``.
+  buildFfiLibrary("buildStaticLib", "staticlib",
+    "codetracer-trace-format-nim.static-writer.nim-c", "static-writer",
+    staticLibraryPath(projectRoot), projectRoot, compilerSdkRefs,
+    nativeIncludeDir, nativeLibDir, nimDependencyDirs, nativeLibraryFile)
+
+when not defined(windows):
+  proc buildFfiHost*(projectRoot, source, output: string;
+                     archive: openArray[BuildActionDef] = [];
+                     archivePath = "";
+                     nativeIncludeDir = ""; nativeLibDir = "";
+                     threads = false): BuildActionDef =
+    ## Construct the typed ``gcc`` edge that compiles the C host program
+    ## ``source`` (a path under ``projectRoot``) to ``output``. It is the
+    ## command the nimble ``testFfi`` / ``testFfiThreads`` tasks run:
+    ## ``gcc -O1 -o <output> <source> <archive> -lzstd -lm [-lpthread]
+    ## -I include``.
+    ##
+    ## With ``archivePath`` (the static library that ``archive`` produces) the
+    ## host links it. The archive and the libraries come AFTER the source: a
+    ## static archive resolves only symbols already undefined when it is read,
+    ## so they sit in later positional slots than the source. Then
+    ## ``nativeIncludeDir`` / ``nativeLibDir`` (required) locate ``zstd.h`` /
+    ## ``libzstd``, as for the Nim edges (the nimble tasks get them from the
+    ## dev shell's ``CPATH`` / ``LIBRARY_PATH``). ``threads`` adds
+    ## ``-lpthread``. Without ``archivePath`` the host is self-contained (the
+    ## fixture guardian ``tests/ffi_host_guard.c``) and links nothing.
+    doAssert projectRoot.len > 0 and not projectRoot.isAbsolute
+    var compileFlags = @["-O1"]
+    var libs: seq[string] = @[]
+    var inputs = @[projectRoot / "include"]
+    var arguments = @[
+      outputArg("output", output, alias = "-o", format = cafSeparate),
+      inputArg("source", projectRoot / source, cpkPositional, 1)]
+    if archivePath.len > 0:
+      doAssert nativeIncludeDir.isAbsolute and nativeLibDir.isAbsolute,
+        "buildFfiHost: linking the archive needs the declared Zstd paths"
+      compileFlags.add("-I" & (projectRoot / "include"))
+      compileFlags.add("-I" & nativeIncludeDir)
+      libs = @["-L" & nativeLibDir, "-Wl,-rpath," & nativeLibDir,
+               "-lzstd", "-lm"]
+      if threads:
+        libs.add("-lpthread")
+      when defined(macosx):
+        libs.add(["-framework", "Security", "-framework", "CoreFoundation"])
+      arguments.add(inputArg("archive", archivePath, cpkPositional, 2))
+      arguments.add(cliArgSeq("linkFlags", libs, cpkPositional, 3))
+      inputs.add(nativeIncludeDir / "zstd.h")
+      inputs.add(nativeLibDir)
+    arguments.add(cliArgSeq("compileFlags", compileFlags, cpkPositional, 0))
+    let call = publicCliCall("gcc", "gcc", "", "gcc.gcc.call", arguments)
+    result = recordToolInvocation(
+      "codetracer-trace-format-nim.ffi-host." & splitFile(output).name, call,
+      deps = combineActionDeps([], archive),
+      extraInputs = inputs,
+      extraOutputs = @[output], dependencyPolicy = automaticMonitorPolicy())
+    registerNativeTools("buildFfiHost", "SharedLibToolSelectors", result.id,
+      SharedLibBackendSelectors, SharedLibZstdSelectors, @[],
+      callerSuppliesZstd = true, checkUses = true)
+
+proc buildInspector(constructor, tool, source, actionId, projectRoot: string;
+                    compilerSdkRefs: seq[string];
+                    nativeIncludeDir, nativeLibDir: string;
+                    nimDependencyDirs: seq[string];
+                    nativeLibraryFile: string;
+                    after: openArray[BuildActionDef]): BuildActionDef =
+  ## The one typed ``nim c`` compile of a repo-root inspector executable
+  ## (``tool`` is its on-disk name, ``source`` the file under ``src/``):
+  ## ``nim c -d:release --mm:arc -p:src -o:<tool> src/<source>``, as the
+  ## nimble ``build*`` tasks spell it. ``buildCtPrint`` documents the rest.
+  doAssert projectRoot.len > 0 and not projectRoot.isAbsolute,
+    constructor & ": projectRoot must be a non-empty relative path, got '" &
+    projectRoot & "'"
+  let output = projectRoot / (when defined(windows): tool & ".exe" else: tool)
+  let dependencyFlags = nimSourceDependencyFlags(nimDependencyDirs)
+  var nativeFlags: seq[string] = @[]
+  var nativeInputs: seq[string] = @[]
+  when defined(windows):
+    if nativeIncludeDir.len > 0 or nativeLibraryFile.len > 0:
+      doAssert nativeIncludeDir.isAbsolute and
+        fileExists(nativeIncludeDir / "zstd.h") and
+        nativeLibraryFile.isAbsolute and fileExists(nativeLibraryFile),
+        "declared Windows Zstd requires its actual header and library file"
+      nativeFlags = @["-d:ctZstdIncludeDir=" & nativeIncludeDir,
+        "-d:ctZstdLibraryFile=" & nativeLibraryFile]
+      nativeInputs = @[nativeIncludeDir, nativeLibraryFile]
+  else:
+    if nativeIncludeDir.len > 0 or nativeLibDir.len > 0:
+      doAssert nativeIncludeDir.isAbsolute and nativeLibDir.isAbsolute
+      nativeFlags = @["--passC:-I" & nativeIncludeDir,
+        "--passL:-L" & nativeLibDir, "--passL:-Wl,-rpath," & nativeLibDir]
+      nativeInputs = @[nativeIncludeDir / "zstd.h", nativeLibDir]
+  let call = publicCliCall("nim", "nim", "c", "nim.nim.c", @[
+    cliArg("mm", "arc", alias = "--mm:", format = cafConcat),
+    cliArgSeq("defines", @["release"], alias = "-d:",
+              format = cafConcat, repeated = true),
+    cliArgSeq("nimSourceDependencyFlags", dependencyFlags, cpkPositional, 0),
+    cliArgSeq("nativeDependencyFlags", nativeFlags, cpkPositional, 0),
+    cliArg("parallelBuild", 2, alias = "--parallelBuild:", format = cafConcat),
+    cliArg("paths", projectRoot / "src", alias = "--path:", format = cafConcat),
+    cliArg("nimcache", projectRoot / ".repro/build" / tool / "nimcache",
+           alias = "--nimcache:", format = cafConcat),
+    outputArg("output", output, alias = "--out:", format = cafConcat),
+    inputArg("source", projectRoot / "src" / source,
+             cpkPositional, 0)
+  ])
+  result = recordToolInvocation(actionId, call,
+    deps = combineActionDeps([], after),
+    extraInputs = @[projectRoot / "src", projectRoot / "codetracer_trace_format.nimble",
+      projectRoot / "nim.cfg", projectRoot / "config.nims",
+      projectRoot / "build_writer_artifacts.nim"] & nativeInputs & nimDependencyDirs,
+    extraOutputs = @[output], dependencyPolicy = automaticMonitorPolicy())
+  registerNativeTools(constructor, "CtPrintToolSelectors", result.id,
+    CtPrintBackendSelectors, CtPrintZstdSelectors, compilerSdkRefs,
+    callerSuppliesZstd = nativeFlags.len > 0,
+    checkUses = true)
 
 proc buildCtPrint*(projectRoot: string;
                    compilerSdkRefs: seq[string] = @[];
@@ -269,49 +420,34 @@ proc buildCtPrint*(projectRoot: string;
   ## ``uses:`` block (the C compiler and ``zstd-dev``, on every host), and the
   ## call refuses a package that does not; the module doc's "Native tool
   ## contract" says why the constructor cannot provision them itself.
-  doAssert projectRoot.len > 0 and not projectRoot.isAbsolute,
-    "buildCtPrint: projectRoot must be a non-empty relative path, got '" &
-    projectRoot & "'"
-  let output = ctPrintPath(projectRoot)
-  let dependencyFlags = nimSourceDependencyFlags(nimDependencyDirs)
-  var nativeFlags: seq[string] = @[]
-  var nativeInputs: seq[string] = @[]
-  when defined(windows):
-    if nativeIncludeDir.len > 0 or nativeLibraryFile.len > 0:
-      doAssert nativeIncludeDir.isAbsolute and
-        fileExists(nativeIncludeDir / "zstd.h") and
-        nativeLibraryFile.isAbsolute and fileExists(nativeLibraryFile),
-        "declared Windows Zstd requires its actual header and library file"
-      nativeFlags = @["-d:ctZstdIncludeDir=" & nativeIncludeDir,
-        "-d:ctZstdLibraryFile=" & nativeLibraryFile]
-      nativeInputs = @[nativeIncludeDir, nativeLibraryFile]
-  else:
-    if nativeIncludeDir.len > 0 or nativeLibDir.len > 0:
-      doAssert nativeIncludeDir.isAbsolute and nativeLibDir.isAbsolute
-      nativeFlags = @["--passC:-I" & nativeIncludeDir,
-        "--passL:-L" & nativeLibDir, "--passL:-Wl,-rpath," & nativeLibDir]
-      nativeInputs = @[nativeIncludeDir / "zstd.h", nativeLibDir]
-  let call = publicCliCall("nim", "nim", "c", "nim.nim.c", @[
-    cliArg("mm", "arc", alias = "--mm:", format = cafConcat),
-    cliArgSeq("defines", @["release"], alias = "-d:",
-              format = cafConcat, repeated = true),
-    cliArgSeq("nimSourceDependencyFlags", dependencyFlags, cpkPositional, 0),
-    cliArgSeq("nativeDependencyFlags", nativeFlags, cpkPositional, 0),
-    cliArg("parallelBuild", 2, alias = "--parallelBuild:", format = cafConcat),
-    cliArg("paths", projectRoot / "src", alias = "--path:", format = cafConcat),
-    cliArg("nimcache", projectRoot / ".repro/build/ct-print/nimcache",
-           alias = "--nimcache:", format = cafConcat),
-    outputArg("output", output, alias = "--out:", format = cafConcat),
-    inputArg("source", projectRoot / "src/codetracer_ct_print.nim",
-             cpkPositional, 0)
-  ])
-  result = recordToolInvocation("codetracer-trace-format-nim.ct-print.nim-c", call,
-    deps = combineActionDeps([], after),
-    extraInputs = @[projectRoot / "src", projectRoot / "codetracer_trace_format.nimble",
-      projectRoot / "nim.cfg", projectRoot / "config.nims",
-      projectRoot / "build_writer_artifacts.nim"] & nativeInputs & nimDependencyDirs,
-    extraOutputs = @[output], dependencyPolicy = automaticMonitorPolicy())
-  registerNativeTools("buildCtPrint", "CtPrintToolSelectors", result.id,
-    CtPrintBackendSelectors, CtPrintZstdSelectors, compilerSdkRefs,
-    callerSuppliesZstd = nativeFlags.len > 0,
-    checkUses = true)
+  buildInspector("buildCtPrint", "ct-print", "codetracer_ct_print.nim",
+    "codetracer-trace-format-nim.ct-print.nim-c", projectRoot,
+    compilerSdkRefs, nativeIncludeDir, nativeLibDir, nimDependencyDirs,
+    nativeLibraryFile, after)
+
+proc buildCtSpace*(projectRoot: string;
+                   compilerSdkRefs: seq[string] = @[];
+                   nativeIncludeDir = ""; nativeLibDir = "";
+                   nimDependencyDirs: seq[string] = @[];
+                   nativeLibraryFile = "";
+                   after: openArray[BuildActionDef] = []): BuildActionDef =
+  ## The ``ct-space`` inspector (``nimble buildCtSpace``), written to the
+  ## repository root. Same arguments and tool contract as ``buildCtPrint``.
+  buildInspector("buildCtSpace", "ct-space", "codetracer_ct_space.nim",
+    "codetracer-trace-format-nim.ct-space.nim-c", projectRoot,
+    compilerSdkRefs, nativeIncludeDir, nativeLibDir, nimDependencyDirs,
+    nativeLibraryFile, after)
+
+proc buildCtfsSalvage*(projectRoot: string;
+                       compilerSdkRefs: seq[string] = @[];
+                       nativeIncludeDir = ""; nativeLibDir = "";
+                       nimDependencyDirs: seq[string] = @[];
+                       nativeLibraryFile = "";
+                       after: openArray[BuildActionDef] = []): BuildActionDef =
+  ## The ``ctfs-salvage`` tool (``nimble buildCtfsSalvage``), written to the
+  ## repository root. Same arguments and tool contract as ``buildCtPrint``.
+  buildInspector("buildCtfsSalvage", "ctfs-salvage",
+    "codetracer_ctfs_salvage.nim",
+    "codetracer-trace-format-nim.ctfs-salvage.nim-c", projectRoot,
+    compilerSdkRefs, nativeIncludeDir, nativeLibDir, nimDependencyDirs,
+    nativeLibraryFile, after)
