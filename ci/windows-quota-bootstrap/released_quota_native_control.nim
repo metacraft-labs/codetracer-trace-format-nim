@@ -18,7 +18,7 @@ proc processImage(process: Handle; flags: DWORD; buffer: WideCString;
   importc: "QueryFullProcessImageNameW".}
 
 # Expected refusal texts. The daemon this control talks to is built from the
-# released reprobuild 0.2.29 bundle's `share/repro/src/runquota`, which
+# released reprobuild 0.2.31 bundle's `share/repro/src/runquota`, which
 # `declared-released-runquota-source-manifest.json` pins file by file; its
 # `libs/runquota_daemon/src/runquota_daemon.nim` is runquota 6ff97313 with CRLF
 # line endings. There `possible` (runquota_daemon.nim:1237) names the amount

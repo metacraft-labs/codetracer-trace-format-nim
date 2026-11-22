@@ -24,12 +24,12 @@ function Assert-Image([string]$Path, [string]$SHA256) {
         throw 'quota-tool/image-bytes'
     }
 }
-Assert-Image $ReleasedReproImage '333c3c72eac55030886b9dc84fe0c42abf6f09c305a3cdd0672dcfa38b84e17b'
+Assert-Image $ReleasedReproImage '35c6bb1c2b88eadda5c8721edd2fe514f3dfff31908b618c7c900a44132b0982'
 Assert-Image $BootstrapNimImage 'a526ad195a37b88760a01b29470e889a7d2a9d826026f9f0b4921924bb40cd1d'
 Assert-Image (Join-Path $BootstrapNimLibrary 'nimbase.h') 'e5416eecfcea794b307b42c422c36141953b1f27e60b5975d1a63fb5b1a068f3'
 Assert-Image $DeclaredGccImage $DeclaredGccSHA256
 $releaseRoot = Split-Path -Parent (Split-Path -Parent $ReleasedReproImage)
-Assert-Image (Join-Path $releaseRoot 'bin/reprobuild.exe') '8364bcb22bd324558087feb9d597c4ad20b393e8da51c2ad45ced6ea479c322c'
+Assert-Image (Join-Path $releaseRoot 'bin/reprobuild.exe') '7706cff4720b4eb176680056a47c95bc6991ac45dbfbee1a98e550e400615f49'
 $releasedSource = Join-Path $releaseRoot 'share/repro/src/runquota'
 $manifest = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'declared-released-runquota-source-manifest.json') -Raw | ConvertFrom-Json
 Assert-DeclaredSourceTree $releasedSource $manifest.members 155
@@ -50,8 +50,8 @@ $beforePath = $env:PATH
 $beforeLease = $env:SHM_LEASE_SRC
 $completed = $false
 try {
-    $hold.HoldFile($releaseRoot, 'bin/repro.exe', '333c3c72eac55030886b9dc84fe0c42abf6f09c305a3cdd0672dcfa38b84e17b')
-    $hold.HoldFile($releaseRoot, 'bin/reprobuild.exe', '8364bcb22bd324558087feb9d597c4ad20b393e8da51c2ad45ced6ea479c322c')
+    $hold.HoldFile($releaseRoot, 'bin/repro.exe', '35c6bb1c2b88eadda5c8721edd2fe514f3dfff31908b618c7c900a44132b0982')
+    $hold.HoldFile($releaseRoot, 'bin/reprobuild.exe', '7706cff4720b4eb176680056a47c95bc6991ac45dbfbee1a98e550e400615f49')
     foreach ($member in $BootstrapInputs.nimMembers) { $hold.HoldFile($BootstrapInputs.nimRoot, $member.path, $member.sha256) }
     foreach ($member in $manifest.members) {
         $hold.HoldFile($releasedSource, $member.path, $member.sha256)

@@ -3,8 +3,8 @@ set -euo pipefail
 
 # Acquire committed source before the owning shell installs its hooks.
 # No working-tree flake, release fallback, host config write or token receipt.
-source_ref='git+https://github.com/metacraft-labs/reprobuild?rev=9979846112d606818f13f5952d808cb4da5bba0b&shallow=1'
-expected_revision='9979846112d606818f13f5952d808cb4da5bba0b'
+source_ref='git+https://github.com/metacraft-labs/reprobuild?rev=7618e3cb21ce17f5c86fbd290f501d60d52e9be1&shallow=1'
+expected_revision='7618e3cb21ce17f5c86fbd290f501d60d52e9be1'
 proof_root="$GITHUB_WORKSPACE/.repro/constructor-binding"
 test ! -L "$GITHUB_WORKSPACE/.repro"
 test ! -L "$proof_root"

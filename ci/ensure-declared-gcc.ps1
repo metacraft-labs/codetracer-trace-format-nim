@@ -5,7 +5,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 # Immutable compiler pin inherited from official Repro source 064daf5b and
-# unchanged through 99798461 (v0.2.29): windows/toolchain-versions.env and
+# unchanged through 7618e3cb (v0.2.31): windows/toolchain-versions.env and
 # ensure-gcc.ps1 (ZIP, POSIX, UCRT).
 $version = "16.1.0"
 $release = "16.1.0posix-14.0.0-ucrt-r2"

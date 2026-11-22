@@ -1,6 +1,6 @@
 {
-  "archiveSha256": "8138b98b6be7ba6cd6d176ff092c091f30488a467855de7fe4f6ec8d505c2345",
-  "sourcePrefix": "reprobuild-0.2.29-windows-x86_64/share/repro/src/runquota/",
+  "archiveSha256": "cc896ab59baddb12c2ad96767bcacb347c5110d74f5a6226ec1257fb1ddd3678",
+  "sourcePrefix": "reprobuild-0.2.31-windows-x86_64/share/repro/src/runquota/",
   "members": [
     {
       "path": "config.nims",
