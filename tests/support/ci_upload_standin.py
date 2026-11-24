@@ -72,6 +72,14 @@ request 200 with `{}`, which a followed redirect would take for success,
 and records each one (method, path, whether an Authorization header came,
 whether it carried --token, the body's length).
 
+--unready-front UPSTREAM runs MinIO's start-up instead of the routes: it
+answers the first --refuse-first requests 503 with MinIO's
+`XMinioServerNotInitialized` error (what MinIO answers while it is still
+initialising, even after `/minio/health/ready` has said ready) and forwards
+every later request unchanged to UPSTREAM, the real MinIO, keeping its Host
+header so a signature made for this front stays valid there. GET
+/_test/requests answers what it saw (method, path, the status it answered).
+
 GET /_test/requests answers the requests seen (method, path, whether an
 Authorization header came), GET /_test/objects what the finalize read back.
 
@@ -89,6 +97,7 @@ import argparse
 import datetime
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import sys
@@ -102,6 +111,10 @@ from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
 REGION = "us-east-1"
+# How long the stand-in waits for MinIO to accept its bucket creation: the
+# time the test gives it to publish its port (`waitFor` in
+# tests/test_managed_sender_ci_routes.nim).
+STARTUP_SECONDS = 30
 # How long a `stall` finalize waits for the client to disconnect at most.
 STALL_LIMIT_SECONDS = 120
 
@@ -181,6 +194,33 @@ class Store:
                     or f"sha256:{seen['sha256']}" != entry.get("contentHash")):
                 ok = False
         return ok
+
+
+def create_bucket(args: argparse.Namespace) -> None:
+    """Creates the bucket through a presigned PUT, like every other call.
+
+    MinIO can answer `/minio/health/ready` and still refuse requests with
+    503 (`XMinioServerNotInitialized`, Service Unavailable) for a moment
+    while it finishes initialising, most often on a loaded host. A 503 is
+    "not ready yet" (S3 documents 503 as a retryable answer:
+    https://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html),
+    so it is retried until STARTUP_SECONDS have passed; any other refusal,
+    and a 503 after that, ends the stand-in. 409 BucketAlreadyOwnedByYou is
+    a bucket that exists."""
+    deadline = time.monotonic() + STARTUP_SECONDS
+    while True:
+        # Signed afresh each time, so its date is the attempt's.
+        request = Request(presign("PUT", args.minio_url, f"/{args.bucket}", args.access_key, args.secret_key),
+                          method="PUT", data=b"")
+        try:
+            urlopen(request, timeout=30).close()
+            return
+        except HTTPError as error:
+            if error.code == 409:  # BucketAlreadyOwnedByYou
+                return
+            if error.code != 503 or time.monotonic() >= deadline:
+                raise
+        time.sleep(0.2)
 
 
 def make_handler(store: Store):
@@ -443,6 +483,61 @@ def make_sink_handler(store: Store):
     return Sink
 
 
+MINIO_NOT_INITIALIZED = (
+    b'<?xml version="1.0" encoding="UTF-8"?>\n<Error><Code>XMinioServerNotInitialized</Code>'
+    b'<Message>Server not initialized yet, please try again.</Message></Error>')
+
+
+def make_unready_front_handler(store: Store):
+    """The --unready-front: a MinIO that is not initialised for its first
+    --refuse-first requests (https://github.com/minio/minio, `errServerNotInitialized`,
+    answered 503 Service Unavailable), then the real one."""
+    upstream = urlparse(store.args.unready_front)
+
+    class Front(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args) -> None:  # quiet
+            return
+
+        def reply(self, status: int, headers: list[tuple[str, str]], raw: bytes) -> None:
+            self.send_response(status)
+            for name, value in headers:
+                if name.lower() not in ("content-length", "transfer-encoding", "connection", "date", "server"):
+                    self.send_header(name, value)
+            self.send_header("content-length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def any_method(self) -> None:
+            path = urlparse(self.path).path
+            if self.command == "GET" and path == "/_test/requests":
+                with store.lock:
+                    self.reply(200, [("content-type", "application/json")], json.dumps(store.requests).encode())
+                return
+            data = self.rfile.read(int(self.headers.get("content-length") or 0))
+            with store.lock:
+                refuse = store.args.refuse_first > 0
+                if refuse:
+                    store.args.refuse_first -= 1
+            if refuse:
+                status, headers, raw = 503, [("content-type", "application/xml"), ("retry-after", "1")], MINIO_NOT_INITIALIZED
+            else:
+                connection = http.client.HTTPConnection(upstream.hostname, upstream.port, timeout=30)
+                try:
+                    forwarded = {k: v for k, v in self.headers.items() if k.lower() != "connection"}
+                    connection.request(self.command, self.path, body=data, headers=forwarded)
+                    response = connection.getresponse()
+                    status, headers, raw = response.status, response.getheaders(), response.read()
+                finally:
+                    connection.close()
+            with store.lock:
+                store.requests.append({"method": self.command, "path": path, "status": status})
+            self.reply(status, headers, raw)
+
+        do_GET = do_POST = do_PUT = do_DELETE = any_method
+
+    return Front
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port-file", required=True)
@@ -463,20 +558,17 @@ def main() -> int:
     parser.add_argument("--redirect", action="append", default=[])
     parser.add_argument("--redirect-to", default="")
     parser.add_argument("--sink", action="store_true")
+    parser.add_argument("--unready-front", default="")
+    parser.add_argument("--refuse-first", type=int, default=0)
     args = parser.parse_args()
-    if not args.sink and not args.method:
-        parser.error("--method is required unless --sink is given")
+    if not args.sink and not args.unready_front and not args.method:
+        parser.error("--method is required unless --sink or --unready-front is given")
     store = Store(args)
-    if args.method == "presigned-url" and not args.sink:
-        # The bucket, created through a presigned PUT like every other call.
-        request = Request(presign("PUT", args.minio_url, f"/{args.bucket}", args.access_key, args.secret_key),
-                          method="PUT", data=b"")
-        try:
-            urlopen(request, timeout=30).close()
-        except HTTPError as error:
-            if error.code != 409:  # BucketAlreadyOwnedByYou
-                raise
-    handler = make_sink_handler(store) if args.sink else make_handler(store)
+    if args.method == "presigned-url" and not args.sink and not args.unready_front:
+        create_bucket(args)
+    handler = (make_sink_handler(store) if args.sink
+               else make_unready_front_handler(store) if args.unready_front
+               else make_handler(store))
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     tmp = args.port_file + ".tmp"
     Path(tmp).write_text(str(server.server_address[1]))

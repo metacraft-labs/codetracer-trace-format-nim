@@ -82,10 +82,19 @@
 ##   port of 127.0.0.1 that answers 200 to anything and records what
 ##   arrived. Another port of the same host is the case Nim keeps the
 ##   Authorization header for, and a 200 is what a followed redirect would
-##   take for success; no real server offers either on demand. The real codetracer-ci on a real MinIO, with a real recording
-##   through this sender, is codetracer-observability-e2e's
-##   `e2e_homeostate_recording_uploads_and_dive_in_resolves`; codetracer-ci's
-##   own `ManagedUploadCiTokenTests` check the method each store names.
+##   take for success; no real server offers either on demand.
+## - For the stand-in's own start-up, the same script runs as a front to the
+##   real MinIO (`--unready-front`) that answers its first requests 503
+##   `XMinioServerNotInitialized` and forwards the rest. Justification: a
+##   MinIO that has reported ready can still answer that for a moment on a
+##   loaded host, which is what once made the stand-in exit, but no MinIO
+##   setting produces it on demand. Everything after the refusals is the
+##   real MinIO.
+##
+## The real codetracer-ci on a real MinIO, with a real recording through this
+## sender, is codetracer-observability-e2e's
+## `e2e_homeostate_recording_uploads_and_dive_in_resolves`; codetracer-ci's
+## own `ManagedUploadCiTokenTests` check the method each store names.
 ##
 ## A missing MinIO or python3 fails the test; it never passes without them.
 ## Under `repro test` the two variables are set from the `CT_MINIO_BIN` and
@@ -183,10 +192,13 @@ var standins: seq[Process]
 proc startStandin(name, methodName: string, wrongKey = false, badSignature = false,
     finalizeScript = "", failUploadUrls = 0, slowLocalWrites = 0.0,
     failSessions = 0, redirects: openArray[string] = [], redirectTo = "",
-    slowObjectReads = 0.0): Running =
+    slowObjectReads = 0.0, storeUrl = ""): Running =
+  ## `storeUrl` is where the stand-in reaches MinIO; the MinIO itself unless
+  ## a test puts something in front of it.
   let portFile = work / (name & ".port")
   var args = @[standinScript, "--port-file", portFile,
-    "--token", Token, "--method", methodName, "--minio-url", minioUrl,
+    "--token", Token, "--method", methodName,
+    "--minio-url", (if storeUrl.len > 0: storeUrl else: minioUrl),
     "--access-key", accessKey, "--secret-key", secretKey, "--bucket", "sender-" & name,
     "--local-root", work / ("local-" & name)]
   if wrongKey:
@@ -219,6 +231,18 @@ proc startSink(name: string): Running =
     "--token", Token], options = {poStdErrToStdOut, poParentStreams})
   standins.add p
   waitFor(proc(): bool = fileExists(portFile), "the redirect sink " & name)
+  Running(process: p, port: parseInt(readFile(portFile).strip()))
+
+proc startUnreadyFront(name: string, refuseFirst: int): Running =
+  ## The MinIO, behind a front that answers its first `refuseFirst` requests
+  ## as a MinIO still initialising does (the stand-in in `--unready-front`
+  ## mode).
+  let portFile = work / (name & ".port")
+  let p = startProcess(python, args = [standinScript, "--unready-front", minioUrl,
+    "--refuse-first", $refuseFirst, "--port-file", portFile, "--token", Token],
+    options = {poStdErrToStdOut, poParentStreams})
+  standins.add p
+  waitFor(proc(): bool = fileExists(portFile), "the unready MinIO front " & name)
   Running(process: p, port: parseInt(readFile(portFile).strip()))
 
 proc url(r: Running): string =
@@ -424,6 +448,31 @@ try:
       for i, r in up.results:
         check objects[r.receipt.objectKey]["sha256"].getStr() == up.items[i].sha256
         check objects[r.receipt.objectKey]["length"].getInt() == int(up.items[i].contentLength)
+
+    test "the stand-in waits out a MinIO 503 after readiness, and its bucket takes an upload":
+      # MinIO can answer `/minio/health/ready` and still refuse requests 503
+      # `XMinioServerNotInitialized` for a moment, most often on a loaded
+      # host. The stand-in's bucket creation is its first request to MinIO:
+      # a 503 there is "not ready yet", not a reason to exit. Here a front
+      # answers the first three requests that way, then forwards to the real
+      # MinIO, so the bucket that the uploads and the finalize's read-back
+      # use is the one created after the refusals.
+      let front = startUnreadyFront("unready-front", refuseFirst = 3)
+      let standin = startStandin("unready", SliceUploadPresignedUrl, storeUrl = front.url)
+      var seen: seq[(string, string, int)]
+      for r in front.getJson("/_test/requests"):
+        seen.add (r["method"].getStr(), r["path"].getStr(), r["status"].getInt())
+      check seen.len == 4
+      if seen.len == 4:
+        for i in 0 ..< 3:
+          check seen[i] == ("PUT", "/sender-unready", 503)
+        check seen[3] == ("PUT", "/sender-unready", 200)
+      let up = uploadTwoSlices(standin, "unready")
+      var state = up.state
+      check state.finalizeManagedUpload(up.backend, finalizeRequest(receiptsOf(up))).ok
+      let objects = standin.getJson("/_test/objects")
+      for i, r in up.results:
+        check objects[r.receipt.objectKey]["sha256"].getStr() == up.items[i].sha256
 
     test "presigned-url: the object store's refusal is reported, not taken for an upload":
       # The stand-in issues URLs whose signature MinIO does not accept: the
