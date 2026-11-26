@@ -264,33 +264,15 @@ jobs:
         # This repository declares no cross-repo siblings (no
         # .github/sibling-repos). The cross-implementation checks run in
         # conformance.yml.
+        id: dev-env
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: reprobuild
-          repro-from-source: ${{ runner.os != 'Windows' && 'true' || 'false' }}
-          # The pin is reprobuild v0.2.31 as released: 7618e3cb is the commit
-          # the v0.2.31 release assets were built from (release run
-          # 44909832258), so the source-built legs run the same revision as
-          # the binary the Windows legs install. Keep it equal to the revision
-          # .github/scripts/bind-unix-constructor.sh binds. v0.2.27 is the
-          # first release that launches a Windows test binary under its .exe
-          # name; earlier ones fail `repro test` on Windows with
-          # `CreateProcessW failed (err=2)` on the extensionless path.
-          repro-build-pin: "7618e3cb21ce17f5c86fbd290f501d60d52e9be1"
-          # Windows legs install this release instead of building the pin
-          # (both arm64 and x64 install its windows-x86_64 archive). Keep it
-          # the tag of repro-build-pin so every leg runs the same revision;
-          # the default `latest` moves with each release.
-          repro-version: "v0.2.31"
-          # The source build overrides reprobuild's `runquota-src` with a clone
-          # of this ref (default `dev`). Keep it equal to the runquota-src rev
-          # in the pinned reprobuild's flake.lock, so the build uses the
-          # RunQuota that reprobuild was locked against rather than whatever
-          # `dev` holds (v0.2.19+ needs runquota's `directoryResolvesWithin`).
-          # v0.2.31's flake.lock pins runquota-src at 6ff97313; move this value
-          # with repro-build-pin. io-mon-src stays on that flake lock (8b8faa81
-          # at v0.2.31) while `repro-posix-io-mon-pin` is empty.
-          repro-runquota-pin: "6ff973131e7f715f0237cb0f08b8dd16cbeba0dc"
+          # The Reprobuild engine is the fleet pin, the action's default:
+          # `pins/reprobuild.json` in metacraft-labs/metacraft-github-actions,
+          # with the companion revisions that pinned revision locks.
+          # .github/scripts/bind-unix-constructor.sh binds the same pin; the
+          # identity step below requires the two to agree.
           gh-token: ${{ steps.ci_token.outputs.token }}
           # The ci_token installation token expires an hour after it is
           # minted. On a loaded host this step alone has outlasted it: run
@@ -302,6 +284,31 @@ jobs:
           # Non-Windows only; the broker does not run on Windows.
           app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
           app-private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+
+      - name: Require a reviewed Windows SDK binding for the installed engine
+        # The Windows SDK bindings were reviewed against one Reprobuild SDK
+        # contract revision, which ci/windows-zstd-artifact-manifest.json
+        # records as sdkRevision: ci/bind-declared-windows-nim.ps1
+        # (declaredSdkContractRevision), ci/bind-declared-windows-zstd.ps1 with
+        # that manifest, ci/windows-quota-bootstrap/ (the Nim archive and the
+        # staged bootstrap source plan) and ci/ensure-declared-gcc.ps1. Their
+        # hashes describe that revision's SDK, so an engine at any other
+        # revision fails here, before they run, until those files are
+        # re-reviewed against it. Never move sdkRevision without that review.
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          REPRO_COMMIT: ${{ steps.dev-env.outputs.repro-commit }}
+          REPRO_ORIGIN: ${{ steps.dev-env.outputs.repro-origin }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $reviewed = (Get-Content -LiteralPath ci/windows-zstd-artifact-manifest.json -Raw | ConvertFrom-Json).sdkRevision
+          Write-Output "Installed Reprobuild: $env:REPRO_COMMIT (origin $env:REPRO_ORIGIN); reviewed Windows SDK contract: $reviewed"
+          if ($env:REPRO_ORIGIN -cne 'pin') { throw "setup-dev-env installed an override, not the pin (origin '$env:REPRO_ORIGIN')." }
+          if ($env:REPRO_COMMIT -notmatch '^[0-9a-f]{40}$') { throw "setup-dev-env reported no full Reprobuild commit ('$env:REPRO_COMMIT')." }
+          if ($env:REPRO_COMMIT -cne $reviewed) {
+            throw "The Windows SDK bindings are reviewed for Reprobuild $reviewed, not the installed pin $env:REPRO_COMMIT. Review the SDK artifacts they bind at the pin and record the review before this leg can run."
+          }
 
       - name: Provision the declared Windows lease authority and Nim compiler payload
         if: runner.os == 'Windows'
@@ -322,17 +329,33 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "declared Windows Zstd prerequisite failed: $LASTEXITCODE" }
 
       - name: Report measured Repro source identity
+        # setup-dev-env reports the engine it installed. It is the pin, not an
+        # override, and the constructor bound before it is the same commit. A
+        # source build (macOS; Linux when the binary cache misses) is a clean
+        # checkout of that commit. A Linux cache hit installs the pinned
+        # commit's Nix package, which has no checkout.
         if: runner.os != 'Windows'
+        env:
+          REPRO_COMMIT: ${{ steps.dev-env.outputs.repro-commit }}
+          REPRO_ORIGIN: ${{ steps.dev-env.outputs.repro-origin }}
+          REPRO_INSTALL_SOURCE: ${{ steps.dev-env.outputs.repro-install-source }}
         run: |
+          set -euo pipefail
           pwd
           git rev-parse HEAD
-          engine_source="$(git -C .reprobuild-src rev-parse HEAD)"
-          echo "Repro source: $engine_source"
-          test "$engine_source" = 7618e3cb21ce17f5c86fbd290f501d60d52e9be1
-          test -z "$(git -C .reprobuild-src status --porcelain)"
-          test "$(command -v repro)" = "$GITHUB_WORKSPACE/.reprobuild-src/build/bin/repro"
-          test "${REPROBUILD_NIX_DAEMON_BIN:?missing source daemon helper}" = "$GITHUB_WORKSPACE/.reprobuild-src/build/bin/reprobuild-nix-daemon"
-          test -x "$REPROBUILD_NIX_DAEMON_BIN"
+          echo "Repro engine: ${REPRO_COMMIT} (origin ${REPRO_ORIGIN}, ${REPRO_INSTALL_SOURCE})"
+          [[ "${REPRO_COMMIT}" =~ ^[0-9a-f]{40}$ ]]
+          test "${REPRO_ORIGIN}" = pin
+          test "$(cat .repro/constructor-binding/source-revision.txt)" = "${REPRO_COMMIT}"
+          if [ "${REPRO_INSTALL_SOURCE}" = source ]; then
+            engine_source="$(git -C .reprobuild-src rev-parse HEAD)"
+            echo "Repro source: $engine_source"
+            test "$engine_source" = "${REPRO_COMMIT}"
+            test -z "$(git -C .reprobuild-src status --porcelain)"
+            test "$(command -v repro)" = "$GITHUB_WORKSPACE/.reprobuild-src/build/bin/repro"
+            test "${REPROBUILD_NIX_DAEMON_BIN:?missing source daemon helper}" = "$GITHUB_WORKSPACE/.reprobuild-src/build/bin/reprobuild-nix-daemon"
+          fi
+          test -x "${REPROBUILD_NIX_DAEMON_BIN:?missing daemon helper}"
           "$REPROBUILD_NIX_DAEMON_BIN" --help
           printf 'daemon helper: %s\n' "$REPROBUILD_NIX_DAEMON_BIN"
           command -v repro
