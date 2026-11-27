@@ -173,6 +173,23 @@ jobs:
           GH_TOKEN: ${{ steps.ci_token.outputs.token }}
         run: bash .github/scripts/bind-unix-constructor.sh
 
+      # The installation token minted above expires an hour after the mint,
+      # and the constructor build above can take longer than that: linux-x64
+      # job 140610219947 minted it at 20:58:43, the build ran until 22:20, and
+      # the next step's `nix build .#ci-checkout-git` then failed with
+      # `HTTP error 401 ... Bad credentials`. The job credential broker that
+      # keeps it fresh starts only in setup-dev-env, below. Re-mint it and
+      # rewrite the job's Git and Nix credential files (setup-nix's
+      # MCL_JOB_CREDENTIALS_DIR) before the steps that fetch with it; the
+      # broker owns those files once it starts.
+      - name: Refresh build authentication after the constructor build
+        if: runner.os != 'Windows'
+        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@dev
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
       - name: Reconcile authenticated inactive checkout templates
         if: matrix.os == 'linux'
         shell: bash
