@@ -19,23 +19,27 @@
 #   2. `consumer_declared.repro.nim` declares what a recorder declares
 #      (`CtPrintToolSelectors`). `repro build` must compile ct-print, and the
 #      binary must run. Before the fix this failed at `zstd.h`.
+#      It also reads the ct-print edge's argv from `repro graph` and checks
+#      that `--noNimblePath` precedes the dependency `--path:` entries, so
+#      the compile takes Nim packages only from `nimDependencyDirs`.
 #
-#   3. `consumer_missing_dependency.repro.nim` names only stew in
-#      `nimDependencyDirs` and leaves out results. A copy of results is
-#      planted on Nim's default nimble path (`NIMBLE_DIR`, see below). A
-#      consumer that supplies `nimDependencyDirs` gets a compile that reads
-#      nothing from that path, so `repro build` must fail on `results`.
-#      Before `buildCtPrint` passed `--noNimblePath` it resolved results from
-#      the planted copy and built.
-#
-# Case 3 runs with `NIMBLE_DIR` naming the planted directory: Nim replaces
-# the `$HOME/.nimble/pkgs2` and `pkgs` entries of its own `config/nim.cfg`
-# with `$NIMBLE_DIR/pkgs2` and `pkgs`. Before checking anything, the script
-# proves with the dev shell's `nim` that Nim resolves `results` from the
-# plant when the nimble path is left on, and not with `--noNimblePath`, so
-# case 3 cannot pass because the plant is invisible. Case 2 also reads the
-# ct-print edge's argv from `repro graph` and checks that `--noNimblePath`
-# precedes the dependency `--path:` entries.
+# Why `--noNimblePath` is checked on the argv and not by a build. A third
+# case used to plant a copy of results on Nim's default nimble path
+# (`NIMBLE_DIR`) and expect a consumer that leaves results out of
+# `nimDependencyDirs` to fail on it. Reprobuild now runs every `nim c` edge
+# with `HOME` and `NIMBLE_DIR` set to a scratch directory of the edge's own
+# under reprobuild's cache, and refuses an edge that reads the host's
+# `NIMBLE_DIR`. So the plant never reached the compiler, and that build
+# failed on results whether or not `buildCtPrint` passed `--noNimblePath`
+# (measured with the flag removed: the case still passed). It tested
+# reprobuild's isolation, not this repository. No plant this script controls
+# can reach the edge's nimble path instead: with `NIMBLE_DIR` set, Nim
+# replaces every `nimblePath` a configuration file or `config.nims` names
+# with `$NIMBLE_DIR/pkgs2` and `$NIMBLE_DIR/pkgs` (`compiler/commands.nim`,
+# the `nimblepath` switch), so under the isolation every nimble path is in
+# the edge's own scratch directory, which only reprobuild writes. The flag's
+# effect cannot be observed through `repro build`, and the case was retired;
+# the argv check is what fails when `buildCtPrint` drops the flag.
 #
 # The edge's monitor record is not checked for nimble path listings: in this
 # stripped environment the graph provisions a statically linked `nim`, which
@@ -80,48 +84,22 @@ for entry in src include nim.cfg config.nims codetracer_trace_format.nimble \
              build_writer_artifacts.nim build_ffi_flags.nim build_ffi.nims; do
   cp -R "$checkout/$entry" "$producer/"
 done
-mkdir -p "$scratch/consumer" "$scratch/consumer-without-zstd-dev" \
-  "$scratch/consumer-missing-dependency"
+mkdir -p "$scratch/consumer" "$scratch/consumer-without-zstd-dev"
 cp "$here/consumer_declared.repro.nim" "$scratch/consumer/repro.nim"
 cp "$here/consumer_undeclared.repro.nim" \
   "$scratch/consumer-without-zstd-dev/repro.nim"
-cp "$here/consumer_missing_dependency.repro.nim" \
-  "$scratch/consumer-missing-dependency/repro.nim"
-
-# The planted nimble directory: results in the `pkgs2` layout nimble installs
-# (`<name>-<version>-<checksum>`), which Nim's nimble path scan accepts.
-planted_nimble="$scratch/planted-nimble"
-mkdir -p "$planted_nimble/pkgs2"
-cp -R "$CT_NIM_RESULTS_SRC" \
-  "$planted_nimble/pkgs2/results-0.5.1-0000000000000000000000000000000000000000"
-chmod -R u+w "$planted_nimble"
-
-# Control: the plant is visible to Nim through its default nimble path, and
-# `--noNimblePath` hides it. Uses the dev shell's `nim`, before the
-# environment is stripped.
-nim_exe="$(command -v nim)" || fail "nim is not on PATH"
-mkdir -p "$scratch/probe"
-printf 'import results\n' > "$scratch/probe/probe.nim"
-probe() {
-  env "NIMBLE_DIR=$planted_nimble" "$nim_exe" check \
-    --hints:off "--nimcache:$scratch/probe/nimcache" "$@" \
-    "$scratch/probe/probe.nim"
-}
-probe >/dev/null 2>&1 ||
-  fail "control: Nim does not resolve results from the planted NIMBLE_DIR"
-if probe --noNimblePath >/dev/null 2>&1; then
-  fail "control: Nim resolves results with --noNimblePath, so the plant is not what case 3 tests"
-fi
 
 stripped_path="$(dirname "$repro_exe"):$(dirname "$nix_exe")"
 stripped_env=(env -i "PATH=$stripped_path" "HOME=$HOME"
   "CT_NIM_STEW_SRC=$CT_NIM_STEW_SRC" "CT_NIM_RESULTS_SRC=$CT_NIM_RESULTS_SRC")
 # Not tools: identity, temp/cache locations, Nix daemon/TLS settings, and the
 # variables that select reprobuild's own helpers (REPRO_BOOTSTRAP_CC compiles
-# the recipe provider, never an action; see the workspace AGENTS.md).
+# the recipe provider, never an action; see the workspace AGENTS.md), and the
+# RUNQUOTA_* pair that names the lease coordinator `repro build` asks for slots.
 for name in USER LOGNAME TMPDIR XDG_CACHE_HOME XDG_RUNTIME_DIR NIX_REMOTE \
             NIX_SSL_CERT_FILE SSL_CERT_FILE REPRO_BOOTSTRAP_CC \
-            REPRO_FOREIGN_ENV_BASH REPROBUILD_NIX_DAEMON_BIN; do
+            REPRO_FOREIGN_ENV_BASH REPROBUILD_NIX_DAEMON_BIN \
+            RUNQUOTA_SOCKET RUNQUOTA_ENDPOINT_SCOPE; do
   if [ -n "${!name+x}" ]; then stripped_env+=("$name=${!name}"); fi
 done
 
@@ -170,19 +148,5 @@ flag = argv.index("--noNimblePath")
 assert flag < argv.index("--path:" + stew) and flag < argv.index("--path:" + results), argv
 ' "$CT_NIM_STEW_SRC" "$CT_NIM_RESULTS_SRC" <<<"$graph" ||
   fail "the ct-print edge does not pass --noNimblePath before its --path: entries"
-
-echo "native-tool-contract: case 3: a dependency missing from nimDependencyDirs is not taken from the nimble path"
-set +e
-missing="$(cd "$scratch/consumer-missing-dependency" &&
-  "${stripped_env[@]}" "NIMBLE_DIR=$planted_nimble" "$repro_exe" build \
-    --daemon=off --force-rebuild --progress=line --action-output=failed 2>&1)"
-status=$?
-set -e
-expected="Error: cannot open file: results"
-if [ "$status" -eq 0 ] || ! grep -qF "$expected" <<<"$missing"; then
-  printf '%s\n' "$missing" | tail -n 40 >&2
-  fail "expected repro build to fail with: $expected (exit $status)"
-fi
-grep -F "$expected" <<<"$missing" | head -n 1
 
 echo "native-tool-contract: OK"

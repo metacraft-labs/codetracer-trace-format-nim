@@ -98,9 +98,9 @@ test-managed-sender-ci-routes:
 
 # The native tool contract of `build_writer_artifacts` (POSIX): a sibling
 # recipe that calls `buildCtPrint` with the documented `uses:` builds ct-print
-# through `repro build` in an environment with no C compiler and no zstd, one
-# that omits `zstd-dev` is refused by name, and one whose `nimDependencyDirs`
-# omits a package does not get it from the nimble path. Not in `test`: it provisions
+# through `repro build` in an environment with no C compiler and no zstd, with
+# `--noNimblePath` ahead of its `nimDependencyDirs` on the ct-print edge, and
+# one that omits `zstd-dev` is refused by name. Not in `test`: it provisions
 # its tools through Nix and takes minutes. CI's reprobuild lane runs it.
 test-native-tool-contract:
     bash tests/native_tool_contract/run.sh
