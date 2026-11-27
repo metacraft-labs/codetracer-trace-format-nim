@@ -89,38 +89,41 @@ proc test_marker_payload_decodes_through_ct_print() =
   removeFile(path)
   recordTrace(path)
 
-  var readerRes = openNewTrace(path)
-  doAssert readerRes.isOk, "ct print could not open the recording: " &
-    readerRes.error
-  var reader = readerRes.get()
-  let doc = buildFullDocument(reader, FullOpts(stripPaths: false))
+  # The reader holds the container open until it is released, and Windows
+  # refuses to delete an open file: the block releases it before the removal.
+  block:
+    var readerRes = openNewTrace(path)
+    doAssert readerRes.isOk, "ct print could not open the recording: " &
+      readerRes.error
+    var reader = readerRes.get()
+    let doc = buildFullDocument(reader, FullOpts(stripPaths: false))
 
-  doAssert doc["metadata"]["program"].getStr() == "marker_demo",
-    "the recording decoded with an empty program: " & $doc["metadata"]
+    doAssert doc["metadata"]["program"].getStr() == "marker_demo",
+      "the recording decoded with an empty program: " & $doc["metadata"]
 
-  var markers: seq[JsonNode] = @[]
-  for ev in doc["events"]:
-    if isCorrelationMarker(ev):
-      markers.add(ev)
+    var markers: seq[JsonNode] = @[]
+    for ev in doc["events"]:
+      if isCorrelationMarker(ev):
+        markers.add(ev)
 
-  doAssert markers.len == 2,
-    "expected both declared markers in ct print's output, got " &
-    $markers.len
+    doAssert markers.len == 2,
+      "expected both declared markers in ct print's output, got " &
+      $markers.len
 
-  doAssert markers[0]["boundary_id"].getStr() == "order-processing"
-  doAssert markers[0]["direction"].getStr() == "send"
-  doAssert markers[0]["key_value"].getStr() == "order-42"
-  doAssert markers[0]["correlation_marker"]["show_value"].getStr() ==
-    "the order body"
-  doAssert markers[0]["correlation_marker"]["description"].getStr() ==
-    "Outbound order"
-  doAssert markers[0]["correlation_marker"]["marker_id"].getInt() == 0
+    doAssert markers[0]["boundary_id"].getStr() == "order-processing"
+    doAssert markers[0]["direction"].getStr() == "send"
+    doAssert markers[0]["key_value"].getStr() == "order-42"
+    doAssert markers[0]["correlation_marker"]["show_value"].getStr() ==
+      "the order body"
+    doAssert markers[0]["correlation_marker"]["description"].getStr() ==
+      "Outbound order"
+    doAssert markers[0]["correlation_marker"]["marker_id"].getInt() == 0
 
-  # "receive" normalises to "recv" — an unrecognised spelling would produce an
-  # unpairable marker, so the API picks a side rather than erroring.
-  doAssert markers[1]["direction"].getStr() == "recv",
-    "'receive' must normalise to 'recv', got " &
-    markers[1]["direction"].getStr()
+    # "receive" normalises to "recv" — an unrecognised spelling would produce an
+    # unpairable marker, so the API picks a side rather than erroring.
+    doAssert markers[1]["direction"].getStr() == "recv",
+      "'receive' must normalise to 'recv', got " &
+      markers[1]["direction"].getStr()
 
   removeFile(path)
   echo "PASS: test_marker_payload_decodes_through_ct_print"
@@ -134,11 +137,14 @@ proc test_marker_mints_no_step() =
   removeFile(path)
   recordTrace(path)
 
-  var reader = openNewTrace(path).get()
-  let doc = buildFullDocument(reader, FullOpts(stripPaths: false))
-  doAssert doc["counts"]["steps"].getInt() == 2,
-    "recordTrace registers exactly 2 steps around 2 markers; ct print sees " &
-    $doc["counts"]["steps"].getInt() & " — a marker minted a step"
+  # The reader holds the container open until it is released, and Windows
+  # refuses to delete an open file: the block releases it before the removal.
+  block:
+    var reader = openNewTrace(path).get()
+    let doc = buildFullDocument(reader, FullOpts(stripPaths: false))
+    doAssert doc["counts"]["steps"].getInt() == 2,
+      "recordTrace registers exactly 2 steps around 2 markers; ct print sees " &
+      $doc["counts"]["steps"].getInt() & " — a marker minted a step"
 
   removeFile(path)
   echo "PASS: test_marker_mints_no_step"
@@ -349,28 +355,31 @@ proc test_payload_step_and_index_geid_are_one_number() =
   doAssert w.close().isOk
   doAssert w.closeCtfs().isOk
 
-  var reader = openNewTrace(path).get()
-  let doc = buildFullDocument(reader, FullOpts(stripPaths: false))
+  # The reader holds the container open until it is released, and Windows
+  # refuses to delete an open file: the block releases it before the removal.
+  block:
+    var reader = openNewTrace(path).get()
+    let doc = buildFullDocument(reader, FullOpts(stripPaths: false))
 
-  var markerStep = -1
-  for ev in doc["events"]:
-    if isCorrelationMarker(ev):
-      markerStep = ev["step_id"].getInt()
-  doAssert markerStep >= 0, "the declared marker must reach the event stream"
+    var markerStep = -1
+    for ev in doc["events"]:
+      if isCorrelationMarker(ev):
+        markerStep = ev["step_id"].getInt()
+    doAssert markerStep >= 0, "the declared marker must reach the event stream"
 
-  let data = readCtfsFromFile(path).get()
-  var idx = openCorrmarkIndex(readNamespace(data).get()).get()
-  let entries = idx.allEntries().get()
-  doAssert entries.len == 2, "expected the boundary and the span coverage"
-  for e in entries:
-    doAssert int(e.geid) == markerStep,
-      "the index coordinate and the payload's step must be the SAME number; " &
-      "payload step_id=" & $markerStep & " index geid=" & $e.geid
+    let data = readCtfsFromFile(path).get()
+    var idx = openCorrmarkIndex(readNamespace(data).get()).get()
+    let entries = idx.allEntries().get()
+    doAssert entries.len == 2, "expected the boundary and the span coverage"
+    for e in entries:
+      doAssert int(e.geid) == markerStep,
+        "the index coordinate and the payload's step must be the SAME number; " &
+        "payload step_id=" & $markerStep & " index geid=" & $e.geid
 
-  # And that number is the ENCLOSING step — the last one emitted — not one past
-  # it. Five steps were registered, so the enclosing step is index 4.
-  doAssert markerStep == 4,
-    "a marker attaches to the enclosing step; got " & $markerStep
+    # And that number is the ENCLOSING step — the last one emitted — not one past
+    # it. Five steps were registered, so the enclosing step is index 4.
+    doAssert markerStep == 4,
+      "a marker attaches to the enclosing step; got " & $markerStep
 
   removeFile(path)
   echo "PASS: test_payload_step_and_index_geid_are_one_number"

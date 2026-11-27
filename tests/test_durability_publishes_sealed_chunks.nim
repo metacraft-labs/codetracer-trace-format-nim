@@ -66,9 +66,12 @@ proc test_a_killed_recording_reads_up_to_its_last_sealed_chunk() =
 
   doAssert w.close().isOk
   doAssert w.closeCtfs().isOk
-  var rd = openNewTrace(path).get()
-  doAssert rd.stepCount().get() == 2 * ChunkSize + 3
-  doAssert rd.functionCount() == 2, "after close both functions are there"
+  # The reader holds the container open until it is released, and Windows
+  # refuses to delete an open file: the block releases it before the removal.
+  block after_close:
+    var rd = openNewTrace(path).get()
+    doAssert rd.stepCount().get() == 2 * ChunkSize + 3
+    doAssert rd.functionCount() == 2, "after close both functions are there"
   removeFile(path)
   echo "PASS: test_a_killed_recording_reads_up_to_its_last_sealed_chunk"
 

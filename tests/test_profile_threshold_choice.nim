@@ -183,7 +183,11 @@ proc test_a_file_backed_writer_leaves_the_chosen_container() =
   let pf = write(2000, 1, large)
   doAssert pf.chosenProfile == cpFull
   doAssert readFile(large) == cast[string](pf.toBytes())
-  doAssert openNewTrace(large).isOk
+  # The opened reader holds `large` open until it is released, which is at the
+  # end of the enclosing scope, and Windows refuses to delete an open file:
+  # the block releases it before `removeDir` below.
+  block:
+    doAssert openNewTrace(large).isOk
   for f in walkDir(TmpDir):
     doAssert not f.path.endsWith(".tmp"), "left behind: " & f.path
   removeDir(TmpDir)
