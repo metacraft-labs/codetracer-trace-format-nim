@@ -21,7 +21,12 @@ import repro_project_dsl
 import "../codetracer-trace-format-nim/build_writer_artifacts"
 
 package ct_print_consumer_missing_dependency:
-  defaultToolProvisioning "path"
+  # The graph provisions every tool in `uses:` through Nix. `run.sh` runs
+  # repro with no `--tool-provisioning` and strips `REPRO_TOOL_PROVISIONING`
+  # (`env -i`), and its PATH holds no compiler and no zstd, so this
+  # declaration is the only provisioning mode the build gets. `"path"` would
+  # resolve every tool from that PATH, which by construction has none of them.
+  defaultToolProvisioning "nix"
 
   uses:
     "nim >=2.2 <3.0"
