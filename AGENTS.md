@@ -75,6 +75,15 @@ shell if you want a shared cache instead.
 | `just bench`                | `nimble bench` — machine-dependent, deliberately not part of `test`   |
 | `just nix-build`            | `nix build .#default`                                                 |
 | `just test-flake-check-lint-hook` | Builds `checks.pre-commit-check`; its `lint` hook must pass in the sandbox |
+| `just test-dev-shell`       | Enters `nix develop` from a scratch git repository; nothing may be written there |
+
+`test-dev-shell` and `test-flake-check-lint-hook` drive Nix itself, so the
+`repro test` graph does not hold them; `ci-reprobuild.yml` runs both on
+linux-x64 in their own step. Every other test-shaped recipe that no workflow
+calls by name (`test-nim`, `test-managed-sender-ci-routes`, `check-ci-refs`)
+or that is manual (`bench`) carries a `# ci-test-audit: <reason>` line above
+it in the `Justfile`, saying what covers it. Give a new test recipe either a
+workflow step or such a line.
 
 `repro.nim` expresses the same graph natively for `reprobuild` (per-test
 build + execute edges); keep the two in sync — see

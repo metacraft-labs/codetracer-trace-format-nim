@@ -20,10 +20,13 @@
 #
 # No mocks: this builds the real check derivation with the real hook runner.
 #
+# The run is one case of the closing `TEST-COUNTS:` line, which CI logs are
+# audited for.
+#
 #   bash tests/test_flake_check_lint_hook.sh
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-fail() { echo "FAIL: $*" >&2; exit 1; }
+fail() { echo "FAIL: $*" >&2; echo "TEST-COUNTS: executed=1 passed=0 failed=1 skipped=0"; exit 1; }
 
 system="$(nix eval --raw --impure --expr builtins.currentSystem)"
 drv="$(nix eval --raw "$REPO#checks.$system.pre-commit-check.drvPath")" \
@@ -46,3 +49,4 @@ case "$lint_line" in
 $(printf '%s\n' "$log" | sed -n '/^Lint\./,$p' | head -n 40)" ;;
 esac
 echo "ok: $lint_line"
+echo "TEST-COUNTS: executed=1 passed=1 failed=0 skipped=0"

@@ -64,6 +64,7 @@ test-ffi-controls:
 # `codetracer_trace_format.nimble` (every `tests/test_*.nim` the package
 # declares). The checks against the Rust implementation of the format live in
 # codetracer-trace-format-conformance.
+# ci-test-audit: covered-by test (repro test runs every file of the nimble test task, which tests/test_every_test_is_listed.nim enforces; test-ffi-controls runs its FFI mutation controls)
 test-nim:
     nimble test
 
@@ -72,6 +73,7 @@ test-nim:
 # (`tests/test_managed_sender_ci_routes.nim`; the dev shell provides `minio`
 # and `python3`). The nimble `test` task and the graph's `test` collection (so
 # `just test`) run it on every host but Windows; this recipe runs it alone.
+# ci-test-audit: covered-by test (repro test runs test_managed_sender_ci_routes on Linux and macOS)
 test-managed-sender-ci-routes:
     nim c -r -d:release -p:src -o:build/test-bin/test_managed_sender_ci_routes tests/test_managed_sender_ci_routes.nim
 
@@ -100,6 +102,7 @@ test-ffi:
 
 # Benchmarks are not part of `test` — they assert throughput and are
 # machine-dependent.
+# ci-test-audit: manual-only (machine-dependent throughput thresholds; see AGENTS.md)
 bench:
     nimble bench
 
@@ -142,16 +145,19 @@ nix-build:
 
 # Entering the dev shell from another git repository must write nothing
 # there (no git hooks, no .nimble). Runs `nix develop`, so it is not part of
-# `test`, which runs inside the shell.
+# `test`, which runs inside the shell; CI runs it in its own step on linux-x64
+# (`ci-reprobuild.yml`).
 test-dev-shell:
     bash tests/test_dev_shell_writes_nothing_elsewhere.sh
 
 # `nix flake check`'s pre-commit check runs the `lint` hook in the build
-# sandbox and passes it. Builds the check, so it is not part of `test`.
+# sandbox and passes it. Builds the check, so it is not part of `test`; CI
+# runs it beside `test-dev-shell`.
 test-flake-check-lint-hook:
     bash tests/test_flake_check_lint_hook.sh
 
 # Check refs with hermetic scanner controls before the network observation.
+# ci-test-audit: covered-by CI refs workflow (ci-refs.yml runs both commands as its own steps)
 check-ci-refs:
     ci/check-ci-refs.sh --self-test
     ci/check-ci-refs.sh

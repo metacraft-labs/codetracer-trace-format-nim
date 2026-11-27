@@ -19,12 +19,19 @@
 # installs: a pre-commit hook runs the committed `.pre-commit-config.yaml`,
 # which it leaves byte-identical.
 #
+# Each entry point (the scratch repository, its subdirectory, the control) is
+# one case of the closing `TEST-COUNTS:` line, which CI logs are audited for.
+#
 #   bash tests/test_dev_shell_writes_nothing_elsewhere.sh
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRATCH="$(mktemp -d)"
 trap 'rm -rf "$SCRATCH"' EXIT
-fail() { echo "FAIL: $*" >&2; exit 1; }
+# Cases run in order and the first failure ends the run, so a failure leaves
+# the cases after it unexecuted.
+CASES=3 passed=0
+counts() { echo "TEST-COUNTS: executed=$1 passed=$passed failed=$2 skipped=$((CASES - $1))"; }
+fail() { echo "FAIL: $*" >&2; counts $((passed + 1)) 1; exit 1; }
 
 git -C "$SCRATCH" init -q
 git -C "$SCRATCH" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
@@ -41,6 +48,7 @@ for dir in "$SCRATCH" "$SCRATCH/sub"; do
   [ "$(ls "$SCRATCH/.git/hooks")" = "$hooks_before" ] || fail "entered from $dir: git hooks were installed into the other repository"
   [ -z "$(git -C "$SCRATCH" config --local --get core.hooksPath || true)" ] || fail "entered from $dir: core.hooksPath was changed"
   [ -z "$(git -C "$SCRATCH" status --porcelain --ignored)" ] || fail "entered from $dir: the other repository is dirty: $(git -C "$SCRATCH" status --porcelain --ignored)"
+  passed=$((passed + 1))
 done
 
 config_before="$(git -C "$REPO" hash-object .pre-commit-config.yaml)"
@@ -53,5 +61,7 @@ nimble_dir="$( cd "$REPO/tests" && env -u NIMBLE_DIR nix develop "$REPO" --no-wr
   || fail "control: the committed .pre-commit-config.yaml was replaced or changed"
 grep -qs -- '--config .pre-commit-config.yaml' "$hooks_dir/pre-commit" "$hooks_dir/pre-commit.repro-local" \
   || fail "control: entered from this repository, no pre-commit hook runs the committed config"
+passed=$((passed + 1))
 
 echo "PASS: entered from another repository the dev shell writes nothing there; from this one it installs its hooks"
+counts "$CASES" 0

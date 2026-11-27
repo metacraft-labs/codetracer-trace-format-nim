@@ -241,6 +241,17 @@ jobs:
             printf "CT_MINIO_BIN=%s\nCT_PYTHON3_BIN=%s\n" "$CT_MINIO_BIN" "$CT_PYTHON3_BIN" >> "$GITHUB_ENV"
           '
 
+      # The two tests that drive Nix itself, so the hermetic `repro test` graph
+      # cannot hold them: `test-dev-shell` enters `nix develop` from a scratch
+      # git repository and asserts nothing is written there, and
+      # `test-flake-check-lint-hook` builds `nix flake check`'s pre-commit
+      # check and asserts its lint hook passes. Neither depends on the
+      # architecture, so one leg runs them; each script prints a TEST-COUNTS
+      # line. `nix develop` only puts `just` on PATH.
+      - name: Dev shell and flake check hook tests
+        if: matrix.os == 'linux' && matrix.arch == 'x64'
+        run: nix develop --no-write-lock-file --command just test-dev-shell test-flake-check-lint-hook
+
       # Pure string checks of the extended-length (\\?\) form the held-input
       # classes give every raw CreateFileW. Seconds, no filesystem access, so
       # it runs before any download and fails fast if the conversion regresses.
