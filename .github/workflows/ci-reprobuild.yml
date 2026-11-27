@@ -437,6 +437,15 @@ jobs:
         if: runner.os != 'Windows'
         run: dev-exec just test-ffi-controls
 
+      - name: Downstream lane contract
+        # `just test` ends with this recipe: tests/test_downstream_lane.sh holds
+        # .github/workflows/downstream.yml, its codetracer pin, the revision
+        # resolver and the consumer driver's refusals to their contract. No
+        # network, and no consumer is run (downstream.yml runs them). A bash
+        # suite, so POSIX only.
+        if: runner.os != 'Windows'
+        run: dev-exec just test-downstream-lane
+
       # Diagnostics on failure. Three things below are load-bearing:
       #
       # 1. `include-hidden-files: true`. actions/upload-artifact@v4 defaults this

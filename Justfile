@@ -39,11 +39,30 @@ build-shared-lib:
 # --- Test -------------------------------------------------------------
 
 # The full suite: the `test` collection of `repro.nim` (the nimble corpus and
-# the C-FFI hosts, one build edge and one execute edge each), then the part the
-# graph does not model, `test-ffi-controls`. CI runs the same two commands.
+# the C-FFI hosts, one build edge and one execute edge each), then the parts the
+# graph does not model, `test-ffi-controls` and `test-downstream-lane`. CI
+# runs the same commands.
 test:
     repro test
     just test-ffi-controls
+    just test-downstream-lane
+
+# The downstream lane's own contract (no network, no consumer is run): the
+# workflow `.github/workflows/downstream.yml` exists, runs on the mainline
+# branches, pins codetracer only by `ci/downstream/repro.lock` or a 40-hex
+# dispatch input, runs every consumer `ci/downstream/run-consumers.sh` defines
+# and never lets provisioning reset this checkout; the resolver and the
+# driver's swap guard refuse what they must. A shell suite, so the graph does
+# not model it, like the controls below.
+test-downstream-lane:
+    bash tests/test_downstream_lane.sh
+
+# Run this repository's consumers against this checkout (see AGENTS.md,
+# "Downstream lane"). Needs a sibling layout like CI's: CT_DIR is the
+# codetracer checkout beside this one.
+# ci-test-audit: covered-by downstream.yml (runs ci/downstream/run-consumers.sh once per consumer, the script this recipe wraps)
+test-downstream CT_DIR="../codetracer" *CONSUMERS="all":
+    bash ci/downstream/run-consumers.sh --ct-dir {{CT_DIR}} {{CONSUMERS}}
 
 # The must-fail controls the graph does not model. A graph node that has to fail
 # cannot be told from a broken one, so `repro.nim` leaves them out:

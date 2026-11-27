@@ -1,0 +1,15 @@
+# Rows of codetracer-native-recorder tests that are red at the revision codetracer
+# pins for that recorder for a reason in the RECORDER, not in this library.
+# ci/downstream/run-consumers.sh appends them to the recorder's own
+# tests/gate-expected-failures.tsv and passes the result as
+# scripts/run-all-nim-tests.sh --baseline, so each row is still held to its
+# SIGNATURE: the same test failing any other way is a plain failure, and the
+# row passing (`unexpected`) fails the lane, so the entry must be struck off
+# the day the recorder is fixed or the pin moves past the fix.
+#
+# The recorder's runner requires field 3 to be a task number (`#NNN`) from
+# the recorder's own task series. These rows are tracked in codetracer-pm
+# instead (the `why` field names the issue), so they carry `#0`.
+#
+# package <TAB> test <TAB> #task <TAB> signature <TAB> why
+ct_recorder	tests/test_member_names_storable.nim	#0	FAIL: 1 member name(s) in source are not storable CTFS names	Tracked by codetracer-pm issues/2026-11-27-native-recorder-export-capture-stem-has-no-member-name-bound.md. At codetracer-native-recorder 95da3c1 (the revision codetracer 5a9ede99 pins; unchanged at its agents tip 993c42c6) the scan refuses ct_cli/src/ct_cli/export_cmd.nim:634, which builds "ct-capture-" & $getCurrentProcessId() with no `# member-name-bound:` comment. That offender comes from a pure text scan of recorder source, so it is present whatever this library does. The test also checks names through this library (codetracer_ctfs/base40), so the signature pins the offender COUNT at 1: any further offender, such as one this library's encoder caused, changes the count and fails the lane.

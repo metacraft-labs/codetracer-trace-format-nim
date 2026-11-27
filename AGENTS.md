@@ -65,7 +65,9 @@ shell if you want a shared cache instead.
 | --------------------------- | --------------------------------------------------------------------- |
 | `just build`                | `repro build`: `ct-print` + `ct-space` + `ctfs-salvage` + `libcodetracer_trace_writer.a` |
 | `just build-static-lib`     | Only the C-FFI static library the Rust crate links                    |
-| `just test`                 | `repro test` (the declared corpus and the C-FFI hosts) **+** `just test-ffi-controls` |
+| `just test`                 | `repro test` (the declared corpus and the C-FFI hosts) **+** `just test-ffi-controls` **+** `just test-downstream-lane` |
+| `just test-downstream-lane` | The downstream lane's contract (`tests/test_downstream_lane.sh`, no network, runs no consumer) |
+| `just test-downstream`      | Runs the consumers against this checkout from a sibling layout (see "Downstream lane") |
 | `just test-ffi-controls`    | The must-fail controls the graph does not model: `nimble testFfiThreads` and the two mutation builds of `test_ffi_failures_reach_the_caller` |
 | `just test-nim`             | Only `nimble test`, run directly                                      |
 | `just test-ffi`             | `nimble testFfi` — compiles `tests/test_ffi.c` against the static lib |
@@ -80,7 +82,8 @@ shell if you want a shared cache instead.
 `test-dev-shell` and `test-flake-check-lint-hook` drive Nix itself, so the
 `repro test` graph does not hold them; `ci-reprobuild.yml` runs both on
 linux-x64 in their own step. Every other test-shaped recipe that no workflow
-calls by name (`test-nim`, `test-managed-sender-ci-routes`, `check-ci-refs`)
+calls by name (`test-nim`, `test-managed-sender-ci-routes`, `check-ci-refs`,
+`test-downstream`)
 or that is manual (`bench`) carries a `# ci-test-audit: <reason>` line above
 it in the `Justfile`, saying what covers it. Give a new test recipe either a
 workflow step or such a line.
@@ -282,6 +285,58 @@ choice the sibling Nim repos `io-mon`, `nim-stackable-hooks` and
   `tests/test_pending_value_after_delta_column.nim` sat unlisted for months
   and failed their own asserts once run. Both have since been fixed and are
   in the nimble `test` task and in `repro.nim`; both pass.
+
+## Downstream lane
+
+codetracer reads traces through this repository's reader, and most recorders
+write them through its writer. Each resolves this repository as a sibling
+checkout or a pinned flake input, so a breaking change here would otherwise
+first show up when a consumer's own CI next moves its pin.
+`.github/workflows/downstream.yml` holds every pull request into, and every
+push to, `dev` and `stable` against them (codetracer-specs
+`Testing/Cross-Repo-CI-Integration.md`, "trace-format-nim downstream lane").
+It checks this commit out as `codetracer-trace-format-nim` and clones every
+consumer beside it, so each consumer reads THIS commit from where it always
+looks. Then it runs `ci/downstream/run-consumers.sh` once per consumer.
+
+**What is pinned.** codetracer is pinned by `ci/downstream/repro.lock`, a nested
+project (`ci/downstream/repro.nim`) that declares only `codetracer` and builds
+nothing. A manual dispatch may name another 40-hex revision. Nothing is ever
+taken from a branch tip. Every other repository comes from codetracer's own
+locks at that revision: `repro.lock` build inputs, the test lock
+`ci/test/siblings/repro.lock`, and `flake.lock` for the private siblings. They
+are resolved by codetracer's `ci/launcher-recorder-e2e-resolve-siblings.sh` and
+cloned by its `provision-repro-lock-siblings` action, with this repository
+excluded so its checkout is never reset. To move the codetracer pin, check
+codetracer out beside a standalone clone at a published revision. Run
+`ci/downstream/run-consumers.sh --ct-dir ../codetracer all` from that layout,
+then `repro lock refresh .` in `ci/downstream`, and commit the lock.
+
+**What runs, and why.** The driver's header is authoritative.
+
+| Consumer | How it builds this repository | What it runs |
+| -------- | ----------------------------- | ------------ |
+| `codetracer-readers` | `config.nims` puts `../codetracer-trace-format-nim/src` on the Nim path | the files of codetracer's lanes `ct-trace-units`, `ct-test-incremental`, `mcr-enrichment-units` and `ct-cli-units` that compile this library (`ci/downstream/ct-reader-suites.sh` compiles each lane and runs the files whose nimcache holds this library's modules), through `ci/lib/run-nim-test-lane.sh` in the `ci` shell |
+| `codetracer-native-recorder` | imports the writer directly (`ct_recorder/nim.cfg`) | `just build-ct-mcr`, which links the writer into the recorder and is what the runner requires, then `scripts/run-all-nim-tests.sh ct_recorder ct_trace_store`: the trace writer and the CTFS store. A test that is red at the pinned recorder for a reason in the recorder is named, with its failure signature, in `ci/downstream/native-recorder-expected-failures.tsv`, which the driver adds to the recorder's own ledger |
+| `codetracer-ruby-recorder` | `codetracer_trace_writer_nim`'s build.rs compiles this repository's writer | `just build-extension`, `just cargo-test`, and the Ruby suite, which records programs and decodes the traces with ct-print |
+| `codetracer-python-recorder` | the same crate | `just dev`, `just cargo-test`, and `pytest codetracer-python-recorder/tests/python` (CTFS round trips through ct-print) |
+| `codetracer-polkavm-recorder` | the same crate | `cargo test --locked`, whose tracer tests decode every trace with ct-print |
+
+The driver sets `CODETRACER_TRACE_FORMAT_NIM_DIR` to this checkout inside each
+consumer's dev shell and unsets `CODETRACER_TRACE_WRITER_NIM_PREBUILT`, so no
+consumer can link a writer from a store path instead. It also builds `ct-print`
+from this checkout and puts it first (`CT_PRINT`, `PATH`). It fails on a failed
+consumer, on one that ran no test, on an unknown consumer and on a missing
+sibling. Its swap guard refuses a layout whose
+`../codetracer-trace-format-nim` is not this checkout.
+`tests/test_downstream_lane.sh` (`just test-downstream-lane`) holds the
+workflow, the lock, the resolver and the driver to all of this.
+
+Other recorders also link the writer through the same crate (beam, cairo,
+cardano, circom, evm, flow, fuel, js, leo, miden, move, php, solana, ton). The
+three Rust recorders above exercise the same crate and the same build.rs path,
+so they cover that route. The format parity with the Rust implementation is
+`conformance.yml`'s job, not this lane's.
 
 ## Specs
 
