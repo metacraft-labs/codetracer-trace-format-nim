@@ -1,8 +1,8 @@
 {
   "status": "proposal-only-no-native-execution",
   "traceHead": "1e58aae4412f94a1a13eaed658cbc3686c38967d",
-  "releaseArchiveSha256": "cc896ab59baddb12c2ad96767bcacb347c5110d74f5a6226ec1257fb1ddd3678",
-  "supplierAuthority": "Exact unmodified155 staged RunQuota files in authenticated released-client archive v0.2.31 (runquota 6ff97313 with CRLF line ends); not the full repository tree or a guessed Git coordinate",
+  "releaseArchiveSha256": "57319f4475de3fbb5b17154e538f89a460c085bdd641c1d55fbde2a83be64eb7",
+  "supplierAuthority": "Exact unmodified163 staged RunQuota files in authenticated released-client archive v0.2.36 (runquota 83d89e58 with CRLF line ends); not the full repository tree or a guessed Git coordinate",
   "buildRecipe": {
     "sourceRevision": "cbfba94e2e10ed5a6078e2b9f90b406f5a8784b7",
     "path": "setup-reprobuild/build-runquota-bootstrap.ps1",
@@ -19,7 +19,7 @@
   },
   "leaseCandidate": {
     "revision": "08a3f50a391b32b053598f64c670d5232e1eb051",
-    "authority": "official v0.2.31 (7618e3cb, the release-asset build) flake.lock nim-shm-lease input of runquota-src; equals runquota 6ff97313 flake.lock root input and repro.lock",
+    "authority": "official v0.2.36 (37a109c4, the release-asset build) flake.lock nim-shm-lease input of runquota-src; equals runquota 83d89e58 flake.lock root input and repro.lock",
     "fullTrackedManifest": [
       {
         "path": ".editorconfig",
@@ -1015,12 +1015,12 @@
   "nativeCredit": false,
   "installedReleaseMembers": {
     "bin/repro.exe": {
-      "size": 1319157,
-      "sha256": "35c6bb1c2b88eadda5c8721edd2fe514f3dfff31908b618c7c900a44132b0982"
+      "size": 1338570,
+      "sha256": "a5ef0533f0d409893e4d0d4d1f7b96902f3d9a56bac2c01ec638b8b1455dfc42"
     },
     "bin/reprobuild.exe": {
-      "size": 52306053,
-      "sha256": "7706cff4720b4eb176680056a47c95bc6991ac45dbfbee1a98e550e400615f49"
+      "size": 55130942,
+      "sha256": "06d08e6f87222c92defd4dadcf49db7cb14a829fc45e970e84f7134bd6a9734a"
     }
   },
   "nativeControls": {

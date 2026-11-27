@@ -268,29 +268,34 @@ jobs:
         with:
           env-flavor: reprobuild
           repro-from-source: ${{ runner.os != 'Windows' && 'true' || 'false' }}
-          # The pin is reprobuild v0.2.31 as released: 7618e3cb is the commit
-          # the v0.2.31 release assets were built from (release run
-          # 44909832258), so the source-built legs run the same revision as
-          # the binary the Windows legs install. Keep it equal to the revision
+          # The pin is reprobuild v0.2.36 as released: 37a109c4 is the commit
+          # the v0.2.36 release assets were built from (release run
+          # 45469802238), so the source-built legs run the same revision as
+          # the binary the Windows legs install. v0.2.36 is the first release
+          # whose io-mon compiles for aarch64 (io-mon b1c32599): the
+          # linux-arm64 source build of v0.2.31 stopped at
+          # `linux_preload_runtime.nim(9813, 20) Error: undeclared identifier:
+          # 'SiteTableView'`. Keep it equal to the revision
           # .github/scripts/bind-unix-constructor.sh binds. v0.2.27 is the
           # first release that launches a Windows test binary under its .exe
           # name; earlier ones fail `repro test` on Windows with
           # `CreateProcessW failed (err=2)` on the extensionless path.
-          repro-build-pin: "7618e3cb21ce17f5c86fbd290f501d60d52e9be1"
+          repro-build-pin: "37a109c4e1cf650e6eb79b11d9fadf6e49e64614"
           # Windows legs install this release instead of building the pin
           # (both arm64 and x64 install its windows-x86_64 archive). Keep it
           # the tag of repro-build-pin so every leg runs the same revision;
           # the default `latest` moves with each release.
-          repro-version: "v0.2.31"
+          repro-version: "v0.2.36"
           # The source build overrides reprobuild's `runquota-src` with a clone
           # of this ref (default `dev`). Keep it equal to the runquota-src rev
           # in the pinned reprobuild's flake.lock, so the build uses the
           # RunQuota that reprobuild was locked against rather than whatever
           # `dev` holds (v0.2.19+ needs runquota's `directoryResolvesWithin`).
-          # v0.2.31's flake.lock pins runquota-src at 6ff97313; move this value
-          # with repro-build-pin. io-mon-src stays on that flake lock (8b8faa81
-          # at v0.2.31) while `repro-posix-io-mon-pin` is empty.
-          repro-runquota-pin: "6ff973131e7f715f0237cb0f08b8dd16cbeba0dc"
+          # v0.2.36's flake.lock pins runquota-src at 83d89e58; move this value
+          # with repro-build-pin. io-mon-src stays on that flake lock (13659436
+          # at v0.2.36, which carries the aarch64 fix b1c32599) while
+          # `repro-posix-io-mon-pin` is empty.
+          repro-runquota-pin: "83d89e581d01c96eadb157bee48cecab6aba1866"
           gh-token: ${{ steps.ci_token.outputs.token }}
           # The ci_token installation token expires an hour after it is
           # minted. On a loaded host this step alone has outlasted it: run
@@ -328,7 +333,7 @@ jobs:
           git rev-parse HEAD
           engine_source="$(git -C .reprobuild-src rev-parse HEAD)"
           echo "Repro source: $engine_source"
-          test "$engine_source" = 7618e3cb21ce17f5c86fbd290f501d60d52e9be1
+          test "$engine_source" = 37a109c4e1cf650e6eb79b11d9fadf6e49e64614
           test -z "$(git -C .reprobuild-src status --porcelain)"
           test "$(command -v repro)" = "$GITHUB_WORKSPACE/.reprobuild-src/build/bin/repro"
           test "${REPROBUILD_NIX_DAEMON_BIN:?missing source daemon helper}" = "$GITHUB_WORKSPACE/.reprobuild-src/build/bin/reprobuild-nix-daemon"
