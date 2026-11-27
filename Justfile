@@ -175,6 +175,15 @@ test-dev-shell:
 test-flake-check-lint-hook:
     bash tests/test_flake_check_lint_hook.sh
 
+# The inherited Git authentication guard of ci/reconcile-checkout-templates.py
+# admits exactly the job credential setup-nix exports and refuses every other
+# numbered configuration. Runs the real script end to end with real Git; CI
+# runs the same file in the "Reconcile authenticated inactive checkout
+# templates" step on Linux (`ci-reprobuild.yml`).
+# ci-test-audit: covered-by ci-reprobuild.yml (the reconcile step runs ci/test-reconcile-checkout-templates.py directly)
+test-checkout-template-auth:
+    python3 ci/test-reconcile-checkout-templates.py
+
 # Check refs with hermetic scanner controls before the network observation.
 # ci-test-audit: covered-by CI refs workflow (ci-refs.yml runs both commands as its own steps)
 check-ci-refs:

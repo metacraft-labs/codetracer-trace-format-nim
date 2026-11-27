@@ -184,6 +184,10 @@ jobs:
           sha256sum --check "$RUNNER_TEMP/trace-checkout-git-templates/git-image.sha256"
           selected_git_package="$(nix build --no-link --no-write-lock-file --print-out-paths .#ci-checkout-git)"
           selected_python_package="$(nix build --no-link --no-write-lock-file --print-out-paths .#ci-checkout-python)"
+          # Hold the inherited-authentication guard to the shape setup-nix
+          # exports, with real Git, before it runs on this job's environment.
+          "$selected_python_package/bin/python3" ci/test-reconcile-checkout-templates.py \
+            --git "$selected_git_package/bin/git"
           # Prove the copy-mode prediction against both real constructors under
           # several umasks before trusting it for the runner's captured umask.
           "$selected_python_package/bin/python3" ci/reconcile-checkout-templates.py \

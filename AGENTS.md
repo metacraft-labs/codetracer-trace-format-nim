@@ -78,12 +78,13 @@ shell if you want a shared cache instead.
 | `just nix-build`            | `nix build .#default`                                                 |
 | `just test-flake-check-lint-hook` | Builds `checks.pre-commit-check`; its `lint` hook must pass in the sandbox |
 | `just test-dev-shell`       | Enters `nix develop` from a scratch git repository; nothing may be written there |
+| `just test-checkout-template-auth` | CI checkout-template reconciliation admits only the job credential `setup-nix` exports |
 
 `test-dev-shell` and `test-flake-check-lint-hook` drive Nix itself, so the
 `repro test` graph does not hold them; `ci-reprobuild.yml` runs both on
 linux-x64 in their own step. Every other test-shaped recipe that no workflow
 calls by name (`test-nim`, `test-managed-sender-ci-routes`, `check-ci-refs`,
-`test-downstream`)
+`test-downstream`, `test-checkout-template-auth`)
 or that is manual (`bench`) carries a `# ci-test-audit: <reason>` line above
 it in the `Justfile`, saying what covers it. Give a new test recipe either a
 workflow step or such a line.

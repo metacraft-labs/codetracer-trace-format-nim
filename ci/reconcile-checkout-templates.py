@@ -6,7 +6,7 @@ samples preserve their original inode, mode, and body. Configuration is held
 only in this process and never hashed or written to the public receipt.
 """
 from pathlib import Path
-import argparse, hashlib, json, os, stat, subprocess, sys, tempfile
+import argparse, hashlib, json, os, re, stat, subprocess, sys, tempfile
 
 def git_template_copy_mode(source_mode, process_umask):
     """Return the mode `git init` gives a regular file copied from a template.
@@ -131,16 +131,32 @@ for variable in ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_TEMPLATE_DIR
                   'GIT_CONFIG_PARAMETERS']:
     if os.environ.get(variable):
         raise RuntimeError('Inherited Git authority refused')
-# Setup installs exactly one owner-scoped authentication entry. Keep its value
-# only in task memory; path selectors and additional configuration stay refused.
+# setup-nix installs the job-scoped credential as exactly three owner-scoped
+# numbered entries, in this order (metacraft-github-actions
+# git-auth/scoped-git-auth.sh, _scoped_git_auth_helper_pairs, "THE JOB-SCOPED
+# CREDENTIAL"): a preemptive-header reset, a helper reset, and the helper that
+# reads the job's rotating token file. Admit nothing else: any other key,
+# count, order, scope or helper command could select hooks, templates or a
+# foreign credential. Keep the values only in task memory; path selectors and
+# additional configuration stay refused. Governed by codetracer-pm
+# spec/Testing/Trace-Nim-Checkout-Template-Constructor-Transition.md; contract
+# suite ci/test-reconcile-checkout-templates.py.
+auth_scope = 'https://github.com/metacraft-labs/'
+job_token_helper = re.compile(r"!/bin/sh '/[^'\n]*/git-auth/git-credential-job-token\.sh' '/[^'\n]*'")
 auth_keys = {name: value for name, value in os.environ.items()
             if name == 'GIT_CONFIG_COUNT' or name.startswith('GIT_CONFIG_KEY_')
             or name.startswith('GIT_CONFIG_VALUE_')}
 if auth_keys:
-    if (set(auth_keys) != {'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'}
-            or auth_keys['GIT_CONFIG_COUNT'] != '1'
-            or auth_keys['GIT_CONFIG_KEY_0'] != 'http.https://github.com/metacraft-labs/.extraHeader'
-            or not auth_keys['GIT_CONFIG_VALUE_0']):
+    expected_names = {'GIT_CONFIG_COUNT'} | {f'GIT_CONFIG_{kind}_{index}'
+                                              for kind in ['KEY', 'VALUE'] for index in range(3)}
+    if (set(auth_keys) != expected_names
+            or auth_keys['GIT_CONFIG_COUNT'] != '3'
+            or [auth_keys[f'GIT_CONFIG_KEY_{index}'] for index in range(3)]
+                != [f'http.{auth_scope}.extraHeader', f'credential.{auth_scope}.helper',
+                    f'credential.{auth_scope}.helper']
+            or auth_keys['GIT_CONFIG_VALUE_0'] != ''
+            or auth_keys['GIT_CONFIG_VALUE_1'] != ''
+            or not job_token_helper.fullmatch(auth_keys['GIT_CONFIG_VALUE_2'])):
         raise RuntimeError('Inherited Git authentication shape refused')
 for key in ['core.hooksPath', 'init.templateDir']:
     result = subprocess.run([str(git), 'config', '--get', key], cwd=root,
