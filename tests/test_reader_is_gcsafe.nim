@@ -24,6 +24,7 @@
 ## fixture directories.
 
 import std/[os, assertions, osproc, streams, strtabs, strutils, tempfiles]
+import ./exact_bytes_file
 import results
 import codetracer_trace_writer/multi_stream_writer
 import codetracer_trace_writer/new_trace_reader
@@ -76,7 +77,7 @@ proc writeTrace(dir, name: string, holdWriter: bool): string =
   let closed = w.close()
   doAssert closed.isOk, "close: " & closed.error
   result = dir / name & ".ct"
-  writeFile(result, cast[string](w.toBytes()))
+  writeBytesFile(result, w.toBytes())
 
 proc checkReader(file: string) {.noinline.} =
   let handle = open(file, fmRead)

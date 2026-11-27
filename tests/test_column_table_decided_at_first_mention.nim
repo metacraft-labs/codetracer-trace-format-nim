@@ -30,6 +30,7 @@
 ## back through the real reader.
 
 import std/[os, strutils, assertions, options]
+import ./exact_bytes_file
 import results
 import codetracer_trace_writer/multi_stream_writer
 import codetracer_trace_writer/new_trace_reader
@@ -51,7 +52,7 @@ proc finish(w: var MultiStreamTraceWriter, name: string): NewTraceReader =
   let closed = w.close()
   doAssert closed.isOk, "close: " & closed.error
   let file = dir / name & ".ct"
-  writeFile(file, cast[string](w.toBytes()))
+  writeBytesFile(file, w.toBytes())
   discard w.closeCtfs()
   let r = openNewTrace(file)
   doAssert r.isOk, "openNewTrace: " & r.error

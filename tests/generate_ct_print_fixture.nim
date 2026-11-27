@@ -16,6 +16,7 @@
 ## Usage:  nim c -r -p:src tests/generate_ct_print_fixture.nim <output.ct>
 
 import std/os
+import ./exact_bytes_file
 import results
 import codetracer_trace_writer/multi_stream_writer
 import codetracer_trace_writer/value_stream
@@ -188,7 +189,7 @@ proc main() =
   let bytes = w.toBytes()
   w.closeCtfs()
 
-  writeFile(outputPath, cast[string](bytes))
+  writeBytesFile(outputPath, bytes)
   echo "Wrote fixture: ", outputPath, " (", bytes.len, " bytes)"
 
 main()

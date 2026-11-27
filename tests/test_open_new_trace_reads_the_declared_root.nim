@@ -47,6 +47,7 @@ include codetracer_trace_writer_ffi
 {.pop.}
 
 import std/[os, osproc, strutils]
+import ./exact_bytes_file
 import codetracer_ctfs/base40
 import codetracer_trace_writer/new_trace_reader as ntr
 import codetracer_trace_writer/step_map_builder
@@ -165,7 +166,7 @@ let forms = [
 
 ensureCtPrint()
 let basePath = dir / "base.ct"
-writeFile(basePath, cast[string](base))
+writeBytesFile(basePath, base)
 let (wantSummary, baseStatus) = execCmdEx(
   quoteShell(ctPrintBin) & " --summary " & quoteShell(basePath))
 doAssert baseStatus == 0, "ct-print --summary of the base: " & wantSummary

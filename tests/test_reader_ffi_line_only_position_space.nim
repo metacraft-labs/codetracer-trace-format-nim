@@ -39,6 +39,7 @@ include codetracer_trace_writer_ffi
 {.pop.}
 
 import std/strutils
+import ./exact_bytes_file
 
 const
   PathA = "/src/main.py"
@@ -71,7 +72,7 @@ proc writeTrace(file: string, steps: openArray[(uint64, uint64)]) =
   doAssert w.close().isOk
   let bytes = w.toBytes()
   w.closeCtfs()
-  writeFile(file, cast[string](bytes))
+  writeBytesFile(file, bytes)
 
 proc ffiLastError(): string =
   let e = trace_writer_last_error()
