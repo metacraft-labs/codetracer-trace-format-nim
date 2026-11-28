@@ -18,6 +18,15 @@ proc ffiCompilerFlags*(app, target: string): seq[string] =
     # without a duplicate-`NimMain` link error. MUST match the
     # `codetracerTraceWriterNimMain` importc in codetracer_trace_writer_ffi.nim.
     "--nimMainPrefix:codetracerTraceWriter",
+    # The library is a guest in its host's process: it installs no signal
+    # handlers. Without this, `codetracer_trace_writer_init` (NimMain) puts
+    # Nim's SIGSEGV/SIGBUS/SIGFPE/SIGILL/SIGINT handlers over the host's. A
+    # Go host (the wasm recorder's wazero) then lost its own fault handling:
+    # a nil dereference it would report as a panic, or recover from, died as
+    # "SIGSEGV: Illegal storage access" with exit 139 and no trace of where.
+    # A Rust host loses its stack-overflow guard the same way. The wasm builds
+    # already pass it.
+    "-d:noSignalHandler",
   ]
   case target
   of "msvc":

@@ -1,3 +1,4 @@
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,9 +48,27 @@ static const char* scratch_path(char* buf, size_t size, const char* name) {
 }
 #define SCRATCH(buf, name) scratch_path((buf), sizeof (buf), (name))
 
+/* The host's own SIGSEGV handler: the library must leave it in place. */
+static void host_segv_handler(int sig) { (void)sig; _exit(99); }
+
 int main(void) {
+    /* The library is a guest in its host's process. A host that handles its
+     * own faults (Go's runtime, Rust's stack-overflow guard) installs its
+     * handler first; initialising the Nim runtime must not replace it. */
+    struct sigaction host = {0}, after = {0};
+    host.sa_handler = host_segv_handler;
+    sigemptyset(&host.sa_mask);
+    if (sigaction(SIGSEGV, &host, NULL) != 0) { perror("sigaction"); return 1; }
+
     /* Initialize Nim runtime */
     codetracer_trace_writer_init();
+
+    if (sigaction(SIGSEGV, NULL, &after) != 0) { perror("sigaction"); return 1; }
+    if (after.sa_handler != host_segv_handler) {
+        fprintf(stderr, "FAIL: codetracer_trace_writer_init replaced the host's SIGSEGV handler\n");
+        return 1;
+    }
+    printf("[OK] the host's SIGSEGV handler survives codetracer_trace_writer_init\n");
 
     printf("=== C FFI Test for codetracer_trace_writer ===\n\n");
 
