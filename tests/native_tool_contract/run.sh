@@ -119,9 +119,23 @@ stripped_env=(env -i "PATH=$stripped_path" "HOME=$HOME"
 # Not tools: identity, temp/cache locations, Nix daemon/TLS settings, and the
 # variables that select reprobuild's own helpers (REPRO_BOOTSTRAP_CC compiles
 # the recipe provider, never an action; see the workspace AGENTS.md).
+#
+# Nor are the sibling-first source trees of reprobuild itself (SHM_QUEUE_SRC
+# ... CONFUTILS_SRC, the engine's `SiblingFirstPackageEnvNames`): Nim source
+# the engine compiles every recipe's provider against, never on an action's
+# PATH. An engine run from a reprobuild git checkout (CI's source-built
+# `.reprobuild-src/build/bin/repro`) takes each from a `../<sibling>` checkout
+# at the revision that checkout pins or from `$<NAME>`, and refuses the tree
+# compiled into it ("no acceptable source for SHM_QUEUE_SRC"); the Nix
+# package's wrapper sets them itself, so a store-installed repro needs none.
+# Measured in linux-x64 job 140767131442. RUNQUOTAD_BIN is the same kind of
+# variable: the engine's lease daemon, which it starts itself when none is
+# reachable; the package wrapper sets it too, and setup-reprobuild exports it
+# for a source-built engine.
 for name in USER LOGNAME TMPDIR XDG_CACHE_HOME XDG_RUNTIME_DIR NIX_REMOTE \
             NIX_SSL_CERT_FILE SSL_CERT_FILE REPRO_BOOTSTRAP_CC \
-            REPRO_FOREIGN_ENV_BASH REPROBUILD_NIX_DAEMON_BIN; do
+            REPRO_FOREIGN_ENV_BASH REPROBUILD_NIX_DAEMON_BIN RUNQUOTAD_BIN \
+            SHM_QUEUE_SRC SHM_GSET_SRC CLI_SPEC_SRC ENTRYPOINTS_SRC CONFUTILS_SRC; do
   if [ -n "${!name+x}" ]; then stripped_env+=("$name=${!name}"); fi
 done
 
