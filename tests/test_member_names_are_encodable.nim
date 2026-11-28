@@ -5,8 +5,8 @@
 ## member its packing happens to match.
 ##
 ## `Refused` is the set of names the Rust writer refuses too
-## (`codetracer-trace-format`'s `member_names_are_refused_alike.rs` drives
-## both writers over it). No mocks: the real CTFS writer and readers.
+## (codetracer-trace-format-conformance's `member_names_are_refused_alike.rs`
+## drives both writers over it). No mocks: the real CTFS writer and readers.
 
 import std/strutils
 import results

@@ -173,6 +173,23 @@ jobs:
           GH_TOKEN: ${{ steps.ci_token.outputs.token }}
         run: bash .github/scripts/bind-unix-constructor.sh
 
+      # The installation token minted above expires an hour after the mint,
+      # and the constructor build above can take longer than that: linux-x64
+      # job 140610219947 minted it at 20:58:43, the build ran until 22:20, and
+      # the next step's `nix build .#ci-checkout-git` then failed with
+      # `HTTP error 401 ... Bad credentials`. The job credential broker that
+      # keeps it fresh starts only in setup-dev-env, below. Re-mint it and
+      # rewrite the job's Git and Nix credential files (setup-nix's
+      # MCL_JOB_CREDENTIALS_DIR) before the steps that fetch with it; the
+      # broker owns those files once it starts.
+      - name: Refresh build authentication after the constructor build
+        if: runner.os != 'Windows'
+        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@dev
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
       - name: Reconcile authenticated inactive checkout templates
         if: matrix.os == 'linux'
         shell: bash
@@ -237,6 +254,7 @@ jobs:
             done
             printf "CT_ZSTD_INCLUDE_DIR=%s\nCT_ZSTD_LIB_DIR=%s\nCT_PCRE_LIB_DIR=%s\nPKG_CONFIG_PATH=%s\n" \
               "$CT_ZSTD_INCLUDE_DIR" "$CT_ZSTD_LIB_DIR" "$CT_PCRE_LIB_DIR" "$pkg_config_dir" >> "$GITHUB_ENV"
+            printf "REPRO_VARIANTS=%s\n" "$REPRO_VARIANTS" >> "$GITHUB_ENV"
             printf "CT_MINIO_BIN=%s\nCT_PYTHON3_BIN=%s\n" "$CT_MINIO_BIN" "$CT_PYTHON3_BIN" >> "$GITHUB_ENV"
           '
 
@@ -260,36 +278,41 @@ jobs:
         run: ./ci/ensure-declared-gcc.ps1 -Destination "$env:RUNNER_TEMP/trace-nim-gcc"
 
       - name: Setup dev env (reprobuild flavor)
-        # setup-dev-env clones the siblings listed in .github/sibling-repos
-        # (codetracer-trace-format, codetracer-trace-format-nim) at the
-        # workspace-lock-pinned revisions before materialising the env.
+        # Clones the siblings .github/sibling-repos declares: the format spec,
+        # which two tests read from ../codetracer-trace-format-spec. The
+        # cross-implementation checks run in conformance.yml.
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: reprobuild
           repro-from-source: ${{ runner.os != 'Windows' && 'true' || 'false' }}
-          # The pin is reprobuild v0.2.29 as released: 99798461 is the commit
-          # the v0.2.29 release assets were built from (release run
-          # 44636838666), so the source-built legs run the same revision as
-          # the binary the Windows legs install. Keep it equal to the revision
+          # The pin is reprobuild v0.2.36 as released: 37a109c4 is the commit
+          # the v0.2.36 release assets were built from (release run
+          # 45469802238), so the source-built legs run the same revision as
+          # the binary the Windows legs install. v0.2.36 is the first release
+          # whose io-mon compiles for aarch64 (io-mon b1c32599): the
+          # linux-arm64 source build of v0.2.31 stopped at
+          # `linux_preload_runtime.nim(9813, 20) Error: undeclared identifier:
+          # 'SiteTableView'`. Keep it equal to the revision
           # .github/scripts/bind-unix-constructor.sh binds. v0.2.27 is the
           # first release that launches a Windows test binary under its .exe
           # name; earlier ones fail `repro test` on Windows with
           # `CreateProcessW failed (err=2)` on the extensionless path.
-          repro-build-pin: "9979846112d606818f13f5952d808cb4da5bba0b"
+          repro-build-pin: "37a109c4e1cf650e6eb79b11d9fadf6e49e64614"
           # Windows legs install this release instead of building the pin
           # (both arm64 and x64 install its windows-x86_64 archive). Keep it
           # the tag of repro-build-pin so every leg runs the same revision;
           # the default `latest` moves with each release.
-          repro-version: "v0.2.29"
+          repro-version: "v0.2.36"
           # The source build overrides reprobuild's `runquota-src` with a clone
           # of this ref (default `dev`). Keep it equal to the runquota-src rev
           # in the pinned reprobuild's flake.lock, so the build uses the
           # RunQuota that reprobuild was locked against rather than whatever
           # `dev` holds (v0.2.19+ needs runquota's `directoryResolvesWithin`).
-          # v0.2.29's flake.lock pins runquota-src at 6ff97313; move this value
-          # with repro-build-pin. io-mon-src stays on that flake lock (8b8faa81
-          # at v0.2.29) while `repro-posix-io-mon-pin` is empty.
-          repro-runquota-pin: "6ff973131e7f715f0237cb0f08b8dd16cbeba0dc"
+          # v0.2.36's flake.lock pins runquota-src at 83d89e58; move this value
+          # with repro-build-pin. io-mon-src stays on that flake lock (13659436
+          # at v0.2.36, which carries the aarch64 fix b1c32599) while
+          # `repro-posix-io-mon-pin` is empty.
+          repro-runquota-pin: "83d89e581d01c96eadb157bee48cecab6aba1866"
           gh-token: ${{ steps.ci_token.outputs.token }}
           # The ci_token installation token expires an hour after it is
           # minted. On a loaded host this step alone has outlasted it: run
@@ -327,7 +350,7 @@ jobs:
           git rev-parse HEAD
           engine_source="$(git -C .reprobuild-src rev-parse HEAD)"
           echo "Repro source: $engine_source"
-          test "$engine_source" = 9979846112d606818f13f5952d808cb4da5bba0b
+          test "$engine_source" = 37a109c4e1cf650e6eb79b11d9fadf6e49e64614
           test -z "$(git -C .reprobuild-src status --porcelain)"
           test "$(command -v repro)" = "$GITHUB_WORKSPACE/.reprobuild-src/build/bin/repro"
           test "${REPROBUILD_NIX_DAEMON_BIN:?missing source daemon helper}" = "$GITHUB_WORKSPACE/.reprobuild-src/build/bin/reprobuild-nix-daemon"
@@ -362,29 +385,45 @@ jobs:
         run: dev-exec nim c -r '--cc:vcc' '--threads:off' '--mm:arc' '-d:release' '-p:src' '-o:build/test-bin/test_live_page_lifetime_msvc.exe' tests/test_live_page_lifetime.nim
 
       - name: repro build
-        # Builds the conventional `build` collection declared in
-        # `repro.nim`. Verifies the primary shipping artefact (the
-        # recorder binary or extension) materialises through the
-        # reprobuild engine identically to `just build`.
+        # Builds the `default` collection declared in `repro.nim` (the
+        # inspectors and the C-FFI static library). `just build` runs the
+        # same command.
         run: dev-exec repro build ${{ runner.os != 'Windows' && '--tool-provisioning=nix' || '' }}
 
       - name: repro test
-        # Materialises the `test` collection.
+        # Materialises the `test` collection. `just test` runs the same command.
         run: dev-exec repro test ${{ runner.os != 'Windows' && '--tool-provisioning=nix' || '' }}
+
+      - name: Sibling ct-print consumer contract (no ambient compiler or zstd)
+        # A recipe that calls `build_writer_artifacts.buildCtPrint` the way
+        # the recorders do must build ct-print from what the graph declares,
+        # with no compiler or zstd in its environment, and one that leaves
+        # `zstd-dev` out of `uses:` must be refused by name. POSIX only: the
+        # Windows constructors take zstd through explicit paths.
+        if: runner.os != 'Windows'
+        run: dev-exec just test-native-tool-contract
+
+      - name: Tool paths invalidate both warm recipe graph caches
+        if: runner.os != 'Windows'
+        run: dev-exec just test-repro-tool-paths
+
+      - name: Windows tool-path manifest accumulation and selection
+        if: runner.os == 'Windows'
+        run: dev-exec just test-repro-tool-path-transport
 
       - name: Inspect the original Windows compiler header boundary on failure
         if: failure() && runner.os == 'Windows'
         shell: pwsh
         run: dev-exec pwsh -NoProfile -File ./ci/inspect-gcc-header-boundary.ps1 -ProjectInclude (Join-Path $env:GITHUB_WORKSPACE "include") -ProjectHeader codetracer_crossing_state.h
 
-      - name: just build (cross-check)
-        # Re-runs the legacy `just build` path inside the same env so
-        # we catch silent divergences between `repro build` outputs
-        # and what the dev shell + Justfile produce today.
-        run: dev-exec just build
-
-      - name: just test (cross-check)
-        run: dev-exec just test
+      - name: FFI must-fail controls
+        # `just test` is `repro test` followed by this step's recipe. The
+        # controls (an archive built `--threads:on`, one without the process
+        # lock, and the two guard mutations of test_ffi_failures_reach_the_caller)
+        # must make their hosts fail, which a graph node cannot express.
+        # `nimble testFfiThreads` skips itself on Windows.
+        if: runner.os != 'Windows'
+        run: dev-exec just test-ffi-controls
 
       # Diagnostics on failure. Three things below are load-bearing:
       #

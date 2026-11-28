@@ -279,8 +279,8 @@ when defined(vcc) or defined(clang_cl):
     cast[uint64](compareExchange64(cast[ptr int64](wordPtr(v, off)),
       cast[int64](desired), cast[int64](expected))) == expected
 
-  proc fenceRelease() {.inline.} = memoryBarrier()
-  proc fenceAcquire() {.inline.} = memoryBarrier()
+  proc fenceRelease*() {.inline.} = memoryBarrier()
+  proc fenceAcquire*() {.inline.} = memoryBarrier()
 else:
   proc load*(v: PageView, off: int): uint64 {.inline.} =
     atomicLoadN(wordPtr(v, off), ATOMIC_ACQUIRE)
@@ -302,8 +302,8 @@ else:
     atomicCompareExchangeN(wordPtr(v, off), addr e, desired, false,
       ATOMIC_ACQ_REL, ATOMIC_RELAXED)
 
-  proc fenceRelease() {.inline.} = atomicThreadFence(ATOMIC_RELEASE)
-  proc fenceAcquire() {.inline.} = atomicThreadFence(ATOMIC_ACQUIRE)
+  proc fenceRelease*() {.inline.} = atomicThreadFence(ATOMIC_RELEASE)
+  proc fenceAcquire*() {.inline.} = atomicThreadFence(ATOMIC_ACQUIRE)
 
 # ---------------------------------------------------------------------------
 # The machine's monotonic clock, process start times
@@ -674,6 +674,24 @@ when defined(windows):
     InvalidHandleValue = -1
 
   proc sectionName(name: string): string = "Local\\" & name
+elif defined(android):
+  # Android's bionic has no POSIX shared memory: shm_open and shm_unlink are
+  # not declared, and the cooperative recorder's Android build failed to
+  # compile here. A named region is a file in a directory both sides reach
+  # (CT_SHM_DIR, else TMPDIR, else /data/local/tmp), mapped as shm_open's would
+  # be; shmPath gives its full path, so open/unlink stand in for
+  # shm_open/shm_unlink.
+  proc c_getenv(name: cstring): cstring {.importc: "getenv", header: "<stdlib.h>".}
+  proc shmDir(): string =
+    for v in ["CT_SHM_DIR", "TMPDIR"]:
+      let d = c_getenv(cstring(v))
+      if d != nil and d[0] != '\0':
+        return $d
+    "/data/local/tmp"
+  proc shmPath(name: string): string = shmDir() & "/ctfs-shm-" & name
+  proc shm_open(name: cstring, oflag: cint, mode: Mode): cint =
+    posix.open(name, oflag, mode)
+  proc shm_unlink(name: cstring): cint = posix.unlink(name)
 else:
   proc shm_open(name: cstring, oflag: cint, mode: Mode): cint {.importc,
     header: "<sys/mman.h>".}
@@ -1003,7 +1021,10 @@ proc setNextFreeBlock*(p: LivePage, n: uint64) =
   p.tapStore(OffNextFreeBlock, n)
 
 # The heartbeat thread: a native thread that touches no Nim-managed memory,
-# so it is safe under every memory manager a consumer builds with.
+# so it is safe under every memory manager a consumer builds with. On POSIX
+# it blocks every signal (see `startHeartbeat`); Windows delivers no signal to
+# an arbitrary thread (a console control handler runs on a thread of its
+# own), so there is nothing to block there.
 
 when defined(windows):
   proc createThreadW(attrs: pointer, stack: uint, start: pointer, arg: pointer,
@@ -1044,8 +1065,33 @@ proc startHeartbeat(p: LivePage) =
       deallocShared(ctl)
       return
   else:
+    # The heartbeat thread runs inside a host process (php-fpm, a Ruby or
+    # Python interpreter, ...) that owns its signal handling. A
+    # process-directed signal is delivered to any one thread that does not
+    # block it (`signal(7)`, "Signal mask and pending signals":
+    # https://man7.org/linux/man-pages/man7/signal.7.html), so a thread that
+    # blocks nothing can receive the host's SIGTERM or SIGQUIT, and the
+    # host's handler then runs on it while another thread may be closing the
+    # container. The heartbeat thread handles no signal, so it blocks them
+    # all. A new thread inherits its creator's mask (`pthread_sigmask(3)`:
+    # https://man7.org/linux/man-pages/man3/pthread_sigmask.3.html), so the
+    # creating thread blocks every signal around `pthread_create` and then
+    # restores its own mask, on every path. SIGKILL and SIGSTOP cannot be
+    # blocked and are left out silently; a synchronous fault (SIGSEGV, ...)
+    # raised by the thread itself still terminates the process.
+    var all, old: Sigset
+    if sigfillset(all) != 0 or pthread_sigmask(SIG_SETMASK, all, old) != 0:
+      # Without a blocked mask the thread would take the host's signals:
+      # start none, as when `pthread_create` fails.
+      deallocShared(ctl)
+      return
     var t: Pthread
-    if pthread_create(addr t, nil, heartbeatMain, cast[pointer](ctl)) != 0:
+    let created = pthread_create(addr t, nil, heartbeatMain,
+                                 cast[pointer](ctl))
+    # Restoring the mask this thread had a moment ago cannot fail: SIG_SETMASK
+    # is valid and `old` was filled by the call above.
+    discard pthread_sigmask(SIG_SETMASK, old, all)
+    if created != 0:
       deallocShared(ctl)
       return
     ctl.thread = cast[uint](t)
@@ -1093,7 +1139,10 @@ proc claimWriterSlot(p: LivePage): Result[int, string] =
     " writer slots are taken (a page has 16, so at most 15 producer " &
     "processes beside the coordinator)")
 
-proc closeLivePage*(p: LivePage)
+proc closeLivePage*(p: LivePage) {.gcsafe.}
+  ## `createLivePage` calls this before its body below. State the effect here
+  ## so that the writer's inferred GC-safety does not depend on declaration
+  ## order; Nim still checks the implementation against it.
 
 proc slotLiveness(mode: LivePageMode): uint64 =
   ## The arm `inguest-heartbeat-liveness` marks an in-guest slot with the

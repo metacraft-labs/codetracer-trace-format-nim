@@ -23,7 +23,7 @@ public static class TraceZstdPhysicalPath {
 }
 '@
 $manifest = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'windows-zstd-artifact-manifest.json') -Raw | ConvertFrom-Json
-if ($manifest.sdkRevision -ne '9979846112d606818f13f5952d808cb4da5bba0b' -or
+if ($manifest.sdkRevision -ne '37a109c4e1cf650e6eb79b11d9fadf6e49e64614' -or
     $manifest.archiveSha256 -ne '7b4eff6719990e38aca93a4844c2e86a1935090625c4611f7e89675e999c56cc' -or
     $manifest.files.Count -ne 3) { throw 'unexpected declared Zstd manifest' }
 # Exact authenticated member set: count plus membership alone permits duplicates.
@@ -65,6 +65,11 @@ try {
   Add-Content -LiteralPath $env:GITHUB_ENV -Value "CT_ZSTD_INCLUDE_DIR=$physicalRoot\include"
   Add-Content -LiteralPath $env:GITHUB_ENV -Value "CT_ZSTD_LIBRARY_FILE=$physicalRoot\static\libzstd_static.lib"
   Add-Content -LiteralPath $env:GITHUB_PATH -Value $physicalRoot
+  . (Join-Path $PSScriptRoot 'repro-tool-paths.ps1')
+  Set-TraceReproToolPaths -Bindings @{
+    CT_ZSTD_INCLUDE_DIR = "$physicalRoot\include"
+    CT_ZSTD_LIBRARY_FILE = "$physicalRoot\static\libzstd_static.lib"
+  }
 } finally {
   foreach ($stream in $held) { $stream.Dispose() }
 }

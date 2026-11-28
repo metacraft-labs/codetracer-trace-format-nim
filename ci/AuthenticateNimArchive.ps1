@@ -54,8 +54,11 @@ function Read-AuthenticatedNimArchive([string]$Archive, $Hold) {
 function Assert-NimPrefixInventory([string]$Prefix, $Members, $Hold) {
     if ($Members.Count -ne 4822) { throw 'nim-prefix/authority-count' }
     $extras = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    # Exact files added by authenticated SDK (b9cf09b0) tarball materialization/registerInUnifiedStore.
+    # Exact files added by authenticated SDK (b9cf09b0) tarball materialization/registerInUnifiedStore,
+    # and the cache identity every sealed prefix records since Repro 844e39ba6
+    # (released from v0.2.35; repro_tool_profiles/prefix_portability.nim PrefixIdentityFileName).
     [void]$extras.Add('.reprobuild-tarball-receipt.json'); [void]$extras.Add('.repro-receipt')
+    [void]$extras.Add('.repro-cache-identity.json')
     $found = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $directories = [Collections.Generic.Queue[string]]::new(); $directories.Enqueue($Prefix)
     while ($directories.Count -gt 0) {

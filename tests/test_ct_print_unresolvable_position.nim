@@ -34,6 +34,7 @@
 ## read back through the real reader.
 
 import std/[os, json, strutils, assertions]
+import ./exact_bytes_file
 import results
 import codetracer_ct_print_lib
 import codetracer_trace_writer/multi_stream_writer
@@ -46,7 +47,7 @@ const
 let dir = getTempDir() / "ctfnim-ct-print-unresolvable-position"
 
 proc packGlobalLineIndexRust(pathId: uint64, line: uint64): uint64 =
-  ## `codetracer-trace-format/codetracer_trace_writer/src/step_stream.rs`
+  ## The Rust `codetracer_trace_writer/src/step_stream.rs`
   ## `pack_global_line_index`: `(path_id << 32) | (line & 0xFFFF_FFFF)`.
   ## Reproduced rather than linked because the point is that the two
   ## packings are independent.
@@ -73,7 +74,7 @@ proc writeTrace(file: string, steps: openArray[(uint64, uint64)]) =
   doAssert w.close().isOk
   let bytes = w.toBytes()
   w.closeCtfs()
-  writeFile(file, cast[string](bytes))
+  writeBytesFile(file, bytes)
 
 proc stepEvents(root: JsonNode): seq[JsonNode] =
   doAssert root.hasKey("events"), "document has no events array"

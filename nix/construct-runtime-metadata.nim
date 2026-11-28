@@ -37,6 +37,18 @@ let installed=getInstalledPkgsMin(root/"pkgs2",opts)
 loadNimbleData(opts)
 saveNimbleData(opts)
 let releases=getOfficialReleases(opts)
+# When Nimble cannot fetch the release list from the GitHub API, it catches the
+# error and returns a hard-coded list without writing this file
+# (nimblepkg/downloadnim.nim, getOfficialReleases). Refuse with exit code 70
+# and say why, instead of dying on an unhandled IOError. The usual cause is the
+# anonymous per-address API quota. The patched Nimble sends GITHUB_TOKEN when
+# it is set (nix/nimble-github-api-auth.patch).
+if not fileExists(root/"official-nim-releases.json"):
+  stderr.writeLine("construct-runtime-metadata: Nimble did not write official-nim-releases.json: " &
+    "the official Nim release query to api.github.com failed" &
+    (if existsEnv("GITHUB_TOKEN"): " even with GITHUB_TOKEN set (check the token)."
+     else: " without a GITHUB_TOKEN; the anonymous per-address quota is likely spent. Set GITHUB_TOKEN and retry."))
+  quit(70)
 let written=parseFile(root/"official-nim-releases.json")
 if written.kind!=JArray or written.len!=releases.len or releases.len==0: quit(66)
 for index,release in releases:

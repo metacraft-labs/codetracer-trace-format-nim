@@ -33,6 +33,7 @@
 ## checks that every case it lists ran.
 
 import std/[os, sets, strutils]
+import ./exact_bytes_file
 import results
 import codetracer_ctfs
 import codetracer_ctfs/types
@@ -191,7 +192,8 @@ testCase "rootMembers enumerates the auto-filled root":
 proc viewAll(path: string) =
   ## Every member through an image read from its file; the image (and its
   ## file handle) is released when this returns.
-  let image = openFileImage(path, BS, 0'u32)
+  # The image takes the block size and the root from the header itself.
+  let image = openFileImage(path)
   check(image.isOk, "openFileImage: " & (if image.isErr: image.unsafeError else: ""))
   if image.isOk:
     var bad = 0
@@ -202,7 +204,7 @@ proc viewAll(path: string) =
 
 testCase "openFileImage + viewMember with the header's value":
   let path = getTempDir() / "ctfs_root_auto_fill_view.ct"
-  writeFile(path, cast[string](v5Zero))
+  writeBytesFile(path, v5Zero)
   viewAll(path)
   try: removeFile(path) except OSError: discard
 
@@ -259,7 +261,7 @@ testCase "openTrace on a trace whose header declares 0":
   for k in 16 + declaredByWriter * 24 ..< int(BS):
     doAssert bytes[k] == 0, "slot bytes past the writer's declaration are not empty"
   bytes.declare(0)
-  writeFile(path, cast[string](bytes))
+  writeBytesFile(path, bytes)
   let zero = openTrace(path)
   check(zero.isOk, "openTrace (declared 0): " &
     (if zero.isErr: zero.unsafeError else: ""))

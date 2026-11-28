@@ -1,0 +1,23 @@
+name: Conformance
+
+# Holds every change here against the Rust implementation of the format: runs
+# the codetracer-trace-format-conformance suite with this commit as the Nim
+# implementation. This repository depends on no other implementation; the
+# suite, and the CI job that provisions what it needs, live in that repository
+# (its `conformance.yml`, a reusable workflow), which depends on both. The
+# Rust implementation's CI runs the same suite against its own changes.
+
+on:
+  pull_request:
+    branches: [dev, stable]
+  push:
+    branches: [dev, stable]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  conformance:
+    uses: metacraft-labs/codetracer-trace-format-conformance/.github/workflows/conformance.yml@agents
+    secrets: inherit

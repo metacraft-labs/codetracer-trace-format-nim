@@ -92,9 +92,11 @@ block:
   echo "PASS canonical truncation, reserved, trailing and overlong refusal"
 
 block:
-  # A caller's scan limit larger than the root the header declares must not
-  # count a member's data as a second `entry.dat`: the duplicate check reads
-  # only the header-declared slots. Slot `k` of an unbounded scan starts at
+  # A scan past the root the header declares must not count a member's data
+  # as a second `entry.dat`: the duplicate check reads only the
+  # header-declared slots. The open takes its scan limit from the header and
+  # no caller can widen it (`ctfs-container.md` §1), so this holds the
+  # reader's own scan to the declared root. Slot `k` of an unbounded scan starts at
   # byte `16 + 24 * k`; for a data block `b` with `b mod 3 == 1` that is the
   # block's first byte when `k = (4096 * b - 16) div 24`, so the member's
   # bytes 16..23 are that slot's name word.
@@ -135,8 +137,8 @@ block:
   let overscanSlot = (dataBlock * 4096 - 16) div 24
   doAssert readU64LE(image, 16 + overscanSlot * 24 + 16) == base40Encode("entry.dat"),
     "the poisoned word is not where an unbounded scan reads a name"
-  let opened = openNewTraceFromBytes(image, 4096, uint32(overscanSlot + 1))
+  let opened = openNewTraceFromBytes(image)
   doAssert opened.isOk, opened.error
   doAssert opened.get().recordedEntryIdentity() ==
     some(RecordedEntryIdentity(callKey: 1, functionId: 1, entryStep: 1))
-  echo "PASS a caller scan limit past the declared root counts no data as entry.dat"
+  echo "PASS a scan past the declared root counts no data as entry.dat"

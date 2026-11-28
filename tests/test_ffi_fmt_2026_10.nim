@@ -62,33 +62,36 @@ block every_value_tag_is_written_and_read:
   doAssert trace_writer_close(w) == 0, $trace_writer_last_error()
   trace_writer_free(w)
 
-  var r = openNewTrace(ctPath(dir, "tags")).get()
-  let evs = r.valueEvents(0).get()
-  var tags: seq[ValueEventKind]
-  for e in evs: tags.add(e.kind)
-  doAssert tags == @[veStepValues, veBindVariable, veDropVariable,
-    veCellValue, veCompoundValue, veAssignCell, veAssignCompoundItem,
-    veVariableCell, veBindVariable], $tags
-  let x = r.varname(evs[1].variableId).get()
-  doAssert x == "x" and evs[1].variablePlace == -3
-  doAssert evs[3].place == 7 and evs[3].valueCbor == c41
-  doAssert evs[4].place == -8 and evs[4].valueCbor == c42
-  doAssert evs[5].place == 9 and evs[5].valueCbor == c43
-  doAssert evs[6].compoundPlace == 10 and evs[6].itemIndex == 2 and
-    evs[6].itemPlace == -11
-  doAssert r.varname(evs[7].variableId).get() == "x" and evs[7].variablePlace == 12
-  doAssert r.varname(evs[8].variableId).get() == "z" and evs[8].variablePlace == 13
-  # The place model's bytes, as the Rust `ValueStreamEvent::encode` writes
-  # them: places zigzag-signed, values length-prefixed.
-  var expect: seq[byte]
-  encodeBindVariableEvent(evs[1].variableId, -3, expect)
-  doAssert expect == @[1'u8, byte(evs[1].variableId), 5]
-  expect.setLen(0)
-  encodeAssignCompoundItemEvent(10, 2, -11, expect)
-  doAssert expect == @[7'u8, 20, 2, 21]
-  expect.setLen(0)
-  encodeCellValueEvent(7, c41, expect)
-  doAssert expect[0 .. 2] == @[4'u8, 14, byte(c41.len)]
+  # The reader holds the container open until it is released, and Windows
+  # refuses to delete an open file: the block releases it before `removeDir`.
+  block:
+    var r = openNewTrace(ctPath(dir, "tags")).get()
+    let evs = r.valueEvents(0).get()
+    var tags: seq[ValueEventKind]
+    for e in evs: tags.add(e.kind)
+    doAssert tags == @[veStepValues, veBindVariable, veDropVariable,
+      veCellValue, veCompoundValue, veAssignCell, veAssignCompoundItem,
+      veVariableCell, veBindVariable], $tags
+    let x = r.varname(evs[1].variableId).get()
+    doAssert x == "x" and evs[1].variablePlace == -3
+    doAssert evs[3].place == 7 and evs[3].valueCbor == c41
+    doAssert evs[4].place == -8 and evs[4].valueCbor == c42
+    doAssert evs[5].place == 9 and evs[5].valueCbor == c43
+    doAssert evs[6].compoundPlace == 10 and evs[6].itemIndex == 2 and
+      evs[6].itemPlace == -11
+    doAssert r.varname(evs[7].variableId).get() == "x" and evs[7].variablePlace == 12
+    doAssert r.varname(evs[8].variableId).get() == "z" and evs[8].variablePlace == 13
+    # The place model's bytes, as the Rust `ValueStreamEvent::encode` writes
+    # them: places zigzag-signed, values length-prefixed.
+    var expect: seq[byte]
+    encodeBindVariableEvent(evs[1].variableId, -3, expect)
+    doAssert expect == @[1'u8, byte(evs[1].variableId), 5]
+    expect.setLen(0)
+    encodeAssignCompoundItemEvent(10, 2, -11, expect)
+    doAssert expect == @[7'u8, 20, 2, 21]
+    expect.setLen(0)
+    encodeCellValueEvent(7, c41, expect)
+    doAssert expect[0 .. 2] == @[4'u8, 14, byte(c41.len)]
   removeDir(dir)
   echo "PASS every_value_tag_is_written_and_read"
 
@@ -102,11 +105,13 @@ block every_event_kind_round_trips_exactly:
       cstring("m" & $k), cstring("c" & $k))
   doAssert trace_writer_close(w) == 0, $trace_writer_last_error()
   trace_writer_free(w)
-  var r = openNewTrace(ctPath(dir, "kinds")).get()
-  doAssert r.ioEventCount().get() == 24
-  for k in 0 .. 23:
-    let ev = r.ioEvent(uint64(k)).get()
-    doAssert ord(ev.kind) == k, "event " & $k & " read back as " & $ev.kind
+  # The reader holds the container open until it is released (see above).
+  block:
+    var r = openNewTrace(ctPath(dir, "kinds")).get()
+    doAssert r.ioEventCount().get() == 24
+    for k in 0 .. 23:
+      let ev = r.ioEvent(uint64(k)).get()
+      doAssert ord(ev.kind) == k, "event " & $k & " read back as " & $ev.kind
   let rh = ct_reader_open(cstring(ctPath(dir, "kinds")))
   doAssert rh != nil
   for k in 0 .. 23:

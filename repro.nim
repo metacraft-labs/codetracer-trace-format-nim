@@ -24,6 +24,13 @@
 ##     consumers put on ``--path:src`` (the FFI static lib compiled by the
 ##     Rust sibling's ``codetracer_trace_writer_nim`` build.rs imports from
 ##     here).
+##   * The other shipping artifacts, in ``default`` beside ``ct-print``:
+##     ``ct-space``, ``ctfs-salvage`` (both at the repo root) and the C-ABI
+##     static library ``libcodetracer_trace_writer.a``.
+##   * The C-FFI host tests (``tests/test_ffi.c``, the worker-thread-exit and
+##     concurrent-writer hosts, the exported-symbol guard) as edges of
+##     ``test``. The must-fail controls of ``nimble testFfiThreads`` are not
+##     modelled; see the note at those edges.
 ##   * The repo's test corpus as per-file BUILD + EXECUTE edges (the
 ##     two-edge template from ``reprobuild-specs/Package-Model.md``
 ##     §"The test template"), collected into ``test-builds`` / ``test``.
@@ -33,41 +40,35 @@
 ## flake on Nix hosts; ``defaultToolProvisioning "path"`` consumes its tools
 ## without changing the existing native build graph.
 ##
-## **libzstd.** ``test_ct_print_agreement``, ``test_logical_step_count`` and
-## ``test_retired_streams_are_refused`` compile ct-print at runtime, through
-## ``tests/ct_print_binary.nim``. On POSIX that supplies ``pkg-config
-## --cflags/--libs libzstd``; the dev shell's ``PKG_CONFIG_PATH`` satisfies
-## both. On Windows the binding names the zstd archive directly: adding MSYS2's
-## whole library directory would let it replace the selected MinGW toolchain's
-## implicit CRT and pthread archives. Each test process compiles its own
+## **libzstd.** ``test_ct_print_agreement``, ``test_logical_step_count``,
+## ``test_retired_streams_are_refused`` and
+## ``test_open_new_trace_reads_the_declared_root`` compile ct-print at
+## runtime, through ``tests/ct_print_binary.nim``. On POSIX that supplies
+## ``pkg-config --cflags/--libs libzstd``; the dev shell's
+## ``PKG_CONFIG_PATH`` satisfies both. On Windows the binding names the zstd
+## archive directly: adding MSYS2's whole library directory would let it
+## replace the selected MinGW toolchain's implicit CRT and pthread archives. Each test process compiles its own
 ## ct-print into a temporary directory it alone owns, with the compiler, Nim
 ## library and search paths it was itself compiled with, so no warm binary or
 ## shared nimcache can stand in for the tree under test. Their EXECUTE edges
 ## still share a capacity-1 pool (``CtPrintPool``) so that the full release
 ## compiles of ct-print run one at a time, as the nimble task runs them.
 ##
-## **The four cross-read tests** (``test_nim_{step,value,io_event}_stream_crossread``
-## and ``test_nim_step_map_crossread``)
-## prove a Nim-written production ``.ct`` bundle is byte-compatible with the
-## canonical RUST reader: each writes a bundle, then invokes the sibling
-## ``../codetracer-trace-format`` Rust integration test via ``cargo test``.
-## The dev shell puts ``cargo`` on ``PATH`` (from the same Rust flake), so
-## the test's ``haveCargo`` branch runs ``cargo`` DIRECTLY — it never enters
-## the ``direnv exec`` fallback. The real cross-check runs; nothing is
-## skipped. Because all four drive ``cargo test`` against the SAME sibling
-## Rust target directory, they are sequenced through a capacity-1 build pool
-## so their concurrent ``cargo`` runs do not race the shared target lock.
+## **Cross-implementation checks are not here.** The tests that hold this
+## library against the Rust implementation of the format (a Nim-written
+## bundle read by the Rust readers, the shared trace-storage fixtures read by
+## the Nim parser) live in ``codetracer-trace-format-conformance``, which
+## depends on both libraries. This recipe neither reads nor builds any other
+## implementation of the format.
 ##
 ## **``test_path_filter``** uses ``std/re`` (Nim's PCRE binding), which
 ## ``dlopen``s ``libpcre.so`` at runtime. The dev shell does not put pcre on
 ## ``LD_LIBRARY_PATH``, so instead of a fragile runtime search this edge
 ## links pcre directly (``--dynlibOverride:pcre --passL:-L<dir> -lpcre``);
 ## the nix ``ld`` wrapper bakes pcre's rpath into the binary, so it runs
-## hermetically with no ``LD_LIBRARY_PATH``. The pcre lib dir is threaded in
-## via the ``CT_PCRE_LIB_DIR`` env var the outer dev-shell nesting exports;
-## when unset the edge falls back to a plain ``--passL:-lpcre`` (the nix C
-## toolchain's ``NIX_LDFLAGS`` may still resolve it) so the recipe stays
-## portable on hosts that put libpcre on the default search path.
+## hermetically with no ``LD_LIBRARY_PATH``. The pcre library directory comes
+## from ``CT_PCRE_LIB_DIR`` in the JSON manifest selected by ``toolPathsFile``.
+## Both its selection and its contents participate in graph invalidation.
 
 import repro_project_dsl
 import repro_dsl_stdlib/foreign_env
@@ -76,9 +77,32 @@ import repro_dsl_stdlib/foreign_env
 # per-test compile edge) and ``edge.testBinary.run(...)`` (the execute
 # edge). It re-exports ``repro_project_dsl``.
 import ct_test_nim_unittest
+# ``shell(...)``: the typed ``sh -c`` edge the FFI test hosts below run through.
+import repro_dsl_stdlib/packages/sh
 
-import std/os
+import std/[os, json, strutils]
 import build_writer_artifacts
+
+# The variant selects a tool-path manifest, and its contents are evaluation
+# inputs too. Changing a selection or editing a selected manifest invalidates
+# provider snapshots and lowered graphs before a cached edge is served.
+proc declaredToolPaths(path: string): JsonNode =
+  doAssert path.isAbsolute and fileExists(path),
+    "owning builds require --variant toolPathsFile=<absolute JSON manifest>"
+  when defined(reproProviderMode):
+    result = parseJson(readDevEnvFile(path))
+  else:
+    result = parseFile(path)
+  doAssert result.kind == JObject and result.hasKey("schema") and
+    result["schema"].kind == JInt and result["schema"].getInt == 1 and
+    result.hasKey("paths") and result["paths"].kind == JObject,
+    "invalid owning tool-path manifest schema"
+  result = result["paths"]
+
+proc declaredToolPath(paths: JsonNode; key: string): string =
+  doAssert paths.hasKey(key) and paths[key].kind == JString and
+    paths[key].getStr.len > 0, "owning tool-path manifest requires " & key
+  paths[key].getStr
 
 type
   TestSpec = object
@@ -87,13 +111,12 @@ type
     ## thing.
     ##   * ``source`` — repo-relative ``.nim`` path.
     ##   * ``binary`` — ``build/test-bin/<stem>`` output. A file the nimble
-    ##     task compiles twice (``test_reader_is_gcsafe``, once per memory
+    ##     task compiles twice (``test_reader_is_gcsafe`` and
+    ##     ``test_container_writer_is_gcsafe``, once per memory
     ##     manager) has one entry per build, with distinct binaries.
     ##   * ``pool`` — run the EXECUTE edge in this capacity-1 pool: the
-    ##     cross-read tests share the sibling Rust target dir
-    ##     (``CrossReadPool``), and the tests that compile ct-print at runtime
-    ##     run those compiles one at a time (``CtPrintPool``). Empty runs
-    ##     unpooled.
+    ##     tests that compile ct-print at runtime run those compiles one at a
+    ##     time (``CtPrintPool``). Empty runs unpooled.
     ##   * ``debugOnly`` — compile WITHOUT ``-d:release``. Matches the flags
     ##     the nimble ``test`` task uses for that file.
     ##     ``test_chunked_compressed_table`` is kept debug-only because that is
@@ -158,7 +181,6 @@ type
     ciRoutes: bool
 
 const
-  CrossReadPool = "codetracer_trace_format_nim.crossread-serial"
   CtPrintPool = "codetracer_trace_format_nim.ct-print-runtime-serial"
 
 # The reproducible green corpus. It is the union of the nimble ``test``
@@ -192,6 +214,7 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_recorded_entry_hierarchy.nim", binary: "build/test-bin/test_recorded_entry_hierarchy", mm: "arc"),
   TestSpec(source: "tests/test_base40.nim", binary: "build/test-bin/test_base40"),
   TestSpec(source: "tests/test_container.nim", binary: "build/test-bin/test_container"),
+  TestSpec(source: "tests/test_changed_entries_scan.nim", binary: "build/test-bin/test_changed_entries_scan"),
   TestSpec(source: "tests/test_ctfs_v5_member_forms.nim", binary: "build/test-bin/test_ctfs_v5_member_forms"),
   # `ctfs-container.md` §1: `root_blocks`, the overflow of the entry array past
   # block 0 and its growth, with no free list root area at any `max_shards`
@@ -207,6 +230,9 @@ const testSpecs: seq[TestSpec] = @[
   # forms alike (version 5, version-6 full, compact, each of the last two
   # under whole-file zstd); the profile writer chooses on raw member bytes.
   TestSpec(source: "tests/test_version_6_containers_read.nim", binary: "build/test-bin/test_version_6_containers_read"),
+  # CCP-8: §1b's closed set and the set the library round-trips, equal in
+  # both directions, with the spec side parsed out of the spec file.
+  TestSpec(source: "tests/test_every_enumerated_scheme_is_implemented_or_not_enumerated.nim", binary: "build/test-bin/test_every_enumerated_scheme_is_implemented_or_not_enumerated"),
   TestSpec(source: "tests/test_profile_threshold_choice.nim", binary: "build/test-bin/test_profile_threshold_choice"),
   TestSpec(source: "tests/test_step_encoding_rule.nim", binary: "build/test-bin/test_step_encoding_rule"),
   TestSpec(source: "tests/test_step_map_v2.nim", binary: "build/test-bin/test_step_map_v2"),
@@ -228,6 +254,7 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_live_page_timens.nim", binary: "build/test-bin/test_live_page_timens", defines: @["ctfsKeyedMutation"]),
   TestSpec(source: "tests/test_live_page_other_user.nim", binary: "build/test-bin/test_live_page_other_user"),
   TestSpec(source: "tests/test_live_page_in_guest.nim", binary: "build/test-bin/test_live_page_in_guest", defines: @["ctfsKeyedMutation"]),
+  TestSpec(source: "tests/test_live_page_heartbeat_blocks_signals.nim", binary: "build/test-bin/test_live_page_heartbeat_blocks_signals"),
   TestSpec(source: "tests/test_root_publication_order.nim", binary: "build/test-bin/test_root_publication_order"),
   TestSpec(source: "tests/test_root_publication_writes_changed_entries.nim", binary: "build/test-bin/test_root_publication_writes_changed_entries", defines: @["ctfsKeyedMutation"]),
   TestSpec(source: "tests/test_keyed_b1.nim", binary: "build/test-bin/test_keyed_b1", defines: @["ctfsKeyedMutation"]),
@@ -262,6 +289,8 @@ const testSpecs: seq[TestSpec] = @[
   # nimble `test` task compiles it.
   TestSpec(source: "tests/test_reader_is_gcsafe.nim", binary: "build/test-bin/test_reader_is_gcsafe"),
   TestSpec(source: "tests/test_reader_is_gcsafe.nim", binary: "build/test-bin/test_reader_is_gcsafe_refc", mm: "refc"),
+  TestSpec(source: "tests/test_container_writer_is_gcsafe.nim", binary: "build/test-bin/test_container_writer_is_gcsafe"),
+  TestSpec(source: "tests/test_container_writer_is_gcsafe.nim", binary: "build/test-bin/test_container_writer_is_gcsafe_refc", mm: "refc"),
   TestSpec(source: "tests/test_golden_fixtures.nim", binary: "build/test-bin/test_golden_fixtures"),
   TestSpec(source: "tests/test_cross_compat.nim", binary: "build/test-bin/test_cross_compat"),
   TestSpec(source: "tests/test_xxh64.nim", binary: "build/test-bin/test_xxh64"),
@@ -299,9 +328,6 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_mixed_column_aware_position_space.nim", binary: "build/test-bin/test_mixed_column_aware_position_space"),
   TestSpec(source: "tests/test_reader_calls_events.nim", binary: "build/test-bin/test_reader_calls_events"),
   TestSpec(source: "tests/test_reader_integration.nim", binary: "build/test-bin/test_reader_integration"),
-  TestSpec(source: "tests/test_nim_step_stream_crossread.nim", binary: "build/test-bin/test_nim_step_stream_crossread", pool: CrossReadPool),
-  TestSpec(source: "tests/test_nim_value_stream_crossread.nim", binary: "build/test-bin/test_nim_value_stream_crossread", pool: CrossReadPool),
-  TestSpec(source: "tests/test_nim_io_event_stream_crossread.nim", binary: "build/test-bin/test_nim_io_event_stream_crossread", pool: CrossReadPool),
   TestSpec(source: "tests/test_streaming_value_encoder.nim", binary: "build/test-bin/test_streaming_value_encoder"),
   TestSpec(source: "tests/test_value_ref.nim", binary: "build/test-bin/test_value_ref"),
   TestSpec(source: "tests/test_multi_stream_writer.nim", binary: "build/test-bin/test_multi_stream_writer"),
@@ -328,6 +354,7 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_name_only_funcs_refusal.nim", binary: "build/test-bin/test_name_only_funcs_refusal"),
   TestSpec(source: "tests/test_ct_print_full.nim", binary: "build/test-bin/test_ct_print_full"),
   TestSpec(source: "tests/test_ct_print_native.nim", binary: "build/test-bin/test_ct_print_native"),
+  TestSpec(source: "tests/test_ct_print_event_log_preview.nim", binary: "build/test-bin/test_ct_print_event_log_preview"),
   TestSpec(source: "tests/test_managed_sender.nim", binary: "build/test-bin/test_managed_sender"),
   # Starts a MinIO and a Python stand-in of codetracer-ci's upload routes,
   # both from the dev shell (``flake.nix``).
@@ -359,6 +386,7 @@ const testSpecs: seq[TestSpec] = @[
   # `-d:release` on the nimble line):
   TestSpec(source: "tests/test_nimcache_is_worktree_local.nim", binary: "build/test-bin/test_nimcache_is_worktree_local", debugOnly: true),
   TestSpec(source: "tests/test_root_auto_fill.nim", binary: "build/test-bin/test_root_auto_fill", debugOnly: true),
+  TestSpec(source: "tests/test_native_decoder_large_root.nim", binary: "build/test-bin/test_native_decoder_large_root", debugOnly: true),
   TestSpec(source: "tests/test_namespace_images_refuse_malformed_input.nim", binary: "build/test-bin/test_namespace_images_refuse_malformed_input", debugOnly: true),
   TestSpec(source: "tests/test_cbor_top_level_type_id.nim", binary: "build/test-bin/test_cbor_top_level_type_id", debugOnly: true),
   TestSpec(source: "tests/test_follow_is_incremental.nim", binary: "build/test-bin/test_follow_is_incremental", debugOnly: true),
@@ -381,8 +409,8 @@ const testSpecs: seq[TestSpec] = @[
   # `nim check` of every src/ module under -d:nimPreviewSlimSystem, with its
   # own temporary nimcache; debug-built like its nimble line.
   TestSpec(source: "tests/test_library_compiles_under_slim_system.nim", binary: "build/test-bin/test_library_compiles_under_slim_system", debugOnly: true),
-  # Drives `cargo test` in the sibling Rust repo, like the other cross-reads.
-  TestSpec(source: "tests/test_nim_step_map_crossread.nim", binary: "build/test-bin/test_nim_step_map_crossread", pool: CrossReadPool),
+  # The Nim reader answers a step-map lookup of line 0 as line 1.
+  TestSpec(source: "tests/test_step_map_line_zero_lookups.nim", binary: "build/test-bin/test_step_map_line_zero_lookups"),
   # Compile ct-print at runtime through `tests/ct_print_binary.nim` (see the
   # module doc) and import it from `tests/` (`-p:tests`).
   TestSpec(source: "tests/test_ct_print_agreement.nim", binary: "build/test-bin/test_ct_print_agreement", pool: CtPrintPool, extraPaths: @["tests"]),
@@ -414,6 +442,7 @@ const testSpecs: seq[TestSpec] = @[
   TestSpec(source: "tests/test_ffi_call_entry_is_the_next_step.nim", binary: "build/test-bin/test_ffi_call_entry_is_the_next_step", mm: "arc"),
   TestSpec(source: "tests/test_ffi_refused_column_stays_with_its_step.nim", binary: "build/test-bin/test_ffi_refused_column_stays_with_its_step", mm: "arc"),
   TestSpec(source: "tests/test_block_size_is_one_of_three.nim", binary: "build/test-bin/test_block_size_is_one_of_three", mm: "arc"),
+  TestSpec(source: "tests/test_open_new_trace_reads_the_declared_root.nim", binary: "build/test-bin/test_open_new_trace_reads_the_declared_root", pool: CtPrintPool, mm: "arc", extraPaths: @["tests"]),
   TestSpec(source: "tests/test_meta_text_is_utf8.nim", binary: "build/test-bin/test_meta_text_is_utf8", mm: "arc"),
   TestSpec(source: "tests/test_ffi_assignment_refuses_unknown_kinds.nim", binary: "build/test-bin/test_ffi_assignment_refuses_unknown_kinds", mm: "arc"),
   # The fault-injection seam is compiled in for this test only. Its two
@@ -426,6 +455,9 @@ const testSpecs: seq[TestSpec] = @[
 package codetracer_trace_format_nim:
   defaultToolProvisioning "path"
 
+  config:
+    toolPathsFile: variant string = ""
+
   uses:
     # Toolchain floor — mirrors the nimble file's ``requires "nim >=
     # 2.2.0"``. ``nimble`` ships alongside so downstream consumers that
@@ -435,6 +467,12 @@ package codetracer_trace_format_nim:
     "nimble"
     when not defined(windows):
       "pkg-config"
+      # The FFI test edges: ``sh`` / ``bash`` run the symbol-export guard and
+      # the fixture-guardian protocol, ``nm`` is what the guard reads the
+      # archive with.
+      "sh >=1"
+      "bash >=4"
+      "nm"
     when defined(macosx):
       "clang"
     else:
@@ -470,9 +508,10 @@ package codetracer_trace_format_nim:
     # edge comes from ``build_writer_artifacts.buildCtPrint``, the same
     # constructor the recorder recipes import so that their test graphs
     # build this prerequisite; the flags are written down once, there.
-    let zstdIncludeDir = getEnv("CT_ZSTD_INCLUDE_DIR")
-    let zstdLibraryFile = (when defined(windows): getEnv("CT_ZSTD_LIBRARY_FILE") else: "")
-    let zstdLibDir = (when defined(windows): "" else: getEnv("CT_ZSTD_LIB_DIR"))
+    let toolPaths = declaredToolPaths(toolPathsFile.value)
+    let zstdIncludeDir = declaredToolPath(toolPaths, "CT_ZSTD_INCLUDE_DIR")
+    let zstdLibraryFile = (when defined(windows): declaredToolPath(toolPaths, "CT_ZSTD_LIBRARY_FILE") else: "")
+    let zstdLibDir = (when defined(windows): "" else: declaredToolPath(toolPaths, "CT_ZSTD_LIB_DIR"))
     when defined(windows):
       doAssert zstdIncludeDir.isAbsolute and dirExists(zstdIncludeDir) and
         fileExists(zstdIncludeDir / "zstd.h") and
@@ -485,14 +524,28 @@ package codetracer_trace_format_nim:
                      else: @[zstdIncludeDir / "zstd.h", zstdLibDir])
     var nimDependencyDirs: seq[string] = @[]
     for key in ["CT_NIM_STEW_SRC", "CT_NIM_RESULTS_SRC", "CT_NIM_UNITTEST2_SRC"]:
-      let dependencyDir = getEnv(key)
+      let dependencyDir = declaredToolPath(toolPaths, key)
       doAssert dependencyDir.isAbsolute and dirExists(dependencyDir),
         "owning builds require complete declared Nim source dependency: " & key
       nimDependencyDirs.add(dependencyDir)
     let ctPrintBuild = buildCtPrint(".", nativeIncludeDir = zstdIncludeDir,
       nativeLibDir = zstdLibDir, nimDependencyDirs = nimDependencyDirs, nativeLibraryFile = zstdLibraryFile)
 
-    discard collect("default", @[ctPrintBuild])
+    # The other shipping artifacts the ``Justfile`` ``build`` recipe builds
+    # next to ``ct-print`` (``nimble buildCtSpace`` / ``buildCtfsSalvage`` /
+    # ``buildStaticLib``), from the same constructors module so each flag list
+    # is written once. ``ct-space`` and ``ctfs-salvage`` land at the repo
+    # root like ``ct-print``; the static library is the archive the Rust
+    # adapter crate links, and the FFI test edges below consume it.
+    let ctSpaceBuild = buildCtSpace(".", nativeIncludeDir = zstdIncludeDir,
+      nativeLibDir = zstdLibDir, nimDependencyDirs = nimDependencyDirs, nativeLibraryFile = zstdLibraryFile)
+    let ctfsSalvageBuild = buildCtfsSalvage(".", nativeIncludeDir = zstdIncludeDir,
+      nativeLibDir = zstdLibDir, nimDependencyDirs = nimDependencyDirs, nativeLibraryFile = zstdLibraryFile)
+    let staticLibBuild = buildStaticLib(".", nativeIncludeDir = zstdIncludeDir,
+      nativeLibDir = zstdLibDir, nimDependencyDirs = nimDependencyDirs, nativeLibraryFile = zstdLibraryFile)
+
+    discard collect("default",
+      @[ctPrintBuild, ctSpaceBuild, ctfsSalvageBuild, staticLibBuild])
 
     # Opt-in owning producer; no shipping/default or test corpus expansion.
     discard collect("sharedLib", @[buildSharedLib(".", nativeIncludeDir = zstdIncludeDir, nativeLibDir = zstdLibDir, nimDependencyDirs = nimDependencyDirs, nativeLibraryFile = zstdLibraryFile)])
@@ -501,18 +554,21 @@ package codetracer_trace_format_nim:
     #
     # Two-edge template per file: a compile-only BUILD edge collected into
     # ``test-builds`` + an EXECUTE edge collected into ``test``. Two
-    # capacity-1 pools sequence EXECUTE edges: the cross-reads' ``cargo
-    # test`` runs share the sibling Rust target dir, and the runtime ct-print
-    # compiles run one at a time (see module doc).
-    let crossReadPool = buildPool(CrossReadPool, 1'u32)
-    discard crossReadPool
+    # capacity-1 pool sequences the EXECUTE edges of the runtime ct-print
+    # compiles, which run one at a time (see module doc).
     let ctPrintPool = buildPool(CtPrintPool, 1'u32)
     discard ctPrintPool
 
     # Provider construction runs before its own dev environment is active.
-    # Bind the owning shell PCRE prefix and the same Zstd metadata output
+    # Bind the owning manifest's PCRE prefix and the same Zstd metadata output
     # explicitly rather than depending on the caller compiler search path.
-    let pcreLibDir = getEnv("CT_PCRE_LIB_DIR")
+    let pcreLibDir =
+      when defined(windows):
+        if toolPaths.hasKey("CT_PCRE_LIB_DIR"):
+          declaredToolPath(toolPaths, "CT_PCRE_LIB_DIR")
+        else: ""
+      else:
+        declaredToolPath(toolPaths, "CT_PCRE_LIB_DIR")
     let zstdPkgConfigDir = (when defined(windows): ""
                            else: zstdIncludeDir.parentDir / "lib" / "pkgconfig")
     when not defined(windows):
@@ -523,10 +579,14 @@ package codetracer_trace_format_nim:
     # ``test_managed_sender_ci_routes`` (``ciRoutes``) runs the owning dev
     # shell's MinIO and python3. A test action's PATH holds only the
     # provisioned tools, so the shell's binaries are bound here, by absolute
-    # path, like the PCRE prefix above. Missing or wrong, construction stops
-    # here: the test has no SKIP arm, and a missing tool must not become one.
-    let minioBin = getEnv("CT_MINIO_BIN")
-    let python3Bin = getEnv("CT_PYTHON3_BIN")
+    # path from the tool-path manifest, like the PCRE prefix above. Missing or
+    # wrong, construction stops here: the test has no SKIP arm, and a missing
+    # tool must not become one. The test is POSIX only (``posixOnly``), so
+    # Windows manifests do not carry the two fields.
+    let minioBin = (when defined(windows): ""
+                    else: declaredToolPath(toolPaths, "CT_MINIO_BIN"))
+    let python3Bin = (when defined(windows): ""
+                      else: declaredToolPath(toolPaths, "CT_PYTHON3_BIN"))
     when not defined(windows):
       doAssert minioBin.isAbsolute and fileExists(minioBin),
         "owning typed tests require the declared MinIO binary (CT_MINIO_BIN=" &
@@ -539,12 +599,6 @@ package codetracer_trace_format_nim:
                               else: @[("PKG_CONFIG_PATH", zstdPkgConfigDir)])
     let executeInputs = (when defined(windows): zstdInputs
                         else: @[zstdPkgConfigDir / "libzstd.pc"])
-
-    # Shared producer data is provisioned at the explicit published revision in
-    # .github/sibling-repos. Declare the runtime tree as an action input too:
-    # fixturePath walks the real workspace sibling; assertions stay unchanged.
-    let traceStorageFixtures =
-      "../codetracer-trace-format/codetracer_ctfs/tests/fixtures/trace_storage"
 
     var testBuildActions: seq[BuildActionDef] = @[]
     var testExecuteActions: seq[BuildActionDef] = @[]
@@ -561,8 +615,7 @@ package codetracer_trace_format_nim:
       # ``test_path_filter`` links libpcre directly so Nim's ``re`` dynlib
       # ``dlopen`` resolves against the already-loaded library — no runtime
       # ``LD_LIBRARY_PATH`` needed (the nix ``ld`` wrapper bakes the rpath
-      # in). ``-L<pcreLibDir>`` comes from ``CT_PCRE_LIB_DIR``; without it
-      # a bare ``-lpcre`` relies on the C toolchain's default search path.
+      # in). ``-L<pcreLibDir>`` comes from the manifest's ``CT_PCRE_LIB_DIR``.
       var extraPassC: seq[string] = @[]
       var extraPassL: seq[string] = @[]
       when defined(windows):
@@ -614,11 +667,10 @@ package codetracer_trace_format_nim:
       # source dependencies when they run, not only when they are built.
       let compilesCtPrint = spec.pool == CtPrintPool
       let testExecuteInputs = executeInputs &
-        (if stem == "test_trace_storage_config": @[traceStorageFixtures]
-         else: newSeq[string]()) &
         (if spec.ciRoutes: @[minioBin, python3Bin] else: newSeq[string]()) &
         (if compilesCtPrint:
-          @["src", "nim.cfg", "tests/ct_print_binary.nim"] & nimDependencyDirs
+          @["src", "nim.cfg", "tests/ct_print_binary.nim",
+            "tests/runtime_nim_compile.nim"] & nimDependencyDirs
          else: newSeq[string]())
       let executeEdge = edge.testBinary.run(
         actionId = "codetracer-trace-format-nim.test_execute." & stem,
@@ -639,6 +691,74 @@ package codetracer_trace_format_nim:
         else:
           appendRegisteredActionToolIdentityRefs(executeEdge.id, ["gcc"])
       testExecuteActions.add(executeEdge)
+
+    # ---- C-FFI host tests (``nimble testFfi`` / ``testFfiThreads``) --------
+    #
+    # Hosts written in C that drive the shipped static library through its C
+    # header, which is the interface the Rust adapter crate and the other
+    # native consumers use. POSIX only, like the nimble tasks (``testFfiThreads``
+    # uses pthreads and mmap). Each is a compile edge from ``buildFfiHost``
+    # (the library is a declared input, so a change to the writer re-links and
+    # re-runs the host) plus an execute edge keyed on the host's exit status.
+    # The ``NimUnittestBinary`` handle is only "a binary path to run"; its run
+    # edge is the generic direct-binary runner and does not care that the
+    # binary is C.
+    when not defined(windows):
+      let ffiLib = staticLibraryPath(".")
+      let ffiDir = "./build/ffi-test"
+
+      # The three replay-observation symbols are exported from the archive.
+      # The script reads only the archive and ``nm``; it builds nothing.
+      let chokepointEdge = shell(
+        command = "bash tests/check_chokepoint_symbols.sh " & ffiLib,
+        actionId = "codetracer-trace-format-nim.ffi_check.chokepoint_symbols",
+        after = @[staticLibBuild],
+        extraInputs = @["tests/check_chokepoint_symbols.sh", ffiLib])
+      appendRegisteredActionToolIdentityRefs(chokepointEdge.id, ["bash", "nm"])
+      testExecuteActions.add(chokepointEdge)
+
+      # ``tests/test_ffi.c``: the whole C ABI surface against the archive.
+      let ffiHostBuild = buildFfiHost(".", "tests/test_ffi.c",
+        ffiDir & "/test_ffi", archive = [staticLibBuild], archivePath = ffiLib,
+        nativeIncludeDir = zstdIncludeDir, nativeLibDir = zstdLibDir)
+      testBuildActions.add(ffiHostBuild)
+      testExecuteActions.add(NimUnittestBinary(path: ffiDir & "/test_ffi").run(
+        actionId = "codetracer-trace-format-nim.ffi_execute.test_ffi",
+        after = [ffiHostBuild, chokepointEdge], extraInputs = [ffiLib],
+        registerImplicitName = false))
+
+      # ``testFfiThreads``, the shipped-flags half: a writer recorded on a
+      # worker thread that exits before the close, and concurrent writers,
+      # both run under the fixture guardian (``tests/ffi_host_guard.c``),
+      # which reserves a receipt, runs the host with a timeout and writes the
+      # terminal verdict into the receipt. NOT MODELLED: the nimble task's
+      # CONTROLS, which rebuild the archive wrongly (``--threads:on``; no
+      # process lock) and require the host to FAIL. A graph node that must
+      # fail cannot be told from a broken one (see the corpus note above), so
+      # ``nimble testFfiThreads`` remains the authority for those.
+      let guardBuild = buildFfiHost(".", "tests/ffi_host_guard.c",
+        ffiDir & "/host_guard")
+      testBuildActions.add(guardBuild)
+      var threadHostBuilds: seq[BuildActionDef] = @[]
+      for host in ["worker_thread_exit", "concurrent_writers"]:
+        let hostBuild = buildFfiHost(".", "tests/test_ffi_" & host & ".c",
+          ffiDir & "/" & host, archive = [staticLibBuild], archivePath = ffiLib,
+          nativeIncludeDir = zstdIncludeDir, nativeLibDir = zstdLibDir,
+          threads = true)
+        testBuildActions.add(hostBuild)
+        threadHostBuilds.add(hostBuild)
+        let guarded = shell(
+          command = "r=$(" & ffiDir & "/host_guard --reserve " & ffiDir &
+            ") && " & ffiDir & "/host_guard " & ffiDir & "/" & host &
+            " \"$r\" && [ \"$(cat \"$r\")\" = \"$(printf 'FFI-GUARD-RESULT-v1\\nnatural\\n0\\n')\" ]",
+          actionId = "codetracer-trace-format-nim.ffi_execute.threads_" & host,
+          after = [guardBuild, hostBuild],
+          # Timing-bounded thread races: re-observe every run instead of
+          # replaying a cached pass.
+          cacheable = false,
+          extraInputs = @[ffiDir & "/host_guard", ffiDir & "/" & host])
+        appendRegisteredActionToolIdentityRefs(guarded.id, ["sh"])
+        testExecuteActions.add(guarded)
 
     discard collect("test", testExecuteActions)
     discard collect("test-builds", testBuildActions)

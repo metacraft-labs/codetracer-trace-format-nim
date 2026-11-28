@@ -6,10 +6,9 @@
   total_events header/trailer); each steps.dat chunk's uncompressed payload is
   header-less (NO per-chunk u32 count). This is BYTE-COMPATIBLE with the Rust
   codetracer_trace_writer::step_stream writer / codetracer_trace_reader::
-  step_stream_reader::StepStreamReader. Proof: tests/test_nim_step_stream_
-  crossread.nim writes a Nim production bundle and shells the Rust test
-  codetracer-trace-format/codetracer_trace_reader/tests/nim_step_stream_
-  crossread.rs to read its steps.dat — decoded GLIs must match.
+  step_stream_reader::StepStreamReader. Proof: the conformance repo's
+  test_nim_step_stream_crossread writes a Nim production bundle and has the
+  Rust StepStreamReader read its steps.dat — decoded GLIs must match.
 - multi_stream_writer.close() now sets has_step_stream (bit 9) in meta.dat
   (alongside has_call_stream). The FFI reader (new_trace_reader.nim
   ensureExecReader) selects framing by that flag: SET ⇒ SPEC reader, CLEAR ⇒
@@ -39,8 +38,8 @@
   Each record is `u8 kind (EventLogKind ordinal), varint step_id, len+metadata,
   len+content` — byte-identical to the Rust event_stream::IoEventRecord::encode.
   BYTE-COMPATIBLE with codetracer_trace_reader::io_event_stream_reader::
-  IoEventStreamReader. Proof: tests/test_nim_io_event_stream_crossread.nim shells
-  the Rust test nim_io_event_stream_crossread.rs to read the Nim events.dat.
+  IoEventStreamReader. Proof: the conformance repo's test_nim_io_event_stream_crossread
+  has the Rust reader read the Nim events.dat.
 - The on-disk kind byte is the EventLogKind ordinal (same u8 as events.log), NOT
   the coarse 4-value IOEventKind. ioEventKindToOrdinal / ordinalToIOEventKind map
   between them and ROUND-TRIP every IOEventKind (stdout↔Write(0), stderr↔
@@ -82,7 +81,7 @@
   has_*_stream bits) even though it writes all the streams.
 - Legacy `TraceWriter` (codetracer_trace_writer.nim) writes events.log +
   meta.dat + meta.json + paths.json, NO split streams.
-- The canonical RUST writer (codetracer-trace-format/codetracer_trace_writer)
+- The canonical RUST writer (the Rust implementation's codetracer_trace_writer)
   ALWAYS writes events.log AND additively writes split streams when the
   recorder opts in — so a real Rust bundle carries BOTH (the transition format).
 

@@ -42,6 +42,7 @@
 ## read back through the real reader.
 
 import std/[os, strutils, assertions]
+import ./exact_bytes_file
 import results
 import codetracer_trace_types
 import codetracer_trace_reader
@@ -53,7 +54,7 @@ const
   PathB = "/src/helper.py"
 
 proc packGlobalLineIndexRust(pathId: uint64, line: uint64): uint64 =
-  ## `codetracer-trace-format/codetracer_trace_writer/src/step_stream.rs`
+  ## The Rust `codetracer_trace_writer/src/step_stream.rs`
   ## `pack_global_line_index`: `(path_id << 32) | (line & 0xFFFF_FFFF)`.
   ## Reproduced rather than linked because the point is that the two
   ## packings are independent — a shared helper would hide the divergence
@@ -82,7 +83,7 @@ proc writeTrace(file: string, steps: openArray[(uint64, uint64)]) =
   doAssert w.close().isOk
   let bytes = w.toBytes()
   w.closeCtfs()
-  writeFile(file, cast[string](bytes))
+  writeBytesFile(file, bytes)
 
 proc lineOnlySpace(pathCount: int): GlobalLineIndex =
   var counts = newSeq[uint64](pathCount)

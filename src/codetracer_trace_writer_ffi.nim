@@ -3565,10 +3565,14 @@ proc readMemberOfPath(path: cstring, member: string, what: string,
   let readable = checkReadableContainer(bytes)
   if readable.isErr:
     return err(what & ": " & readable.error)
-  if not hasInternalFile(bytes, member):
+  # The member is looked up with the container's own geometry
+  # (`ctfs-container.md` §1): the 31-slot, 4096-byte defaults would miss a
+  # member past slot 30 and refuse a 1024- or 2048-byte container.
+  let (blockSize, maxEntries) = declaredGeometry(bytes)
+  if not hasInternalFile(bytes, member, maxEntries):
     return ok(newSeq[byte]())
   found = true
-  let data = readInternalFile(bytes, member)
+  let data = readInternalFile(bytes, member, blockSize, maxEntries)
   if data.isErr:
     return err(what & ": " & data.error)
   ok(data.get())

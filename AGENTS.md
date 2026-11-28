@@ -10,11 +10,20 @@ linchpin of the CodeTracer subtree:
   the repo root and not under `build/bin/`);
 - it ships **`ct-space`**, the container space inspector;
 - it ships **`libcodetracer_trace_writer.a`**, the C-FFI static library that
-  the sibling Rust crate `codetracer-trace-format/codetracer_trace_writer_nim`
-  compiles (via its `build.rs`) and links into every Rust-side recorder.
+  the Rust adapter crate `codetracer_trace_writer_nim` compiles (via its
+  `build.rs`) and links into every Rust-side recorder.
 
-The container format itself is specified in `codetracer-trace-format-spec`;
-the canonical Rust implementation is the sibling `codetracer-trace-format`.
+The container format itself is specified in `codetracer-trace-format-spec`.
+
+**This repository depends on no other implementation of the format.** The
+Rust implementation and its Nim adapter crate depend on this one, never the
+other way. Tests that hold the two implementations against each other (a
+Nim-written bundle read by the Rust readers, the shared trace-storage fixtures
+read by both parsers) live in
+[`codetracer-trace-format-conformance`](https://github.com/metacraft-labs/codetracer-trace-format-conformance),
+which depends on both. This repository's CI runs that suite against every
+change here (`.github/workflows/conformance.yml`). Do not add a test here that
+needs a checkout of the other implementation: put it in the conformance repo.
 
 ## Dev environment
 
@@ -29,12 +38,16 @@ nix develop             # or just `cd` in with direnv active
 
 `flake.nix` provides:
 
-- `devShells.default` — Nim 2.2 + nimble (from `nix-codetracer-toolchains`,
-  the same pin the sibling Rust repo uses), `gcc`, `pkg-config`, `zstd`,
-  `pcre`, a Rust toolchain + `capnproto`, and `just` / `nixfmt` / `prek`.
+- `devShells.default` — Nim 2.2 + nimble (from `nix-codetracer-toolchains`),
+  `gcc`, `pkg-config`, `zstd`, `pcre`, and `just` / `nixfmt` / `prek`.
 - `packages.default` — `ct-print`, built with a bare `nim c` against the
   pinned dependency sources (no network inside the sandbox).
 - `checks.pre-commit-check` — the `git-hooks.nix` hook set (`just lint`).
+  It runs in the Nix build sandbox, which has none of the dev shell's tools,
+  so its `lint` hook is a wrapper that carries `just`, `nim`, `nixfmt` and the
+  seeded Nim dependencies itself, and `just lint` uses no shebang recipe (the
+  sandbox has no `/usr/bin/env`). `just test-flake-check-lint-hook` builds the
+  check and asserts the hook passes.
 
 ### Nim dependencies
 
@@ -46,37 +59,36 @@ first `nimble test` on a clean machine therefore resolves its dependencies
 without hitting the network. Set `NIMBLE_DIR` yourself before entering the
 shell if you want a shared cache instead.
 
-### Why Rust is in a Nim repo's shell
-
-`tests/test_nim_{step,value,io_event}_stream_crossread.nim` write a real
-production `.ct` bundle and then drive the sibling Rust reader's integration
-test (`cargo test -p codetracer_trace_reader …` in
-`../codetracer-trace-format`) to prove the bundle is byte-compatible with the
-canonical reader. Those tests contain a source-level SKIP arm for
-environments that have neither `cargo` nor `direnv`. Shipping the Rust
-toolchain in this shell is what keeps the cross-read proof actually running
-instead of silently skipping. **Never** "fix" a cross-read failure by
-removing the toolchain so the SKIP arm engages. To cross-check against a Rust
-checkout that is not the sibling (a worktree on the branch being ported),
-point `CODETRACER_TRACE_FORMAT_DIR` at it.
-
 ## Commands
 
 | Command                     | What it does                                                          |
 | --------------------------- | --------------------------------------------------------------------- |
-| `just build`                | `ct-print` + `ct-space` + `libcodetracer_trace_writer.a`              |
+| `just build`                | `repro build`: `ct-print` + `ct-space` + `ctfs-salvage` + `libcodetracer_trace_writer.a` |
 | `just build-static-lib`     | Only the C-FFI static library the Rust crate links                    |
-| `just test`                 | `nimble test` (the full declared corpus) **+** the C-FFI smoke test   |
-| `just test-nim`             | Only `nimble test`                                                    |
+| `just test`                 | `repro test` (the declared corpus and the C-FFI hosts) **+** `just test-ffi-controls` |
+| `just test-ffi-controls`    | The must-fail controls the graph does not model: `nimble testFfiThreads` and the two mutation builds of `test_ffi_failures_reach_the_caller` |
+| `just test-nim`             | Only `nimble test`, run directly                                      |
 | `just test-ffi`             | `nimble testFfi` — compiles `tests/test_ffi.c` against the static lib |
 | `just lint`                 | `nim check` over the library entry points + `nixfmt --check`          |
+| `just test-repro-tool-paths` | Real provider compilation and warm graph invalidation for shell input paths (POSIX) |
 | `just format` (alias `fmt`) | `nixfmt flake.nix`                                                    |
 | `just bench`                | `nimble bench` — machine-dependent, deliberately not part of `test`   |
 | `just nix-build`            | `nix build .#default`                                                 |
+| `just test-flake-check-lint-hook` | Builds `checks.pre-commit-check`; its `lint` hook must pass in the sandbox |
 
 `repro.nim` expresses the same graph natively for `reprobuild` (per-test
 build + execute edges); keep the two in sync — see
 `codetracer-specs/Repo-Requirements.md` §2.8.1.
+
+The owning shell and Windows prerequisite binders select a schema-1 JSON
+manifest (`schema: 1`, `paths: {CT_*: absolute-path}`) through the tracked
+`toolPathsFile` variant. Re-entry replaces an inherited owning selection and
+preserves unrelated variants. Override it after activation with
+`repro test --variant toolPathsFile=/absolute/path/paths.json`; the required
+platform fields are documented in `README.md`. The graph reads the manifest
+as an evaluation input and has no ambient `CT_*` fallback. Run
+`just test-repro-tool-paths` on POSIX when changing this boundary; Windows'
+pure binder contract is `just test-repro-tool-path-transport`.
 
 Nim has no formatter this repo trusts unattended (`nimpretty` reflows
 `when`/`case` bodies), so `just format` covers the Nix sources only — the same
@@ -156,7 +168,7 @@ choice the sibling Nim repos `io-mon`, `nim-stackable-hooks` and
   `test`, and do not "promote" `test_chunked_compressed_table.nim` to a
   release build — the corpus compiles it in **debug** on purpose.
   **Know the cost of that split:** `.github/workflows/ci-reprobuild.yml` runs
-  `just test` and nothing else, and `repro.nim` deliberately does not model
+  `repro test` and the FFI controls (the two halves of `just test`) and nothing else, and `repro.nim` deliberately does not model
   benchmarks, so **nothing in CI ever runs `just bench`**. A threshold in
   `bench` is documentation plus a manual command, not an enforced gate. Run
   `just bench` by hand when touching the reader or the writer's append path.

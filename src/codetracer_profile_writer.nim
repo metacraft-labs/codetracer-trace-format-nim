@@ -31,7 +31,7 @@ when defined(nimPreviewSlimSystem):
 ## **Byte-identical to the Rust writer.** The compact container is a function
 ## of the full container (§1f, "Two writers produce the same bytes"), and the
 ## two writers' full containers are byte-identical; so are their compact ones,
-## which `codetracer-trace-format`'s cross-writer test checks.
+## which codetracer-trace-format-conformance's cross-writer test checks.
 
 import std/os
 import results

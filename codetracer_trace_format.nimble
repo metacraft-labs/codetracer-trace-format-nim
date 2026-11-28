@@ -12,6 +12,23 @@ requires "nim >= 2.2.0"
 requires "stew >= 0.1.0"
 requires "results"
 
+# The two mutation builds of `test_ffi_failures_reach_the_caller`, each removing
+# one half of the guard: the test must FAIL under both. Shared by the `test` task
+# and `testFfiMutations`, which `just test-ffi-controls` runs because a build
+# graph cannot express a node that must fail.
+proc ffiMutationControls() =
+  for mutation in ["ffiGuardNoCatch", "ffiGuardNoLatch"]:
+    let (mutOut, mutCode) = gorgeEx("nim c -r -d:release -d:ffiFaultInjection -d:" &
+      mutation & " --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src " &
+      "-o:tests/test_ffi_failures_mutant_" & mutation &
+      " tests/test_ffi_failures_reach_the_caller.nim")
+    if mutCode == 0 or "ALL PASS" in mutOut:
+      echo mutOut
+      raise newException(AssertionDefect, "mutation " & mutation &
+        " left test_ffi_failures_reach_the_caller GREEN: the test does not " &
+        "detect the loss of the guard it exists for")
+    echo "PASS: mutation " & mutation & " turns test_ffi_failures_reach_the_caller red"
+
 task test, "Run all tests":
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_recorded_entry_identity.nim"
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_recorded_entry_hierarchy.nim"
@@ -19,6 +36,7 @@ task test, "Run all tests":
   exec "nim c -r tests/test_nimcache_is_worktree_local.nim"
   exec "nim c -r tests/test_base40.nim"
   exec "nim c -r tests/test_container.nim"
+  exec "nim c -r -d:release tests/test_changed_entries_scan.nim"
   # Container version 5: a member's MapBlock is 0 (empty), its only data
   # block tagged with bit 63, or a mapping block; readers refuse every
   # other container version, naming it.
@@ -70,6 +88,9 @@ task test, "Run all tests":
   # reaped; the file-only form hosts no page. Arms: a heartbeat thread
   # started anyway; the in-guest slot left on the heartbeat rule.
   exec "nim c -r -d:release -d:ctfsKeyedMutation -p:src tests/test_live_page_in_guest.nim"
+  # The hosted writer's heartbeat thread blocks every signal, so a host's
+  # process-directed stop signal never runs on it (POSIX; Windows skips).
+  exec "nim c -r -d:release -p:src tests/test_live_page_heartbeat_blocks_signals.nim"
   # Explicit publication dependencies precede dependent members at every
   # file/live-page write prefix, including real kills and write failures.
   exec "nim c -r -d:release -p:src tests/test_root_publication_order.nim"
@@ -113,6 +134,9 @@ task test, "Run all tests":
   # A header declaring `MaxRootEntries = 0` is the auto-filled root
   # (`ctfs-container.md` §1): every reader scans the slots that fill block 0.
   exec "nim c -r -p:src tests/test_root_auto_fill.nim"
+  # A root larger than 4096 entries (a checkpointed MCR recording declares
+  # 10,922) is read; one larger than the image is still refused.
+  exec "nim c -r -p:src tests/test_native_decoder_large_root.nim"
   exec "nim c -r tests/test_sharded_root_layout.nim"
   exec "nim c -r tests/test_chunk_index.nim"
   exec "nim c -r tests/test_fixed_record_table.nim"
@@ -130,6 +154,10 @@ task test, "Run all tests":
   # inferred GC-safety. refc too, because consumers build with it.
   exec "nim c -r -p:src tests/test_reader_is_gcsafe.nim"
   exec "nim c -r -p:src --mm:refc tests/test_reader_is_gcsafe.nim"
+  # The same for the container writer's entry points (`publish`, every seal,
+  # `createCtfsStreaming`, `closeCtfs`).
+  exec "nim c -r -p:src tests/test_container_writer_is_gcsafe.nim"
+  exec "nim c -r -p:src --mm:refc tests/test_container_writer_is_gcsafe.nim"
   # The same §5d bound in the *other* Nim transcription of the §4 walk:
   # `codetracer_trace_reader.nim`'s own `readInternalFile`. It bounded byte
   # offsets only, and read a null mapping root as a walk through block 0 —
@@ -281,6 +309,11 @@ task test, "Run all tests":
   # carrying frames does not (the control), and the version-6 header's values
   # are refused by name.
   exec "nim c -r -d:release -p:src tests/test_version_6_containers_read.nim"
+  # CCP-8: the closed set of whole-file schemes in `ctfs-container.md` §1b and
+  # the set this library can store and recover must be the SAME set, asserted
+  # in both directions. The spec side is PARSED out of the spec rather than
+  # mirrored here, so neither side can move alone.
+  exec "nim c -r -d:release -p:src tests/test_every_enumerated_scheme_is_implemented_or_not_enumerated.nim"
   # The column-aware step encoding end to end: the writer's opt-in, the
   # DeltaColumn round-trip, Layout A paths.dat, the position decoder, and the
   # meta.dat unknown-flag-bit rejection that keeps the extension clean.
@@ -299,21 +332,10 @@ task test, "Run all tests":
   exec "nim c -r -d:release -p:src tests/test_mixed_column_aware_position_space.nim"
   exec "nim c -r -d:release -p:src tests/test_reader_calls_events.nim"
   exec "nim c -r -d:release -p:src tests/test_reader_integration.nim"
-  # M24a-1: cross-read proof — a Nim-written production steps.dat is read by
-  # the canonical Rust StepStreamReader (skips cleanly if the sibling Rust repo
-  # or its toolchain is absent).
-  exec "nim c -r -d:release -p:src tests/test_nim_step_stream_crossread.nim"
-  # M24a-2: cross-read proof — a Nim-written production values.dat is read by
-  # the canonical Rust ValueStreamReader (skips cleanly if the sibling Rust repo
-  # or its toolchain is absent).
-  exec "nim c -r -d:release -p:src tests/test_nim_value_stream_crossread.nim"
-  # M24a-3: cross-read proof — a Nim-written production events.dat is read by
-  # the canonical Rust IoEventStreamReader (skips cleanly if the sibling Rust
-  # repo or its toolchain is absent).
-  exec "nim c -r -d:release -p:src tests/test_nim_io_event_stream_crossread.nim"
-  # The Nim and Rust step-map readers answer every lookup alike, a lookup of
-  # line 0 (answered as line 1) included.
-  exec "nim c -r -d:release -p:src tests/test_nim_step_map_crossread.nim"
+  # The Nim reader answers a step-map lookup of line 0 as line 1. Holding
+  # this library's bundles against the Rust readers is the job of
+  # codetracer-trace-format-conformance, which depends on both.
+  exec "nim c -r -d:release -p:src tests/test_step_map_line_zero_lookups.nim"
   exec "nim c -r -p:src tests/test_streaming_value_encoder.nim"
   exec "nim c -r -p:src tests/test_value_ref.nim"
   exec "nim c -r -d:release -p:src tests/test_multi_stream_writer.nim"
@@ -358,6 +380,9 @@ task test, "Run all tests":
   # the retired `event_log.*` words, a lone event-log member, an unassigned
   # event-log kind.
   exec "nim c -r -d:release -p:src tests/test_ct_print_native.nim"
+  # ct-print prints a read's full content when eventlog.dat carries a preview
+  # of it, taking the bytes from the thread-stream record with the same geid.
+  exec "nim c -r -d:release -p:src tests/test_ct_print_event_log_preview.nim"
   # Line-only orphan pending-value carry-forward (92fce3a regression).
   # `include`s codetracer_trace_writer_ffi, so it needs --mm:arc and the
   # --nimMainPrefix the FFI's NimMain importc expects (see buildStaticLib).
@@ -464,6 +489,10 @@ task test, "Run all tests":
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_call_entry_is_the_next_step.nim"
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_refused_column_stays_with_its_step.nim"
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_block_size_is_one_of_three.nim"
+  # Every open entry point -- by path, from bytes, `refresh`, the C ABI and
+  # ct-print -- takes the block size and the root directory from the
+  # container's header, not from the 4096-byte, 31-slot defaults.
+  exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_open_new_trace_reads_the_declared_root.nim"
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_meta_text_is_utf8.nim"
   exec "nim c -r -d:release --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_assignment_refuses_unknown_kinds.nim"
   # Every class of C ABI entry point reports its failure to the caller, and
@@ -471,17 +500,7 @@ task test, "Run all tests":
   # builds, each removing one half of the guard: the test must FAIL under both,
   # or it is not measuring the guard.
   exec "nim c -r -d:release -d:ffiFaultInjection --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src tests/test_ffi_failures_reach_the_caller.nim"
-  for mutation in ["ffiGuardNoCatch", "ffiGuardNoLatch"]:
-    let (mutOut, mutCode) = gorgeEx("nim c -r -d:release -d:ffiFaultInjection -d:" &
-      mutation & " --mm:arc --nimMainPrefix:codetracerTraceWriter -p:src " &
-      "-o:tests/test_ffi_failures_mutant_" & mutation &
-      " tests/test_ffi_failures_reach_the_caller.nim")
-    if mutCode == 0 or "ALL PASS" in mutOut:
-      echo mutOut
-      raise newException(AssertionDefect, "mutation " & mutation &
-        " left test_ffi_failures_reach_the_caller GREEN: the test does not " &
-        "detect the loss of the guard it exists for")
-    echo "PASS: mutation " & mutation & " turns test_ffi_failures_reach_the_caller red"
+  ffiMutationControls()
   # The C ABI's in-memory constructors: an embedder with no filesystem gets a
   # container's BYTES rather than a file. Carries its own positive control (the
   # file arm, in the same directory) and its own mutation control (one extra
@@ -672,3 +691,6 @@ task testFfi, "Build and run C FFI test":
   else:
     exec "gcc -o tests/test_ffi tests/test_ffi.c ./libcodetracer_trace_writer.a -lzstd -lm -I include"
   exec "./tests/test_ffi"
+
+task testFfiMutations, "Guard mutations of test_ffi_failures_reach_the_caller must turn it red":
+  ffiMutationControls()

@@ -814,7 +814,7 @@ proc printSpans(filePath: string, jsonOut: bool) =
   # A declared `0` is the auto-filled root (`ctfs-container.md` §1,
   # "Auto-fill"), not a nonsensical header.
   let maxRoot = headerRootEntryCount(bytes)
-  if blockSize == 0'u32 or maxRoot == 0'u32 or int(maxRoot) > 4096:
+  if blockSize == 0'u32 or maxRoot == 0'u32 or not rootDirectoryFits(bytes):
     quit("ct-print: nonsensical CTFS root header (blockSize=" & $blockSize &
       " maxRootEntries=" & $maxRoot & ") in " & filePath)
 
@@ -1421,10 +1421,15 @@ proc main() =
     let layoutBytes = dataR.get()
     if not ctfs_container.hasCtfsMagic(layoutBytes):
       break decideLayout  # non-CTFS ⇒ openNewTrace reports it
-    let retired = refuseRetiredMembers(layoutBytes, DefaultMaxRootEntries)
+    # Both checks scan the root directory the container's own header
+    # declares (`ctfs-container.md` §1, a declared `0` being the auto-filled
+    # root), as `printSpans` does: with the 31-slot default, a recording whose
+    # members lie past slot 30 was refused as one with no `steps.dat`.
+    let layoutRoot = headerRootEntryCount(layoutBytes)
+    let retired = refuseRetiredMembers(layoutBytes, layoutRoot)
     if retired.isErr:
       quit("ct-print: " & filePath & ": " & retired.error)
-    if not ctfs_container.hasInternalFile(layoutBytes, "steps.dat"):
+    if not ctfs_container.hasInternalFile(layoutBytes, "steps.dat", layoutRoot):
       stderr.writeLine("ct-print: " & filePath &
         " carries no `steps.dat` (the execution stream). It is truncated, or " &
         "it is not a trace container.")

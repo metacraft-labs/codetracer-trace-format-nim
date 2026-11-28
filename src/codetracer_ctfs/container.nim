@@ -505,7 +505,11 @@ proc interningSetRefusal*(c: Ctfs): string =
 
 proc readMemberBytes*(data: openArray[byte], name: string,
     fileSize: uint64, mapBlock: uint64,
-    blockSize: uint32): Result[seq[byte], string]
+    blockSize: uint32): Result[seq[byte], string] {.gcsafe.}
+  ## `entryItem`, and through it `publish`, calls this before its body
+  ## below. State the effect here so that the writer's inferred GC-safety
+  ## does not depend on declaration order; Nim still checks the
+  ## implementation against it.
 
 proc flushDirtyData*(c: var Ctfs) =
   ## Hand every block written since the last publication, outside the root
@@ -552,10 +556,8 @@ proc entryChanged*(c: Ctfs, i: int): bool =
   let off = c.fileEntryOffset(i)
   if off + FileEntrySize > c.fileRoot.len:
     return true
-  for k in 0 ..< FileEntrySize:
-    if c.data[off + k] != c.fileRoot[off + k]:
-      return true
-  false
+  not equalMem(unsafeAddr c.data[off], unsafeAddr c.fileRoot[off],
+               FileEntrySize)
 
 proc rootLayoutChanged(c: Ctfs): bool =
   ## The root region is not the one the file holds: its size, or its header,
@@ -570,11 +572,40 @@ proc rootLayoutChanged(c: Ctfs): bool =
   false
 
 proc changedEntries*(c: Ctfs): seq[int] =
-  ## The root slots whose entry differs from what the file last received.
-  for i in 0 ..< int(c.maxRootEntries):
-    if c.fileEntryOffset(i) + FileEntrySize > c.data.len: break
-    if c.entryChanged(i):
-      result.add i
+  ## The root slots whose entry differs from what the file last received:
+  ## `entryChanged` of every slot the image holds whole, in slot order.
+  ##
+  ## Every `publish` asks this, and a streaming writer publishes at every
+  ## `syncEntry`, so the scan runs once per sealed chunk over the WHOLE root
+  ## directory -- about 10,900 slots for a recorder container that takes
+  ## periodic checkpoints (64 root blocks).  Compared slot by slot, a byte at
+  ## a time, it was 30-50% of such a recording's CPU (ct-mcr, ck10 with
+  ## 50 ms checkpoints, 2026-11-16).  The slots the file
+  ## already holds are compared in runs of `Run` slots with one `equalMem`
+  ## each, and only a run that differs is looked at slot by slot; the slots
+  ## the file does not hold yet are changed by definition.
+  const Run = 64
+  let base = containerHeaderSize(c.data)
+  if c.data.len < base: return
+  let inImage = min(int(c.maxRootEntries),
+                    (c.data.len - base) div FileEntrySize)
+  let inFile =
+    if c.fileRoot.len < base: 0
+    else: min(inImage, (c.fileRoot.len - base) div FileEntrySize)
+  var i = 0
+  while i < inFile:
+    let n = min(Run, inFile - i)
+    let off = base + i * FileEntrySize
+    if not equalMem(unsafeAddr c.data[off], unsafeAddr c.fileRoot[off],
+                    n * FileEntrySize):
+      for k in i ..< i + n:
+        let o = base + k * FileEntrySize
+        if not equalMem(unsafeAddr c.data[o], unsafeAddr c.fileRoot[o],
+                        FileEntrySize):
+          result.add k
+    i += n
+  for k in inFile ..< inImage:
+    result.add k
 
 proc setRootPublicationOrder*(c: var Ctfs, names: openArray[string]):
     Result[void, string] =
@@ -1604,6 +1635,34 @@ proc isCompactContainer*(data: openArray[byte]): bool =
   ## framed members store their chunks as content (`ctfs-container.md` §1f).
   data.len > V6ProfileOffset and data[5] == CtfsVersionV6 and
     data[V6ProfileOffset] == uint8(ord(cpCompact))
+
+proc declaredGeometry*(bytes: openArray[byte]):
+    tuple[blockSize, maxEntries: uint32] =
+  ## The block size and the root directory size to look the members of the
+  ## container image `bytes` up with (`locateMember`, `readInternalFile`,
+  ## `hasInternalFile` and every reader over them): the ones its header
+  ## declares (`ctfs-container.md` §1, "Container Header"), a declared
+  ## `MaxRootEntries` of `0` read as the auto-filled root ("Block 0 Layout").
+  ## A reader may take them once, when it opens the container, and keep them
+  ## ("The Root Directory Is Fixed At Creation").
+  ##
+  ## Never the library's defaults (4096 bytes, 31 slots): a lookup that scans
+  ## 31 slots of a larger root misses every member past slot 30 and opens the
+  ## container as an empty one, and one that resolves members with a block
+  ## size other than the header's is refused (`memberRuns`).
+  ##
+  ## A compact container has neither: its header carries `0` for both and its
+  ## members are found through its directory (§1d), which `locateMember` and
+  ## `hasInternalFile` read without either value. The defaults are returned
+  ## for it only so that no reader is handed a zero block size. An image too
+  ## short to carry the two fields answers `(0, 0)`; `checkReadableContainer`
+  ## refuses it before anything is looked up.
+  if bytes.len < HeaderSize + ExtHeaderSize:
+    (0'u32, 0'u32)
+  elif isCompactContainer(bytes):
+    (DefaultBlockSize, DefaultMaxRootEntries)
+  else:
+    (readU32LE(bytes, 8), headerRootEntryCount(bytes))
 
 proc locateMember*(data: openArray[byte], name: string,
     blockSize: uint32 = DefaultBlockSize,

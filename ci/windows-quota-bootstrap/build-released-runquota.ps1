@@ -24,15 +24,15 @@ function Assert-Image([string]$Path, [string]$SHA256) {
         throw 'quota-tool/image-bytes'
     }
 }
-Assert-Image $ReleasedReproImage '333c3c72eac55030886b9dc84fe0c42abf6f09c305a3cdd0672dcfa38b84e17b'
+Assert-Image $ReleasedReproImage 'a5ef0533f0d409893e4d0d4d1f7b96902f3d9a56bac2c01ec638b8b1455dfc42'
 Assert-Image $BootstrapNimImage 'a526ad195a37b88760a01b29470e889a7d2a9d826026f9f0b4921924bb40cd1d'
 Assert-Image (Join-Path $BootstrapNimLibrary 'nimbase.h') 'e5416eecfcea794b307b42c422c36141953b1f27e60b5975d1a63fb5b1a068f3'
 Assert-Image $DeclaredGccImage $DeclaredGccSHA256
 $releaseRoot = Split-Path -Parent (Split-Path -Parent $ReleasedReproImage)
-Assert-Image (Join-Path $releaseRoot 'bin/reprobuild.exe') '8364bcb22bd324558087feb9d597c4ad20b393e8da51c2ad45ced6ea479c322c'
+Assert-Image (Join-Path $releaseRoot 'bin/reprobuild.exe') '06d08e6f87222c92defd4dadcf49db7cb14a829fc45e970e84f7134bd6a9734a'
 $releasedSource = Join-Path $releaseRoot 'share/repro/src/runquota'
 $manifest = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'declared-released-runquota-source-manifest.json') -Raw | ConvertFrom-Json
-Assert-DeclaredSourceTree $releasedSource $manifest.members 155
+Assert-DeclaredSourceTree $releasedSource $manifest.members 163
 $plan = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'staged-major2-bootstrap-source-plan.json') -Raw | ConvertFrom-Json
 Assert-DeclaredSourceTree $LeaseSourceRoot $plan.leaseCandidate.fullTrackedManifest 140
 if (Test-Path -LiteralPath $EvidenceRoot) { throw 'quota-output/occupied' }
@@ -44,14 +44,14 @@ foreach ($member in $manifest.members) {
     $null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination)
     [IO.File]::Copy((Join-Path $releasedSource $member.path), $destination, $false)
 }
-Assert-DeclaredSourceTree $source $manifest.members 155
+Assert-DeclaredSourceTree $source $manifest.members 163
 $hold = [QuotaBootstrapInputs]::new()
 $beforePath = $env:PATH
 $beforeLease = $env:SHM_LEASE_SRC
 $completed = $false
 try {
-    $hold.HoldFile($releaseRoot, 'bin/repro.exe', '333c3c72eac55030886b9dc84fe0c42abf6f09c305a3cdd0672dcfa38b84e17b')
-    $hold.HoldFile($releaseRoot, 'bin/reprobuild.exe', '8364bcb22bd324558087feb9d597c4ad20b393e8da51c2ad45ced6ea479c322c')
+    $hold.HoldFile($releaseRoot, 'bin/repro.exe', 'a5ef0533f0d409893e4d0d4d1f7b96902f3d9a56bac2c01ec638b8b1455dfc42')
+    $hold.HoldFile($releaseRoot, 'bin/reprobuild.exe', '06d08e6f87222c92defd4dadcf49db7cb14a829fc45e970e84f7134bd6a9734a')
     foreach ($member in $BootstrapInputs.nimMembers) { $hold.HoldFile($BootstrapInputs.nimRoot, $member.path, $member.sha256) }
     foreach ($member in $manifest.members) {
         $hold.HoldFile($releasedSource, $member.path, $member.sha256)
@@ -105,8 +105,8 @@ try {
         }
     } finally { Pop-Location }
     $hold.Verify()
-    Assert-DeclaredSourceTree $source $manifest.members 155
-    Assert-DeclaredSourceTree $releasedSource $manifest.members 155
+    Assert-DeclaredSourceTree $source $manifest.members 163
+    Assert-DeclaredSourceTree $releasedSource $manifest.members 163
     Assert-DeclaredSourceTree $LeaseSourceRoot $plan.leaseCandidate.fullTrackedManifest 140
     $hold.Verify()
     $completed = $true

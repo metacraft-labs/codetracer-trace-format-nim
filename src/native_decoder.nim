@@ -70,7 +70,7 @@
 ##   module returns `Result[..., string]` and the CLI treats `isErr` as a
 ##   user-visible error rather than a silent fallback.
 
-import std/[json, base64, strutils, algorithm, options]
+import std/[json, base64, strutils, algorithm, options, tables]
 import results
 import stew/endians2
 import codetracer_ctfs/base40
@@ -191,7 +191,8 @@ proc probeContainerLayout*(data: openArray[byte]): Result[NativeBundleInfo, stri
   # A declared `0` is the auto-filled root (`ctfs-container.md` §1,
   # "Auto-fill"), not a nonsensical header.
   let maxRoot = if compact: 0'u32 else: headerRootEntryCount(data)
-  if not compact and (blockSize == 0 or maxRoot == 0 or int(maxRoot) > 4096):
+  if not compact and (blockSize == 0 or maxRoot == 0 or
+      not rootDirectoryFits(data)):
     return err(
       "nonsensical CTFS root header (blockSize=" & $blockSize &
       " maxRoot=" & $maxRoot & ")")
@@ -531,6 +532,67 @@ proc osEventKindName*(k: uint8): string =
   of 14: "elkGetrandom"
   else: "elk_unknown_" & $k
 
+const
+  EventLogPreviewKinds* = {2'u8, 3'u8, 11'u8}
+    ## `elkRead`, `elkReadFile`, `elkRecv`: the kinds whose `eventlog.dat`
+    ## content may be a PREVIEW, a prefix of the bytes read
+    ## (MCR-Event-Log-Stream.md §2.2).  A preview is told apart by its length:
+    ## shorter than the call's return value, the number of bytes read.
+  OsEventFixedBytes = 20
+    ## An OS event's fixed record after the 26-byte header: returnValue u64,
+    ## errorCode u32, dataLen u32, savedErrno u32; the data follows.
+
+proc fillPreviewContent*(entries: var seq[OsEventLogEntry],
+                         perThread: openArray[seq[NativeEvent]]):
+    Result[void, string] =
+  ## Replace each preview entry's content with the full bytes of the
+  ## thread-stream record it was made from: the record on thread `tid` with
+  ## the same geid.  The event log is a derived stream; the thread stream is
+  ## the recording.  So ct-print shows a preview entry's whole read, as it
+  ## did when the event log carried every byte.  A preview with no such
+  ## record, or one that is not a prefix of the record's data, is refused by
+  ## name: printing the preview as the content would be a silent loss.
+  var wanted = initTable[uint64, int]()   # geid -> entry index
+  for i, e in entries:
+    if e.kind in EventLogPreviewKinds and e.returnValue > 0 and
+        int64(e.content.len) < e.returnValue:
+      wanted[e.geid] = i
+  if wanted.len == 0: return ok()
+  var found = 0
+  for t in 0 ..< perThread.len:
+    for ev in perThread[t]:
+      let i = wanted.getOrDefault(ev.geid, -1)
+      if i < 0 or ev.ctTid != entries[i].tid: continue
+      if ev.payload.len < OsEventFixedBytes:
+        return err("eventlog.dat: the preview at geid " & $ev.geid &
+                   " names a thread-stream record too short for an OS event")
+      let dataLen = int(readU32LE(ev.payload, 12))
+      if OsEventFixedBytes + dataLen > ev.payload.len:
+        return err("eventlog.dat: the preview at geid " & $ev.geid &
+                   "'s thread-stream record is truncated")
+      let pre = entries[i].content
+      if dataLen < pre.len:
+        return err("eventlog.dat: the preview at geid " & $ev.geid &
+                   " is longer than its thread-stream record's data")
+      for k in 0 ..< pre.len:
+        if ev.payload[OsEventFixedBytes + k] != pre[k]:
+          return err("eventlog.dat: the preview at geid " & $ev.geid &
+                     " differs from its thread-stream record at byte " & $k)
+      entries[i].content =
+        ev.payload[OsEventFixedBytes ..< OsEventFixedBytes + dataLen]
+      inc found
+  if found != wanted.len:
+    for g, i in wanted:
+      var seen = false
+      for t in 0 ..< perThread.len:
+        for ev in perThread[t]:
+          if ev.geid == g and ev.ctTid == entries[i].tid: seen = true
+      if not seen:
+        return err("eventlog.dat: the preview entry at geid " & $g &
+                   " (thread " & $entries[i].tid & ") has no thread-stream " &
+                   "record to take its full content from")
+  ok()
+
 proc decodeOsEventLog(data: openArray[byte], blockSize, maxRoot: uint32):
     Result[seq[OsEventLogEntry], string] =
   ## Decode `eventlog.dat` (chunk-prefixed records) using `eventlog.idx`
@@ -805,7 +867,10 @@ proc decodeNativeDocument*(data: openArray[byte], opts: NativeOpts):
   let osR = decodeOsEventLog(data, info.blockSize, info.maxRoot)
   if osR.isErr:
     return err(osR.error)
-  let osEvents = osR.get()
+  var osEvents = osR.get()
+  let fillR = fillPreviewContent(osEvents, perThread)
+  if fillR.isErr:
+    return err(fillR.error)
 
   # ----- counts -----
   var counts = newJObject()

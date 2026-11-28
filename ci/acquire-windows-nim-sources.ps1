@@ -100,11 +100,15 @@ try {
   $proof | ConvertTo-Json -Depth 20 | Set-Content -Encoding utf8 -LiteralPath $Receipt
   # Export only after every complete tree qualifies; original Unix selection unchanged.
   if (!$env:GITHUB_ENV) { throw 'missing CI export destination' }
+  $toolPathBindings = @{}
   foreach ($pair in @(@('CT_NIM_STEW_SRC','nim-stew'),@('CT_NIM_RESULTS_SRC','nim-results'),@('CT_NIM_UNITTEST2_SRC','nim-unittest2'))) {
     $value = Join-Path $Destination $pair[1]
     if ($value -match '[\r\n]') { throw 'invalid source export path' }
     ($pair[0]+'='+$value) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+    $toolPathBindings[$pair[0]] = $value
   }
+  . (Join-Path $PSScriptRoot 'repro-tool-paths.ps1')
+  Set-TraceReproToolPaths -Bindings $toolPathBindings
 } finally {
   $env:GIT_CONFIG_GLOBAL = $priorGlobal
   $env:GIT_CONFIG_NOSYSTEM = $priorNoSystem

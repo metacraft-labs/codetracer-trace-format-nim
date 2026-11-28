@@ -1,4 +1,14 @@
-# Build-time shared fixture and cross-reader source. This is an explicit
-# published source input to setup-dev-env's supported clone-siblings path;
-# the root-only solved graph currently contains no Rust library dependency.
-metacraft-labs/codetracer-trace-format=016d4ddfd151dcfd70d8a4ace7087318683cfbdf
+# Cross-repo siblings cloned by setup-dev-env (clone-siblings), each next to
+# this checkout at ../<name>.
+#
+# The format specification. Two tests read it from the sibling checkout, as
+# they do in a workspace: test_every_enumerated_scheme_is_implemented_or_not_enumerated
+# parses ctfs-container.md §1b, and it and test_compact_container_layout read
+# fixtures/minimal_trace.ct. Without it the first fails, by design.
+#
+# Pinned to an exact revision (codetracer-trace-format-spec latest eac36f1, the
+# revision the local gates of this branch ran against) rather than `=latest`,
+# which clone-siblings warns makes the build not reproducible. repro.lock pins
+# no sibling of this repository (its deps list only the repository itself), so
+# this entry is the spec's only pin; move it when a spec change is needed here.
+codetracer-trace-format-spec=eac36f16a6c94ec2e44467b2f329e78642b78a07

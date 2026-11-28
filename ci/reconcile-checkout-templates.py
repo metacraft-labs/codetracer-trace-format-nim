@@ -6,7 +6,7 @@ samples preserve their original inode, mode, and body. Configuration is held
 only in this process and never hashed or written to the public receipt.
 """
 from pathlib import Path
-import argparse, hashlib, json, os, stat, subprocess, sys, tempfile
+import argparse, hashlib, json, os, re, stat, subprocess, sys, tempfile
 
 def git_template_copy_mode(source_mode, process_umask):
     """Return the mode `git init` gives a regular file copied from a template.
@@ -131,16 +131,35 @@ for variable in ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_TEMPLATE_DIR
                   'GIT_CONFIG_PARAMETERS']:
     if os.environ.get(variable):
         raise RuntimeError('Inherited Git authority refused')
-# Setup installs exactly one owner-scoped authentication entry. Keep its value
-# only in task memory; path selectors and additional configuration stay refused.
+# Setup installs exactly one owner-scoped job credential, in the shape
+# metacraft-github-actions git-auth/scoped-git-auth.sh (`scoped_git_auth_emit`,
+# since its 54bfe36) documents: for the owner's URL prefix, an empty
+# `http.<prefix>.extraHeader` (so a header actions/checkout persisted is not
+# sent), an empty `credential.<prefix>.helper` (so no runner helper answers for
+# the scope), then that action's own helper, which reads the job's token from
+# `$MCL_JOB_CREDENTIALS_DIR` when GitHub challenges. Nothing secret is in the
+# environment. Path selectors and any other configuration stay refused.
 auth_keys = {name: value for name, value in os.environ.items()
             if name == 'GIT_CONFIG_COUNT' or name.startswith('GIT_CONFIG_KEY_')
             or name.startswith('GIT_CONFIG_VALUE_')}
 if auth_keys:
-    if (set(auth_keys) != {'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'}
-            or auth_keys['GIT_CONFIG_COUNT'] != '1'
-            or auth_keys['GIT_CONFIG_KEY_0'] != 'http.https://github.com/metacraft-labs/.extraHeader'
-            or not auth_keys['GIT_CONFIG_VALUE_0']):
+    scope = 'https://github.com/metacraft-labs/'
+    credentials = os.environ.get('MCL_JOB_CREDENTIALS_DIR', '')
+    helper = re.fullmatch(r"!/bin/sh '([^']+)' '([^']+)'", auth_keys.get('GIT_CONFIG_VALUE_2', ''))
+    if (set(auth_keys) != {'GIT_CONFIG_COUNT', *(f'GIT_CONFIG_{kind}_{n}'
+                                                  for kind in ('KEY', 'VALUE') for n in range(3))}
+            or auth_keys['GIT_CONFIG_COUNT'] != '3'
+            or auth_keys['GIT_CONFIG_KEY_0'] != f'http.{scope}.extraHeader'
+            or auth_keys['GIT_CONFIG_VALUE_0'] != ''
+            or auth_keys['GIT_CONFIG_KEY_1'] != f'credential.{scope}.helper'
+            or auth_keys['GIT_CONFIG_VALUE_1'] != ''
+            or auth_keys['GIT_CONFIG_KEY_2'] != f'credential.{scope}.helper'
+            or helper is None
+            or not os.path.isabs(credentials) or helper.group(2) != credentials
+            or os.path.normpath(helper.group(1)) != helper.group(1)
+            or not re.fullmatch(r'/.+/_actions/metacraft-labs/metacraft-github-actions/[^/]+'
+                                r'/git-auth/git-credential-job-token\.sh', helper.group(1))
+            or os.path.islink(helper.group(1)) or not os.path.isfile(helper.group(1))):
         raise RuntimeError('Inherited Git authentication shape refused')
 for key in ['core.hooksPath', 'init.templateDir']:
     result = subprocess.run([str(git), 'config', '--get', key], cwd=root,

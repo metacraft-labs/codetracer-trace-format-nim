@@ -38,15 +38,20 @@ proc test_close_alone_publishes_meta_dat() =
   let path = getTempDir() / "test_close_publishes_meta.ct"
   removeFile(path)
 
-  block:
-    var w = initMultiStreamWriter(path, "entry_sizes",
-      recordingId = "01949fcc-7d92-7e9c-aaaa-eeeeeeeeeeee").get()
-    doAssert w.registerPath("/src/app.py").isOk
-    doAssert w.registerStep(0, 1, []).isOk
-    doAssert w.registerStep(0, 2, []).isOk
-    doAssert w.close().isOk
-    # DELIBERATELY no closeCtfs(): this test is about what `close()` alone
-    # guarantees.  Before the fix `meta.dat` came back at 0 bytes here.
+  # The writer stays open while the container is read: leaving its block, as
+  # this test once did, releases nothing (`Ctfs` has no destructor; only
+  # `closeCtfs`/`abortCtfs` release it), so the container file stayed open to
+  # the end of the process and Windows refused the `removeFile` below. It is
+  # closed after the reads.
+  var w = initMultiStreamWriter(path, "entry_sizes",
+    recordingId = "01949fcc-7d92-7e9c-aaaa-eeeeeeeeeeee").get()
+  doAssert w.registerPath("/src/app.py").isOk
+  doAssert w.registerStep(0, 1, []).isOk
+  doAssert w.registerStep(0, 2, []).isOk
+  doAssert w.close().isOk
+  # DELIBERATELY no closeCtfs() before the reads: this test is about what
+  # `close()` alone guarantees.  Before the fix `meta.dat` came back at 0
+  # bytes here.
 
   let data = readCtfsFromFile(path).get()
   let meta = member(data, "meta.dat")
@@ -64,6 +69,7 @@ proc test_close_alone_publishes_meta_dat() =
     doAssert m.isOk, name & " missing: " & m.error
     doAssert m.get().len > 0, name & " reads back empty after close()"
 
+  doAssert w.closeCtfs().isOk
   removeFile(path)
   echo "PASS: test_close_alone_publishes_meta_dat"
 

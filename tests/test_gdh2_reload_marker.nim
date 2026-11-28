@@ -47,6 +47,7 @@
 ## campaign is under a standing mandate to prevent.
 
 import std/[os, strutils, options]
+import ./exact_bytes_file
 import results
 import codetracer_trace_writer/multi_stream_writer
 import codetracer_trace_writer/new_trace_reader
@@ -570,7 +571,7 @@ when isMainModule:
     currentGate = "gdh2_dump_container"
     check(paramCount() >= 2, "dump needs an output path")
     let built = buildTwoMarkerContainer()
-    writeFile(paramStr(2), cast[string](built.bytes))
+    writeBytesFile(paramStr(2), built.bytes)
     echo "wrote " & paramStr(2) & " (" & $built.bytes.len & " bytes, " &
       "path ids " & $built.v1Id & "/" & $built.v2Id & "/" & $built.v3Id &
       ", " & $built.execEvents & " exec records)"
@@ -579,7 +580,7 @@ when isMainModule:
     currentGate = "gdh2_dump_plain_container"
     check(paramCount() >= 2, "dump-plain needs an output path")
     let plain = buildNoMarkerContainer()
-    writeFile(paramStr(2), cast[string](plain))
+    writeBytesFile(paramStr(2), plain)
     echo "wrote " & paramStr(2) & " (" & $plain.len & " bytes, no markers)"
     quit(0)
 

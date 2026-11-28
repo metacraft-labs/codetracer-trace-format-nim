@@ -25,6 +25,7 @@
 ## conversion, and are read through the real reader.
 
 import std/[os, options, strutils]
+import ./exact_bytes_file
 import results
 import codetracer_ctfs/types
 import codetracer_ctfs/container
@@ -134,7 +135,7 @@ proc test_every_form_answers_as_version_5() =
   # From a path, too.
   createDir(TmpDir)
   let p = TmpDir / "compact.ct"
-  try: writeFile(p, cast[string](compact)) except IOError: doAssert false
+  try: writeBytesFile(p, compact) except IOError: doAssert false
   doAssert openNewTrace(p).isOk
   echo "PASS: test_every_form_answers_as_version_5"
 

@@ -1,9 +1,9 @@
-schema = "reprobuild.solved-graph-lock.v2"
+schema = "reprobuild.solved-graph-lock.v3"
 
 [lock]
 platform = "amd64-linux"
-optimal = false
-inputs_digest = "fnv1a64:b65bd06357f484a7"
-variants = []
+optimal = true
+inputs_digest = "fnv1a64:db803ebe13b3b438"
+variants = [{ name = "toolPathsFile", value = "" }]
 packages = [{ name = "codetracer_trace_format_nim", version = "0.1.0", source = "codetracer_trace_format_nim", selection = "selected" }, { name = "gcc", version = "12.0.0", source = "gcc", selection = "selected" }, { name = "nim", version = "2.2.0", source = "nim", selection = "selected" }, { name = "nimble", version = "1.0.0", source = "nimble", selection = "selected" }, { name = "pkg-config", version = "1.0.0", source = "pkg-config", selection = "selected" }]
-deps = [{ name = "codetracer-trace-format-nim", path = ".", coord_kind = "vcs", url = "https://github.com/metacraft-labs/codetracer-trace-format-nim", ref = "", revision = "4438eda4fb3c7e7de5dcd6bfe2359efc58415d49", integrity = "git-sha1:4438eda4fb3c7e7de5dcd6bfe2359efc58415d49", version = "", visibility = "public", participation = "", depends = "", tags = "" }]
+deps = [{ name = "codetracer-trace-format-nim", self = "true", coord_kind = "vcs", url = "https://github.com/metacraft-labs/codetracer-trace-format-nim", revision = "26e0319bb35c13c2bb4c3c9f2f3ac261977930b1", integrity = "git-sha1:26e0319bb35c13c2bb4c3c9f2f3ac261977930b1", version = "", visibility = "public", participation = "", depends = "", tags = "" }]

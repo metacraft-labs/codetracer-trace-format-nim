@@ -34,6 +34,7 @@ include codetracer_trace_writer_ffi
 {.pop.}
 
 import std/strutils
+import ./exact_bytes_file
 
 const
   # '/' + 46 filler + '/' + '0' + 48 filler = 97 bytes: path_len 47 from the
@@ -53,7 +54,7 @@ proc writeLineOnlyTrace(file: string, path: string) =
   doAssert w.close().isOk
   let bytes = w.toBytes()
   w.closeCtfs()
-  writeFile(file, cast[string](bytes))
+  writeBytesFile(file, bytes)
 
 proc ffiLastError(): string =
   let e = trace_writer_last_error()

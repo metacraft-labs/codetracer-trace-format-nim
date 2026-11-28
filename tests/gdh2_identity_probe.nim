@@ -33,6 +33,7 @@
 ## on BOTH sides rather than assume it.
 
 import std/[os, strutils]
+import ./exact_bytes_file
 import results
 import codetracer_trace_writer/multi_stream_writer
 import codetracer_trace_writer/value_stream
@@ -106,7 +107,7 @@ proc main() =
   let bytes = w.toBytes()
   discard w.closeCtfs()
   if bytes.len == 0: die("the writer produced an empty container")
-  writeFile(outPath, cast[string](bytes))
+  writeBytesFile(outPath, bytes)
 
   # Read the recording id back OUT of the container rather than echoing
   # the constant: the pin has to be shown to have reached the bytes.  A
@@ -137,7 +138,7 @@ proc main() =
     if m.isErr: die("cannot extract member " & member & ": " & m.error)
     let mb = m.get()
     if mb.len == 0: die("member " & member & " is empty")
-    writeFile(outPath & ".member-" & member, cast[string](mb))
+    writeBytesFile(outPath & ".member-" & member, mb)
     echo "member_" & member.replace(".", "_") & "_bytes=" & $mb.len
 
 when isMainModule:

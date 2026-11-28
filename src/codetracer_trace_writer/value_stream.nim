@@ -102,7 +102,7 @@ const
     ## the tag-0 ``StepValues`` event of the step whose execution left the
     ## scope.  The encoding is byte-identical to the canonical Rust
     ## ``ValueStreamEvent::DropVariables`` in
-    ## ``codetracer-trace-format/codetracer_trace_writer/src/value_stream.rs``,
+    ## the Rust ``codetracer_trace_writer/src/value_stream.rs``,
     ## which is what lets each writer's output be read by the other's decoder.
 
   TagBindVariable* = 1'u8
@@ -133,7 +133,7 @@ const
     ## tag-0 ``StepValues`` event of the step the assignment belongs to.  The
     ## encoding is byte-identical to the canonical Rust
     ## ``ValueStreamEvent::Assignment`` in
-    ## ``codetracer-trace-format/codetracer_trace_writer/src/value_stream.rs``
+    ## the Rust ``codetracer_trace_writer/src/value_stream.rs``
     ## (``TAG_ASSIGNMENT``), which is what lets the Rust
     ## ``ValueRecordEntry::decode`` read back what this writer produced.
 

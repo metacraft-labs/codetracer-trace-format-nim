@@ -6,10 +6,19 @@
       url = "github:metacraft-labs/devops-modules/c8ef41d446e211892fe9775182b43d5d517554ac";
       flake = false;
     };
-    # Same toolchain source as the sibling Rust `codetracer-trace-format`
-    # repo, so the Nim/Rust pair that make up the trace-format layer are
-    # built with one pinned compiler set rather than two.
-    codetracer-toolchains.url = "github:metacraft-labs/nix-codetracer-toolchains";
+    # The toolchain source shared by the CodeTracer trace-format repositories,
+    # so the Nim and Rust implementations of the format are built with one
+    # pinned compiler set rather than two.
+    codetracer-toolchains = {
+      url = "github:metacraft-labs/nix-codetracer-toolchains";
+      # microvm.nix (reached through devops-modules) takes its `spectrum`
+      # input from spectrum-os.org, a single host with no mirror of record.
+      # Only microvm's cloud-hypervisor-graphics overlay reads it, and nothing
+      # here uses that, but `nix flake archive` fetches every locked input:
+      # when that host is unreachable, the conformance suite's source
+      # constructor fails. Point it at this flake's own source instead.
+      inputs.nixos-modules.inputs.microvm.inputs.spectrum.follows = "";
+    };
     nixpkgs.follows = "codetracer-toolchains/nixpkgs";
 
     flake-parts = {
@@ -109,6 +118,24 @@
             "${inputs.nim-unittest2}"
           ];
 
+          # One tracked variant selects this manifest, rather than baking
+          # ambient shell exports into a reusable provider graph.
+          reproToolPaths = pkgs.writeText "trace-format-nim-tool-paths.json" (
+            builtins.toJSON {
+              schema = 1;
+              paths = {
+                CT_NIM_STEW_SRC = "${inputs.nim-stew}";
+                CT_NIM_RESULTS_SRC = "${inputs.nim-results}";
+                CT_NIM_UNITTEST2_SRC = "${inputs.nim-unittest2}";
+                CT_ZSTD_INCLUDE_DIR = "${pkgs.zstd.dev}/include";
+                CT_ZSTD_LIB_DIR = "${pkgs.zstd.out}/lib";
+                CT_PCRE_LIB_DIR = "${pkgs.pcre.out}/lib";
+                CT_MINIO_BIN = "${pkgs.minio}/bin/minio";
+                CT_PYTHON3_BIN = "${pkgs.python3}/bin/python3";
+              };
+            }
+          );
+
           # A ready-made `NIMBLE_DIR` payload.  nimble accepts any
           # `pkgs2/<name>-<version>-<40 hex chars>` directory that carries the
           # package's `.nimble`; the checksum component is not verified when
@@ -140,6 +167,29 @@
             lib = pkgs.lib;
             src = inputs.standard-hooks-src;
           };
+          # The flake check's `lint` hook carries its own tools. The check runs
+          # in the Nix build sandbox, where nothing puts `just`, `nim`, the Nim
+          # dependencies or `nixfmt` on PATH, so a bare `just lint` entry
+          # failed to start at all ("No such file or directory"). The
+          # dependencies are the dev shell's `NIMBLE_DIR` seed, read in place:
+          # `nim check` only reads `pkgs2/`. The installed git hook keeps
+          # running `just lint` from the committed `.pre-commit-config.yaml`
+          # with the dev shell's tools. `tests/test_flake_check_lint_hook.sh`.
+          lintHook = pkgs.writeShellApplication {
+            name = "trace-format-nim-lint";
+            runtimeInputs = [
+              pkgs.just
+              pkgs.bash
+              pkgs.coreutils
+              nim
+              pkgs.nixfmt-rfc-style
+            ];
+            text = ''
+              export NIMBLE_DIR=${nimbleSeed}
+              exec just lint
+            '';
+          };
+
           preCommit = inputs.pre-commit-hooks.lib.${system}.run {
             src = ./.;
             package = pkgs.prek;
@@ -151,7 +201,7 @@
               lint = {
                 enable = true;
                 name = "Lint";
-                entry = "just lint";
+                entry = pkgs.lib.getExe lintHook;
                 language = "system";
                 pass_filenames = false;
                 stages = [ "pre-commit" ];
@@ -183,16 +233,6 @@
               # libpcre at run time.
               pkgs.pcre
 
-              # The three `test_nim_*_crossread` tests shell out to
-              # `cargo test` in the sibling `codetracer-trace-format`
-              # checkout to prove a Nim-written bundle is readable by the
-              # canonical Rust reader.  Without a Rust toolchain here they
-              # would take their SKIP arm and the cross-read proof would
-              # silently stop running.  capnproto is needed by that
-              # sibling's `codetracer_trace_format_capnp` crate.
-              toolchainsPkgs.rust-stable
-              pkgs.capnproto
-
               # `tests/test_managed_sender_ci_routes.nim` uploads through the
               # codetracer-ci sender into a real MinIO, with codetracer-ci's
               # upload routes played by a Python stand-in
@@ -222,9 +262,11 @@
             # pcre directly instead of relying on a run-time library search.
             CT_PCRE_LIB_DIR = "${pkgs.pcre.out}/lib";
 
-            # Consumed by `repro.nim`'s `test_managed_sender_ci_routes` edge, which
-            # hands them to the test as `MINIO_BIN` / `PYTHON3_BIN`: a test action's
-            # PATH holds only the provisioned tools, not this shell's packages.
+            # The same two binaries `reproToolPaths` gives `repro.nim`'s
+            # `test_managed_sender_ci_routes` edge, which hands them to the test as
+            # `MINIO_BIN` / `PYTHON3_BIN`: a test action's PATH holds only the
+            # provisioned tools, not this shell's packages. CI validates these
+            # exports as store paths.
             CT_MINIO_BIN = "${pkgs.minio}/bin/minio";
             CT_PYTHON3_BIN = "${pkgs.python3}/bin/python3";
 
@@ -239,6 +281,7 @@
             # repository has at its top level; elsewhere it is skipped and
             # nothing is written. `tests/test_dev_shell_writes_nothing_elsewhere.sh`.
             shellHook = ''
+              source ${./scripts/select-repro-tool-paths.sh} ${reproToolPaths} || exit $?
               ct_tfn_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
               if [ -n "$ct_tfn_root" ] \
                 && [ -f "$ct_tfn_root/codetracer_trace_format.nimble" ] \
@@ -317,6 +360,11 @@
           # `include/` mirror the source-tree locations the sibling-checkout
           # builds read.  Consumers also link libzstd.
           # Same selected constructors used by the guarded owning shell.
+          # The schema-1 tool-path manifest this repo's own shell selects
+          # through the `toolPathsFile` variant. A consumer whose repro build
+          # evaluates this recipe (codetracer's `build-once`) selects the same
+          # file, so the paths are stated once, here, by the recipe's owner.
+          packages.repro-tool-paths = reproToolPaths;
           packages.ci-nimble = nimble;
           packages.ci-nimble-source = nimbleSource;
           packages.ci-nimble-runtime-metadata = nimbleRuntimeMetadata;

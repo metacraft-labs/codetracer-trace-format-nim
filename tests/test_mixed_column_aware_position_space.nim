@@ -37,6 +37,7 @@
 ## back through the real reader.
 
 import std/[os, assertions]
+import ./exact_bytes_file
 import results
 import codetracer_trace_types
 import codetracer_trace_reader
@@ -65,7 +66,7 @@ proc writeMixedTrace(file: string) =
   doAssert w.close().isOk
   let bytes = w.toBytes()
   w.closeCtfs()
-  writeFile(file, cast[string](bytes))
+  writeBytesFile(file, bytes)
 
 proc writeFullyTabledTrace(file: string) =
   ## Both files tabled.
@@ -78,7 +79,7 @@ proc writeFullyTabledTrace(file: string) =
   doAssert w.close().isOk
   let bytes = w.toBytes()
   w.closeCtfs()
-  writeFile(file, cast[string](bytes))
+  writeBytesFile(file, bytes)
 
 # ---------------------------------------------------------------------------
 

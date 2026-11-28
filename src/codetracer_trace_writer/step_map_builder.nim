@@ -331,7 +331,11 @@ proc openStepMapIn*(container: openArray[byte]): Result[StepMapReader, string] =
     var image = ? reconstructImage(container)
     image[V6CompressionOffset] = uint8(ord(wfcNone))
     return openStepMapIn(image)
-  var bytes = readInternalFile(container, StepMapFileName)
+  # Looked up with the container's own block size and root directory
+  # (`ctfs-container.md` §1), not the 4096-byte, 31-slot defaults, which miss
+  # a member past slot 30 and refuse a 1024- or 2048-byte container.
+  let (blockSize, maxEntries) = declaredGeometry(container)
+  var bytes = readInternalFile(container, StepMapFileName, blockSize, maxEntries)
   if bytes.isErr:
     return err(StepMapFileName & ": " & bytes.unsafeError)
   openStepMap(move bytes.get(), isCompactContainer(container))
