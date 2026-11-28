@@ -43,6 +43,7 @@
 ## campaign is under a standing mandate to prevent.
 
 import std/[os, strutils, options]
+import ./exact_bytes_file
 import results
 import codetracer_trace_writer/multi_stream_writer
 import codetracer_trace_writer/new_trace_reader
@@ -841,7 +842,7 @@ when isMainModule:
     let v1 = readFixtureLines("probe_v1.gd")
     let v2 = readFixtureLines("probe_v2.gd")
     let built = buildTwoVersionContainer(v1, v2)
-    writeFile(paramStr(2), cast[string](built.bytes))
+    writeBytesFile(paramStr(2), built.bytes)
     echo "wrote " & paramStr(2) & " (" & $built.bytes.len & " bytes, ids " &
       $built.v1Id & " and " & $built.v2Id & ")"
     quit(0)

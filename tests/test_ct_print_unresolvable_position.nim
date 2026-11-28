@@ -34,6 +34,7 @@
 ## read back through the real reader.
 
 import std/[os, json, strutils, assertions]
+import ./exact_bytes_file
 import results
 import codetracer_ct_print_lib
 import codetracer_trace_writer/multi_stream_writer
@@ -73,7 +74,7 @@ proc writeTrace(file: string, steps: openArray[(uint64, uint64)]) =
   doAssert w.close().isOk
   let bytes = w.toBytes()
   w.closeCtfs()
-  writeFile(file, cast[string](bytes))
+  writeBytesFile(file, bytes)
 
 proc stepEvents(root: JsonNode): seq[JsonNode] =
   doAssert root.hasKey("events"), "document has no events array"

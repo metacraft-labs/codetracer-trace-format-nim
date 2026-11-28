@@ -133,30 +133,40 @@ for variable in ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_TEMPLATE_DIR
         raise RuntimeError('Inherited Git authority refused')
 # setup-nix installs the job-scoped credential as exactly three owner-scoped
 # numbered entries, in this order (metacraft-github-actions
-# git-auth/scoped-git-auth.sh, _scoped_git_auth_helper_pairs, "THE JOB-SCOPED
-# CREDENTIAL"): a preemptive-header reset, a helper reset, and the helper that
-# reads the job's rotating token file. Admit nothing else: any other key,
-# count, order, scope or helper command could select hooks, templates or a
-# foreign credential. Keep the values only in task memory; path selectors and
-# additional configuration stay refused. Governed by codetracer-pm
-# spec/Testing/Trace-Nim-Checkout-Template-Constructor-Transition.md; contract
-# suite ci/test-reconcile-checkout-templates.py.
-auth_scope = 'https://github.com/metacraft-labs/'
-job_token_helper = re.compile(r"!/bin/sh '/[^'\n]*/git-auth/git-credential-job-token\.sh' '/[^'\n]*'")
+# git-auth/scoped-git-auth.sh, _scoped_git_auth_helper_pairs and
+# `scoped_git_auth_emit`, "THE JOB-SCOPED CREDENTIAL", since its 54bfe36): an
+# empty `http.<prefix>.extraHeader` (so a header actions/checkout persisted is
+# not sent), an empty `credential.<prefix>.helper` (so no runner helper answers
+# for the scope), then that action's own helper, which reads the job's rotating
+# token file in `$MCL_JOB_CREDENTIALS_DIR` when GitHub challenges. Admit nothing
+# else: any other key, count, order, scope or helper command could select
+# hooks, templates or a foreign credential. The helper must be the action's own
+# script, an existing regular file at a normalized path, and its credential
+# directory must be this job's. Keep the values only in task memory; path
+# selectors and additional configuration stay refused. Governed by
+# codetracer-pm spec/Testing/Trace-Nim-Checkout-Template-Constructor-Transition.md;
+# contract suite ci/test-reconcile-checkout-templates.py.
 auth_keys = {name: value for name, value in os.environ.items()
             if name == 'GIT_CONFIG_COUNT' or name.startswith('GIT_CONFIG_KEY_')
             or name.startswith('GIT_CONFIG_VALUE_')}
 if auth_keys:
-    expected_names = {'GIT_CONFIG_COUNT'} | {f'GIT_CONFIG_{kind}_{index}'
-                                              for kind in ['KEY', 'VALUE'] for index in range(3)}
-    if (set(auth_keys) != expected_names
+    scope = 'https://github.com/metacraft-labs/'
+    credentials = os.environ.get('MCL_JOB_CREDENTIALS_DIR', '')
+    helper = re.fullmatch(r"!/bin/sh '([^']+)' '([^']+)'", auth_keys.get('GIT_CONFIG_VALUE_2', ''))
+    if (set(auth_keys) != {'GIT_CONFIG_COUNT', *(f'GIT_CONFIG_{kind}_{n}'
+                                                  for kind in ('KEY', 'VALUE') for n in range(3))}
             or auth_keys['GIT_CONFIG_COUNT'] != '3'
-            or [auth_keys[f'GIT_CONFIG_KEY_{index}'] for index in range(3)]
-                != [f'http.{auth_scope}.extraHeader', f'credential.{auth_scope}.helper',
-                    f'credential.{auth_scope}.helper']
+            or auth_keys['GIT_CONFIG_KEY_0'] != f'http.{scope}.extraHeader'
             or auth_keys['GIT_CONFIG_VALUE_0'] != ''
+            or auth_keys['GIT_CONFIG_KEY_1'] != f'credential.{scope}.helper'
             or auth_keys['GIT_CONFIG_VALUE_1'] != ''
-            or not job_token_helper.fullmatch(auth_keys['GIT_CONFIG_VALUE_2'])):
+            or auth_keys['GIT_CONFIG_KEY_2'] != f'credential.{scope}.helper'
+            or helper is None
+            or not os.path.isabs(credentials) or helper.group(2) != credentials
+            or os.path.normpath(helper.group(1)) != helper.group(1)
+            or not re.fullmatch(r'/.+/_actions/metacraft-labs/metacraft-github-actions/[^/]+'
+                                r'/git-auth/git-credential-job-token\.sh', helper.group(1))
+            or os.path.islink(helper.group(1)) or not os.path.isfile(helper.group(1))):
         raise RuntimeError('Inherited Git authentication shape refused')
 for key in ['core.hooksPath', 'init.templateDir']:
     result = subprocess.run([str(git), 'config', '--get', key], cwd=root,

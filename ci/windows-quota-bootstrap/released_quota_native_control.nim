@@ -18,10 +18,10 @@ proc processImage(process: Handle; flags: DWORD; buffer: WideCString;
   importc: "QueryFullProcessImageNameW".}
 
 # Expected refusal texts. The daemon this control talks to is built from the
-# released reprobuild 0.2.31 bundle's `share/repro/src/runquota`, which
+# released reprobuild 0.2.36 bundle's `share/repro/src/runquota`, which
 # `declared-released-runquota-source-manifest.json` pins file by file; its
-# `libs/runquota_daemon/src/runquota_daemon.nim` is runquota 6ff97313 with CRLF
-# line endings. There `possible` (runquota_daemon.nim:1237) names the amount
+# `libs/runquota_daemon/src/runquota_daemon.nim` is runquota 83d89e58 with CRLF
+# line endings. There `possible` (runquota_daemon.nim:1495) names the amount
 # asked for and the budget in force in every budget refusal; runquota's
 # `libs/runquota_daemon/tests/t_denial_names_the_amounts.nim` pins those texts
 # with `==`, and so does this control, because a prefix match would keep
@@ -29,8 +29,8 @@ proc processImage(process: Handle; flags: DWORD; buffer: WideCString;
 
 proc budgetBytesText(value: uint64): string =
   ## The daemon's byte spelling (`humanBytes`, runquota
-  ## `libs/runquota_daemon/src/runquota_daemon/host_config.nim:522` at
-  ## 6ff97313): `N GiB` or `N MiB` only for exact multiples, otherwise the
+  ## `libs/runquota_daemon/src/runquota_daemon/host_config.nim:673` at
+  ## 83d89e58): `N GiB` or `N MiB` only for exact multiples, otherwise the
   ## byte count, so neither figure is rounded. Restated here rather than
   ## imported so the control checks the daemon's output against the
   ## documented format instead of against the daemon's own formatter.
@@ -42,7 +42,7 @@ proc budgetBytesText(value: uint64): string =
   else: $value & " bytes"
 
 const InvalidRequestRefusal =
-  # runquota_daemon.nim:1262 at 6ff97313 for `milliCpu(0)`, `bytes(4096)`:
+  # runquota_daemon.nim:1520 at 83d89e58 for `milliCpu(0)`, `bytes(4096)`:
   # both halves are named, CPU in milli-CPU with an `m` suffix. The request
   # carries no client estimate and no command-stats id, so
   # `effectiveResources` leaves it unchanged and these are the figures the
@@ -50,7 +50,7 @@ const InvalidRequestRefusal =
   "lease request must reserve CPU and memory (requested 0m CPU and 4096 bytes)"
 
 proc overMemoryBudgetRefusal(budget: uint64): string =
-  ## runquota_daemon.nim:1284 at 6ff97313 for a request of `budget + 1` bytes
+  ## runquota_daemon.nim:1542 at 83d89e58 for a request of `budget + 1` bytes
   ## on the default machine. `resourceRequest` names no machine, so the
   ## request resolves to `local` (`DefaultMachineId`); `normalizeTopology`
   ## makes `local`'s memory the daemon's `config.memoryBytes`, which is the
@@ -143,15 +143,15 @@ proc main() =
     protocolError.diagnostic.message
 
   # The missing endpoint. The launcher passes `\\.\pipe\trace-quota-missing-<guid>`,
-  # which `endpointForPath` (runquota_ipc.nim:179 at 6ff97313) uses as-is, so
+  # which `endpointForPath` (runquota_ipc.nim:179 at 83d89e58) uses as-is, so
   # the client opens exactly that name rather than a hashed `runquota-<token>`.
   doAssert paramStr(2).startsWith(r"\\.\pipe\"),
     "missing endpoint is not a named-pipe path: " & paramStr(2)
   let missing = endpointForPath(paramStr(2))
   doAssert missing.kind == endpointNamedPipe and missing.path == paramStr(2),
     "missing endpoint resolved to " & $missing.kind & " " & missing.path
-  # What the pinned client raises for it. `connect` (runquota_client.nim:180
-  # at 6ff97313) opens the transport with `connectEndpoint` before any RQSP
+  # What the pinned client raises for it. `connect` (runquota_client.nim:205
+  # at 83d89e58) opens the transport with `connectEndpoint` before any RQSP
   # byte is sent, and the named-pipe arm (runquota_ipc.nim:1715-1758) calls
   # `CreateFileW(..., OPEN_EXISTING)` once. Only ERROR_PIPE_BUSY (231) is
   # retried through `WaitNamedPipeW`; every other error goes straight to

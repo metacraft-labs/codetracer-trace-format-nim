@@ -280,11 +280,19 @@ when not defined(windows):
                      archivePath = "";
                      nativeIncludeDir = ""; nativeLibDir = "";
                      threads = false): BuildActionDef =
-    ## Construct the typed ``gcc`` edge that compiles the C host program
+    ## Construct the typed C compiler edge that compiles the C host program
     ## ``source`` (a path under ``projectRoot``) to ``output``. It is the
     ## command the nimble ``testFfi`` / ``testFfiThreads`` tasks run:
     ## ``gcc -O1 -o <output> <source> <archive> -lzstd -lm [-lpthread]
     ## -I include``.
+    ##
+    ## The compiler is the C backend this edge registers
+    ## (``SharedLibBackendSelectors``): ``clang`` on macOS, ``gcc`` elsewhere.
+    ## The executable the edge invokes must be that selector, because the
+    ## engine resolves the edge's executable against the tool profiles of the
+    ## consumer's ``uses:``, which on macOS declare ``clang`` and no ``gcc``;
+    ## an edge that invoked ``gcc`` there failed tool resolution with
+    ## "references executable gcc but no tool profile was resolved for it".
     ##
     ## With ``archivePath`` (the static library that ``archive`` produces) the
     ## host links it. The archive and the libraries come AFTER the source: a
@@ -318,7 +326,9 @@ when not defined(windows):
       inputs.add(nativeIncludeDir / "zstd.h")
       inputs.add(nativeLibDir)
     arguments.add(cliArgSeq("compileFlags", compileFlags, cpkPositional, 0))
-    let call = publicCliCall("gcc", "gcc", "", "gcc.gcc.call", arguments)
+    const compiler = SharedLibBackendSelectors[0]
+    let call = publicCliCall(compiler, compiler, "",
+      compiler & "." & compiler & ".call", arguments)
     result = recordToolInvocation(
       "codetracer-trace-format-nim.ffi-host." & splitFile(output).name, call,
       deps = combineActionDeps([], archive),

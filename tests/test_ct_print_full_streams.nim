@@ -78,7 +78,10 @@
 ## than the ct-print under test. `ru_maxrss` is bytes on macOS and KiB on
 ## Linux. On macOS the peak and the cap also take the physical footprint into
 ## account (`residentBytes`): page compression keeps a runaway process's
-## resident set far below what it holds.
+## resident set far below what it holds. Windows has no `wait4`: the child is
+## started with `CreateProcessW` and its peak is the larger of the peak
+## working set and the peak private commit the system keeps for it
+## (`memoryOf`), the commit standing in for the macOS footprint.
 ##
 ## Falsifiability: at `bbe8b15` (before the fix), on the shared macOS arm64
 ## host, the large `--full` run passed twice the memory bound (237 MiB) after
@@ -110,8 +113,12 @@
 ## production reader, and printed by the shipped `ct-print` binary built from
 ## this tree (`tests/ct_print_binary.nim`).
 
-import std/[os, posix, strutils, sequtils, json, options, monotimes, times,
+import std/[os, strutils, sequtils, json, options, monotimes, times,
   tempfiles, algorithm]
+when defined(windows):
+  import std/[winlean, widestrs]
+else:
+  import std/posix
 import results
 import codetracer_trace_types
 import codetracer_trace_writer/cbor
@@ -152,7 +159,8 @@ const
 # Running the binary, measured
 # ---------------------------------------------------------------------------
 
-proc c_exit(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
+when not defined(windows):
+  proc c_exit(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
 
 when defined(macosx):
   type RusageInfoV0 {.importc: "struct rusage_info_v0",
@@ -162,34 +170,82 @@ when defined(macosx):
   proc proc_pid_rusage(pid: cint, flavor: cint, buffer: pointer): cint
     {.importc, header: "<libproc.h>".}
 
-proc residentBytes(pid: Pid): int64 =
-  ## The child's memory right now, or 0 when it cannot be read. On macOS this
-  ## is the larger of the resident set and the physical footprint: the kernel
-  ## compresses and swaps a growing process's pages, so its resident set
-  ## stalls at a few GB while its footprint keeps climbing. Measured on the
-  ## shared macOS arm64 host on the trace of the issue below: the unfixed
-  ## binary's resident set read 4.7 GB while its footprint was 60 GB, so a
-  ## cap on the resident set alone never fires.
-  when defined(macosx):
-    var info: RusageInfoV0
-    if proc_pid_rusage(cint(pid), 0, addr info) == 0:  # RUSAGE_INFO_V0
-      return int64(max(info.ri_resident_size, info.ri_phys_footprint))
-  elif defined(linux):
-    try:
-      let fields = readFile("/proc/" & $pid & "/statm").splitWhitespace()
-      return parseBiggestInt(fields[1]) * int64(sysconf(SC_PAGESIZE))
-    except CatchableError:
-      discard
-  0
+when defined(windows):
+  type ProcessMemoryCountersEx = object
+    ## `PROCESS_MEMORY_COUNTERS_EX`:
+    ## https://learn.microsoft.com/en-us/windows/win32/api/psapi/ns-psapi-process_memory_counters_ex
+    cb: uint32
+    pageFaultCount: uint32
+    peakWorkingSetSize: uint
+    workingSetSize: uint
+    quotaPeakPagedPoolUsage: uint
+    quotaPagedPoolUsage: uint
+    quotaPeakNonPagedPoolUsage: uint
+    quotaNonPagedPoolUsage: uint
+    pagefileUsage: uint
+    peakPagefileUsage: uint
+    privateUsage: uint
+
+  proc k32GetProcessMemoryInfo(process: Handle,
+      counters: ptr ProcessMemoryCountersEx, cb: uint32): WINBOOL
+    {.stdcall, dynlib: "kernel32", importc: "K32GetProcessMemoryInfo".}
+    ## https://learn.microsoft.com/en-us/windows/win32/api/psapi/nf-psapi-getprocessmemoryinfo
+
+  proc memoryOf(process: Handle): tuple[now, peak: int64] =
+    ## The child's memory now and its peak, or zeros when they cannot be read:
+    ## the larger of its working set and its private commit. The commit is
+    ## the Windows counterpart of the macOS footprint `residentBytes` reads
+    ## below: the memory manager trims a growing process's working set, so
+    ## the working set alone understates what the process holds. The peaks
+    ## are the system's own, as `wait4`'s `ru_maxrss` is on POSIX.
+    var c: ProcessMemoryCountersEx
+    c.cb = uint32(sizeof(c))
+    if k32GetProcessMemoryInfo(process, addr c, c.cb) != 0:
+      result.now = int64(max(c.workingSetSize, c.privateUsage))
+      result.peak = int64(max(c.peakWorkingSetSize, c.peakPagefileUsage))
+
+  proc createForChild(path: string): Handle =
+    ## `path` created (or truncated) for writing, as a handle the child
+    ## inherits as its stdout or stderr.
+    var sa = SECURITY_ATTRIBUTES(nLength: int32(sizeof(SECURITY_ATTRIBUTES)),
+      lpSecurityDescriptor: nil, bInheritHandle: 1)
+    result = createFileW(newWideCString(path), GENERIC_WRITE, FILE_SHARE_READ,
+      addr sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0)
+    doAssert result != INVALID_HANDLE_VALUE,
+      "cannot create " & path & ": " & osErrorMsg(osLastError())
+
+else:
+  proc residentBytes(pid: Pid): int64 =
+    ## The child's memory right now, or 0 when it cannot be read. On macOS this
+    ## is the larger of the resident set and the physical footprint: the kernel
+    ## compresses and swaps a growing process's pages, so its resident set
+    ## stalls at a few GB while its footprint keeps climbing. Measured on the
+    ## shared macOS arm64 host on the trace of the issue below: the unfixed
+    ## binary's resident set read 4.7 GB while its footprint was 60 GB, so a
+    ## cap on the resident set alone never fires.
+    when defined(macosx):
+      var info: RusageInfoV0
+      if proc_pid_rusage(cint(pid), 0, addr info) == 0:  # RUSAGE_INFO_V0
+        return int64(max(info.ri_resident_size, info.ri_phys_footprint))
+    elif defined(linux):
+      try:
+        let fields = readFile("/proc/" & $pid & "/statm").splitWhitespace()
+        return parseBiggestInt(fields[1]) * int64(sysconf(SC_PAGESIZE))
+      except CatchableError:
+        discard
+    0
 
 type Measured = object
-  exitCode: int        ## -1 when the child was killed by a signal
+  exitCode: int
+    ## -1 when the child was killed: by a signal on POSIX, and on Windows by
+    ## the `TerminateProcess` this test sends past `runLimit` or the cap.
   signal: int
   timedOut: bool
   overMemoryCap: bool
   maxRssBytes: int64
     ## The larger of `wait4`'s peak resident set and the largest
-    ## `residentBytes` sampled while the child ran.
+    ## `residentBytes` sampled while the child ran; on Windows the largest
+    ## `memoryOf` sampled, peaks included.
   seconds: float
   stdoutBytes: int64
 
@@ -201,57 +257,108 @@ proc runCtPrintMeasured(args: openArray[string],
   ##
   ## The cap exists for the host, not for the verdict: this test runs on
   ## shared machines, and the defect it guards against grew to 32 GB.
-  var argvSeq = @[ctPrintBin]
-  for a in args: argvSeq.add(a)
-  let argv = allocCStringArray(argvSeq)
-  defer: deallocCStringArray(argv)
-  # Converted before the fork: the child only makes async-signal-safe calls.
-  let outC = stdoutPath.cstring
-  let errC = stderrPath.cstring
-  let binC = ctPrintBin.cstring
-  let started = getMonoTime()
-  let pid = fork()
-  if pid == 0:
-    let fo = posix.open(outC, O_WRONLY or O_CREAT or O_TRUNC, Mode(0o600))
-    let fe = posix.open(errC, O_WRONLY or O_CREAT or O_TRUNC, Mode(0o600))
-    if fo < 0 or fe < 0 or dup2(fo, 1) < 0 or dup2(fe, 2) < 0:
-      c_exit(126)
-    discard execv(binC, argv)
-    c_exit(127)
-  doAssert pid > 0, "fork failed: " & osErrorMsg(osLastError())
-  var status: cint
-  var ru: Rusage
-  var sampledPeak = 0'i64
-  while true:
-    let r = wait4(pid, addr status, WNOHANG, addr ru)
-    if r == pid:
-      break
-    if r < 0 and errno != EINTR:
-      doAssert false, "wait4 failed: " & osErrorMsg(osLastError())
-    let now = residentBytes(pid)
-    sampledPeak = max(sampledPeak, now)
-    let overTime = getMonoTime() - started > runLimit
-    let overMemory = not overTime and now > memoryCap
-    if overTime or overMemory:
-      discard kill(pid, SIGKILL)
-      result.timedOut = overTime
-      result.overMemoryCap = overMemory
-      while wait4(pid, addr status, 0, addr ru) < 0 and errno == EINTR:
-        discard
-      break
-    sleep(20)
-  result.seconds = float((getMonoTime() - started).inMilliseconds) / 1000.0
-  when defined(macosx):
-    result.maxRssBytes = int64(ru.ru_maxrss)
+  when defined(windows):
+    # CreateProcessW, with the two files as the child's standard handles:
+    # https://learn.microsoft.com/en-us/windows/win32/procthread/creating-a-child-process-with-redirected-input-and-output
+    var cmd = quoteShellWindows(ctPrintBin)
+    for a in args: cmd.add(" " & quoteShellWindows(a))
+    let fo = createForChild(stdoutPath)
+    let fe = createForChild(stderrPath)
+    var si: STARTUPINFO
+    si.cb = int32(sizeof(si))
+    si.dwFlags = STARTF_USESTDHANDLES
+    si.hStdInput = getStdHandle(STD_INPUT_HANDLE)
+    si.hStdOutput = fo
+    si.hStdError = fe
+    var pi: PROCESS_INFORMATION
+    let started = getMonoTime()
+    let created = createProcessW(nil, newWideCString(cmd), nil, nil, 1, 0,
+      nil, nil, si, pi)
+    let createError = osLastError()
+    discard closeHandle(fo)
+    discard closeHandle(fe)
+    doAssert created != 0,
+      "CreateProcessW " & cmd & " failed: " & osErrorMsg(createError)
+    discard closeHandle(pi.hThread)
+    var sampledPeak = 0'i64
+    var killed = false
+    while true:
+      let w = waitForSingleObject(pi.hProcess, 20)
+      let (now, peak) = memoryOf(pi.hProcess)
+      sampledPeak = max(sampledPeak, max(now, peak))
+      if w == WAIT_OBJECT_0:
+        break
+      doAssert w == WAIT_TIMEOUT,
+        "WaitForSingleObject failed: " & osErrorMsg(osLastError())
+      let overTime = getMonoTime() - started > runLimit
+      let overMemory = not overTime and now > memoryCap
+      if overTime or overMemory:
+        discard terminateProcess(pi.hProcess, 1)
+        result.timedOut = overTime
+        result.overMemoryCap = overMemory
+        killed = true
+        discard waitForSingleObject(pi.hProcess, INFINITE)
+        break
+    result.seconds = float((getMonoTime() - started).inMilliseconds) / 1000.0
+    result.maxRssBytes = max(sampledPeak, memoryOf(pi.hProcess).peak)
+    var code: int32
+    doAssert getExitCodeProcess(pi.hProcess, code) != 0,
+      "GetExitCodeProcess failed: " & osErrorMsg(osLastError())
+    discard closeHandle(pi.hProcess)
+    result.exitCode = if killed: -1 else: int(cast[uint32](code))
+    result.stdoutBytes = int64(getFileSize(stdoutPath))
   else:
-    result.maxRssBytes = int64(ru.ru_maxrss) * 1024
-  result.maxRssBytes = max(result.maxRssBytes, sampledPeak)
-  if WIFEXITED(status):
-    result.exitCode = int(WEXITSTATUS(status))
-  else:
-    result.exitCode = -1
-    result.signal = int(WTERMSIG(status))
-  result.stdoutBytes = int64(getFileSize(stdoutPath))
+    var argvSeq = @[ctPrintBin]
+    for a in args: argvSeq.add(a)
+    let argv = allocCStringArray(argvSeq)
+    defer: deallocCStringArray(argv)
+    # Converted before the fork: the child only makes async-signal-safe calls.
+    let outC = stdoutPath.cstring
+    let errC = stderrPath.cstring
+    let binC = ctPrintBin.cstring
+    let started = getMonoTime()
+    let pid = fork()
+    if pid == 0:
+      let fo = posix.open(outC, O_WRONLY or O_CREAT or O_TRUNC, Mode(0o600))
+      let fe = posix.open(errC, O_WRONLY or O_CREAT or O_TRUNC, Mode(0o600))
+      if fo < 0 or fe < 0 or dup2(fo, 1) < 0 or dup2(fe, 2) < 0:
+        c_exit(126)
+      discard execv(binC, argv)
+      c_exit(127)
+    doAssert pid > 0, "fork failed: " & osErrorMsg(osLastError())
+    var status: cint
+    var ru: Rusage
+    var sampledPeak = 0'i64
+    while true:
+      let r = wait4(pid, addr status, WNOHANG, addr ru)
+      if r == pid:
+        break
+      if r < 0 and errno != EINTR:
+        doAssert false, "wait4 failed: " & osErrorMsg(osLastError())
+      let now = residentBytes(pid)
+      sampledPeak = max(sampledPeak, now)
+      let overTime = getMonoTime() - started > runLimit
+      let overMemory = not overTime and now > memoryCap
+      if overTime or overMemory:
+        discard kill(pid, SIGKILL)
+        result.timedOut = overTime
+        result.overMemoryCap = overMemory
+        while wait4(pid, addr status, 0, addr ru) < 0 and errno == EINTR:
+          discard
+        break
+      sleep(20)
+    result.seconds = float((getMonoTime() - started).inMilliseconds) / 1000.0
+    when defined(macosx):
+      result.maxRssBytes = int64(ru.ru_maxrss)
+    else:
+      result.maxRssBytes = int64(ru.ru_maxrss) * 1024
+    result.maxRssBytes = max(result.maxRssBytes, sampledPeak)
+    if WIFEXITED(status):
+      result.exitCode = int(WEXITSTATUS(status))
+    else:
+      result.exitCode = -1
+      result.signal = int(WTERMSIG(status))
+    result.stdoutBytes = int64(getFileSize(stdoutPath))
 
 proc mib(n: int64): string = formatFloat(float(n) / 1048576.0, ffDecimal, 1) & " MiB"
 

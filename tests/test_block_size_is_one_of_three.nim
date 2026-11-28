@@ -10,6 +10,7 @@ include codetracer_trace_writer_ffi
 {.pop.}
 
 import std/[os, strutils]
+import ./exact_bytes_file
 import codetracer_trace_writer/new_trace_reader as ntr
 
 proc lastErr(): string =
@@ -43,7 +44,7 @@ let opened = ntr.openNewTraceFromBytes(image)
 doAssert opened.isErr, "a container declaring an 8192-byte block is refused"
 doAssert "8192" in opened.error, "the refusal names the value: " & opened.error
 let p8 = dir / "declares8192.ct"
-writeFile(p8, cast[string](image))
+writeBytesFile(p8, image)
 let openedPath = ntr.openNewTrace(p8)
 doAssert openedPath.isErr and "8192" in openedPath.error,
   "and from a path: " & (if openedPath.isErr: openedPath.error else: "opened")

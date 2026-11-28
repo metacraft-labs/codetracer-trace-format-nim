@@ -21,6 +21,7 @@
 ## caller's larger entry count does not read a data block as entries.
 
 import std/[os, strutils]
+import ./exact_bytes_file
 import results
 import codetracer_ctfs/types
 import codetracer_ctfs/container
@@ -97,7 +98,7 @@ block a_file_image_reads_what_is_asked_and_reads_it_as_the_copy:
   doAssert c.writeToFile(big, patterned(520 * int(DefaultBlockSize), 4)).isOk
   let whole = c.toBytes()
   let path = tempPath("lazy.ct")
-  writeFile(path, cast[string](whole))
+  writeBytesFile(path, whole)
   defer: removeFile(path)
   let image = openFileImage(path).get()
   doAssert image.readsFromFile
@@ -133,15 +134,15 @@ block a_file_cut_short_after_it_was_opened_is_refused:
     doAssert c.writeToFile(a, patterned(5000, 1)).isOk
   let whole = c.toBytes()
   let path = tempPath("cut.ct")
-  writeFile(path, cast[string](whole))
+  writeBytesFile(path, whole)
   defer: removeFile(path)
   let image = openFileImage(path).get()
   let v = viewMember(image, "a.dat").get()
-  writeFile(path, cast[string](whole[0 ..< 2 * int(DefaultBlockSize)]))
+  writeBytesFile(path, whole[0 ..< 2 * int(DefaultBlockSize)])
   let r = v.contents()
   doAssert r.isErr and "could not be read" in r.error, $r
   # Control: an image of the uncut file reads the member.
-  writeFile(path, cast[string](whole))
+  writeBytesFile(path, whole)
   doAssert viewMember(openFileImage(path).get(), "a.dat").get().contents().get() ==
     readInternalFile(whole, "a.dat").get()
   echo "PASS a_file_cut_short_after_it_was_opened_is_refused"
@@ -156,7 +157,7 @@ block a_container_without_blocks_is_read_whole:
   for (what, bytes) in [("compact", compactBytes),
       ("compressed", compressImage(compactBytes).get())]:
     let path = tempPath(what & ".ct")
-    writeFile(path, cast[string](bytes))
+    writeBytesFile(path, bytes)
     let image = openFileImage(path).get()
     removeFile(path)
     doAssert not image.readsFromFile, what
@@ -175,7 +176,7 @@ block a_file_without_the_ctfs_magic_is_refused:
       ("sub-block", newSeq[byte](64)),
       ("zero-blocks", newSeq[byte](2 * int(DefaultBlockSize)))]:
     let path = tempPath(what & ".ct")
-    writeFile(path, cast[string](bytes))
+    writeBytesFile(path, bytes)
     let r = openFileImage(path)
     removeFile(path)
     doAssert r.isErr, what & " was opened"
@@ -216,7 +217,7 @@ block the_root_directory_ends_where_the_header_says:
   # the data block a 170-entry scan would reach -- at the open, which takes
   # its geometry from the header alone, and at a refresh given that count.
   let path = tempPath("small-root.ct")
-  writeFile(path, cast[string](whole))
+  writeBytesFile(path, whole)
   defer: removeFile(path)
   let image = openFileImage(path).get()
   doAssert image.readsFromFile

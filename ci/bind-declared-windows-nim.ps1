@@ -47,18 +47,28 @@ function Assert-DeclaredNimProducer($Profile, $Receipt, [string]$ExportedPrefix)
         $object.stripComponents -ne 1) { throw "nim-producer/$role/stripComponents" }
     $pathFields = if ($role -eq 'profile') {
       @('selectedStorePath','realizationBoundary','resolvedExecutablePath')
-    } else { @('realizationBoundary') }
+    } else { @() }
     foreach ($name in $pathFields) {
       if ($null -eq $object.PSObject.Properties[$name] -or $object.$name -isnot [string] -or
           -not [IO.Path]::IsPathFullyQualified($object.$name)) { throw "nim-producer/$role/$name" }
     }
   }
+  # The receipt is sealed into the prefix it describes, so the SDK (Repro
+  # 844e39ba6, released from v0.2.35 and carried by the pinned v0.2.36)
+  # records its boundary as the prefix itself, "." -- never the absolute
+  # staging path the prefix was extracted at,
+  # which exists only on the realizing host and only until the prefix is moved
+  # into place (repro_tool_profiles.nim `writeTarballReceipt`). Any other value
+  # is a receipt the pinned SDK did not write.
+  if ($null -eq $Receipt.PSObject.Properties['realizationBoundary'] -or
+      $Receipt.realizationBoundary -isnot [string] -or $Receipt.realizationBoundary -cne '.') {
+    throw 'nim-producer/receipt/realizationBoundary'
+  }
   if (-not [IO.Path]::IsPathFullyQualified($ExportedPrefix)) { throw 'nim-producer/exported-prefix' }
   $prefix = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($Profile.selectedStorePath))
-  # The SDK (064daf5b through b9cf09b0) writes receipt.realizationBoundary in the extraction directory
-  # before moving/publishing it. That typed historical path is not final
-  # physical authority; the public profile/exported prefix is, together with
-  # complete independent archive-member correspondence below.
+  # The physical authority is the public profile/exported prefix, together with
+  # complete independent archive-member correspondence below; the receipt's
+  # boundary is relative to the prefix it is sealed in (see above).
   if (-not [string]::Equals($prefix,[IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($Profile.realizationBoundary)),[StringComparison]::OrdinalIgnoreCase)) {
     throw 'nim-producer/profile/realizationBoundary'
   }
@@ -94,10 +104,17 @@ try {
     Assert-DeclaredNimProducer $profile $receipt $env:REPRO_PREFIX_NIM
     $controls = [Collections.Generic.List[object]]::new()
     $controls.Add([ordered]@{name='actual-sdk-producer';result='accepted'})
+    # A receipt that records an absolute staging path is what SDKs before
+    # Repro 844e39ba6 wrote; the pinned SDK never does, so it is refused.
     $historical = $receipt | ConvertTo-Json -Depth 32 | ConvertFrom-Json
     $historical.realizationBoundary = 'Z:\historical-producer\tool-store\tmp\extract.123.456.e6eaf87df71f8362'
-    Assert-DeclaredNimProducer $profile $historical $env:REPRO_PREFIX_NIM
-    $controls.Add([ordered]@{name='historical-other-machine-receipt-is-not-physical-authority';result='accepted'})
+    $refused = $false
+    try { Assert-DeclaredNimProducer $profile $historical $env:REPRO_PREFIX_NIM } catch {
+      if ($_.Exception.Message -cne 'nim-producer/receipt/realizationBoundary') { throw }
+      $refused = $true
+    }
+    if (-not $refused) { throw 'a receipt recording an absolute staging path was accepted' }
+    $controls.Add([ordered]@{name='receipt-recording-a-staging-path-is-refused';result='refused'})
     foreach ($role in @('profile','receipt')) {
       $original = if ($role -eq 'profile') { $profile } else { $receipt }
       $fields = if ($role -eq 'profile') {
@@ -266,7 +283,7 @@ try {
           }
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "REPRO_PREFIX_NIM=$prefix"
           Add-Content -LiteralPath $env:GITHUB_PATH -Value (Join-Path $prefix 'bin')
-          [ordered]@{declaredSdkContractRevision='7618e3cb21ce17f5c86fbd290f501d60d52e9be1'; archiveSha256=$archiveSha;
+          [ordered]@{declaredSdkContractRevision='37a109c4e1cf650e6eb79b11d9fadf6e49e64614'; archiveSha256=$archiveSha;
             physicalPrefix=$prefix; image=$binding.ImagePath; imageSha256=$binding.ImageSha256;
             headerSha256=$binding.HeaderSha256; profileInspection=$env:REPRO_TOOL_PROFILE_INSPECTION} | ConvertTo-Json -Depth 5
         } finally { $binding.Dispose() }

@@ -55,6 +55,7 @@
 ## a debugger takes.
 
 import std/[os, assertions, strutils, json]
+import ./exact_bytes_file
 import results
 import codetracer_trace_types
 import codetracer_trace_reader
@@ -136,7 +137,7 @@ proc test_the_space_is_the_sum_of_the_recorded_counts() =
   # End to end through the production reader: the steps must come back at
   # the coordinates they were registered at.
   let file = dir / "sized.ct"
-  writeFile(file, cast[string](bytes))
+  writeBytesFile(file, bytes)
   var readerRes = openTrace(file)
   doAssert readerRes.isOk, "openTrace refused a sized trace"
   var reader = readerRes.get()

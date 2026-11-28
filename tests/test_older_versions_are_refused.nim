@@ -28,6 +28,7 @@ include codetracer_trace_writer_ffi
 {.pop.}
 
 import std/strutils
+import ./exact_bytes_file
 import codetracer_trace_reader as legacy_reader
 
 const
@@ -44,7 +45,7 @@ proc writeCurrent(file: string) =
   doAssert w.close().isOk
   let bytes = w.toBytes()
   w.closeCtfs()
-  writeFile(file, cast[string](bytes))
+  writeBytesFile(file, bytes)
 
 proc stamp(file: string, metaVersion = -1, ctfsVersion = -1) =
   ## Rewrite the meta.dat schema version and/or the container version byte in

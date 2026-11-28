@@ -28,6 +28,7 @@ include codetracer_trace_writer_ffi
 {.pop.}
 
 import std/[os, strutils, options]
+import ./exact_bytes_file
 import codetracer_trace_writer/new_trace_reader as ntr
 
 const
@@ -113,7 +114,7 @@ proc test_c_reader_names_the_conventional_table() =
   copyMem(addr bytes[0], trace_writer_container_ptr(h), n)
   trace_writer_free(h)
   let ct = getTempDir() / "ffi_conventional_kind.ct"
-  writeFile(ct, cast[string](bytes))
+  writeBytesFile(ct, bytes)
   let r = ct_reader_open(cstring(ct))
   doAssert r != nil
   doAssert ct_reader_path_table_kind(r, 0) == CtPathTableLines

@@ -51,6 +51,7 @@
 ## back through `openTrace` / `readEvents`, the same path a debugger takes.
 
 import std/[os, assertions]
+import ./exact_bytes_file
 import results
 import codetracer_trace_types
 import codetracer_trace_reader
@@ -227,7 +228,7 @@ proc test_stride_boundary_end_to_end() =
   doAssert w.close().isOk
   let bytes = w.toBytes()
   w.closeCtfs()
-  writeFile(file, cast[string](bytes))
+  writeBytesFile(file, bytes)
 
   var readerRes = openTrace(file)
   doAssert readerRes.isOk, "openTrace failed (see trace reader Result)"

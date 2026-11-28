@@ -42,6 +42,7 @@
 ## read back through the real reader.
 
 import std/[os, strutils, assertions]
+import ./exact_bytes_file
 import results
 import codetracer_trace_types
 import codetracer_trace_reader
@@ -82,7 +83,7 @@ proc writeTrace(file: string, steps: openArray[(uint64, uint64)]) =
   doAssert w.close().isOk
   let bytes = w.toBytes()
   w.closeCtfs()
-  writeFile(file, cast[string](bytes))
+  writeBytesFile(file, bytes)
 
 proc lineOnlySpace(pathCount: int): GlobalLineIndex =
   var counts = newSeq[uint64](pathCount)

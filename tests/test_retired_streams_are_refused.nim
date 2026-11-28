@@ -71,8 +71,12 @@ proc withMember(member: string, content: seq[byte]): string =
 proc test_the_recording_itself_reads() =
   let path = getTempDir() / "retired_control.ct"
   recording(path)
-  doAssert openNewTrace(path).isOk
-  doAssert openTrace(path).isOk
+  # An opened reader holds the container open until it is released, which is
+  # at the end of the enclosing scope, and Windows refuses to delete an open
+  # file: the block releases both before `removeFile` below.
+  block:
+    doAssert openNewTrace(path).isOk
+    doAssert openTrace(path).isOk
   let h = ct_reader_open(cstring(path))
   doAssert not h.isNil, $trace_writer_last_error()
   ct_reader_close(h)
